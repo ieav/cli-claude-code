@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.json /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.md /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.yaml)",
+      "Bash(wc -l /private/tmp/claude-501/-Users-ieav-projects-claude-code-cli-claude-code-i-main/32cc1607-66ed-4b2d-af56-8fa0fc05a243/tasks/*.output)",
+      "Bash(ls:*)",
+      "Bash(wc:*)"
+    ]
+  }
+}
