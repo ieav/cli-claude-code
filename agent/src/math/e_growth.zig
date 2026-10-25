@@ -1,6 +1,5 @@
 /// e-based growth control — uses sigmoid, exponential decay, and logistic functions
 /// to bound all expansion in the system. Nature's growth limit applied to agent resources.
-
 const std = @import("std");
 const constants = @import("constants.zig");
 

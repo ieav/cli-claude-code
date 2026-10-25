@@ -1,6 +1,6 @@
 /// Memory system coordinator — dispatches across working/episodic/semantic tiers.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const types = @import("types.zig");
 const working = @import("working.zig");
 const episodic = @import("episodic.zig");
@@ -54,7 +54,7 @@ pub const MemorySystem = struct {
 test "MemorySystem store and retrieve" {
     // Note: requires a temp database
     var tmp: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&tmp, "/tmp/zage_mem_test_{d}.db", .{std.time.milliTimestamp()}) catch return;
+    const path = std.fmt.bufPrint(&tmp, "/tmp/zage_mem_test_{d}.db", .{time_mod.nowMillis()}) catch return;
     defer std.posix.unlink(path) catch {};
 
     var db = try database.Database.init(std.testing.allocator, path);
@@ -71,8 +71,8 @@ test "MemorySystem store and retrieve" {
         .description = "A test feedback memory",
         .content = "Always use e-based sigmoid for resource limits",
         .access_count = 0,
-        .created_at = std.time.milliTimestamp(),
-        .updated_at = std.time.milliTimestamp(),
+        .created_at = time_mod.nowMillis(),
+        .updated_at = time_mod.nowMillis(),
     });
 
     try std.testing.expectEqual(@as(usize, 1), mem.workingCount());

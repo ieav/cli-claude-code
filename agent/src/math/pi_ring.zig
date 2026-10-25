@@ -1,6 +1,5 @@
 /// π-based ring buffer — ensures uniform information coverage via π-fraction indexing.
 /// The π fractional sequence disperses access patterns, preventing hotspot clustering.
-
 const std = @import("std");
 const constants = @import("constants.zig");
 
@@ -121,7 +120,7 @@ test "PiRingBuffer π-dispersed access covers all items" {
     var ring = PiRingBuffer(u32, 16).init();
     for (0..16) |i| ring.push(@intCast(i));
     // All π-indexed accesses should return valid data
-    var seen = [_]bool{false} ** 16;
+    var seen: [16]bool = @splat(false);
     var count: usize = 0;
     for (0..16) |i| {
         if (ring.getByPiIndex(i)) |val| {

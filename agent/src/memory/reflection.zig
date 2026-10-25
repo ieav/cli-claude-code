@@ -1,7 +1,7 @@
 /// Reflection engine — analyzes past decisions and generates improvement insights.
 /// Triggered periodically (π × 10min ≈ 31.4min) or after user feedback.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 const types = @import("types.zig");
 
@@ -59,7 +59,7 @@ pub const ReflectionEngine = struct {
         if (count % REFLECT_EVERY_N == 0) return true;
 
         // Also check time-based trigger (π × 10min)
-        const now = std.time.milliTimestamp();
+        const now = time_mod.nowMillis();
         const last = self.last_reflection_at.load(.monotonic);
         const pi_interval: i64 = @intFromFloat(math.constants.PI * 10.0 * 60.0 * 1000.0);
         if (last > 0 and (now - last) > pi_interval) return true;
@@ -127,7 +127,7 @@ pub const ReflectionEngine = struct {
             .insights = try self.allocator.dupe(u8, insights_buf.items),
             .action_items = try self.allocator.dupe(u8, actions_buf.items),
             .quality_score = quality_score,
-            .created_at = std.time.milliTimestamp(),
+            .created_at = time_mod.nowMillis(),
         };
 
         try self.reflections.append(reflection);
@@ -150,7 +150,7 @@ pub const ReflectionEngine = struct {
     /// Decay old reflections using e-based relevance decay.
     /// Reflections older than threshold have reduced relevance.
     pub fn decayOldReflections(self: *Self, max_age_ms: i64) usize {
-        const now = std.time.milliTimestamp();
+        const now = time_mod.nowMillis();
         var removed: usize = 0;
         // Remove reflections older than max_age with low quality
         var i: usize = 0;

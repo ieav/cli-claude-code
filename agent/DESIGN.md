@@ -1,4 +1,4 @@
-# Zage — Zig 自学习 Agent 完整实现计划
+# Ziv — Zig 自学习 Agent 完整设计文档
 
 ## Context
 
@@ -968,8 +968,15 @@ zage/
 │   │   └── phi_condense.zig           # φ 知识浓缩 (Fibonacci hash, golden search)
 │   │
 │   ├── llm/                           # LLM 多模型层
-│   │   ├── provider.zig / claude.zig / openai.zig / ollama.zig
-│   │   ├── message.zig / streaming.zig / tool_call.zig / token.zig
+│   │   ├── mod.zig                    # 模块导出 + 模型工厂 + 后端检测 + 模型目录
+│   │   ├── provider.zig              # 统一 vtable 接口 (complete/stream/countTokens)
+│   │   ├── message.zig              # 消息序列化 + JSON 转义
+│   │   ├── streaming.zig            # SSE 解析器 (通用 + Claude 特化)
+│   │   ├── claude.zig               # Anthropic Claude 后端 (Messages API)
+│   │   ├── openai.zig               # OpenAI 后端 (Chat Completions API)
+│   │   ├── ollama.zig               # Ollama 本地后端 (/api/chat)
+│   │   └── compaction.zig           # 消息压缩 (phi 阈值触发)
+│   │
 │   │
 │   ├── memory/                        # 三层记忆系统
 │   │   ├── memory.zig / working.zig / episodic.zig / semantic.zig
@@ -981,10 +988,18 @@ zage/
 │   ├── embedding/                     # 向量嵌入
 │   │   ├── embedder.zig / api_embedder.zig / local_embedder.zig / store.zig
 │   │
-│   ├── tools/                         # 工具系统
-│   │   ├── registry.zig / bash.zig / file_read.zig / file_write.zig
-│   │   ├── file_edit.zig / glob.zig / grep.zig
-│   │   ├── web_search.zig / web_fetch.zig / memory_tool.zig
+│   ├── tools/                         # comptime 工具系统 (12 工具)
+│   │   ├── mod.zig                    # 模块导出 (12 工具注册)
+│   │   ├── registry.zig              # comptime 注册器 + 增强接口 + 别名
+│   │   ├── orchestration.zig          # 工具编排 (并行安全/串行不安全分组)
+│   │   ├── auth_mode.zig             # 6 种授权模式 + 权限管道
+│   │   ├── rule_parser.zig           # 权限规则解析 (Bash(git status) 语法)
+│   │   ├── classifier.zig            # 自动模式分类器 (预留 LLM 集成)
+│   │   ├── denial_tracker.zig        # 拒绝追踪 (防自动拒绝循环)
+│   │   ├── bash.zig / file_read.zig / file_write.zig
+│   │   ├── glob.zig / grep.zig / file_edit.zig
+│   │   ├── web_search.zig / task_create.zig / task_list.zig / task_update.zig
+│   │   ├── ask_user.zig / tool_search.zig
 │   │
 │   ├── task/                          # 异步任务系统 [新增]
 │   │   ├── scheduler.zig              # 任务调度器
@@ -1005,6 +1020,12 @@ zage/
 │   │   ├── error_handler.zig          # 错误反馈交互
 │   │   ├── progress_reporter.zig      # 后台任务进度展示
 │   │   └── choice_prompt.zig          # 用户选择提示器
+│   │
+│   ├── checkpoint/                    # 操作记录与回滚
+│   │   ├── mod.zig                    # 模块导出
+│   │   ├── file_history.zig          # SHA256 文件快照备份
+│   │   ├── op_log.zig               # 操作记录引擎
+│   │   └── rollback.zig             # 回滚执行器
 │   │
 │   ├── storage/
 │   │   ├── database.zig / vector.zig / migrations.zig / json_store.zig
@@ -1037,7 +1058,245 @@ zage/
 
 ---
 
-## 六、更新后的分阶段实施
+## 六、多模型切换架构
+
+### 设计目标
+
+运行时无需重启即可在 Claude/OpenAI/Ollama 之间自由切换模型，用户通过 `/model` 命令操作。
+
+### 架构
+
+```
+用户输入: /model claude-sonnet-4-6
+     │
+     ▼
+┌──────────────────────────────┐
+│  ModelSwitcher (repl.zig)    │
+│  ├── model_name              │
+│  ├── backend (BackendType)   │
+│  ├── settings (Config)       │
+│  ├── io (std.Io)             │
+│  │                           │
+│  │  Provider 缓存:           │
+│  ├── openai_provider?        │
+│  ├── claude_provider?        │
+│  └── ollama_provider?        │
+└──────────────────────────────┘
+     │
+     │  detectBackend(model_name)
+     ▼
+┌──────────────────────────────┐
+│  BackendType (llm/mod.zig)   │
+│  ├── .claude  ← claude-*    │
+│  ├── .openai  ← gpt-*/o1-*  │
+│  └── .ollama  ← 其他         │
+└──────────────────────────────┘
+     │
+     │  getProvider()
+     ▼
+┌──────────────────────────────┐
+│  Provider (统一 vtable)      │
+│  ├── complete()              │
+│  ├── stream()                │
+│  ├── countTokens()           │
+│  ├── supportsToolUse()       │
+│  └── supportsStreaming()     │
+└──────────────────────────────┘
+```
+
+### 后端检测规则
+
+| 模型名前缀 | 路由到 | 认证 |
+|-----------|--------|------|
+| `claude-` | ClaudeProvider | Anthropic API Key (`x-api-key`) |
+| `gpt-`, `o1-`, `o3-`, `chatgpt-` | OpenAIProvider | Bearer Token |
+| 其他 | OllamaProvider | 无 (本地) |
+
+### 模型目录
+
+`llm/mod.zig` 中预置了 9 个已知模型：
+
+| 后端 | 模型 | 说明 |
+|------|------|------|
+| Claude | claude-opus-4-6 | 最强 |
+| Claude | claude-sonnet-4-6 | 均衡 |
+| Claude | claude-haiku-4-5 | 快速 |
+| OpenAI | gpt-4o | 旗舰 |
+| OpenAI | gpt-4o-mini | 轻量 |
+| OpenAI | o3-mini | 推理 |
+| Ollama | llama3.2 | 本地 |
+| Ollama | qwen2.5 | 本地 |
+| Ollama | deepseek-r1 | 本地 |
+
+也支持自定义模型名，自动路由到对应后端。
+
+### REPL 命令
+
+```
+ziv (gpt-4o) [0%] > /model                    # 显示当前模型 + 可用模型表格
+ziv (gpt-4o) [0%] > /model claude-sonnet-4-6  # 切换到 Claude
+ziv (claude-sonnet-4-6) [12%] > /model llama3.2  # 切换到本地 Ollama
+ziv (gpt-4o) [5%] > /config                   # 交互式配置菜单
+ziv (gpt-4o) [45%] > /compact                 # 压缩对话历史
+ziv (gpt-4o) [45%] > /clear                   # 清空对话
+ziv (gpt-4o) [12%] > /context                 # 查看上下文用量
+ziv (gpt-4o) [12%] > /undo                    # 撤销上一轮
+```
+
+提示符格式：`{mode_indicator} ({model_name}) [{ctx_usage}%] > `
+
+其中 `ctx_usage` 是当前对话历史占 128K 上下文窗口的估算百分比（每轮实时更新），类似 Claude HUD 的上下文使用率显示。
+
+### Agent Loop 架构
+
+v0.3.0 实现了完整的 Agent 循环：
+
+```
+用户输入
+  │
+  ├── append user message → history
+  │
+  └── Agent Loop (max 50 iterations):
+        │
+        ├── 1. maybeCompact(history)     ← φ 阈值自动压缩
+        │
+        ├── 2. prov.complete(history)    ← 发送完整历史（含系统提示词）
+        │
+        ├── 3. 打印响应内容 (text/thinking/tool_use)
+        │
+        ├── 4. append assistant message → history
+        │
+        ├── 5. stop_reason == .tool_use ?
+        │     ├── NO → break（结束循环）
+        │     └── YES → 提取 tool_use blocks:
+        │           │
+        │           ├── 查找工具定义 (DefaultRegistry.findByName)
+        │           ├── 权限检查 (checkToolPermission → allow/deny/ask)
+        │           │     └── ask → 提示用户确认 [y/N]
+        │           ├── 执行工具 (DefaultRegistry.execute)
+        │           └── 构建 tool_result → append 到 history
+        │
+        └── 继续循环（LLM 收到工具结果后继续推理）
+```
+
+### 对话管理命令
+
+| 命令 | 功能 |
+|------|------|
+| `/compact` | 手动压缩历史（保留系统提示词 + 最近 61.8% 消息） |
+| `/clear` (`/reset`, `/new`) | 清空历史，只保留系统提示词 |
+| `/context` | 显示 token 用量、消息数、压缩阈值 |
+| `/undo` | 撤销上一轮（移除 assistant + tool_result + user） |
+| `/rewind` | 回滚到检查点（选择 rollback point） |
+
+### 交互式配置菜单 (/config)
+
+两级菜单结构：
+
+```
+Level 1 — 主菜单:
+  1. API Keys → 子菜单
+  2. Default model       输入新值
+  3. Max tokens           输入新值
+  4. Permission mode      数字选择
+  5. Checkpointing        toggle on/off
+  6. System prompt        输入/重置
+  7. Save & Exit          → saveSettings()
+  8. Exit without saving
+
+Level 2 — API Keys 子菜单:
+  1. OpenAI API Key       (掩码显示 sk-...xyz)
+  2. Anthropic API Key    (掩码显示)
+  3. Brave API Key        (掩码显示)
+  4. Ollama Host URL
+  5. Back → 返回主菜单
+```
+
+`saveSettings()` 将配置序列化为 JSON 写入 `~/.config/ziv/settings.json`，目录不存在则自动创建。
+
+### 配置支持
+
+`config.zig` 的 `Settings` 结构（v0.3.0 更新）：
+
+```zig
+pub const Settings = struct {
+    permission_mode: PermissionMode = .default,
+    allow_rules: []const PermissionRule = &.{},
+    deny_rules: []const PermissionRule = &.{},
+    api_keys: ApiKeys = .{},
+    default_model: []const u8 = "gpt-4o",
+    max_tokens: u32 = 4096,
+    max_snapshots: u32 = 100,
+    checkpointing_enabled: bool = true,
+    system_prompt: ?[]const u8 = null,  // v0.3.0 新增：自定义系统提示词
+};
+```
+
+配置文件 `~/.config/ziv/settings.json`：
+```json
+{
+  "default_model": "claude-sonnet-4-6",
+  "system_prompt": "You are a helpful coding assistant...",
+  "api_keys": {
+    "openai": "sk-...",
+    "anthropic": "sk-ant-...",
+  }
+}
+```
+
+**环境变量回退**（v0.3.0 新增）：
+- `OPENAI_API_KEY` → `api_keys.openai`
+- `ANTHROPIC_API_KEY` → `api_keys.anthropic`
+- `BRAVE_API_KEY` → `api_keys.brave_api_key`
+- 仅在 settings.json 中未配置时生效
+
+**配置持久化**（v0.3.0 新增）：
+- `saveSettings()` 通过 `/config` 菜单触发
+- 自动创建 `~/.config/ziv/` 目录
+- JSON 序列化所有配置项
+
+### 切换时 API Key 校验
+
+切换模型前先检查对应后端的 API Key 是否已配置：
+- 缺少 key → 友好提示 "Error: API key not configured for Claude backend"
+- Ollama → 无需 key
+
+---
+
+## 七、权限系统架构
+
+### 6 种授权模式
+
+| 模式 | 提示符 | 行为 |
+|------|--------|------|
+| Default | `ziv` | 危险操作需要确认 |
+| Accept Edits | `ziv[edit]` | 自动接受文件编辑，破坏性仍需确认 |
+| Plan | `ziv[plan]` | 只读，阻止所有写操作 |
+| Bypass | `ziv[bypass]` | 跳过所有权限检查 |
+| Don't Ask | `ziv[dontask]` | 自动拒绝需要确认的操作 |
+| Auto | `ziv[auto]` | 分类器自动决定 |
+
+### 权限管道（6 步检查）
+
+```
+工具调用请求
+  ├── Step 1: Deny rules      → 直接拒绝
+  ├── Step 2: Ask rules       → 必须确认 (bypass-immune)
+  ├── Step 3: Tool check      → 工具自身权限函数
+  ├── Step 4: Safety paths    → 保护路径 (.git/, /etc/)
+  ├── Step 5: Mode behavior   → 按当前模式决定
+  └── Step 6: Allow rules     → 放行
+```
+
+### 工具编排
+
+`orchestration.zig` 智能分组：
+- **并发安全工具并行执行**：FileRead, Glob, Grep, ToolSearch, TaskList
+- **不安全工具串行执行**：Bash, FileWrite, FileEdit, TaskCreate, TaskUpdate
+
+---
+
+## 八、更新后的分阶段实施
 
 ### Phase 1: 基础 + 数学核心（1-2 周）
 - 项目骨架、build.zig、SQLite
@@ -1083,7 +1342,7 @@ zage/
 
 ---
 
-## 七、自诊断引擎 — 用户质疑时排查自身逻辑
+## 九、自诊断引擎 — 用户质疑时排查自身逻辑
 
 ### 核心思想
 
@@ -1360,7 +1619,7 @@ pub const SelfDiagnostic = struct {
 
 ---
 
-## 八、自主优化研究 — 上网学习最优方案
+## 十、自主优化研究 — 上网学习最优方案
 
 ### 核心思想
 
@@ -1662,7 +1921,7 @@ pub const OptimizationResearcher = struct {
 
 ---
 
-## 九、整合到已有架构的映射
+## 十一、整合到已有架构的映射
 
 新增的两个模块直接融入已有架构，不引入新的子系统：
 
@@ -1701,6 +1960,29 @@ pub const OptimizationResearcher = struct {
                            diagnose_tool（用户主动触发诊断）
                            research_tool（用户主动触发研究）
 
+权限系统 (tools/auth_mode) ←── 6 种授权模式
+                           规则解析器 (rule_parser.zig)
+                           自动分类器 (classifier.zig)
+                           拒绝追踪 (denial_tracker.zig)
+
+工具编排 (tools/orchestration) ←── 并行/串行分组执行
+
+多模型切换 (llm/mod.zig) ←── 后端自动检测
+                           Provider 工厂 (getProvider)
+                           模型目录 (KNOWN_MODELS)
+
+REPL (repl.zig)       ←── /model 命令 + ModelSwitcher
+                           提示符显示当前模型 + 上下文使用率 [N%]
+                           Agent Loop: tool_use → 执行 → 结果回传
+                           对话历史保持 + 自动/手动压缩
+                           API key 缺失友好提示
+                           /config 交互式配置 + saveSettings
+                           /compact, /clear, /context, /undo 对话管理
+
+操作记录 (checkpoint/) ←── 文件快照 + 操作日志 + 完整回滚引擎
+                           trackEdit: 执行前备份 → SHA256 校验 → 写入 .ziv/checkpoints/
+                           rollbackTo: 反向遍历日志 → restoreSnapshot → 文件恢复/新文件删除
+
 错误处理 (error/)      ←──  自诊断融入错误分析流程
                            错误发生后自动触发决策链回溯
 ```
@@ -1714,14 +1996,15 @@ src/
 │   └── self_diagnostic.zig      # 自诊断引擎（新增）
 ├── research/
 │   └── optimization_researcher.zig  # 优化研究引擎（新增）
-└── tools/
-    ├── diagnose_tool.zig        # 诊断工具（新增）
-    └── research_tool.zig        # 研究工具（新增）
+├── tools/
+│   ├── diagnose_tool.zig        # 诊断工具（新增）
+│   └── research_tool.zig        # 研究工具（新增）
+└── system_prompt.zig            # 默认系统提示词（v0.3.0 新增）
 ```
 
 ---
 
-## 十、更新后的完整分阶段实施
+## 十二、更新后的完整分阶段实施
 
 ### Phase 1: 基础 + 数学核心（1-2 周）
 - 项目骨架、build.zig、SQLite
@@ -1757,22 +2040,44 @@ src/
 - φ 知识浓缩算法
 - e 控制知识衰减
 
-### Phase 7: 多模型 + 网络搜索 + 优化研究（1-2 周）
-- OpenAI / Ollama 后端
+### Phase 7: 多模型 + 网络搜索 + 优化研究（1-2 周）✅ 已完成
+- OpenAI / Ollama / **Claude 三后端完整实现**
+- **运行时模型切换 (/model 命令)**
+- **后端自动检测 + Provider 工厂**
+- **Zig 0.16 API 全面适配 (ArrayList, http.Client, json, Io)**
+- **Anthropic API Key 配置支持**
 - 网络搜索 API
 - **OptimizationResearcher 优化研究引擎**
 - **并发网络搜索 + φ 精选 + 方案对比**
 - 知识图谱
 
-### Phase 8: 打磨（1-2 周）
+### Phase 8: 权限系统 + 工具编排 ✅ 已完成
+- 6 种授权模式 + 权限管道
+- 规则解析器 + 自动分类器 + 拒绝追踪器
+- 工具编排 (并行安全/串行不安全分组)
+- 操作记录引擎 + 文件快照 + 完整回滚逻辑（trackEdit/restoreSnapshot/rollbackTo）
+
+### Phase 9: 打磨（1-2 周）
 - 高级 REPL、更多工具
 - 完善自诊断交互展示
 - 完善优化研究交互展示
 - 跨平台测试
 
+### Phase 10: 完整 Agent Loop ✅ 已完成 (v0.3.0)
+- **系统提示词** — `system_prompt.zig` 默认提示词 + Settings.system_prompt 自定义字段
+- **对话历史保持** — ArrayList 消息累积，多轮上下文随对话增长
+- **工具调用循环** — 检测 `stop_reason == .tool_use` → 提取 tool_use blocks → 权限检查 → 执行 → tool_result 回传 → 循环直到 `end_turn`
+- **压缩接入** — 每次 LLM 调用前自动检查 φ 阈值；`/compact` 手动触发
+- **交互式配置菜单** — `/config` 两级菜单，API key 掩码显示，保存到 settings.json
+- **API key 环境变量回退** — OPENAI_API_KEY / ANTHROPIC_API_KEY / BRAVE_API_KEY
+- **配置持久化** — `saveSettings()` 序列化 JSON 写入文件
+- **对话管理命令** — `/compact`、`/clear`、`/context`、`/undo`
+- **上下文使用率显示** — 提示符 `[N%]` 实时显示上下文占比（类 Claude HUD）
+- **Token 用量追踪** — session 级 input/output token 累计
+
 ---
 
-## 十一、验证方式
+## 十三、验证方式
 
 1. **数学模块**：单元测试 π 环形缓冲的均匀覆盖、sigmoid 输出 ∈(0,1)、Fibonacci 哈希分布
 2. **异步任务**：提交 10 个后台任务，确认并发执行且不超过 e 控制的上限
@@ -1782,3 +2087,12 @@ src/
 6. **e 衰减**：30 天未访问的知识重要性应衰减到 initial × e^(-1) ≈ 36.8%
 7. **自诊断**：故意让 agent 遗漏一步，用户质疑后确认能回溯定位到薄弱环节
 8. **优化研究**：说"优化向量搜索"，确认 agent 并发搜索 3+ 关键词，展示 φ 精选方案对比
+9. **多模型切换**：`/model claude-sonnet-4-6` 切换到 Claude，`/model gpt-4o` 切换到 OpenAI，`/model llama3.2` 切换到 Ollama，确认提示符和 stats 显示正确
+10. **权限系统**：在 plan 模式下尝试文件写入，确认被阻止；切换到 bypass 模式，确认跳过检查
+11. **Zig 0.16 构建**：`zig build` 零错误通过
+12. **Agent Loop (v0.3.0)**：发送消息，确认 LLM 返回 tool_use 时自动执行工具并反馈结果，循环直到 end_turn
+13. **对话历史 (v0.3.0)**：连续多轮对话，验证上下文保持；`/context` 显示正确的 token 估算
+14. **上下文使用率 (v0.3.0)**：提示符 `[N%]` 随对话增长而递增，`/compact` 后回降
+15. **配置菜单 (v0.3.0)**：`/config` 设置 API key → 保存 → 退出重启 → 确认配置生效
+16. **环境变量 (v0.3.0)**：设置 `OPENAI_API_KEY` 环境变量，确认不配 settings.json 也能使用
+17. **对话管理 (v0.3.0)**：`/undo` 撤销一轮、`/clear` 清空、`/compact` 压缩，各自正确修改历史

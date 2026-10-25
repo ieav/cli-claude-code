@@ -1,5 +1,4 @@
 /// Vector store — stores and searches embeddings using cosine similarity on SQLite BLOBs.
-
 const std = @import("std");
 
 pub const VectorStore = struct {

@@ -2,7 +2,6 @@
 /// π — circular information coverage
 /// e — natural growth limits
 /// φ — knowledge condensation ratio
-
 pub const PI: f64 = 3.14159265358979323846;
 pub const E: f64 = 2.71828182845904523536;
 pub const PHI: f64 = 0.61803398874989484820;

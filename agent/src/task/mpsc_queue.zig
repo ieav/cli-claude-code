@@ -1,12 +1,14 @@
 /// MPSC (Multi-Producer Single-Consumer) lock-free queue.
 /// Based on the Vyukov algorithm. Multiple threads can push, one thread pops.
-
+/// Uses a heap-allocated stub node to avoid self-referential pointer issues.
 const std = @import("std");
 
 pub fn MPSCQueue(comptime T: type) type {
     return struct {
-        stub: Node,
+        stub: *Node,
         head: std.atomic.Value(*Node),
+        tail: *Node,
+        allocator: std.mem.Allocator,
 
         const Node = struct {
             data: T,
@@ -15,19 +17,22 @@ pub fn MPSCQueue(comptime T: type) type {
 
         const Self = @This();
 
-        pub fn init() Self {
+        pub fn init(allocator: std.mem.Allocator) !Self {
+            const stub = try allocator.create(Node);
+            stub.* = .{
+                .data = undefined,
+                .next = std.atomic.Value(?*Node).init(null),
+            };
             return .{
-                .stub = .{
-                    .data = undefined,
-                    .next = std.atomic.Value(?*Node).init(null),
-                },
-                .head = std.atomic.Value(?*Node).init(null),
-                // head starts pointing to stub
+                .stub = stub,
+                .head = std.atomic.Value(*Node).init(stub),
+                .tail = stub,
+                .allocator = allocator,
             };
         }
 
-        pub fn push(self: *Self, allocator: std.mem.Allocator, item: T) !void {
-            const node = try allocator.create(Node);
+        pub fn push(self: *Self, item: T) !void {
+            const node = try self.allocator.create(Node);
             node.* = .{
                 .data = item,
                 .next = std.atomic.Value(?*Node).init(null),
@@ -38,14 +43,22 @@ pub fn MPSCQueue(comptime T: type) type {
         }
 
         pub fn pop(self: *Self) ?T {
-            _ = self;
-            return null;
+            const tail = self.tail;
+            const next = tail.next.load(.acquire) orelse return null;
+            const data = next.data;
+            self.tail = next;
+            // Free old tail (but never free the stub)
+            if (tail != self.stub) {
+                self.allocator.destroy(tail);
+            }
+            return data;
         }
 
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            _ = self;
-            _ = allocator;
-            // Nodes are freed by the consumer after popping
+        pub fn deinit(self: *Self) void {
+            // Drain remaining nodes
+            while (self.pop()) |_| {}
+            // Free the stub
+            self.allocator.destroy(self.stub);
         }
     };
 }

@@ -1,10 +1,9 @@
 /// Memory types — defines the memory taxonomy for the three-tier memory system.
-
 pub const MemoryType = enum {
-    user,       // User preferences, role, knowledge
-    feedback,   // Corrections and guidance from user
-    project,    // Project-specific context
-    reference,  // External references and resources
+    user, // User preferences, role, knowledge
+    feedback, // Corrections and guidance from user
+    project, // Project-specific context
+    reference, // External references and resources
 };
 
 pub const MemoryEntry = struct {
@@ -19,7 +18,7 @@ pub const MemoryEntry = struct {
 };
 
 pub const MemoryTier = enum {
-    working,    // In-memory LRU, current session
-    episodic,   // SQLite, past interaction history
-    semantic,   // Knowledge graph, extracted facts
+    working, // In-memory LRU, current session
+    episodic, // SQLite, past interaction history
+    semantic, // Knowledge graph, extracted facts
 };

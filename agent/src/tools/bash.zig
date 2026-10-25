@@ -1,5 +1,4 @@
 /// Bash tool — executes shell commands via std.process.run.
-
 const std = @import("std");
 const registry = @import("registry.zig");
 

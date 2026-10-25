@@ -1,7 +1,6 @@
 /// φ-based knowledge condensation — the golden ratio (~0.618) determines optimal compression.
 /// Fibonacci hashing gives the most uniform key distribution possible.
 /// Golden section search finds optima with minimal evaluations.
-
 const std = @import("std");
 const constants = @import("constants.zig");
 
@@ -78,7 +77,7 @@ pub fn compressedDimension(original_dim: usize) usize {
 
 test "fibonacciHash distribution" {
     // Hash should distribute keys well
-    var counts = [_]usize{0} ** 16;
+    var counts: [16]usize = @splat(0);
     for (0..256) |i| {
         const idx = fibonacciHash(@intCast(i), 4); // table_size = 2^4 = 16
         counts[idx] += 1;
@@ -90,7 +89,7 @@ test "fibonacciHash distribution" {
 }
 
 test "fibonacciHash no collisions for sequential keys in small range" {
-    var seen = [_]bool{false} ** 8;
+    var seen: [8]bool = @splat(false);
     var unique: usize = 0;
     for (0..8) |i| {
         const idx = fibonacciHash(@intCast(i), 3);

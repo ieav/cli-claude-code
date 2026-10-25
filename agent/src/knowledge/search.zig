@@ -1,7 +1,6 @@
 /// Web search integration — queries external search APIs for knowledge.
 /// Supports multiple backends: Brave, SearXNG, DuckDuckGo (HTML fallback).
-/// Uses std.http.Client for real HTTP requests.
-
+/// Uses std.http.Client for real HTTP requests (Zig 0.16 API).
 const std = @import("std");
 const math = @import("../math/mod.zig");
 
@@ -43,7 +42,7 @@ pub const WebSearch = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, backend: SearchBackend, api_key: ?[]const u8) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, backend: SearchBackend, api_key: ?[]const u8) Self {
         const base_url: []const u8 = switch (backend) {
             .brave => "https://api.search.brave.com/res/v1/web/search",
             .searxng => "http://localhost:8888/search",
@@ -54,7 +53,7 @@ pub const WebSearch = struct {
             .backend = backend,
             .api_key = api_key,
             .base_url = base_url,
-            .http_client = .{ .allocator = allocator },
+            .http_client = .{ .allocator = allocator, .io = io },
             .total_searches = std.atomic.Value(usize).init(0),
         };
     }
@@ -81,36 +80,37 @@ pub const WebSearch = struct {
     fn searchBrave(self: *Self, query: []const u8, max_results: usize) ![]SearchResult {
         const api_key = self.api_key orelse return error.ApiKeyRequired;
 
-        // Build URL with query parameters
         const encoded_query = try self.urlEncode(query);
         defer self.allocator.free(encoded_query);
 
-        const url = try std.fmt.allocPrint(self.allocator,
+        const url = try std.fmt.allocPrint(
+            self.allocator,
             "{s}?q={s}&count={d}",
             .{ self.base_url, encoded_query, max_results },
         );
         defer self.allocator.free(url);
 
         const uri = try std.Uri.parse(url);
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
-        defer self.allocator.free(auth_header);
+        const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        defer self.allocator.free(auth_value);
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
-        try headers.append("accept", "application/json");
-        try headers.append("authorization", auth_header);
-
-        var req = try self.http_client.open(.GET, uri, .{ .headers = headers });
+        var req = try self.http_client.request(.GET, uri, .{
+            .extra_headers = &.{
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "authorization", .value = auth_value },
+            },
+        });
         defer req.deinit();
-        try req.send();
-        try req.finish();
-        try req.wait();
+        try req.sendBodiless();
 
-        if (req.response.status.class() != .success) {
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try req.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        const response_body = try self.readResponseBody(&response);
         defer self.allocator.free(response_body);
 
         return self.parseBraveResults(response_body, max_results);
@@ -118,13 +118,13 @@ pub const WebSearch = struct {
 
     /// Parse Brave Search API JSON response.
     fn parseBraveResults(self: *Self, body: []const u8, max_results: usize) ![]SearchResult {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, body) catch
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
             return &.{};
 
         const web_results = parsed.object.get("web") orelse return &.{};
         const results_array = web_results.object.get("results") orelse return &.{};
 
-        var output = std.ArrayList(SearchResult).init(self.allocator);
+        var output = std.ArrayList(SearchResult).empty;
         const count = @min(results_array.array.items.len, max_results);
 
         for (results_array.array.items[0..count], 0..) |item, i| {
@@ -141,10 +141,9 @@ pub const WebSearch = struct {
             else
                 try self.allocator.dupe(u8, "");
 
-            // Rank-based relevance: first results are more relevant
             const relevance = 1.0 - @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(count, 1)));
 
-            try output.append(.{
+            try output.append(self.allocator, .{
                 .title = title,
                 .url = url_val,
                 .snippet = snippet,
@@ -152,7 +151,7 @@ pub const WebSearch = struct {
             });
         }
 
-        return output.toOwnedSlice();
+        return output.toOwnedSlice(self.allocator);
     }
 
     /// Search using SearXNG instance (self-hosted metasearch).
@@ -160,7 +159,8 @@ pub const WebSearch = struct {
         const encoded_query = try self.urlEncode(query);
         defer self.allocator.free(encoded_query);
 
-        const url = try std.fmt.allocPrint(self.allocator,
+        const url = try std.fmt.allocPrint(
+            self.allocator,
             "{s}?q={s}&format=json&categories=general",
             .{ self.base_url, encoded_query },
         );
@@ -168,21 +168,22 @@ pub const WebSearch = struct {
 
         const uri = try std.Uri.parse(url);
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
-        try headers.append("accept", "application/json");
-
-        var req = try self.http_client.open(.GET, uri, .{ .headers = headers });
+        var req = try self.http_client.request(.GET, uri, .{
+            .extra_headers = &.{
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
         defer req.deinit();
-        try req.send();
-        try req.finish();
-        try req.wait();
+        try req.sendBodiless();
 
-        if (req.response.status.class() != .success) {
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try req.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        const response_body = try self.readResponseBody(&response);
         defer self.allocator.free(response_body);
 
         return self.parseSearXNGResults(response_body, max_results);
@@ -190,12 +191,12 @@ pub const WebSearch = struct {
 
     /// Parse SearXNG JSON response.
     fn parseSearXNGResults(self: *Self, body: []const u8, max_results: usize) ![]SearchResult {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, body) catch
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
             return &.{};
 
         const results_array = parsed.object.get("results") orelse return &.{};
 
-        var output = std.ArrayList(SearchResult).init(self.allocator);
+        var output = std.ArrayList(SearchResult).empty;
         const count = @min(results_array.array.items.len, max_results);
 
         for (results_array.array.items[0..count], 0..) |item, i| {
@@ -214,7 +215,7 @@ pub const WebSearch = struct {
 
             const relevance = 1.0 - @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(count, 1)));
 
-            try output.append(.{
+            try output.append(self.allocator, .{
                 .title = title,
                 .url = url_val,
                 .snippet = snippet,
@@ -222,49 +223,63 @@ pub const WebSearch = struct {
             });
         }
 
-        return output.toOwnedSlice();
+        return output.toOwnedSlice(self.allocator);
     }
 
     /// Search using DuckDuckGo HTML endpoint (no API key needed).
     fn searchDuckDuckGo(self: *Self, query: []const u8, max_results: usize) ![]SearchResult {
-        // DuckDuckGo HTML search via POST
-        const post_body = try std.fmt.allocPrint(self.allocator, "q={s}", .{query});
+        const encoded_query = try self.urlEncode(query);
+        defer self.allocator.free(encoded_query);
+
+        const post_body = try std.fmt.allocPrint(self.allocator, "q={s}", .{encoded_query});
         defer self.allocator.free(post_body);
 
         const uri = try std.Uri.parse(self.base_url);
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
-        try headers.append("content-type", "application/x-www-form-urlencoded");
-        try headers.append("user-agent", "ZageAgent/1.0");
-
-        var req = try self.http_client.open(.POST, uri, .{ .headers = headers });
+        var req = try self.http_client.request(.POST, uri, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+                .{ .name = "user-agent", .value = "ZageAgent/1.0" },
+            },
+        });
         defer req.deinit();
-        req.transfer_type = .chunked;
 
-        try req.send();
-        try req.writer().writeAll(post_body);
-        try req.finish();
-        try req.wait();
+        // Send POST body
+        req.transfer_encoding = .{ .content_length = post_body.len };
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(post_body);
+        try body_writer.end();
+        try req.connection.?.flush();
 
-        if (req.response.status.class() != .success) {
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try req.reader().readAllAlloc(self.allocator, 2 * 1024 * 1024);
+        const response_body = try self.readResponseBody(&response);
         defer self.allocator.free(response_body);
 
         return self.parseDuckDuckGoHTML(response_body, max_results);
     }
 
+    /// Read the full response body into an allocated buffer.
+    fn readResponseBody(self: *Self, response: *std.http.Client.Response) ![]u8 {
+        var transfer_buf: [8192]u8 = undefined;
+        const reader = response.reader(&transfer_buf);
+        const content_length = response.head.content_length orelse 1024 * 64;
+        const body = try reader.readAlloc(self.allocator, content_length);
+        return body;
+    }
+
     /// Parse DuckDuckGo HTML response to extract results.
     /// DDG HTML uses <a class="result__a" href="...">Title</a> and <a class="result__snippet">...
     fn parseDuckDuckGoHTML(self: *Self, html: []const u8, max_results: usize) ![]SearchResult {
-        var results = std.ArrayList(SearchResult).init(self.allocator);
+        var results = std.ArrayList(SearchResult).empty;
         var pos: usize = 0;
 
         while (pos < html.len and results.items.len < max_results) {
-            // Find result title: <a class="result__a"
             const title_marker = "<a class=\"result__a\"";
             const title_start = std.mem.indexOfPos(u8, html, pos, title_marker) orelse break;
             const href_start = std.mem.indexOfPos(u8, html, title_start, "href=\"") orelse break;
@@ -272,13 +287,11 @@ pub const WebSearch = struct {
             const href_end = std.mem.indexOfScalar(u8, html[href_begin..], '"') orelse break;
             const url = html[href_begin .. href_begin + href_end];
 
-            // Extract title text
             const tag_end = std.mem.indexOfScalar(u8, html[title_start..], '>') orelse break;
             const title_begin = title_start + tag_end + 1;
             const title_end = std.mem.indexOfScalar(u8, html[title_begin..], '<') orelse break;
             const title = html[title_begin .. title_begin + title_end];
 
-            // Find snippet: <a class="result__snippet"
             var snippet: []const u8 = "";
             const snippet_marker = "result__snippet";
             if (std.mem.indexOfPos(u8, html, title_begin, snippet_marker)) |snip_pos| {
@@ -297,7 +310,7 @@ pub const WebSearch = struct {
             const idx = results.items.len;
             const relevance = 1.0 - @as(f64, @floatFromInt(idx)) / @as(f64, @floatFromInt(@max(max_results, 1)));
 
-            try results.append(.{
+            try results.append(self.allocator, .{
                 .title = try self.allocator.dupe(u8, title),
                 .url = try self.allocator.dupe(u8, url),
                 .snippet = try self.allocator.dupe(u8, snippet),
@@ -307,13 +320,13 @@ pub const WebSearch = struct {
             pos = title_begin + 1;
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// URL-encode a query string for use in search URLs.
     pub fn urlEncode(self: *Self, input: []const u8) ![]u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        const writer = buf.writer();
+        var buf = std.ArrayList(u8).empty;
+        const writer = buf.writer(self.allocator);
 
         for (input) |c| {
             switch (c) {
@@ -328,23 +341,23 @@ pub const WebSearch = struct {
                 },
             }
         }
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(self.allocator);
     }
 
     /// Generate search keywords from a user query using φ condensation.
     /// Extracts the most important words/phrases and condenses using golden ratio.
     pub fn generateSearchKeywords(self: *Self, query: []const u8) ![]const u8 {
-        var keywords = std.ArrayList(u8).init(self.allocator);
-        defer keywords.deinit();
+        var keywords = std.ArrayList(u8).empty;
+        defer keywords.deinit(self.allocator);
 
         // Simple keyword extraction: split on whitespace, take significant words
         var words = std.mem.splitSequence(u8, query, " ");
-        var word_list = std.ArrayList([]const u8).init(self.allocator);
-        defer word_list.deinit();
+        var word_list = std.ArrayList([]const u8).empty;
+        defer word_list.deinit(self.allocator);
 
         while (words.next()) |word| {
             if (word.len > 3) { // Skip short words
-                try word_list.append(word);
+                try word_list.append(self.allocator, word);
             }
         }
 
@@ -374,8 +387,8 @@ pub const WebSearch = struct {
 };
 
 test "WebSearch URL encoding" {
-    var ws = WebSearch.init(std.testing.allocator, .duckduckgo, null);
-    defer ws.deinit();
+    var ws = WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
+    // Only testing urlEncode, no HTTP calls needed
 
     const encoded = try ws.urlEncode("hello world & test");
     defer std.testing.allocator.free(encoded);
@@ -384,8 +397,7 @@ test "WebSearch URL encoding" {
 }
 
 test "WebSearch generateSearchKeywords" {
-    var ws = WebSearch.init(std.testing.allocator, .duckduckgo, null);
-    defer ws.deinit();
+    var ws = WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
 
     const keywords = try ws.generateSearchKeywords("how to optimize vector search performance");
     defer std.testing.allocator.free(keywords);
@@ -394,8 +406,7 @@ test "WebSearch generateSearchKeywords" {
 }
 
 test "WebSearch parseDuckDuckGoHTML" {
-    var ws = WebSearch.init(std.testing.allocator, .duckduckgo, null);
-    defer ws.deinit();
+    var ws = WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
 
     const html =
         \\<div><a class="result__a" href="https://example.com/zig">Zig Programming Language</a></div>

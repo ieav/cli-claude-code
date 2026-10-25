@@ -1,5 +1,4 @@
 /// FileWrite tool — writes content to a file.
-
 const std = @import("std");
 const registry = @import("registry.zig");
 

@@ -1,7 +1,7 @@
 /// Knowledge graph — stores entities and relationships in SQLite.
 /// Supports entity search, relationship traversal, and φ-based pruning.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 const database = @import("../storage/database.zig");
 
@@ -44,21 +44,31 @@ pub const KnowledgeGraph = struct {
     }
 
     pub fn addNode(self: *Self, entity: []const u8, entity_type: EntityType, source: ?[]const u8) !i64 {
-        const now = std.time.milliTimestamp();
+        const now = time_mod.nowMillis();
+        const q_entity = try database.Database.quoteString(self.allocator, entity);
+        defer self.allocator.free(q_entity);
+        const q_source = if (source) |s|
+            try database.Database.quoteString(self.allocator, s)
+        else
+            "NULL";
+        defer if (source != null) self.allocator.free(q_source);
+
         const sql = try std.fmt.allocPrint(self.allocator,
             \\INSERT INTO knowledge_nodes (entity, entity_type, properties, source, created_at, updated_at)
-            \\VALUES ('{s}', '{s}', NULL, '{?s}', {d}, {d})
-        , .{ entity, @tagName(entity_type), source, now, now });
+            \\VALUES ({s}, '{s}', NULL, {s}, {d}, {d})
+        , .{ q_entity, @tagName(entity_type), q_source, now, now });
         defer self.allocator.free(sql);
         try self.db.exec(sql);
-        // Return last insert rowid (simplified - would use sqlite3_last_insert_rowid)
-        return 0;
+        return self.db.lastInsertRowId();
     }
 
     pub fn addEdge(self: *Self, from_id: i64, to_id: i64, relation: []const u8, weight: f32) !void {
-        const sql = try std.fmt.allocPrint(self.allocator,
-            "INSERT INTO knowledge_edges (from_id, to_id, relation, weight) VALUES ({d}, {d}, '{s}', {d:.3})",
-            .{ from_id, to_id, relation, weight },
+        const q_relation = try database.Database.quoteString(self.allocator, relation);
+        defer self.allocator.free(q_relation);
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "INSERT INTO knowledge_edges (from_id, to_id, relation, weight) VALUES ({d}, {d}, {s}, {d:.3})",
+            .{ from_id, to_id, q_relation, weight },
         );
         defer self.allocator.free(sql);
         try self.db.exec(sql);
@@ -68,7 +78,8 @@ pub const KnowledgeGraph = struct {
     /// Edges with weight < φ × max_weight are removed.
     pub fn pruneWeakEdges(self: *Self, max_weight: f32) !usize {
         const threshold = math.pruningThreshold(max_weight);
-        const sql = try std.fmt.allocPrint(self.allocator,
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
             "DELETE FROM knowledge_edges WHERE weight < {d:.6}",
             .{threshold},
         );
@@ -86,7 +97,7 @@ pub const KnowledgeGraph = struct {
 
 test "KnowledgeGraph addNode and addEdge" {
     var tmp: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&tmp, "/tmp/zage_kg_test_{d}.db", .{std.time.milliTimestamp()}) catch return;
+    const path = std.fmt.bufPrint(&tmp, "/tmp/zage_kg_test_{d}.db", .{time_mod.nowMillis()}) catch return;
     defer std.posix.unlink(path) catch {};
 
     var db = try database.Database.init(std.testing.allocator, path);

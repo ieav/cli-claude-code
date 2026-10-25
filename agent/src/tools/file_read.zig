@@ -1,5 +1,4 @@
 /// FileRead tool — reads file contents with line numbers.
-
 const std = @import("std");
 const registry = @import("registry.zig");
 

@@ -9,6 +9,9 @@ pub const storage = @import("storage/mod.zig");
 pub const memory_mod = @import("memory/mod.zig");
 pub const knowledge = @import("knowledge/mod.zig");
 pub const research = @import("research/optimization_researcher.zig");
+pub const util = @import("util/mod.zig");
+pub const checkpoint = @import("checkpoint/mod.zig");
+pub const integration_tests = @import("tests/integration.zig");
 
 pub fn main() !void {
     // Create I/O context (Zig 0.16 Threaded Io)
@@ -26,7 +29,7 @@ pub fn main() !void {
 
     try std.Io.Writer.writeAll(w,
         \\╔══════════════════════════════════════╗
-        \\║  Ziv — Zig 自学习 Agent v0.1.0      ║
+        \\║  Ziv — Zig 自学习 Agent v0.3.0      ║
         \\║  pi 圆融 · e 增长 · phi 浓缩         ║
         \\╚══════════════════════════════════════╝
         \\

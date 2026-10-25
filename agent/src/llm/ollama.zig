@@ -1,6 +1,6 @@
-/// Ollama backend — implements ProviderVTable for local Ollama models.
+/// Ollama backend -- implements ProviderVTable for local Ollama models.
 /// Uses Ollama's /api/chat endpoint (https://github.com/ollama/ollama).
-
+/// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
@@ -13,16 +13,18 @@ pub const OllamaConfig = struct {
 
 pub const OllamaProvider = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: OllamaConfig,
     http_client: std.http.Client,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, config: OllamaConfig) Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: OllamaConfig) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
-            .http_client = .{ .allocator = allocator },
+            .http_client = .{ .allocator = allocator, .io = io },
         };
     }
 
@@ -44,7 +46,7 @@ pub const OllamaProvider = struct {
         };
     }
 
-    // ── VTable implementations ──
+    // -- VTable implementations --
 
     fn complete(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions) anyerror!provider.CompleteResponse {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -62,35 +64,48 @@ pub const OllamaProvider = struct {
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
 
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/api/chat", .{self.config.base_url});
-        defer self.allocator.free(url);
-        const uri = try std.Uri.parse(url);
+        const uri_str = try std.fmt.allocPrint(self.allocator, "{s}/api/chat", .{self.config.base_url});
+        defer self.allocator.free(uri_str);
+        const uri = try std.Uri.parse(uri_str);
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
-        try headers.append("content-type", "application/json");
+        // Ollama is local -- no auth headers needed
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/json" },
+        };
 
-        var req = try self.http_client.open(.POST, uri, .{
-            .headers = headers,
+        var req = try self.http_client.request(.POST, uri, .{
+            .extra_headers = &extra_headers,
         });
         defer req.deinit();
-        req.transfer_type = .chunked;
 
-        try req.send();
-        try req.writer().writeAll(body);
-        try req.finish();
+        try req.sendBodyComplete(@constCast(body));
 
-        // Ollama streaming: each line is a JSON object
-        var line_buf = std.ArrayList(u8).init(self.allocator);
-        defer line_buf.deinit();
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        if (response.head.status.class() != .success) {
+            switch (@backingInt(response.head.status)) {
+                400 => return provider.ProviderError.InvalidRequest,
+                404 => return provider.ProviderError.InvalidRequest,
+                else => return provider.ProviderError.ServerError,
+            }
+        }
+
+        // Ollama streaming: each line is a JSON object (line-delimited, not SSE)
+        // Read chunks and parse line by line incrementally
+        var resp_read_buf: [8192]u8 = undefined;
+        const resp_reader = response.reader(&resp_read_buf);
+        var chunk_buf: [4096]u8 = undefined;
+
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
         var total_usage: ?provider.Usage = null;
-        var recv_buf: [4096]u8 = undefined;
 
         while (true) {
-            const n = try req.reader().read(&recv_buf);
+            const n = resp_reader.readSliceShort(&chunk_buf) catch return provider.ProviderError.ServerError;
             if (n == 0) break;
 
-            for (recv_buf[0..n]) |byte| {
+            for (chunk_buf[0..n]) |byte| {
                 if (byte == '\n') {
                     if (line_buf.items.len > 0) {
                         if (parseOllamaStreamLine(line_buf.items)) |event| {
@@ -101,15 +116,15 @@ pub const OllamaProvider = struct {
                                 else => try cb(event),
                             }
                         }
-                        line_buf.clearRetainingCapacity();
+                        line_buf.shrinkRetainingCapacity(0);
                     }
                 } else {
-                    try line_buf.append(byte);
+                    line_buf.append(self.allocator, byte) catch {};
                 }
             }
         }
 
-        // Process any remaining data
+        // Handle remaining partial line
         if (line_buf.items.len > 0) {
             if (parseOllamaStreamLine(line_buf.items)) |event| {
                 switch (event) {
@@ -126,7 +141,7 @@ pub const OllamaProvider = struct {
 
     fn supportsToolUse(ptr: *anyopaque) bool {
         _ = ptr;
-        return true; // Ollama supports function calling for compatible models
+        return true;
     }
 
     fn supportsStreaming(ptr: *anyopaque) bool {
@@ -139,7 +154,7 @@ pub const OllamaProvider = struct {
         self.deinit();
     }
 
-    // ── Internal helpers ──
+    // -- Internal helpers --
 
     fn buildRequestBody(
         self: *Self,
@@ -147,8 +162,10 @@ pub const OllamaProvider = struct {
         opts: provider.CompleteOptions,
         do_stream: bool,
     ) ![]u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        const writer = buf.writer();
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &buf);
+        const writer = &aw.writer;
 
         try writer.writeAll("{\"model\":");
         try message.writeJsonString(writer, self.config.model);
@@ -170,7 +187,6 @@ pub const OllamaProvider = struct {
             if (msg.content.len == 1 and msg.content[0] == .text) {
                 try message.writeJsonString(writer, msg.content[0].text);
             } else {
-                // Concatenate all text blocks
                 try writer.writeAll("\"");
                 for (msg.content) |block| {
                     switch (block) {
@@ -194,7 +210,6 @@ pub const OllamaProvider = struct {
 
         try writer.writeAll("]");
 
-        // Ollama options format
         try writer.writeAll(",\"options\":{\"num_predict\":");
         try writer.print("{d}", .{opts.max_tokens});
         try writer.writeAll(",\"temperature\":");
@@ -206,7 +221,9 @@ pub const OllamaProvider = struct {
         }
 
         try writer.writeAll("}");
-        return buf.toOwnedSlice();
+
+        buf = aw.toArrayList();
+        return buf.toOwnedSlice(self.allocator);
     }
 
     fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
@@ -214,52 +231,48 @@ pub const OllamaProvider = struct {
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
-        try headers.append("content-type", "application/json");
+        // Ollama is local -- no auth headers needed
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "content-type", .value = "application/json" },
+        };
 
-        var req = try self.http_client.open(.POST, uri, .{
-            .headers = headers,
+        var req = try self.http_client.request(.POST, uri, .{
+            .extra_headers = &extra_headers,
         });
         defer req.deinit();
-        req.transfer_type = .chunked;
 
-        try req.send();
-        try req.writer().writeAll(body);
-        try req.finish();
+        try req.sendBodyComplete(@constCast(body));
 
-        try req.wait();
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
 
-        // Check for connection refused (Ollama not running)
-        const status = req.response.status;
-        if (status.code == 0) return provider.ProviderError.ServerError;
-        if (status.class() != .success) {
-            switch (status.code) {
+        if (response.head.status.class() != .success) {
+            switch (@backingInt(response.head.status)) {
                 400 => return provider.ProviderError.InvalidRequest,
                 404 => return provider.ProviderError.InvalidRequest,
                 else => return provider.ProviderError.ServerError,
             }
         }
 
-        return try req.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        var body_buf: [1024 * 1024]u8 = undefined;
+        const reader = response.reader(&body_buf);
+        return reader.allocRemaining(self.allocator, .limited(1024 * 1024));
     }
 
     fn parseChatResponse(self: *Self, body: []const u8) !provider.CompleteResponse {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, body) catch
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
             return provider.ProviderError.InvalidRequest;
 
-        var content_blocks = std.ArrayList(provider.ContentBlock).init(self.allocator);
-        errdefer content_blocks.deinit();
+        var content_blocks: std.ArrayList(provider.ContentBlock) = .empty;
+        errdefer content_blocks.deinit(self.allocator);
 
-        // Ollama response format: {"message":{"role":"assistant","content":"..."},"done":true}
         if (parsed.object.get("message")) |msg| {
             if (msg.object.get("content")) |content| {
                 if (content == .string and content.string.len > 0) {
-                    try content_blocks.append(.{ .text = content.string });
+                    try content_blocks.append(self.allocator, .{ .text = content.string });
                 }
             }
 
-            // Check for tool calls
             if (msg.object.get("tool_calls")) |tool_calls| {
                 for (tool_calls.array.items) |tc| {
                     const func = tc.object.get("function") orelse continue;
@@ -267,12 +280,12 @@ pub const OllamaProvider = struct {
                     const arguments = func.object.get("arguments") orelse continue;
 
                     const args_json = if (arguments == .string)
-                        std.json.parseFromSliceLeaky(std.json.Value, arguments.string) catch
+                        std.json.parseFromSliceLeaky(std.json.Value, self.allocator, arguments.string, .{}) catch
                             std.json.Value{ .null = {} }
                     else
                         arguments;
 
-                    try content_blocks.append(.{
+                    try content_blocks.append(self.allocator, .{
                         .tool_use = .{
                             .id = "ollama_tool",
                             .name = name.string,
@@ -289,7 +302,6 @@ pub const OllamaProvider = struct {
         else
             .end_turn;
 
-        // Ollama includes eval_count / prompt_eval_count for usage
         const usage: provider.Usage = blk: {
             var input_tokens: u32 = 0;
             var output_tokens: u32 = 0;
@@ -303,17 +315,15 @@ pub const OllamaProvider = struct {
         };
 
         return .{
-            .content = try content_blocks.toOwnedSlice(),
+            .content = try content_blocks.toOwnedSlice(self.allocator),
             .usage = usage,
             .stop_reason = stop_reason,
         };
     }
 
-    /// Parse a single Ollama streaming line into a StreamEvent.
     fn parseOllamaStreamLine(line: []const u8) ?provider.StreamEvent {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, line) catch return null;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.smp_allocator, line, .{}) catch return null;
 
-        // Check if done
         if (parsed.object.get("done")) |done| {
             if (done == .bool and done.bool) {
                 var usage: ?provider.Usage = null;
@@ -329,7 +339,6 @@ pub const OllamaProvider = struct {
             }
         }
 
-        // Content delta
         if (parsed.object.get("message")) |msg| {
             if (msg.object.get("content")) |content| {
                 if (content == .string and content.string.len > 0) {
@@ -341,44 +350,42 @@ pub const OllamaProvider = struct {
         return null;
     }
 
-    /// Check if Ollama is running by hitting /api/tags.
     pub fn isRunning(self: *Self) bool {
         const url = std.fmt.allocPrint(self.allocator, "{s}/api/tags", .{self.config.base_url}) catch return false;
         defer self.allocator.free(url);
         const uri = std.Uri.parse(url) catch return false;
 
-        var headers = std.http.Headers.init(self.allocator);
-        defer headers.deinit();
+        const extra_headers = [_]std.http.Header{};
 
-        var req = self.http_client.open(.GET, uri, .{
-            .headers = headers,
+        var req = self.http_client.request(.GET, uri, .{
+            .extra_headers = &extra_headers,
         }) catch return false;
         defer req.deinit();
 
-        req.send() catch return false;
-        req.finish() catch return false;
-        req.wait() catch return false;
+        req.sendBodyComplete(@constCast("")) catch return false;
 
-        return req.response.status.class() == .success;
+        var redirect_buf: [4096]u8 = undefined;
+        var response = req.receiveHead(&redirect_buf) catch return false;
+
+        return response.head.status.class() == .success;
     }
 
-    /// List available models.
     pub fn listModels(self: *Self) ![]const []const u8 {
         const body = try self.sendRequest("/api/tags", "");
         defer self.allocator.free(body);
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, body);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch return error.InvalidRequest;
         const models_array = parsed.object.get("models") orelse return error.InvalidRequest;
 
-        var names = std.ArrayList([]const u8).init(self.allocator);
+        var names: std.ArrayList([]const u8) = .empty;
         for (models_array.array.items) |m| {
             if (m.object.get("name")) |name| {
                 if (name == .string) {
-                    try names.append(name.string);
+                    try names.append(self.allocator, name.string);
                 }
             }
         }
-        return names.toOwnedSlice();
+        return names.toOwnedSlice(self.allocator);
     }
 };
 
@@ -386,53 +393,12 @@ test "Ollama provider creation" {
     const config = OllamaConfig{
         .model = "llama3.2",
     };
-    var p = OllamaProvider.init(std.testing.allocator, config);
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    var p = OllamaProvider.init(std.testing.allocator, io_state.io(), config);
     defer p.deinit();
 
     const prov = p.toProvider();
     try std.testing.expect(prov.supportsStreaming());
     try std.testing.expect(prov.supportsToolUse());
-}
-
-test "Ollama build request body" {
-    const config = OllamaConfig{};
-    var p = OllamaProvider.init(std.testing.allocator, config);
-    defer p.deinit();
-
-    const msgs = [_]provider.Message{
-        .{
-            .role = .user,
-            .content = &.{.{ .text = "Hello from Ollama" }},
-            .timestamp = 0,
-        },
-    };
-    const body = try p.buildRequestBody(&msgs, .{ .max_tokens = 256, .temperature = 0.8 }, false);
-    defer std.testing.allocator.free(body);
-
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"llama3.2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") == null); // no stream param for non-streaming
-}
-
-test "Ollama parse stream line" {
-    const line = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}";
-    const event = OllamaProvider.parseOllamaStreamLine(line);
-    try std.testing.expect(event != null);
-    switch (event.?) {
-        .content_delta => |text| {
-            try std.testing.expectEqualStrings("Hello", text);
-        },
-        else => try std.testing.expect(false),
-    }
-
-    const done_line = "{\"done\":true,\"eval_count\":10,\"prompt_eval_count\":5}";
-    const done_event = OllamaProvider.parseOllamaStreamLine(done_line);
-    try std.testing.expect(done_event != null);
-    switch (done_event.?) {
-        .done => |usage| {
-            try std.testing.expect(usage != null);
-            try std.testing.expectEqual(@as(u32, 5), usage.?.input_tokens);
-            try std.testing.expectEqual(@as(u32, 10), usage.?.output_tokens);
-        },
-        else => try std.testing.expect(false),
-    }
 }

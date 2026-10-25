@@ -1,6 +1,5 @@
 /// LLM Provider abstraction — comptime vtable pattern for multi-model support.
 /// Each backend (Claude, OpenAI, Ollama) implements this vtable.
-
 const std = @import("std");
 
 pub const MessageRole = enum {

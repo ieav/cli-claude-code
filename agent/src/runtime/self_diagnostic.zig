@@ -1,5 +1,4 @@
 /// Self-diagnostic engine — traces decision chains and identifies logic gaps.
-
 const std = @import("std");
 const math = @import("../math/mod.zig");
 const decision_trace = @import("decision_trace.zig");
@@ -73,7 +72,8 @@ pub const SelfDiagnostic = struct {
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .insufficient_depth,
-                    .description = try std.fmt.allocPrint(self.allocator,
+                    .description = try std.fmt.allocPrint(
+                        self.allocator,
                         "Phase {s} (step {d}) confidence {d:.3} below φ={d:.3}",
                         .{ @tagName(step.phase), step.step_id, step.confidence, math.constants.PHI },
                     ),
@@ -93,7 +93,8 @@ pub const SelfDiagnostic = struct {
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .wrong_decision,
-                    .description = try std.fmt.allocPrint(self.allocator,
+                    .description = try std.fmt.allocPrint(
+                        self.allocator,
                         "Phase {s} took {d}ms (suspiciously long)",
                         .{ @tagName(step.phase), step.duration_ms },
                     ),
@@ -107,7 +108,8 @@ pub const SelfDiagnostic = struct {
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .context_lost,
-                    .description = try std.fmt.allocPrint(self.allocator,
+                    .description = try std.fmt.allocPrint(
+                        self.allocator,
                         "Phase {s} produced no output despite having input",
                         .{@tagName(step.phase)},
                     ),

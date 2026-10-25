@@ -1,6 +1,6 @@
 /// Event bus — publishes events to subscribers. Uses π ring buffer for event history.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 
 pub const EventType = enum {
@@ -64,7 +64,7 @@ pub const EventBus = struct {
     pub fn emit(self: *Self, event_type: EventType, message: []const u8) void {
         const event = Event{
             .event_type = event_type,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = time_mod.nowMillis(),
             .message = message,
             .data = null,
         };
@@ -83,7 +83,7 @@ pub const EventBus = struct {
     pub fn emitWithData(self: *Self, event_type: EventType, message: []const u8, data: std.json.Value) void {
         const event = Event{
             .event_type = event_type,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = time_mod.nowMillis(),
             .message = message,
             .data = data,
         };

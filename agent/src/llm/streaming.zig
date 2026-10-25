@@ -1,6 +1,6 @@
 /// SSE (Server-Sent Events) parser for LLM streaming responses.
 /// Parses chunked HTTP response into StreamEvent items.
-
+/// Compatible with Zig 0.16.
 const std = @import("std");
 const provider = @import("provider.zig");
 
@@ -22,8 +22,8 @@ pub const SSEParser = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .buffer = std.ArrayList(u8).init(allocator),
-            .events = std.ArrayList(SSEEvent).init(allocator),
+            .buffer = .empty,
+            .events = .empty,
         };
     }
 
@@ -34,14 +34,14 @@ pub const SSEParser = struct {
             if (event.data) |d| self.allocator.free(d);
             if (event.id) |id| self.allocator.free(id);
         }
-        self.events.deinit();
-        self.buffer.deinit();
+        self.events.deinit(self.allocator);
+        self.buffer.deinit(self.allocator);
     }
 
     /// Feed raw bytes from the HTTP response into the parser.
     /// Returns the number of complete events parsed.
     pub fn feed(self: *Self, chunk: []const u8) !usize {
-        try self.buffer.appendSlice(chunk);
+        try self.buffer.appendSlice(self.allocator, chunk);
         const count_before = self.events.items.len;
         try self.parseBuffer();
         return self.events.items.len - count_before;
@@ -50,27 +50,25 @@ pub const SSEParser = struct {
     /// Get and drain all parsed events.
     pub fn drain(self: *Self) []SSEEvent {
         const items = self.events.items;
-        // Caller takes ownership of event strings
         const result = self.allocator.dupe(SSEEvent, items) catch &.{};
-        self.events.clearRetainingCapacity();
-        return result;
+        self.events.shrinkRetainingCapacity(0);
+        return @constCast(result);
     }
 
     fn parseBuffer(self: *Self) !void {
         var buf = self.buffer.items;
         while (true) {
-            // Find event boundary (double newline)
             const boundary = findDoubleNewline(buf);
             if (boundary == null) break;
 
             const event_bytes = buf[0..boundary.?];
-            buf = buf[boundary.? + 2 ..]; // skip \n\n
+            buf = buf[boundary.? + 2 ..];
 
             var event = SSEEvent{};
             var lines = std.mem.splitSequence(u8, event_bytes, "\n");
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
-                if (line[0] == ':') continue; // comment
+                if (line[0] == ':') continue;
                 if (std.mem.indexOfScalar(u8, line, ':')) |colon_idx| {
                     const field = line[0..colon_idx];
                     var value = line[colon_idx + 1 ..];
@@ -89,9 +87,8 @@ pub const SSEParser = struct {
             }
 
             if (event.data != null) {
-                try self.events.append(event);
+                try self.events.append(self.allocator, event);
             } else {
-                // Empty event, free unused allocations
                 if (event.event) |e| self.allocator.free(e);
                 if (event.id) |id| self.allocator.free(id);
             }
@@ -103,7 +100,7 @@ pub const SSEParser = struct {
             std.mem.copyForwards(u8, self.buffer.items, buf);
             self.buffer.shrinkRetainingCapacity(remaining);
         } else if (remaining == 0) {
-            self.buffer.clearRetainingCapacity();
+            self.buffer.shrinkRetainingCapacity(0);
         }
     }
 
@@ -119,8 +116,7 @@ pub const SSEParser = struct {
 
 /// Parse a Claude SSE data payload into a StreamEvent.
 pub fn parseClaudeStreamEvent(allocator: std.mem.Allocator, data: []const u8) ?provider.StreamEvent {
-    _ = allocator;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, data) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, data, .{}) catch return null;
 
     const event_type = parsed.object.get("type") orelse return null;
     if (event_type != .string) return null;

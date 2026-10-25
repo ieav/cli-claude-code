@@ -1,5 +1,4 @@
 /// Error handler — formats errors for user display with analysis and fix options.
-
 const std = @import("std");
 
 pub const ErrorReport = struct {

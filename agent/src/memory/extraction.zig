@@ -1,6 +1,5 @@
 /// Memory extraction — extracts memorable facts from conversations.
 /// Uses φ condensation to keep only the most valuable knowledge.
-
 const std = @import("std");
 const math = @import("../math/mod.zig");
 const types = @import("types.zig");

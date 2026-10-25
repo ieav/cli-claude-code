@@ -1,7 +1,7 @@
 /// Cron scheduler — periodic tasks with π/φ/e-based intervals.
 /// Runs background maintenance, reflection, and knowledge updates.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 
 pub const CronTask = struct {
@@ -57,7 +57,7 @@ pub const CronScheduler = struct {
 
     fn schedulerLoop(self: *Self) void {
         while (self.running.load(.monotonic)) {
-            const now = std.time.milliTimestamp();
+            const now = time_mod.nowMillis();
 
             for (self.tasks.items) |*task| {
                 if (!task.enabled.load(.monotonic)) continue;

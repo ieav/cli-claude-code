@@ -1,5 +1,4 @@
 /// Runtime monitor — periodically runs detection rules and reports issues.
-
 const std = @import("std");
 const event_bus = @import("../task/event_bus.zig");
 const rules = @import("rules.zig");

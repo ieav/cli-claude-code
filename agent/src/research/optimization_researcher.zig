@@ -1,8 +1,8 @@
 /// Optimization researcher — searches the web for best solutions and presents options to user.
 /// Uses e-controlled search depth and φ-based result filtering.
 /// Full implementation with concurrent search, solution ranking, and compatibility scoring.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 const knowledge_search = @import("../knowledge/search.zig");
 
@@ -31,6 +31,8 @@ pub const SourceType = enum {
     unknown,
 };
 
+pub const Complexity = enum { low, medium, high };
+
 pub const Solution = struct {
     id: u32,
     name: []const u8,
@@ -40,7 +42,7 @@ pub const Solution = struct {
     pros: []const []const u8,
     cons: []const []const u8,
     compatibility: f64, // 0-1
-    complexity: enum { low, medium, high },
+    complexity: Complexity,
     relevance: f64, // 0-1 from search ranking
 };
 
@@ -112,7 +114,7 @@ pub const OptimizationResearcher = struct {
         time_budget_ms: u64,
     ) !ResearchResult {
         _ = self.total_researches.fetchAdd(1, .monotonic);
-        const start_time = std.time.milliTimestamp();
+        const start_time = time_mod.nowMillis();
 
         // Step 1: Generate search keywords from the query
         const keywords = try self.web_search.generateSearchKeywords(query);
@@ -134,7 +136,7 @@ pub const OptimizationResearcher = struct {
 
         for (search_queries) |search_q| {
             // Check time budget (e-controlled)
-            if (std.time.milliTimestamp() > deadline) break;
+            if (time_mod.nowMillis() > deadline) break;
 
             const results = self.web_search.search(search_q, 20) catch &.{};
             sources_searched += 1;
@@ -171,7 +173,7 @@ pub const OptimizationResearcher = struct {
         // Step 8: Generate reasoning
         const reasoning = try self.generateReasoning(solutions, intent, recommendation_index);
 
-        const elapsed = std.time.milliTimestamp() - start_time;
+        const elapsed = time_mod.nowMillis() - start_time;
 
         return .{
             .query = try self.allocator.dupe(u8, query),
@@ -335,8 +337,6 @@ pub const OptimizationResearcher = struct {
         return .low;
     }
 
-    pub const Complexity = enum { low, medium, high };
-
     /// Generate pros for a solution based on source type.
     fn generatePros(self: *Self, result: knowledge_search.SearchResult, source_type: SourceType) ![]const []const u8 {
         _ = result;
@@ -482,7 +482,7 @@ pub const OptimizationResearcher = struct {
 };
 
 test "OptimizationResearcher research" {
-    var ws = knowledge_search.WebSearch.init(std.testing.allocator, .duckduckgo, null);
+    var ws = knowledge_search.WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
     defer ws.deinit();
     var researcher = OptimizationResearcher.init(std.testing.allocator, &ws);
 
@@ -494,7 +494,7 @@ test "OptimizationResearcher research" {
 }
 
 test "OptimizationResearcher classifySource" {
-    var ws = knowledge_search.WebSearch.init(std.testing.allocator, .duckduckgo, null);
+    var ws = knowledge_search.WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
     defer ws.deinit();
     var researcher = OptimizationResearcher.init(std.testing.allocator, &ws);
 
@@ -506,7 +506,7 @@ test "OptimizationResearcher classifySource" {
 }
 
 test "OptimizationResearcher selectRecommendation" {
-    var ws = knowledge_search.WebSearch.init(std.testing.allocator, .duckduckgo, null);
+    var ws = knowledge_search.WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
     defer ws.deinit();
     var researcher = OptimizationResearcher.init(std.testing.allocator, &ws);
 
@@ -542,7 +542,7 @@ test "OptimizationResearcher selectRecommendation" {
 }
 
 test "OptimizationResearcher generateSearchQueries" {
-    var ws = knowledge_search.WebSearch.init(std.testing.allocator, .duckduckgo, null);
+    var ws = knowledge_search.WebSearch.init(std.testing.allocator, undefined, .duckduckgo, null);
     defer ws.deinit();
     var researcher = OptimizationResearcher.init(std.testing.allocator, &ws);
 

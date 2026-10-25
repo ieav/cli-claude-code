@@ -1,6 +1,5 @@
 /// Thread pool — manages a pool of worker threads that execute tasks from a queue.
 /// Concurrency is bounded by e-based logistic function: max = sigmoid(pressure) × hw_threads.
-
 const std = @import("std");
 const math = @import("../math/mod.zig");
 const mpsc = @import("mpsc_queue.zig");

@@ -1,8 +1,8 @@
 /// Decision trace — records the full reasoning chain for each user query.
 /// Enables self-diagnostic: when user questions a result, we can replay the decision chain
 /// and identify which step had a logic gap.
-
 const std = @import("std");
+const time_mod = @import("../util/time.zig");
 
 pub const DecisionPhase = enum {
     memory_retrieval,
@@ -46,7 +46,7 @@ pub const DecisionTrace = struct {
             .allocator = allocator,
             .query = query,
             .steps = std.ArrayList(DecisionStep).init(allocator),
-            .started_at = std.time.milliTimestamp(),
+            .started_at = time_mod.nowMillis(),
             .completed_at = null,
         };
     }
@@ -72,7 +72,7 @@ pub const DecisionTrace = struct {
     }
 
     pub fn complete(self: *Self) void {
-        self.completed_at = std.time.milliTimestamp();
+        self.completed_at = time_mod.nowMillis();
     }
 
     pub fn getSteps(self: *const Self) []const DecisionStep {
@@ -88,15 +88,20 @@ pub const DecisionTrace = struct {
 
     /// Find all steps with confidence below the golden ratio threshold.
     pub fn findWeakSteps(self: *const Self, threshold: f64) []const DecisionStep {
-        var result = std.ArrayList(*const DecisionStep).init(self.allocator);
+        var result = std.ArrayList(usize).init(self.allocator);
         defer result.deinit();
-        for (self.steps.items) |*step| {
+        for (self.steps.items, 0..) |step, i| {
             if (step.confidence < threshold) {
-                // Can't return pointers to local list, return slice of items
+                result.append(i) catch break;
             }
         }
-        // Return items with low confidence
-        return self.steps.items; // simplified for now
+        if (result.items.len == 0) return &.{};
+        // Allocate a slice of weak steps
+        var weak = self.allocator.alloc(DecisionStep, result.items.len) catch return &.{};
+        for (result.items, 0..) |idx, i| {
+            weak[i] = self.steps.items[idx];
+        }
+        return weak;
     }
 
     /// Total duration of the decision chain.
@@ -104,6 +109,6 @@ pub const DecisionTrace = struct {
         if (self.completed_at) |end| {
             return end - self.started_at;
         }
-        return std.time.milliTimestamp() - self.started_at;
+        return time_mod.nowMillis() - self.started_at;
     }
 };

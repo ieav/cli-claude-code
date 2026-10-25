@@ -1,5 +1,4 @@
 /// Message serialization/deserialization for LLM API calls.
-
 const std = @import("std");
 const provider = @import("provider.zig");
 
@@ -74,6 +73,7 @@ fn serializeContentBlock(writer: anytype, block: *const provider.ContentBlock) !
             try writer.writeAll(",\"input\":");
             // input is already a std.json.Value, stringify it
             var buf = std.ArrayList(u8).init(writer.context.allocator orelse return error.NoAllocator);
+            defer buf.deinit();
             try std.json.stringify(tu.input, .{}, buf.writer());
             try writer.writeAll(buf.items);
         },
@@ -107,7 +107,7 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
             '\t' => try writer.writeAll("\\t"),
             else => {
                 if (c < 0x20) {
-                    try writer.print("\\u{:0>4x}", .{c});
+                    try writer.print("\\u{x:0>4}", .{c});
                 } else {
                     try writer.writeByte(c);
                 }
