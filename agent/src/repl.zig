@@ -626,10 +626,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             logger.info("LLM call: model={s} history_len={d} max_tokens={d}", .{
                 switcher.modelName(), history.items.len, switcher.settings.max_tokens,
             });
-            const response = prov.complete(history.items, .{
+            // Stream the response: text deltas print live as they arrive.
+            const response = streamComplete(prov, history.items, .{
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
-            }) catch |err| {
+            }, w, &file_writer, allocator) catch |err| {
                 logger.err("LLM call failed: {}", .{err});
                 try std.Io.Writer.print(w, "  [LLM error: {}]\n\n", .{err});
                 try std.Io.File.Writer.flush(&file_writer);
@@ -654,24 +655,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 traceAddStep(t, .llm_generation, gen_conf, "history + system prompt", out_desc, @tagName(response.stop_reason), allocator) catch {};
             }
 
-            // Print response content
+            // Text/thinking deltas were already printed live by streamComplete;
+            // only tool info remains to show here.
             for (response.content) |block| {
                 switch (block) {
-                    .text => |t| {
-                        try std.Io.Writer.writeAll(w, "  ");
-                        try std.Io.Writer.writeAll(w, t);
-                        try std.Io.Writer.writeAll(w, "\n");
-                    },
-                    .thinking => |t| {
-                        try std.Io.Writer.print(w, "  [thinking: {s}]\n", .{t});
-                    },
                     .tool_use => |tc| {
-                        try std.Io.Writer.print(w, "  [calling tool: {s}]\n", .{tc.name});
+                        try std.Io.Writer.print(w, "  [tool_use: {s}]\n", .{tc.name});
                     },
                     .tool_result => |tr| {
                         const label = if (tr.is_error) "error" else "result";
                         try std.Io.Writer.print(w, "  [tool {s}: {s}]\n", .{ label, tr.content });
                     },
+                    else => {},
                 }
             }
             try std.Io.Writer.print(w, "  [tokens: in={d} out={d} | stop: {s}]\n", .{
@@ -681,19 +676,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             });
             try std.Io.File.Writer.flush(&file_writer);
 
-            // Append assistant response to history. Deep-copy the blocks
-            // first: their strings (and tool_use JSON trees) live in the
-            // response's DOM arena, which is freed right after — history
-            // must own its memory. This closes the per-response DOM leak.
+            // Append assistant response to history. The streaming aggregator
+            // already produced REPL-owned blocks (strings duped onto the
+            // session allocator; no DOM arena involved), so no deep copy
+            // or arena release is needed here.
             const stop_reason = response.stop_reason;
-            const owned_blocks = try cloneContentBlocks(allocator, response.content);
-            errdefer freeContentBlocks(allocator, owned_blocks);
             try history.append(allocator, .{
                 .role = .assistant,
-                .content = owned_blocks,
+                .content = response.content,
                 .timestamp = util_time.nowMillis(),
             });
-            response.free(allocator);
 
             // Record in operation log
             _ = log.record("LLMResponse", input, "response", null, false) catch {};
@@ -1259,6 +1251,85 @@ fn traceAddStep(
         .alternatives = &.{},
         .dependencies = &.{},
     });
+}
+
+/// Streaming aggregation state: prints text deltas live while assembling a
+/// CompleteResponse equivalent owned by the REPL (no DOM arena).
+const StreamAgg = struct {
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+    text: std.ArrayList(u8) = .empty,
+    tools: std.ArrayList(llm.provider.ToolUseBlock) = .empty,
+    usage: llm.provider.Usage = .{ .input_tokens = 0, .output_tokens = 0 },
+    stop_reason: llm.provider.CompleteResponse.StopReason = .end_turn,
+    saw_error: ?llm.provider.ProviderError = null,
+
+    fn deinit(self: *StreamAgg) void {
+        self.text.deinit(self.alloc);
+        // Tool strings are session-lifetime (freed with history); just drop the list.
+        self.tools.deinit(self.alloc);
+    }
+};
+
+fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!void {
+    const self: *StreamAgg = @ptrCast(@alignCast(ctx_opaque.?));
+    switch (event) {
+        .content_delta => |d| {
+            // Live print: this is the whole point of streaming.
+            try std.Io.Writer.writeAll(self.w, d);
+            std.Io.File.Writer.flush(self.file_writer) catch {};
+            try self.text.appendSlice(self.alloc, d);
+        },
+        .thinking_delta => {},
+        .tool_call => |tu| {
+            try std.Io.Writer.print(self.w, "\n  [calling tool: {s}]\n", .{tu.name});
+            std.Io.File.Writer.flush(self.file_writer) catch {};
+            try self.tools.append(self.alloc, .{
+                .id = try self.alloc.dupe(u8, tu.id),
+                .name = try self.alloc.dupe(u8, tu.name),
+                .input = try dupeJsonValue(self.alloc, tu.input),
+            });
+            self.stop_reason = .tool_use;
+        },
+        .done => |u| {
+            if (u) |uu| self.usage = uu;
+        },
+        .error_occurred => |e| self.saw_error = e,
+    }
+}
+
+/// Stream the completion, printing deltas live; returns REPL-owned blocks.
+fn streamComplete(
+    prov: llm.Provider,
+    history: []const llm.Message,
+    opts: llm.provider.CompleteOptions,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+    alloc: std.mem.Allocator,
+) !llm.provider.CompleteResponse {
+    var agg = StreamAgg{ .alloc = alloc, .w = w, .file_writer = file_writer };
+    defer agg.deinit();
+
+    try prov.stream(history, opts, @ptrCast(&agg), streamCb);
+    if (agg.saw_error) |e| return e;
+
+    var blocks: std.ArrayList(llm.ContentBlock) = .empty;
+    errdefer blocks.deinit(alloc);
+    if (agg.text.items.len > 0) {
+        const t = try alloc.dupe(u8, agg.text.items);
+        try blocks.append(alloc, .{ .text = t });
+    }
+    for (agg.tools.items) |tu| {
+        try blocks.append(alloc, .{ .tool_use = tu });
+    }
+
+    try std.Io.Writer.writeAll(w, "\n");
+    return .{
+        .content = try blocks.toOwnedSlice(alloc),
+        .usage = agg.usage,
+        .stop_reason = agg.stop_reason,
+    };
 }
 
 fn isFileModifyingTool(tool_name: []const u8) bool {

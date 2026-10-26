@@ -43,10 +43,12 @@ pub const WebSearch = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, backend: SearchBackend, api_key: ?[]const u8) Self {
+        const env = @import("../util/env.zig");
         const base_url: []const u8 = switch (backend) {
-            .brave => "https://api.search.brave.com/res/v1/web/search",
-            .searxng => "http://localhost:8888/search",
-            .duckduckgo => "https://html.duckduckgo.com/html/",
+            .brave => env.get("ZIV_BRAVE_URL") orelse "https://api.search.brave.com/res/v1/web/search",
+            .searxng => env.get("ZIV_SEARXNG_URL") orelse "http://localhost:8888/search",
+            // ZIV_DDGO_URL exists so tests can point the keyless backend at a mock.
+            .duckduckgo => env.get("ZIV_DDGO_URL") orelse "https://html.duckduckgo.com/html/",
         };
         return .{
             .allocator = allocator,
@@ -67,12 +69,21 @@ pub const WebSearch = struct {
     pub fn search(self: *Self, query: []const u8, max_results: usize) ![]SearchResult {
         _ = self.total_searches.fetchAdd(1, .monotonic);
 
-        const body = switch (self.backend) {
+        return self.searchOnce(query, max_results) catch |err| {
+            // Back off once on rate limiting instead of failing outright.
+            if (err != error.RateLimited) return err;
+            var req: std.c.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = std.c.nanosleep(&req, null);
+            return self.searchOnce(query, max_results);
+        };
+    }
+
+    fn searchOnce(self: *Self, query: []const u8, max_results: usize) ![]SearchResult {
+        return switch (self.backend) {
             .brave => try self.searchBrave(query, max_results),
             .searxng => try self.searchSearXNG(query, max_results),
             .duckduckgo => try self.searchDuckDuckGo(query, max_results),
         };
-        return body;
     }
 
     /// Search using Brave Search API.
@@ -105,6 +116,7 @@ pub const WebSearch = struct {
         var redirect_buf: [4096]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
 
+        if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
@@ -177,6 +189,7 @@ pub const WebSearch = struct {
         var redirect_buf: [4096]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
 
+        if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
@@ -252,6 +265,7 @@ pub const WebSearch = struct {
         var redirect_buf: [4096]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
 
+        if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }

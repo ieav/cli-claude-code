@@ -92,14 +92,14 @@ pub const ProviderError = error{
 
 pub const ProviderVTable = struct {
     complete_fn: *const fn (*anyopaque, []const Message, CompleteOptions) anyerror!CompleteResponse,
-    stream_fn: *const fn (*anyopaque, []const Message, CompleteOptions, *StreamCallback) anyerror!void,
+    stream_fn: *const fn (*anyopaque, []const Message, CompleteOptions, ?*anyopaque, *const StreamCallback) anyerror!void,
     count_tokens_fn: ?*const fn (*anyopaque, []const u8) anyerror!u32,
     supports_tool_use_fn: *const fn (*anyopaque) bool,
     supports_streaming_fn: *const fn (*anyopaque) bool,
     deinit_fn: *const fn (*anyopaque) void,
 };
 
-pub const StreamCallback = fn (StreamEvent) anyerror!void;
+pub const StreamCallback = fn (?*anyopaque, StreamEvent) anyerror!void;
 
 pub const Provider = struct {
     ptr: *anyopaque,
@@ -109,8 +109,8 @@ pub const Provider = struct {
         return self.vtable.complete_fn(self.ptr, messages, opts);
     }
 
-    pub fn stream(self: Provider, messages: []const Message, opts: CompleteOptions, cb: *StreamCallback) anyerror!void {
-        return self.vtable.stream_fn(self.ptr, messages, opts, cb);
+    pub fn stream(self: Provider, messages: []const Message, opts: CompleteOptions, ctx: ?*anyopaque, cb: *const StreamCallback) anyerror!void {
+        return self.vtable.stream_fn(self.ptr, messages, opts, ctx, cb);
     }
 
     pub fn countTokens(self: Provider, text: []const u8) anyerror!u32 {

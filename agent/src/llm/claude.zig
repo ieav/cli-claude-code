@@ -62,7 +62,7 @@ pub const ClaudeProvider = struct {
         return self.parseResponse(response_body);
     }
 
-    fn stream(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, cb: *provider.StreamCallback) anyerror!void {
+    fn stream(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, ctx: ?*anyopaque, cb: *const provider.StreamCallback) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
@@ -107,8 +107,15 @@ pub const ClaudeProvider = struct {
         var total_usage: ?provider.Usage = null;
 
         while (true) {
-            const n = resp_reader.readSliceShort(&chunk_buf) catch return provider.ProviderError.ServerError;
-            if (n == 0) break;
+            // Incremental read: take whatever is buffered right now (at least
+            // one byte) instead of waiting for the 4 KiB buffer to fill —
+            // readSliceShort buffered the whole SSE response before parsing,
+            // killing real-time streaming.
+            const avail = resp_reader.peekGreedy(1) catch break;
+            if (avail.len == 0) break;
+            const n = @min(avail.len, chunk_buf.len);
+            @memcpy(chunk_buf[0..n], avail[0..n]);
+            resp_reader.toss(n);
 
             _ = sse_parser.feed(chunk_buf[0..n]) catch {};
             const events = sse_parser.drain();
@@ -127,16 +134,16 @@ pub const ClaudeProvider = struct {
                         switch (stream_event) {
                             .done => |u| {
                                 if (u) |new_usage| total_usage = new_usage;
-                                try cb(.{ .done = total_usage });
+                                try cb(ctx, .{ .done = total_usage });
                                 return;
                             },
-                            else => try cb(stream_event),
+                            else => try cb(ctx, stream_event),
                         }
                     }
                 }
             }
         }
-        try cb(.{ .done = total_usage });
+        try cb(ctx, .{ .done = total_usage });
     }
 
     fn countTokens(ptr: *anyopaque, text: []const u8) anyerror!u32 {
