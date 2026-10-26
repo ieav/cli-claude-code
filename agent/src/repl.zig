@@ -467,6 +467,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
                 if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 clearHistory(&history, sys_prompt);
+                // Drop the stale memory-injection block from the surviving
+                // system message so the fresh conversation isn't primed
+                // with the cleared one's memories.
+                if (memory_block) |mb| {
+                    allocator.free(mb);
+                    const fresh_blocks = try allocator.alloc(llm.ContentBlock, 1);
+                    fresh_blocks[0] = .{ .text = sys_prompt };
+                    allocator.free(history.items[0].content);
+                    history.items[0].content = fresh_blocks;
+                    memory_block = null; // the end-of-session defer must not double-free
+                    injected_count = 0;
+                }
                 message_count = 0;
                 total_input_tokens = 0;
                 total_output_tokens = 0;
