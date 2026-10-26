@@ -4,6 +4,7 @@
 /// Adapted for Zig 0.16 I/O API.
 const std = @import("std");
 const tools_mod = @import("tools/mod.zig");
+const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
@@ -22,6 +23,7 @@ const reflection_mod = @import("memory/reflection.zig");
 const database_mod = @import("storage/database.zig");
 const math_mod = @import("math/mod.zig");
 const knowledge_search = @import("knowledge/search.zig");
+const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
@@ -212,6 +214,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     else
         null;
     defer if (mem_sys) |*ms| ms.deinit();
+    // Semantic tier: the knowledge graph shares the memory database.
+    var kgraph: ?knowledge_graph.KnowledgeGraph = if (mem_db != null)
+        knowledge_graph.KnowledgeGraph.init(allocator, &mem_db.?)
+    else
+        null;
 
     // Add system prompt as first message, appending cross-session memories
     // recovered from .ziv/memory.db (most recent first, token-budgeted).
@@ -252,6 +259,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     }
     var window_tools: u32 = 0;
     var window_errors: u32 = 0;
+
+    // M8-deep: live decision trace — one trace per user query, steps added
+    // at each real agent-loop decision point; /diagnose reads it.
+    var live_trace: ?decision_trace.DecisionTrace = null;
+    defer if (live_trace) |*t| t.deinit();
 
     try std.Io.Writer.writeAll(w,
         \\Type your message (or /help for commands):
@@ -302,7 +314,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w);
                 }
-                if (mem_sys) |*ms| extractSessionMemories(ms, &history, w) catch {};
+                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
@@ -413,7 +425,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
-                if (mem_sys) |*ms| extractSessionMemories(ms, &history, w) catch {};
+                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 clearHistory(&history, sys_prompt);
                 message_count = 0;
                 total_input_tokens = 0;
@@ -439,13 +451,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
+            } else if (std.mem.eql(u8, input, "/knowledge")) {
+                try printKnowledge(if (kgraph) |*g| g else null, w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
             } else if (std.mem.startsWith(u8, input, "/diagnose")) {
                 const rest = if (input.len > "/diagnose".len) input["/diagnose".len..] else "";
                 const concern = std.mem.trim(u8, rest, " \t");
                 if (concern.len == 0) {
                     try std.Io.Writer.writeAll(w, "  Usage: /diagnose <your concern about the last answer>\n\n");
                 } else {
-                    try runDiagnose(concern, injected_count, window_tools, window_errors, allocator, w);
+                    try runDiagnose(if (live_trace) |*t| t else null, concern, injected_count, window_tools, window_errors, allocator, w);
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -517,6 +533,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
         }
 
+        // Fresh decision trace for this query.
+        if (live_trace) |*t| t.deinit();
+        live_trace = decision_trace.DecisionTrace.init(allocator, try allocator.dupe(u8, input));
+        if (live_trace) |*t| {
+            // Step 1: memory retrieval (system-prompt injection status).
+            traceAddStep(t, .memory_retrieval, if (injected_count > 0) 0.8 else 0.3, input, "recency-ranked e-decay injection", "injected count from startup", allocator) catch {};
+        }
+
         // Append user message to history
         var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
         user_blocks[0] = .{ .text = try allocator.dupe(u8, input) };
@@ -571,6 +595,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             total_input_tokens += response.usage.input_tokens;
             total_output_tokens += response.usage.output_tokens;
 
+            // Live decision trace: generation step.
+            if (live_trace) |*t| {
+                const gen_conf: f64 = if (response.usage.output_tokens > 0) 0.9 else 0.4;
+                const out_desc: []const u8 = if (response.content.len > 0) "content blocks" else "empty response";
+                traceAddStep(t, .llm_generation, gen_conf, "history + system prompt", out_desc, @tagName(response.stop_reason), allocator) catch {};
+            }
+
             // Print response content
             for (response.content) |block| {
                 switch (block) {
@@ -622,6 +653,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             result_blocks.clearRetainingCapacity();
 
             var has_tool_use = false;
+            // Phase 1 (serial): permission gate + pre-execution backup for
+            // every tool_use; approved calls are collected for phase 2.
+            var prepared = std.ArrayList(PreparedCall).empty;
+            defer prepared.deinit(allocator);
+
             // Iterate the owned copy in history — the response was freed above.
             const last_assistant = history.items[history.items.len - 1].content;
             for (last_assistant) |block| {
@@ -630,8 +666,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const tc = block.tool_use;
 
                     // Find tool definition
-                    const tool_def = tools_mod.DefaultRegistry.findByName(tc.name);
-                    if (tool_def == null) {
+                    const tool_def = tools_mod.DefaultRegistry.findByName(tc.name) orelse {
                         try std.Io.Writer.print(w, "  [Unknown tool: {s}]\n", .{tc.name});
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = tc.id,
@@ -639,6 +674,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             .is_error = true,
                         } });
                         continue;
+                    };
+
+                    // Backup file before modification (for rollback support)
+                    var snap_id: ?[16]u8 = null;
+                    if (isFileModifyingTool(tc.name)) {
+                        if (registry.getStringField(tc.input, "path")) |fp| {
+                            var sid: [16]u8 = undefined;
+                            const ts = util_time.nowMillis();
+                            for (&sid, 0..) |*byte, i| {
+                                byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
+                            }
+                            fhist.trackEdit(fp, sid, io) catch {};
+                            snap_id = sid;
+                        }
                     }
 
                     // Permission check
@@ -649,22 +698,22 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         .provider = switcher.getProvider() catch null,
                         .allocator = allocator,
                     };
-                    const decision = auth.checkToolPermission(tool_def.?, tc.input, &perm_ctx);
+                    const decision = auth.checkToolPermission(tool_def, tc.input, &perm_ctx);
 
-                    switch (decision) {
-                        .deny => |d| {
+                    const approved: bool = switch (decision) {
+                        .deny => |d| blk: {
                             try std.Io.Writer.print(w, "  [Permission denied: {s}]\n", .{d.message});
                             try result_blocks.append(allocator, .{ .tool_result = .{
                                 .tool_use_id = tc.id,
                                 .content = d.message,
                                 .is_error = true,
                             } });
+                            break :blk false;
                         },
-                        .ask => |a| {
+                        .ask => |a| blk: {
                             try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tc.name, a.message });
                             try std.Io.File.Writer.flush(&file_writer);
 
-                            // Read approval
                             var ans_buf: [64]u8 = undefined;
                             var ans_writer = std.Io.Writer.fixed(&ans_buf);
                             _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
@@ -673,7 +722,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                     .content = "Failed to read approval",
                                     .is_error = true,
                                 } });
-                                continue;
+                                break :blk false;
                             };
                             r.toss(1);
                             const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
@@ -685,19 +734,55 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                     .is_error = true,
                                 } });
                                 try std.Io.File.Writer.flush(&file_writer);
-                                continue;
+                                break :blk false;
                             }
-                            // Approved — fall through to execute
-                            const tool_errored = try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
-                            window_tools += 1;
-                            if (tool_errored) window_errors += 1;
+                            break :blk true;
                         },
-                        .allow => {
-                            const tool_errored = try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
-                            window_tools += 1;
-                            if (tool_errored) window_errors += 1;
-                        },
+                        .allow => true,
+                    };
+
+                    if (approved) {
+                        try prepared.append(allocator, .{
+                            .call = .{ .tool_name = tc.name, .input = tc.input, .tool_use_id = tc.id },
+                            .snap_id = snap_id,
+                        });
                     }
+                }
+            }
+
+            // Phase 2: execute approved calls. partitionToolCalls groups
+            // concurrency-safe tools into batches that run in parallel on
+            // the e-bounded thread pool; unsafe tools run serially. Results
+            // come back in the original call order.
+            if (prepared.items.len > 0) {
+                const call_view = try allocator.alloc(orchestration_mod.ToolCall, prepared.items.len);
+                defer allocator.free(call_view);
+                for (prepared.items, 0..) |p, i| call_view[i] = p.call;
+
+                const batches = try orchestration_mod.partitionToolCalls(call_view, tools_mod.default_tools, allocator);
+                defer {
+                    for (batches) |b| allocator.free(b.calls);
+                    allocator.free(batches);
+                }
+                const results = try orchestration_mod.executeBatches(batches, allocator, io, tools_mod.default_tools);
+                defer allocator.free(results);
+
+                var batch_errors: u32 = 0;
+                for (prepared.items, 0..) |p, i| {
+                    window_tools += 1;
+                    const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, &file_writer);
+                    if (errored) {
+                        window_errors += 1;
+                        batch_errors += 1;
+                    }
+                }
+
+                // Live decision trace: execution step for this batch.
+                if (live_trace) |*t| {
+                    const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
+                    var step_buf: [96]u8 = undefined;
+                    const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
+                    traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", allocator) catch {};
                 }
             }
 
@@ -735,7 +820,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 /// Extract memorable facts from this session and persist them to the
 /// episodic tier, so the next session can inject them (T3.1).
 /// φ condensation keeps only the top 61.8% of candidates by importance.
-fn extractSessionMemories(mem: *memory_mod.MemorySystem, history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
+/// Stored facts also become knowledge-graph nodes (semantic tier), chained
+/// by "co_extracted" edges within the session.
+fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
     var engine = extraction_mod.ExtractionEngine.init(mem.allocator);
     defer engine.deinit();
 
@@ -771,6 +858,7 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, history: *std.ArrayList
     std.sort.pdq(extraction_mod.ExtractedFact, candidates.items, {}, ByImportance.lessThan);
 
     var stored: usize = 0;
+    var last_node_id: ?i64 = null;
     for (candidates.items[0..target]) |f| {
         const now = util_time.nowMillis();
         mem.store(.{
@@ -787,6 +875,16 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, history: *std.ArrayList
             .updated_at = now,
         }) catch continue;
         stored += 1;
+
+        // Semantic tier: mirror the stored fact as a graph node.
+        if (kg) |g| {
+            if (g.addNode(f.content[0..@min(48, f.content.len)], .concept, @tagName(f.fact_type)) catch null) |nid| {
+                if (last_node_id) |prev| {
+                    g.addEdge(prev, nid, "co_extracted", 0.618) catch {};
+                }
+                last_node_id = nid;
+            }
+        }
     }
     if (stored > 0) {
         try w.print("  Saved {d} memories for future sessions.\n", .{stored});
@@ -886,6 +984,7 @@ fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *std.
 /// M8: /diagnose — build a lightweight decision trace from real session
 /// stats and run the self-diagnostic engine against the user's concern.
 fn runDiagnose(
+    live: ?*decision_trace.DecisionTrace,
     concern: []const u8,
     injected_count: usize,
     window_tools: u32,
@@ -893,58 +992,66 @@ fn runDiagnose(
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
 ) !void {
-    // DecisionTrace takes ownership of query (freed in deinit) — dupe it.
-    var trace = decision_trace.DecisionTrace.init(alloc, try alloc.dupe(u8, concern));
-    defer trace.deinit();
+    var fallback_trace: ?decision_trace.DecisionTrace = null;
+    defer if (fallback_trace) |*t| t.deinit();
 
-    // Step 1: memory retrieval — confidence drops when nothing was injected.
-    const mem_conf: f64 = if (injected_count > 0) 0.8 else 0.3;
-    try trace.addStep(.{
-        .step_id = 1,
-        .phase = .memory_retrieval,
-        .timestamp = util_time.nowMillis(),
-        .input = try alloc.dupe(u8, concern),
-        .output = try alloc.print("injected={d}", .{injected_count}),
-        .reasoning = try alloc.dupe(u8, "recency-ranked e-decay injection"),
-        .confidence = mem_conf,
-        .duration_ms = 0,
-        .alternatives = &.{},
-        .dependencies = &.{},
-    });
-    // Step 2: tool execution — confidence tracks the error rate.
-    const tool_conf: f64 = if (window_tools == 0)
-        0.9
-    else
-        1.0 - @as(f64, @floatFromInt(window_errors)) / @as(f64, @floatFromInt(window_tools));
-    try trace.addStep(.{
-        .step_id = 2,
-        .phase = .tool_execution,
-        .timestamp = util_time.nowMillis(),
-        .input = try alloc.dupe(u8, "session tool window"),
-        .output = try alloc.print("tools={d} errors={d}", .{ window_tools, window_errors }),
-        .reasoning = try alloc.dupe(u8, "permission pipeline + thread pool"),
-        .confidence = tool_conf,
-        .duration_ms = 0,
-        .alternatives = &.{},
-        .dependencies = &.{},
-    });
-    // Step 3: LLM generation.
-    try trace.addStep(.{
-        .step_id = 3,
-        .phase = .llm_generation,
-        .timestamp = util_time.nowMillis(),
-        .input = try alloc.dupe(u8, "history + system prompt"),
-        .output = try alloc.dupe(u8, "assistant message"),
-        .reasoning = try alloc.dupe(u8, "provider stream + tool_use loop"),
-        .confidence = 0.9,
-        .duration_ms = 0,
-        .alternatives = &.{},
-        .dependencies = &.{},
-    });
+    // Prefer the live trace recorded by the agent loop; fall back to a
+    // static 3-step construction when no query has run yet.
+    const trace: *decision_trace.DecisionTrace = blk: {
+        if (live) |t| break :blk t;
+        fallback_trace = decision_trace.DecisionTrace.init(alloc, try alloc.dupe(u8, concern));
+        const t: *decision_trace.DecisionTrace = &fallback_trace.?;
+
+        const mem_conf: f64 = if (injected_count > 0) 0.8 else 0.3;
+        try t.addStep(.{
+            .step_id = 1,
+            .phase = .memory_retrieval,
+            .timestamp = util_time.nowMillis(),
+            .input = try alloc.dupe(u8, concern),
+            .output = try alloc.print("injected={d}", .{injected_count}),
+            .reasoning = try alloc.dupe(u8, "recency-ranked e-decay injection"),
+            .confidence = mem_conf,
+            .duration_ms = 0,
+            .alternatives = &.{},
+            .dependencies = &.{},
+        });
+        const tool_conf: f64 = if (window_tools == 0)
+            0.9
+        else
+            1.0 - @as(f64, @floatFromInt(window_errors)) / @as(f64, @floatFromInt(window_tools));
+        try t.addStep(.{
+            .step_id = 2,
+            .phase = .tool_execution,
+            .timestamp = util_time.nowMillis(),
+            .input = try alloc.dupe(u8, "session tool window"),
+            .output = try alloc.print("tools={d} errors={d}", .{ window_tools, window_errors }),
+            .reasoning = try alloc.dupe(u8, "permission pipeline + thread pool"),
+            .confidence = tool_conf,
+            .duration_ms = 0,
+            .alternatives = &.{},
+            .dependencies = &.{},
+        });
+        try t.addStep(.{
+            .step_id = 3,
+            .phase = .llm_generation,
+            .timestamp = util_time.nowMillis(),
+            .input = try alloc.dupe(u8, "history + system prompt"),
+            .output = try alloc.dupe(u8, "assistant message"),
+            .reasoning = try alloc.dupe(u8, "provider stream + tool_use loop"),
+            .confidence = 0.9,
+            .duration_ms = 0,
+            .alternatives = &.{},
+            .dependencies = &.{},
+        });
+        break :blk t;
+    };
     trace.complete();
 
+    const source: []const u8 = if (live != null) "live agent-loop trace" else "static fallback";
+    try std.Io.Writer.print(w, "  Diagnosing ({s}, {d} steps)…\n", .{ source, trace.getSteps().len });
+
     var diag = self_diagnostic.SelfDiagnostic.init(alloc);
-    const report = diag.diagnose(&trace, concern) catch {
+    const report = diag.diagnose(trace, concern) catch {
         try std.Io.Writer.writeAll(w, "  Diagnosis failed.\n\n");
         return;
     };
@@ -1051,6 +1158,57 @@ fn freeContentBlocks(alloc: std.mem.Allocator, blocks: []const llm.ContentBlock)
     alloc.free(@constCast(blocks));
 }
 
+/// Semantic tier listing: /knowledge shows graph size and recent nodes.
+fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void {
+    if (kg == null) {
+        try std.Io.Writer.writeAll(w, "  Knowledge graph unavailable (database disabled).\n\n");
+        return;
+    }
+    const g: *knowledge_graph.KnowledgeGraph = kg.?;
+    const total = g.nodeCount() catch 0;
+    if (total == 0) {
+        try std.Io.Writer.writeAll(w, "  Knowledge graph is empty — nodes are added when sessions extract memories.\n\n");
+        return;
+    }
+    const rows = g.recentNodes(5) catch {
+        try std.Io.Writer.writeAll(w, "  (failed to read knowledge graph)\n\n");
+        return;
+    };
+    defer g.freeNodeRows(rows);
+    try std.Io.Writer.print(w, "  Knowledge graph: {d} nodes. Most recent:\n", .{total});
+    for (rows) |r| {
+        const entity = r.entity[0..@min(r.entity.len, 60)];
+        const src = r.source orelse "";
+        try std.Io.Writer.print(w, "    #{d} [{s}] {s} (from {s})\n", .{ r.id, r.entity_type, entity, src });
+    }
+    try std.Io.Writer.writeAll(w, "\n");
+}
+
+/// Append one step to the live decision trace (all strings duped; the
+/// trace frees them in deinit).
+fn traceAddStep(
+    t: *decision_trace.DecisionTrace,
+    phase: decision_trace.DecisionPhase,
+    confidence: f64,
+    input: []const u8,
+    output: []const u8,
+    reasoning: []const u8,
+    alloc: std.mem.Allocator,
+) !void {
+    try t.addStep(.{
+        .step_id = @intCast(t.getSteps().len + 1),
+        .phase = phase,
+        .timestamp = util_time.nowMillis(),
+        .input = try alloc.dupe(u8, input),
+        .output = try alloc.dupe(u8, output),
+        .reasoning = try alloc.dupe(u8, reasoning),
+        .confidence = confidence,
+        .duration_ms = 0,
+        .alternatives = &.{},
+        .dependencies = &.{},
+    });
+}
+
 fn isFileModifyingTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "FileWrite") or
         std.mem.eql(u8, tool_name, "FileEdit") or
@@ -1059,52 +1217,35 @@ fn isFileModifyingTool(tool_name: []const u8) bool {
 }
 
 /// Execute a single tool call and record result.
-fn executeAndRecord(
-    tc: llm.provider.ToolUseBlock,
+/// A tool_use that passed the permission gate in phase 1 and is queued for
+/// execution (possibly in parallel) in phase 2.
+const PreparedCall = struct {
+    call: orchestration_mod.ToolCall,
+    snap_id: ?[16]u8,
+};
+
+/// Phase 2 tail: print the outcome, truncate oversized output, record in the
+/// operation log, append the tool_result block. Returns true on tool error.
+fn finishToolCall(
+    p: PreparedCall,
+    result: registry.ToolResult,
     alloc: std.mem.Allocator,
-    io: std.Io,
     log: *op_log.OperationLog,
-    fhist: *file_history.FileHistoryState,
     result_blocks: *std.ArrayList(llm.ContentBlock),
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
 ) !bool {
-    try std.Io.Writer.print(w, "  [Executing: {s}]\n", .{tc.name});
-    try std.Io.File.Writer.flush(file_writer);
-    logger.info("Tool execute: {s}", .{tc.name});
-
-    // Backup file before modification (for rollback support)
-    var snap_id: ?[16]u8 = null;
-    if (isFileModifyingTool(tc.name)) {
-        if (registry.getStringField(tc.input, "path")) |fp| {
-            // Generate snapshot ID
-            var sid: [16]u8 = undefined;
-            const ts = util_time.nowMillis();
-            for (&sid, 0..) |*byte, i| {
-                byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
-            }
-            fhist.trackEdit(fp, sid, io) catch {};
-            snap_id = sid;
-        }
-    }
-
-    const result = tools_mod.DefaultRegistry.execute(tc.name, alloc, tc.input, io) catch {
-        logger.err("Tool failed: {s}", .{tc.name});
-        try result_blocks.append(alloc, .{ .tool_result = .{
-            .tool_use_id = tc.id,
-            .content = "Tool execution failed",
-            .is_error = true,
-        } });
-        _ = log.record(tc.name, "execution", "error", null, false) catch {};
-        return true;
-    };
+    logger.info("Tool execute: {s}", .{p.call.tool_name});
 
     // Truncate large outputs for history — must dupe before freeing
     const max_result = 4096;
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    try std.Io.Writer.print(w, "  [Result: {s}]\n", .{if (raw.len > 200) raw[0..200] else raw});
+    try std.Io.Writer.print(w, "  [{s}: {s}]\n", .{
+        p.call.tool_name,
+        if (raw.len > 200) raw[0..200] else raw,
+    });
 
     const content_for_history: []const u8 = if (truncated)
         try alloc.dupe(u8, raw[0..max_result])
@@ -1112,11 +1253,11 @@ fn executeAndRecord(
         raw; // ownership transfers, no dupe needed
 
     try result_blocks.append(alloc, .{ .tool_result = .{
-        .tool_use_id = tc.id,
+        .tool_use_id = p.call.tool_use_id,
         .content = content_for_history,
         .is_error = result.is_error,
     } });
-    _ = log.record(tc.name, "executed", result.output, snap_id, snap_id != null) catch {};
+    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null) catch {};
     if (truncated and !result.is_error) {
         alloc.free(result.output);
     }
@@ -1697,6 +1838,7 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /memory           Show injected and stored memories
         \\  /research <topic> Web research with phi-curated solutions
         \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
+        \\  /knowledge         Browse the knowledge graph (semantic tier)
         \\
         \\Models (use /model to switch):
         \\  Claude:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5

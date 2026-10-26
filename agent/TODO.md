@@ -128,6 +128,13 @@
 - **allocPrint 迁移（65 处 → 0）**: `std.fmt.allocPrint(alloc, fmt, args)` 全量改 `alloc.print(fmt, args)`（0.17 正道、0.18 前置要求），含 7 处跨行形态手工处理。`std.fmt.allocPrint` 在 src 中已绝迹。
 - **验证**: build/test 全绿（含新增深拷贝测试）、REPL 冒烟正常；深拷贝的运行时路径待下次真实 LLM 对话自然覆盖（本机 Ollama 未运行，单测已覆盖同等逻辑）。
 
+### P21: 三个空转骨架接线（agent loop 并行 / 知识图谱写入 / 真实决策链）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **① M7 并行接入 agent loop**: 工具执行重构为两阶段——阶段 1 串行完成权限门（deny/ask 交互照旧产出错误 result）+ trackEdit 备份 + 收集 `PreparedCall`；阶段 2 整批交给 `partitionToolCalls → executeBatches`：并发安全工具（FileRead/Glob/Grep/WebSearch/TaskList…）在 e 上限线程池**真并行**，非安全工具串行，结果按原序回收（`finishToolCall`：打印/截断/op_log/入 history）。`executeAndRecord` 拆分为 PreparedCall + finishToolCall。/run 命令路径不受影响。
+- **② 知识图谱（semantic 层）启用**: `extractSessionMemories` 在 φ 过滤后的每条事实入库同时 `addNode(entity=记忆名, .concept, source=fact_type)`，同会话节点间连 `co_extracted` 边（weight=φ）；新增 `recentNodes` 查询 API（prepared）与 `/knowledge` 命令（节点总数 + 最近 5 条）。实测：提取 1 条 → `/knowledge` 显示 `#1 [concept] 我 prefer 用 zig 写 agent (from user_preference)`。
+- **③ 真实决策链**: agent loop 内逐步埋点——每条用户查询新建 `DecisionTrace`（live），记录 memory_retrieval（注入置信）、llm_generation（按 output_tokens/content 置信，reasoning=stop_reason）、tool_execution（批内错误率置信）；`/diagnose` 优先用 live 链（输出标注 "live agent-loop trace, N steps"），无查询时静态 3 步构造作兜底。实测：查询因无 key 失败 → /diagnose 显示 1 步 live 链并正确诊断记忆薄弱。
+- **验证**: 全量测试绿、REPL 冒烟（/run Bash、/knowledge、live /diagnose、提取→图谱）全过。
+
 ## 已完成事项
 
 ### Phase 1: 增强工具接口 ✅

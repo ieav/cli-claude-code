@@ -102,6 +102,55 @@ pub const KnowledgeGraph = struct {
         if (!try stmt.step()) return error.NoRows;
         return @intCast(stmt.columnInt64(0));
     }
+
+    /// A lightweight node row for listings (avoids owning properties JSON).
+    pub const NodeRow = struct {
+        id: i64,
+        entity: []u8,
+        entity_type: []u8,
+        source: ?[]u8,
+        created_at: i64,
+    };
+
+    /// Most recently created nodes. Caller owns the slice and every string;
+    /// release with freeNodeRows.
+    pub fn recentNodes(self: *Self, limit: usize) ![]NodeRow {
+        var stmt = try database.Statement.prepare(
+            self.allocator,
+            self.db,
+            "SELECT id, entity, entity_type, source, created_at " ++
+                "FROM knowledge_nodes ORDER BY id DESC LIMIT ?1",
+        );
+        defer stmt.finalize();
+        stmt.bindInt64(1, @intCast(limit));
+
+        var rows: std.ArrayList(NodeRow) = .empty;
+        errdefer {
+            for (rows.items) |r| self.freeNodeRow(r);
+            rows.deinit(self.allocator);
+        }
+        while (try stmt.step()) {
+            try rows.append(self.allocator, .{
+                .id = stmt.columnInt64(0),
+                .entity = try self.allocator.dupe(u8, stmt.columnText(1)),
+                .entity_type = try self.allocator.dupe(u8, stmt.columnText(2)),
+                .source = if (stmt.columnText(3).len > 0) try self.allocator.dupe(u8, stmt.columnText(3)) else null,
+                .created_at = stmt.columnInt64(4),
+            });
+        }
+        return rows.toOwnedSlice(self.allocator);
+    }
+
+    fn freeNodeRow(self: *Self, r: NodeRow) void {
+        self.allocator.free(r.entity);
+        self.allocator.free(r.entity_type);
+        if (r.source) |s| self.allocator.free(s);
+    }
+
+    pub fn freeNodeRows(self: *Self, rows: []NodeRow) void {
+        for (rows) |r| self.freeNodeRow(r);
+        self.allocator.free(rows);
+    }
 };
 
 test "KnowledgeGraph addNode and addEdge" {
