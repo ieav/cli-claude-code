@@ -83,7 +83,7 @@ Ziv 内置 6 种授权执行模式，通过 `/mode` 命令循环切换：
 | **Plan** | `ziv[plan]>` | 只读模式，所有写操作被阻止 |
 | **Bypass** | `ziv[bypass]>` | 跳过所有权限检查 |
 | **Don't Ask** | `ziv[dontask]>` | 自动拒绝所有需要确认的操作 |
-| **Auto** | `ziv[auto]>` | 自动分类器决定（预留 LLM 集成） |
+| **Auto** | `ziv[auto]>` | 分类器自动决定；ask 级操作交 LLM 分类（provider 可达时，实测 mock 直通），失败降级规则 |
 
 切换流程（Shift+Tab 或 `/mode`）：
 ```
@@ -312,7 +312,7 @@ Ziv Agent v0.4.0
 
 所有后端通过 comptime vtable 模式统一接口：
 - `complete()` — 同步请求
-- `stream()` — SSE 流式响应
+- `stream()` — SSE 流式响应（**REPL 默认走此路径，回复逐块实时显示**）
 - `countTokens()` — token 估算
 - `supportsToolUse()` / `supportsStreaming()`
 
@@ -463,7 +463,7 @@ auto 模式下的工具分类：
 **情景记忆完整闭环（v0.3.x 已实现）**：
 - **提取**：`/quit`、`/clear` 时启发式扫描 user/assistant 消息（中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…），φ 浓缩只保重要性前 61.8% 后入库
 - **幂等**：id = 内容双 Wyhash，`INSERT OR REPLACE` —— 同一句话重复提及自动去重并刷新时间戳
-- **注入**：下次启动取最近 20 条，按 **e 衰减**（30 天半衰，`e^(-age/τ)`）排序，token 预算 800 截断后拼入 system prompt（ziv.log 可见 `[INF] memory: injected N entries`）
+- **注入**：下次启动取最近 20 条，按 **0.5×e 衰减 + 0.5×与最新记忆的向量余弦**（64 维 hash 词袋嵌入）混合排序，token 预算 800 截断后拼入 system prompt（ziv.log 可见 `[INF] memory: injected N entries`）
 - **查看**：`/memory` 命令
 
 **反思引擎（已接线）**：会话内维护查询窗口（≤20 条 + 工具/错误计数），每 10 轮或 π×10min 触发反思；`/quit` 时强制收尾。insights 以 `.feedback` 记忆入库，下会话自动注入——改进经验跨会话生效。
@@ -483,12 +483,12 @@ auto 模式下的工具分类：
 
 ### 5.10 自诊断引擎
 
-`/diagnose <你的质疑>` 触发。当前实现（轻量版）：
+`/diagnose <你的质疑>` 触发（live 决策链版）：
 1. 用**真实会话统计**构造决策链：记忆注入置信（注入 0 条 → 0.3）/ 工具错误率置信 / 生成置信
 2. SelfDiagnostic 找 confidence < phi 的弱步骤
 3. 输出 root cause + 改进建议，并与记忆系统真实联动（例：记忆库为空时会诊断出"检索环节薄弱"）
 
-> 已知限制：决策链为 3 步静态构造，agent loop 内逐步记录真实决策链是后续任务。
+> 决策链已升级为 agent loop 内 7 阶段真实埋点（检索/上下文组装/工具选择/执行/生成/后处理/反思触发）；/diagnose 优先使用 live trace，无查询时才用静态兜底。
 
 ### 5.11 自主优化研究
 
@@ -579,6 +579,8 @@ Ziv 支持 5 层配置源，后者覆盖前者：
 | `api_keys.anthropic` | string | null | Anthropic API Key（也支持 ANTHROPIC_API_KEY 环境变量） |
 | `api_keys.anthropic_base_url` | string | null | Anthropic API 自定义地址（也支持 ANTHROPIC_BASE_URL 环境变量） |
 | `api_keys.brave` | string | null | Brave Search API Key（也支持 BRAVE_API_KEY 环境变量） |
+
+搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
 | `api_keys.ollama_host` | string | `"http://localhost:11434"` | Ollama 服务地址 |
 | `allow_rules` | string[] | [] | 允许规则列表 |
 | `deny_rules` | string[] | [] | 拒绝规则列表 |
