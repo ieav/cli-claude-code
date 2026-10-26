@@ -504,7 +504,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/version")) {
-                try std.Io.Writer.writeAll(w, "  Ziv v0.3.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
+                try std.Io.Writer.writeAll(w, "  Ziv v0.4.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else {

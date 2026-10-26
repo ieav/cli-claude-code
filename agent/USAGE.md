@@ -2,7 +2,7 @@
 
 > 一个用 Zig 构建的支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库）的 CLI Agent。
 > 核心算法由三大数学常数驱动：**pi** 圆融信息、**e** 控制增长、**phi** 浓缩知识。
-> v0.3.0 — 完整 Agent Loop：系统提示词 + 对话历史 + 工具调用循环 + 交互式配置。
+> v0.4.0 — 自学习闭环：记忆/反思飞轮 + 知识图谱 + /research /diagnose + 工具并行编排（π/e/φ 全落地）。
 
 ---
 
@@ -40,7 +40,7 @@ zig build install
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — Zig 自学习 Agent v0.3.0      ║
+║  Ziv — Zig 自学习 Agent v0.4.0      ║
 ║  pi 圆融 · e 增长 · phi 浓缩         ║
 ╚══════════════════════════════════════╝
 ```
@@ -51,7 +51,7 @@ zig build install
 |------|------|
 | `/help`, `/h` | 显示帮助信息 |
 | `/quit`, `/q`, `/exit` | 退出 Ziv |
-| `/version` | 显示版本号 (v0.3.0) |
+| `/version` | 显示版本号 (v0.4.0) |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
 | `/run <ToolName> <json>` | 直接执行工具 |
@@ -268,7 +268,7 @@ ziv> /model mistral             # → Ollama 后端（本地模型）
 ## 4. 架构总览
 
 ```
-Ziv Agent v0.3.0
+Ziv Agent v0.4.0
 ├── math/           数学常数核心 (pi, e, phi)
 ├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 消息压缩
 ├── tools/          comptime 工具系统 (12 tools) + 权限 + 编排
@@ -692,7 +692,7 @@ agent/
 │   └── migrations/        # SQL 迁移脚本
 └── src/
     ├── main.zig           # 入口 + 自检
-    ├── repl.zig           # 交互式 REPL（v0.3.0 — 完整 Agent Loop）
+    ├── repl.zig           # 交互式 REPL（v0.4.0 — 完整 Agent Loop）
     ├── config.zig         # 五层配置层级 + saveSettings + env 回退
     ├── system_prompt.zig  # 默认系统提示词
     │
@@ -838,6 +838,7 @@ agent/
 - [x] 操作记录引擎 + 文件快照 + 完整回滚逻辑（trackEdit/restoreSnapshot/rollbackTo）
 - [x] 30+ 工具库 (util/)
 - [x] **v0.3.0 — 完整 Agent Loop**
+- [x] **v0.4.0 — 自学习闭环与引擎接线**（记忆/反思/图谱/研究/诊断/并行，详见 TODO P13-P21）
 - [x] 系统提示词 (system_prompt.zig)
 - [x] 对话历史保持 (多轮上下文)
 - [x] 工具调用循环 (tool_use → 权限检查 → 执行 → 结果回传)

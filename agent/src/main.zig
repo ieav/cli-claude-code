@@ -100,7 +100,7 @@ pub fn main() !void {
 
     try std.Io.Writer.writeAll(w,
         \\╔══════════════════════════════════════╗
-        \\║  Ziv — Zig 自学习 Agent v0.3.0      ║
+        \\║  Ziv — Zig 自学习 Agent v0.4.0      ║
         \\║  pi 圆融 · e 增长 · phi 浓缩         ║
         \\╚══════════════════════════════════════╝
         \\
