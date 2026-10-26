@@ -72,7 +72,7 @@ pub const LLMClassifier = struct {
         const input_str = std.json.Stringify.valueAlloc(self.allocator, input, .{}) catch "{}";
         defer self.allocator.free(input_str);
 
-        const prompt = try std.fmt.allocPrint(self.allocator,
+        const prompt = try self.allocator.print(
             \\You are a tool safety classifier. Respond with exactly "ALLOW" or "BLOCK: reason".
             \\
             \\Tool: {s}

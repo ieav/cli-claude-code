@@ -14,11 +14,11 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         .sub_path = path,
         .data = content,
     }) catch |err| {
-        const msg = std.fmt.allocPrint(alloc, "Failed to write '{s}': {}", .{ path, err }) catch "write failed";
+        const msg = alloc.print("Failed to write '{s}': {}", .{ path, err }) catch "write failed";
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 
-    const msg = std.fmt.allocPrint(alloc, "Wrote {} bytes to {s}", .{ content.len, path }) catch "wrote file";
+    const msg = alloc.print("Wrote {} bytes to {s}", .{ content.len, path }) catch "wrote file";
     return registry.ToolResult{ .output = msg };
 }
 

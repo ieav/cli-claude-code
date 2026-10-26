@@ -48,7 +48,7 @@ fn analyzeError(allocator: std.mem.Allocator, code: []const u8, message: []const
         return allocator.dupe(u8, "知识冲突：新旧信息存在矛盾。");
     }
     // Generic fallback
-    return std.fmt.allocPrint(allocator, "发生错误: {s} - {s}", .{ code, message });
+    return allocator.print("发生错误: {s} - {s}", .{ code, message });
 }
 
 fn suggestFixes(allocator: std.mem.Allocator, code: []const u8) ![]const FixOption {

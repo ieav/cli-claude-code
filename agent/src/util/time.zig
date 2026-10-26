@@ -47,7 +47,7 @@ pub fn formatIso(allocator: std.mem.Allocator, timestamp_ms: i64) ![]u8 {
     const minute = @divTrunc(@rem(time_of_day, 3600), 60);
     const second = @rem(time_of_day, 60);
 
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return allocator.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         // Unsigned: 0.17 emits a '+' sign for zero-padded signed integers.
         @as(u32, @intCast(year)),
         @as(u32, @intCast(month + 1)),

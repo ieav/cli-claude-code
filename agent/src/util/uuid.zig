@@ -33,8 +33,7 @@ pub fn v4(allocator: std.mem.Allocator) ![]u8 {
     // Variant 1
     buf[8] = (buf[8] & 0x3f) | 0x80;
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{x}-{x}-{x}-{x}-{x}",
         .{
             buf[0..4],
@@ -72,7 +71,7 @@ pub fn v4Buf(buf: *[36]u8) void {
 pub fn shortId(allocator: std.mem.Allocator) ![]u8 {
     var buf: [4]u8 = undefined;
     randomBytes(&buf);
-    return std.fmt.allocPrint(allocator, "{x}", .{&buf});
+    return allocator.print("{x}", .{&buf});
 }
 
 test "UUID v4 format" {

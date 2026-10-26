@@ -39,6 +39,7 @@ test {
     _ = @import("memory/reflection.zig");
     _ = @import("memory/working.zig");
     _ = @import("research/optimization_researcher.zig");
+    _ = @import("repl.zig");
     _ = @import("runtime/builtin_rules.zig");
     _ = @import("runtime/error_handler.zig");
     _ = @import("runtime/monitor.zig");

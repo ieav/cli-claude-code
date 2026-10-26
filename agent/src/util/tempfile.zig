@@ -7,7 +7,7 @@ const uuid = @import("uuid.zig");
 pub fn create(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
     const id = try uuid.shortId(allocator);
     defer allocator.free(id);
-    const path = try std.fmt.allocPrint(allocator, "/tmp/{s}_{s}{s}", .{ prefix, id, suffix });
+    const path = try allocator.print("/tmp/{s}_{s}{s}", .{ prefix, id, suffix });
     errdefer allocator.free(path);
 
     var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
@@ -27,14 +27,14 @@ pub fn create(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const 
 pub fn createDir(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     const id = try uuid.shortId(allocator);
     defer allocator.free(id);
-    const name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, id });
+    const name = try allocator.print("{s}_{s}", .{ prefix, id });
     errdefer allocator.free(name);
 
     var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     defer io_state.deinit();
     const io = io_state.io();
 
-    const path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{name});
+    const path = try allocator.print("/tmp/{s}", .{name});
     std.Io.Dir.cwd().createDirPath(io, path) catch return error.TempDirCreateFailed;
     return path;
 }

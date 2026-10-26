@@ -118,7 +118,7 @@ pub const FileHistoryState = struct {
             self.sequence += 1;
             const basename_start = std.mem.lastIndexOfScalar(u8, file_path, '/') orelse 0;
             const basename = if (basename_start > 0) file_path[basename_start + 1 ..] else file_path;
-            const backup_path = std.fmt.allocPrint(self.allocator, "{s}/{d}_{s}", .{
+            const backup_path = self.allocator.print("{s}/{d}_{s}", .{
                 self.checkpoint_dir,
                 self.sequence,
                 basename,

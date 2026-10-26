@@ -216,11 +216,11 @@ pub const OptimizationResearcher = struct {
             .compare_approaches => "comparison",
             .solve_problem => "solution",
         };
-        const q2 = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ intent_modifier, keywords });
+        const q2 = try self.allocator.print("{s} {s}", .{ intent_modifier, keywords });
         try queries.append(self.allocator, q2);
 
         // Query 3: Technical/academic angle
-        const q3 = try std.fmt.allocPrint(self.allocator, "{s} 2024 2025", .{keywords});
+        const q3 = try self.allocator.print("{s} 2024 2025", .{keywords});
         try queries.append(self.allocator, q3);
 
         return queries.toOwnedSlice(self.allocator);

@@ -18,7 +18,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // Read file
     const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| {
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "Cannot read file: {}", .{err}),
+            .output = try alloc.print("Cannot read file: {}", .{err}),
             .is_error = true,
         };
     };
@@ -27,7 +27,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // Find old_string
     const first_pos = std.mem.indexOf(u8, contents, old_string) orelse
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "old_string not found in {s}", .{path}),
+            .output = try alloc.print("old_string not found in {s}", .{path}),
             .is_error = true,
         };
 
@@ -66,7 +66,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         .data = new_contents.items,
     }) catch |err| {
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "Cannot write file: {}", .{err}),
+            .output = try alloc.print("Cannot write file: {}", .{err}),
             .is_error = true,
         };
     };
@@ -77,7 +77,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         @as(usize, 1);
 
     return registry.ToolResult{
-        .output = try std.fmt.allocPrint(alloc, "Replaced {d} occurrence(s) in {s}", .{ count, path }),
+        .output = try alloc.print("Replaced {d} occurrence(s) in {s}", .{ count, path }),
     };
 }
 

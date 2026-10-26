@@ -9,6 +9,6 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, _: std.Io) anyer
     // In real agent loop, this would prompt the user.
     // For now, return the question as output.
     return registry.ToolResult{
-        .output = try std.fmt.allocPrint(alloc, "[Question to user]: {s}\n(Awaiting user response)", .{question}),
+        .output = try alloc.print("[Question to user]: {s}\n(Awaiting user response)", .{question}),
     };
 }

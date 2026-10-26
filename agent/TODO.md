@@ -121,6 +121,13 @@
   - 修复 self_diagnostic 的悬垂隐患：owned_gaps 曾浅拷贝已释放的 description 指针（新增 DiagnosisReport.free + 深拷贝）；修复 DecisionTrace query 所有权契约踩坑（init 接收堆分配，repl 侧 dupe）。
 - **验证**: 178 pass / 1 skip / 179 total 全绿；REPL 实测 TaskCreate/Update/List、4 路并行编排、/research 真网络、/diagnose 双场景（有/无记忆）全通过；/help 已收录新命令。
 
+### P20: 三项技术债清偿（缺陷修复轮）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **DOM 泄漏（每 LLM 响应漏一块）**: agent loop 在把 assistant 响应放进 history 前改为**深拷贝** content blocks（`cloneContentBlocks`：text/thinking 字符串、tool_use 的 id/name 与 **json.Value 整树递归拷贝**、tool_result 字符串），随后立即 `response.free(allocator)` 释放 DOM arena；tool_use 提取循环改从 history 的 owned 拷贝迭代（响应已释放）。泄漏从"每次 LLM 调用"降为"会话级持有"（与 history 生命周期一致，进程退出回收）。新增深拷贝单测（testing.allocator 零泄漏 + 嵌套 JSON 树存活断言）；repl.zig 首次纳入测试聚合。
+- **facade 吞错**: `MemorySystem.store` 对 episodic 失败从"打印 warning 后假装成功"改为"记录并**上抛错误**"——调用方（extractSessionMemories/runReflection）原有的 catch 计数逻辑随之恢复真实（彻底杜绝 P15 式"Saved N 虚高"假阳性）。
+- **allocPrint 迁移（65 处 → 0）**: `std.fmt.allocPrint(alloc, fmt, args)` 全量改 `alloc.print(fmt, args)`（0.17 正道、0.18 前置要求），含 7 处跨行形态手工处理。`std.fmt.allocPrint` 在 src 中已绝迹。
+- **验证**: build/test 全绿（含新增深拷贝测试）、REPL 冒烟正常；深拷贝的运行时路径待下次真实 LLM 对话自然覆盖（本机 Ollama 未运行，单测已覆盖同等逻辑）。
+
 ## 已完成事项
 
 ### Phase 1: 增强工具接口 ✅

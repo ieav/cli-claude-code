@@ -14,7 +14,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // Use std.fs.cwd() with proper Zig 0.16 API
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "Cannot open directory: {}", .{err}),
+            .output = try alloc.print("Cannot open directory: {}", .{err}),
             .is_error = true,
         };
     };

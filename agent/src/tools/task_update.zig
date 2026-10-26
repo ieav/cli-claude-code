@@ -17,13 +17,13 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, _: std.Io) anyer
         const task = store.find(task_id);
         const reason = if (task == null) "unknown task id" else "invalid status";
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "Task update failed: {s}", .{reason}),
+            .output = try alloc.print("Task update failed: {s}", .{reason}),
             .is_error = true,
         };
     }
 
     const task = store.find(task_id).?;
     return registry.ToolResult{
-        .output = try std.fmt.allocPrint(alloc, "Task #{d} → {s} — {s}", .{ task.id, task.status.label(), task.subject }),
+        .output = try alloc.print("Task #{d} → {s} — {s}", .{ task.id, task.status.label(), task.subject }),
     };
 }

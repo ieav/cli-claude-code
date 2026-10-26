@@ -19,7 +19,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     var count: u32 = 0;
     for (search_result.matches) |m| {
         if (count >= max_results) break;
-        const line = std.fmt.allocPrint(alloc, "{s}:{d}: {s}\n", .{ m.file_path, m.line_number, m.line_content }) catch continue;
+        const line = alloc.print("{s}:{d}: {s}\n", .{ m.file_path, m.line_number, m.line_content }) catch continue;
         defer alloc.free(line);
         output.appendSlice(alloc, line) catch continue;
         count += 1;
@@ -36,7 +36,7 @@ fn simpleSearch(allocator: std.mem.Allocator, pattern: []const u8, path: []const
     _ = path;
     _ = max_results;
     return registry.ToolResult{
-        .output = try std.fmt.allocPrint(allocator, "Pattern: {s} (simple search not yet implemented)", .{pattern}),
+        .output = try allocator.print("Pattern: {s} (simple search not yet implemented)", .{pattern}),
     };
 }
 

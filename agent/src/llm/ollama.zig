@@ -64,7 +64,7 @@ pub const OllamaProvider = struct {
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
 
-        const uri_str = try std.fmt.allocPrint(self.allocator, "{s}/api/chat", .{self.config.base_url});
+        const uri_str = try self.allocator.print("{s}/api/chat", .{self.config.base_url});
         defer self.allocator.free(uri_str);
         const uri = try std.Uri.parse(uri_str);
 
@@ -227,7 +227,7 @@ pub const OllamaProvider = struct {
     }
 
     fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.config.base_url, path });
+        const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
 
@@ -351,7 +351,7 @@ pub const OllamaProvider = struct {
     }
 
     pub fn isRunning(self: *Self) bool {
-        const url = std.fmt.allocPrint(self.allocator, "{s}/api/tags", .{self.config.base_url}) catch return false;
+        const url = self.allocator.print("{s}/api/tags", .{self.config.base_url}) catch return false;
         defer self.allocator.free(url);
         const uri = std.Uri.parse(url) catch return false;
 

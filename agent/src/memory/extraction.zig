@@ -170,7 +170,7 @@ test "ExtractionEngine condense with φ ratio" {
 
     // Add 10 facts
     for (0..10) |i| {
-        const content = try std.fmt.allocPrint(std.testing.allocator, "fact {d}", .{i});
+        const content = try std.testing.allocator.print("fact {d}", .{i});
         defer std.testing.allocator.free(content);
         try engine.extracted_facts.append(std.testing.allocator, .{
             .content = try std.testing.allocator.dupe(u8, content),

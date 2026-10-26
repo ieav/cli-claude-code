@@ -9,7 +9,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const max_size: usize = 1024 * 1024;
 
     const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, std.Io.Limit.limited(max_size)) catch |err| {
-        const msg = std.fmt.allocPrint(alloc, "Failed to read '{s}': {}", .{ path, err }) catch "read failed";
+        const msg = alloc.print("Failed to read '{s}': {}", .{ path, err }) catch "read failed";
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 
@@ -20,7 +20,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     var line_num: usize = 1;
     var iter = std.mem.splitSequence(u8, contents, "\n");
     while (iter.next()) |line| : (line_num += 1) {
-        const formatted = std.fmt.allocPrint(alloc, "{d:6}\t{s}\n", .{ line_num, line }) catch continue;
+        const formatted = alloc.print("{d:6}\t{s}\n", .{ line_num, line }) catch continue;
         defer alloc.free(formatted);
         result.appendSlice(alloc, formatted) catch {};
     }

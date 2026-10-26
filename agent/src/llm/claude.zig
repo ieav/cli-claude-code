@@ -70,7 +70,7 @@ pub const ClaudeProvider = struct {
         var sse_parser = streaming_mod.SSEParser.init(self.allocator);
         defer sse_parser.deinit();
 
-        const uri_str = try std.fmt.allocPrint(self.allocator, "{s}/v1/messages", .{self.config.base_url});
+        const uri_str = try self.allocator.print("{s}/v1/messages", .{self.config.base_url});
         defer self.allocator.free(uri_str);
         const uri = try std.Uri.parse(uri_str);
 
@@ -288,7 +288,7 @@ pub const ClaudeProvider = struct {
     }
 
     fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.config.base_url, path });
+        const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
 
         const uri = try std.Uri.parse(url);

@@ -27,6 +27,10 @@ pub const MemorySystem = struct {
     }
 
     /// Store a memory entry across tiers.
+    /// Working memory is stored first; if the episodic (SQLite) write fails
+    /// the error is logged AND returned so callers can skip their
+    /// success-counting (the old swallow-and-warn behavior produced
+    /// inflated "saved N" counts when the table was missing).
     pub fn store(self: *Self, entry: types.MemoryEntry) !void {
         // Always store in working memory (fast access)
         try self.working_mem.store(entry);
@@ -34,6 +38,7 @@ pub const MemorySystem = struct {
         // Also persist to episodic storage
         self.episodic_mem.store(entry) catch |err| {
             std.debug.print("Warning: episodic store failed: {}\n", .{err});
+            return err;
         };
     }
 

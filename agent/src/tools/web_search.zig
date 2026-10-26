@@ -24,7 +24,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     const results = ws.search(query, max_results) catch |err| {
         return registry.ToolResult{
-            .output = try std.fmt.allocPrint(alloc, "Web search failed ({s}): {s}", .{ @tagName(backend), @errorName(err) }),
+            .output = try alloc.print("Web search failed ({s}): {s}", .{ @tagName(backend), @errorName(err) }),
             .is_error = true,
         };
     };

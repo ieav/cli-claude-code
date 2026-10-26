@@ -9,7 +9,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const result = std.process.run(alloc, io, .{
         .argv = &.{ "/bin/sh", "-c", command },
     }) catch |err| {
-        const msg = std.fmt.allocPrint(alloc, "Failed to execute: {}", .{err}) catch "exec failed";
+        const msg = alloc.print("Failed to execute: {}", .{err}) catch "exec failed";
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 

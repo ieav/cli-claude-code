@@ -124,7 +124,7 @@ pub const ReflectionEngine = struct {
             .id = std.mem.zeroes([16]u8),
             .trigger = trigger,
             .input_summary = try self.allocator.dupe(u8, summary_buf.items),
-            .decisions_made = try std.fmt.allocPrint(self.allocator, "queries={d} tools={d} errors={d}", .{ recent_queries.len, recent_tools_used, recent_errors }),
+            .decisions_made = try self.allocator.print("queries={d} tools={d} errors={d}", .{ recent_queries.len, recent_tools_used, recent_errors }),
             .insights = try self.allocator.dupe(u8, insights_buf.items),
             .action_items = try self.allocator.dupe(u8, actions_buf.items),
             .quality_score = quality_score,

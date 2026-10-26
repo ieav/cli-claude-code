@@ -52,7 +52,7 @@ pub fn repeat(allocator: std.mem.Allocator, s: []const u8, n: usize) ![]u8 {
 pub fn truncate(allocator: std.mem.Allocator, s: []const u8, max_len: usize) ![]u8 {
     if (s.len <= max_len) return allocator.dupe(u8, s);
     if (max_len < 3) return allocator.dupe(u8, s[0..max_len]);
-    return std.fmt.allocPrint(allocator, "{s}...", .{s[0 .. max_len - 3]});
+    return allocator.print("{s}...", .{s[0 .. max_len - 3]});
 }
 
 /// Indent each line of a string by `indent` spaces. Caller owns returned slice.

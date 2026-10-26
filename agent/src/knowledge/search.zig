@@ -83,15 +83,14 @@ pub const WebSearch = struct {
         const encoded_query = try self.urlEncode(query);
         defer self.allocator.free(encoded_query);
 
-        const url = try std.fmt.allocPrint(
-            self.allocator,
+        const url = try self.allocator.print(
             "{s}?q={s}&count={d}",
             .{ self.base_url, encoded_query, max_results },
         );
         defer self.allocator.free(url);
 
         const uri = try std.Uri.parse(url);
-        const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        const auth_value = try self.allocator.print("Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);
 
         var req = try self.http_client.request(.GET, uri, .{
@@ -159,8 +158,7 @@ pub const WebSearch = struct {
         const encoded_query = try self.urlEncode(query);
         defer self.allocator.free(encoded_query);
 
-        const url = try std.fmt.allocPrint(
-            self.allocator,
+        const url = try self.allocator.print(
             "{s}?q={s}&format=json&categories=general",
             .{ self.base_url, encoded_query },
         );
@@ -231,7 +229,7 @@ pub const WebSearch = struct {
         const encoded_query = try self.urlEncode(query);
         defer self.allocator.free(encoded_query);
 
-        const post_body = try std.fmt.allocPrint(self.allocator, "q={s}", .{encoded_query});
+        const post_body = try self.allocator.print("q={s}", .{encoded_query});
         defer self.allocator.free(post_body);
 
         const uri = try std.Uri.parse(self.base_url);

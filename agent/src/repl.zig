@@ -598,24 +598,33 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             });
             try std.Io.File.Writer.flush(&file_writer);
 
-            // Append assistant response to history
+            // Append assistant response to history. Deep-copy the blocks
+            // first: their strings (and tool_use JSON trees) live in the
+            // response's DOM arena, which is freed right after — history
+            // must own its memory. This closes the per-response DOM leak.
+            const stop_reason = response.stop_reason;
+            const owned_blocks = try cloneContentBlocks(allocator, response.content);
+            errdefer freeContentBlocks(allocator, owned_blocks);
             try history.append(allocator, .{
                 .role = .assistant,
-                .content = response.content,
+                .content = owned_blocks,
                 .timestamp = util_time.nowMillis(),
             });
+            response.free(allocator);
 
             // Record in operation log
             _ = log.record("LLMResponse", input, "response", null, false) catch {};
 
             // Check if tool calling is needed
-            if (response.stop_reason != .tool_use) break;
+            if (stop_reason != .tool_use) break;
 
             // Execute tool calls — reuse result_blocks, clear from previous iteration
             result_blocks.clearRetainingCapacity();
 
             var has_tool_use = false;
-            for (response.content) |block| {
+            // Iterate the owned copy in history — the response was freed above.
+            const last_assistant = history.items[history.items.len - 1].content;
+            for (last_assistant) |block| {
                 if (block == .tool_use) {
                     has_tool_use = true;
                     const tc = block.tool_use;
@@ -895,7 +904,7 @@ fn runDiagnose(
         .phase = .memory_retrieval,
         .timestamp = util_time.nowMillis(),
         .input = try alloc.dupe(u8, concern),
-        .output = try std.fmt.allocPrint(alloc, "injected={d}", .{injected_count}),
+        .output = try alloc.print("injected={d}", .{injected_count}),
         .reasoning = try alloc.dupe(u8, "recency-ranked e-decay injection"),
         .confidence = mem_conf,
         .duration_ms = 0,
@@ -912,7 +921,7 @@ fn runDiagnose(
         .phase = .tool_execution,
         .timestamp = util_time.nowMillis(),
         .input = try alloc.dupe(u8, "session tool window"),
-        .output = try std.fmt.allocPrint(alloc, "tools={d} errors={d}", .{ window_tools, window_errors }),
+        .output = try alloc.print("tools={d} errors={d}", .{ window_tools, window_errors }),
         .reasoning = try alloc.dupe(u8, "permission pipeline + thread pool"),
         .confidence = tool_conf,
         .duration_ms = 0,
@@ -949,6 +958,97 @@ fn runDiagnose(
         try std.Io.Writer.print(w, "  → {s}\n", .{s.suggestion});
     }
     try std.Io.Writer.writeAll(w, "\n");
+}
+
+/// Deep-copy a json.Value tree onto `alloc` (the response DOM is arena-owned
+/// and freed after history takes over).
+fn dupeJsonValue(alloc: std.mem.Allocator, v: std.json.Value) anyerror!std.json.Value {
+    return switch (v) {
+        .null, .bool, .integer, .float => v,
+        .string, .number_string => |s| blk: {
+            const d = try alloc.dupe(u8, s);
+            break :blk if (v == .string) .{ .string = d } else .{ .number_string = d };
+        },
+        .array => |arr| blk: {
+            var out = std.json.Array.init(alloc);
+            for (arr.items) |item| try out.append(try dupeJsonValue(alloc, item));
+            break :blk .{ .array = out };
+        },
+        .object => |obj| blk: {
+            var out: std.json.ObjectMap = .empty;
+            errdefer out.deinit(alloc);
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                try out.put(alloc, try alloc.dupe(u8, e.key_ptr.*), try dupeJsonValue(alloc, e.value_ptr.*));
+            }
+            break :blk .{ .object = out };
+        },
+    };
+}
+
+fn freeJsonValue(alloc: std.mem.Allocator, v: std.json.Value) void {
+    switch (v) {
+        .null, .bool, .integer, .float => {},
+        .string, .number_string => |s| alloc.free(s),
+        .array => |arr| {
+            for (arr.items) |item| freeJsonValue(alloc, item);
+            var mut = arr;
+            mut.deinit();
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                alloc.free(e.key_ptr.*);
+                freeJsonValue(alloc, e.value_ptr.*);
+            }
+            var mut = obj;
+            mut.deinit(alloc);
+        },
+    }
+}
+
+/// Deep-copy content blocks so history owns every string and JSON tree.
+fn cloneContentBlocks(alloc: std.mem.Allocator, blocks: []const llm.ContentBlock) ![]llm.ContentBlock {
+    const out = try alloc.alloc(llm.ContentBlock, blocks.len);
+    var filled: usize = 0;
+    errdefer freeContentBlocks(alloc, out[0..filled]);
+    for (blocks, 0..) |b, i| {
+        out[i] = switch (b) {
+            .text => |t| .{ .text = try alloc.dupe(u8, t) },
+            .thinking => |t| .{ .thinking = try alloc.dupe(u8, t) },
+            .tool_use => |tu| .{ .tool_use = .{
+                .id = try alloc.dupe(u8, tu.id),
+                .name = try alloc.dupe(u8, tu.name),
+                .input = try dupeJsonValue(alloc, tu.input),
+            } },
+            .tool_result => |tr| .{ .tool_result = .{
+                .tool_use_id = try alloc.dupe(u8, tr.tool_use_id),
+                .content = try alloc.dupe(u8, tr.content),
+                .is_error = tr.is_error,
+            } },
+        };
+        filled = i + 1;
+    }
+    return out;
+}
+
+fn freeContentBlocks(alloc: std.mem.Allocator, blocks: []const llm.ContentBlock) void {
+    for (blocks) |b| {
+        switch (b) {
+            .text => |t| alloc.free(t),
+            .thinking => |t| alloc.free(t),
+            .tool_use => |tu| {
+                alloc.free(tu.id);
+                alloc.free(tu.name);
+                freeJsonValue(alloc, tu.input);
+            },
+            .tool_result => |tr| {
+                alloc.free(tr.tool_use_id);
+                alloc.free(tr.content);
+            },
+        }
+    }
+    alloc.free(@constCast(blocks));
 }
 
 fn isFileModifyingTool(tool_name: []const u8) bool {
@@ -1616,4 +1716,34 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /run Bash {"command":"ls"}
         \\
     );
+}
+
+test "cloneContentBlocks deep-copies text and tool_use JSON trees" {
+    const alloc = std.testing.allocator;
+
+    var input_obj: std.json.ObjectMap = .empty;
+    defer input_obj.deinit(alloc);
+    try input_obj.put(alloc, "command", .{ .string = "ls -la" });
+    var nested_arr = std.json.Array.init(alloc);
+    defer nested_arr.deinit(); // the map copy shares this buffer; freed once here
+    try nested_arr.append(.{ .integer = 1 });
+    try nested_arr.append(.{ .string = "two" });
+    try input_obj.put(alloc, "nested", .{ .array = nested_arr });
+
+    const blocks = [_]llm.ContentBlock{
+        .{ .text = "hello" },
+        .{ .tool_use = .{ .id = "tu_1", .name = "Bash", .input = .{ .object = input_obj } } },
+    };
+
+    const owned = try cloneContentBlocks(alloc, &blocks);
+    defer freeContentBlocks(alloc, owned);
+
+    try std.testing.expectEqualStrings("hello", owned[0].text);
+    try std.testing.expectEqualStrings("tu_1", owned[1].tool_use.id);
+    // Nested JSON survives the deep copy.
+    const cmd = registry.getStringField(owned[1].tool_use.input, "command");
+    try std.testing.expectEqualStrings("ls -la", cmd.?);
+    const nested = owned[1].tool_use.input.object.get("nested").?;
+    try std.testing.expectEqual(@as(i64, 1), nested.array.items[0].integer);
+    try std.testing.expectEqualStrings("two", nested.array.items[1].string);
 }
