@@ -6,6 +6,7 @@ const std = @import("std");
 const tools_mod = @import("tools/mod.zig");
 const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
+const classifier_mod = @import("tools/classifier.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -184,7 +185,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     defer switcher.deinit();
 
     // Session state
-    var current_mode: auth.PermissionMode = .default;
+    var current_mode: auth.PermissionMode = switcher.settings.permission_mode;
     var log = op_log.OperationLog.init(allocator);
     defer log.deinit();
     var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, ".ziv/checkpoints"));
@@ -312,7 +313,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q") or std.mem.eql(u8, input, "/exit")) {
                 // M4: session-end reflection on whatever the window still holds.
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w);
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
                 }
                 if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
@@ -360,40 +361,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // agent-loop tool calls (previously it bypassed the mode
                 // entirely, letting Plan mode perform writes).
                 if (tools_mod.DefaultRegistry.findByName(tool_name)) |tool_def| {
-                    const perm_ctx = registry.PermissionContext{
-                        .mode = current_mode,
-                        .allow_rules = switcher.settings.allow_rules,
-                        .deny_rules = switcher.settings.deny_rules,
-                        .provider = switcher.getProvider() catch null,
-                        .allocator = allocator,
-                    };
-                    const decision = auth.checkToolPermission(tool_def, parsed, &perm_ctx);
-                    switch (decision) {
-                        .deny => |d| {
-                            try std.Io.Writer.print(w, "  [Permission denied: {s}]\n\n", .{d.message});
-                            try std.Io.File.Writer.flush(&file_writer);
-                            continue;
-                        },
-                        .ask => |a| {
-                            try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_name, a.message });
-                            try std.Io.File.Writer.flush(&file_writer);
-                            var ans_buf: [64]u8 = undefined;
-                            var ans_writer = std.Io.Writer.fixed(&ans_buf);
-                            _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
-                                try std.Io.Writer.writeAll(w, "\n  [Cancelled]\n\n");
-                                try std.Io.File.Writer.flush(&file_writer);
-                                continue;
-                            };
-                            r.toss(1);
-                            const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
-                            if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
-                                try std.Io.Writer.writeAll(w, "  [Denied by user]\n\n");
-                                try std.Io.File.Writer.flush(&file_writer);
-                                continue;
-                            }
-                        },
-                        .allow => {},
-                    }
+                    if (!try permissionGate(tool_def, parsed, current_mode, &switcher, allocator, r, w, &file_writer)) continue;
                 }
 
                 // Backup file before modification (for /run commands)
@@ -623,6 +591,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             };
 
             // Call LLM with full history
+            if (live_trace) |*t| {
+                var ctx_buf: [96]u8 = undefined;
+                const out_desc = std.fmt.bufPrint(&ctx_buf, "history={d} ctx~{d}t", .{ history.items.len, est_ctx }) catch "history";
+                traceAddStep(t, .context_assembly, if (est_ctx < MAX_CONTEXT_TOKENS) 0.9 else 0.5, "messages + memory block", out_desc, "compaction-checked assembly", allocator) catch {};
+            }
             logger.info("LLM call: model={s} history_len={d} max_tokens={d}", .{
                 switcher.modelName(), history.items.len, switcher.settings.max_tokens,
             });
@@ -689,6 +662,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
             // Record in operation log
             _ = log.record("LLMResponse", input, "response", null, false) catch {};
+            if (live_trace) |*t| {
+                traceAddStep(t, .response_postprocess, 0.95, "stream aggregation", "blocks appended to history", "REPL-owned copy", allocator) catch {};
+            }
 
             // Check if tool calling is needed
             if (stop_reason != .tool_use) break;
@@ -700,6 +676,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Phase 1 (serial): permission gate + pre-execution backup for
             // every tool_use; approved calls are collected for phase 2.
             var prepared = std.ArrayList(PreparedCall).empty;
+            var total_calls: u32 = 0;
             defer prepared.deinit(allocator);
 
             // Iterate the owned copy in history — the response was freed above.
@@ -707,6 +684,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             for (last_assistant) |block| {
                 if (block == .tool_use) {
                     has_tool_use = true;
+                    total_calls += 1;
                     const tc = block.tool_use;
 
                     // Find tool definition
@@ -734,63 +712,32 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         }
                     }
 
-                    // Permission check
-                    const perm_ctx = registry.PermissionContext{
-                        .mode = current_mode,
-                        .allow_rules = switcher.settings.allow_rules,
-                        .deny_rules = switcher.settings.deny_rules,
-                        .provider = switcher.getProvider() catch null,
-                        .allocator = allocator,
-                    };
-                    const decision = auth.checkToolPermission(tool_def, tc.input, &perm_ctx);
-
-                    const approved: bool = switch (decision) {
-                        .deny => |d| blk: {
-                            try std.Io.Writer.print(w, "  [Permission denied: {s}]\n", .{d.message});
-                            try result_blocks.append(allocator, .{ .tool_result = .{
-                                .tool_use_id = tc.id,
-                                .content = d.message,
-                                .is_error = true,
-                            } });
-                            break :blk false;
-                        },
-                        .ask => |a| blk: {
-                            try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tc.name, a.message });
-                            try std.Io.File.Writer.flush(&file_writer);
-
-                            var ans_buf: [64]u8 = undefined;
-                            var ans_writer = std.Io.Writer.fixed(&ans_buf);
-                            _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
-                                try result_blocks.append(allocator, .{ .tool_result = .{
-                                    .tool_use_id = tc.id,
-                                    .content = "Failed to read approval",
-                                    .is_error = true,
-                                } });
-                                break :blk false;
-                            };
-                            r.toss(1);
-                            const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
-                            if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
-                                try std.Io.Writer.writeAll(w, "  [Denied by user]\n");
-                                try result_blocks.append(allocator, .{ .tool_result = .{
-                                    .tool_use_id = tc.id,
-                                    .content = "denied by user",
-                                    .is_error = true,
-                                } });
-                                try std.Io.File.Writer.flush(&file_writer);
-                                break :blk false;
-                            }
-                            break :blk true;
-                        },
-                        .allow => true,
-                    };
-
-                    if (approved) {
-                        try prepared.append(allocator, .{
-                            .call = .{ .tool_name = tc.name, .input = tc.input, .tool_use_id = tc.id },
-                            .snap_id = snap_id,
-                        });
+                    // Permission check (shared gate; auto mode may delegate
+                    // the ambiguous ask case to the LLM classifier).
+                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, &file_writer);
+                    if (!approved) {
+                        try result_blocks.append(allocator, .{ .tool_result = .{
+                            .tool_use_id = tc.id,
+                            .content = "denied by permission gate",
+                            .is_error = true,
+                        } });
+                        continue;
                     }
+
+                    try prepared.append(allocator, .{
+                        .call = .{ .tool_name = tc.name, .input = tc.input, .tool_use_id = tc.id },
+                        .snap_id = snap_id,
+                    });
+                }
+            }
+
+            // Live decision trace: selection step (permission outcomes).
+            if (live_trace) |*t| {
+                if (total_calls > 0) {
+                    const conf: f64 = if (total_calls == 0) 0.9 else @as(f64, @floatFromInt(prepared.items.len)) / @as(f64, @floatFromInt(total_calls));
+                    var sel_buf: [96]u8 = undefined;
+                    const out_desc = std.fmt.bufPrint(&sel_buf, "approved={d} rejected={d}", .{ prepared.items.len, total_calls - prepared.items.len }) catch "selection";
+                    traceAddStep(t, .tool_selection, conf, "tool_use blocks", out_desc, "permission gate", allocator) catch {};
                 }
             }
 
@@ -852,7 +799,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // M4: periodic reflection on the query window (every N exchanges
         // or after a π-spaced interval; see ReflectionEngine.shouldReflect).
         if (mem_sys != null and reflector.shouldReflect()) {
-            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w);
+            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
+            if (live_trace) |*t| {
+                traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", allocator) catch {};
+            }
         }
 
         try std.Io.Writer.writeAll(w, "\n");
@@ -922,7 +872,7 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
 
         // Semantic tier: mirror the stored fact as a graph node.
         if (kg) |g| {
-            if (g.addNode(f.content[0..@min(48, f.content.len)], .concept, @tagName(f.fact_type)) catch null) |nid| {
+            if (g.addNode(f.content[0..@min(48, f.content.len)], entityTypeForFact(f.fact_type), @tagName(f.fact_type)) catch null) |nid| {
                 if (last_node_id) |prev| {
                     g.addEdge(prev, nid, "co_extracted", 0.618) catch {};
                 }
@@ -945,24 +895,65 @@ fn runReflection(
     window_errors: *u32,
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    provider: ?llm.Provider,
 ) void {
     const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
+
+    // LLM augmentation: when a provider is reachable, ask it to summarize
+    // the query window into one improvement insight; heuristics stay as
+    // the fallback (and quality score source).
+    var llm_insights: ?[]u8 = null;
+    if (provider) |p| {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        const pw = &aw.writer;
+        pw.writeAll("Recent queries in this session:\n") catch {};
+        for (window_queries.items) |q| {
+            pw.print("- {s}\n", .{q}) catch {};
+        }
+        var prompt_list = aw.toArrayList();
+        defer prompt_list.deinit(alloc);
+
+        const sys_blocks = alloc.alloc(llm.ContentBlock, 1) catch null;
+        if (sys_blocks) |sb| {
+            sb[0] = .{ .text = "你是反思引擎。用一句中文总结这些交互的改进点，不超过40字，只输出总结本身。" };
+            const user_blocks = alloc.alloc(llm.ContentBlock, 1) catch null;
+            if (user_blocks) |ub| {
+                ub[0] = .{ .text = prompt_list.items };
+                const msgs = [_]llm.Message{
+                    .{ .role = .system, .content = sb, .timestamp = util_time.nowMillis() },
+                    .{ .role = .user, .content = ub, .timestamp = util_time.nowMillis() },
+                };
+                if (p.complete(&msgs, .{ .max_tokens = 100, .temperature = 0.3 })) |resp| {
+                    var r = resp;
+                    defer r.free(alloc);
+                    if (r.content.len > 0 and r.content[0] == .text) {
+                        llm_insights = alloc.dupe(u8, r.content[0].text) catch null;
+                    }
+                } else |_| {}
+                alloc.free(ub);
+            }
+            alloc.free(sb);
+        }
+    }
+    const insights: []const u8 = llm_insights orelse reflection.insights;
+    defer if (llm_insights) |li| alloc.free(li);
 
     var name_buf: [64]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "reflection q={d} tools={d}", .{ window_queries.items.len, window_tools.* }) catch "reflection";
     const now = util_time.nowMillis();
     mem.store(.{
-        .id = injection_mod.memoryId(reflection.insights),
+        .id = injection_mod.memoryId(insights),
         .mem_type = .feedback,
         .name = name,
         .description = @tagName(reflection.trigger),
-        .content = reflection.insights,
+        .content = insights,
         .access_count = 0,
         .created_at = now,
         .updated_at = now,
     }) catch {};
-    logger.info("reflection: quality={d:.2} insights stored", .{reflection.quality_score});
-    w.print("  [Reflection] {s}\n", .{reflection.insights}) catch {};
+    logger.info("reflection: quality={d:.2} insights stored (llm={})", .{ reflection.quality_score, llm_insights != null });
+    w.print("  [Reflection] {s}\n", .{insights}) catch {};
 
     // Reset the window.
     for (window_queries.items) |q| alloc.free(q);
@@ -1330,6 +1321,86 @@ fn streamComplete(
         .usage = agg.usage,
         .stop_reason = agg.stop_reason,
     };
+}
+
+/// Map an extracted fact type to a knowledge-graph entity type.
+fn entityTypeForFact(f: extraction_mod.FactType) knowledge_graph.EntityType {
+    return switch (f) {
+        .user_preference => .concept,
+        .technical_fact => .technology,
+        .pattern_observed => .code_pattern,
+        .error_solution => .custom,
+        .project_context => .organization,
+    };
+}
+
+/// Shared permission gate for the agent loop and /run.
+/// deny → prints and returns false; allow → true; ask → interactive y/N,
+/// except in auto mode where a reachable LLM classifier decides (with the
+/// rule-based fallback of "allow" on classifier failure).
+fn permissionGate(
+    tool_def: *const registry.ToolDefinition,
+    input: std.json.Value,
+    mode: auth.PermissionMode,
+    switcher: *ModelSwitcher,
+    alloc: std.mem.Allocator,
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+) !bool {
+    const perm_ctx = registry.PermissionContext{
+        .mode = mode,
+        .allow_rules = switcher.settings.allow_rules,
+        .deny_rules = switcher.settings.deny_rules,
+        .provider = switcher.getProvider() catch null,
+        .allocator = alloc,
+    };
+    var decision = auth.checkToolPermission(tool_def, input, &perm_ctx);
+
+    // Auto mode: delegate ambiguous (ask) calls to the LLM classifier.
+    if (mode == .auto and decision == .ask) {
+        if (switcher.getProvider() catch null) |p| {
+            var lc = classifier_mod.LLMClassifier.init(alloc, p);
+            const cr = lc.classify(tool_def, input) catch classifier_mod.ClassifierResult{ .allow = {} };
+            decision = switch (cr) {
+                .allow => .{ .allow = {} },
+                .block => |b| .{ .deny = .{ .message = b.reason } },
+            };
+            logger.info("classifier(auto): {s} -> {s}", .{ tool_def.name, switch (cr) {
+                .allow => "allow",
+                .block => "block",
+            } });
+        }
+    }
+
+    switch (decision) {
+        .deny => |d| {
+            try std.Io.Writer.print(w, "  [Permission denied: {s}]\n", .{d.message});
+            try std.Io.File.Writer.flush(file_writer);
+            return false;
+        },
+        .allow => return true,
+        .ask => |a| {
+            try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
+            try std.Io.File.Writer.flush(file_writer);
+
+            var ans_buf: [64]u8 = undefined;
+            var ans_writer = std.Io.Writer.fixed(&ans_buf);
+            _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
+                try std.Io.Writer.writeAll(w, "\n  [Cancelled]\n");
+                try std.Io.File.Writer.flush(file_writer);
+                return false;
+            };
+            r.toss(1);
+            const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
+            if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
+                try std.Io.Writer.writeAll(w, "  [Denied by user]\n");
+                try std.Io.File.Writer.flush(file_writer);
+                return false;
+            }
+            return true;
+        },
+    }
 }
 
 fn isFileModifyingTool(tool_name: []const u8) bool {

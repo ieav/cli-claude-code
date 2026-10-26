@@ -2,6 +2,7 @@
 /// under a token budget (T3.3).
 const std = @import("std");
 const tokens = @import("../util/tokens.zig");
+const embedding = @import("../util/embedding.zig");
 const time_mod = @import("../util/time.zig");
 const types = @import("types.zig");
 const database = @import("../storage/database.zig");
@@ -27,16 +28,37 @@ pub fn decayScore(updated_at: i64, now: i64) f64 {
 pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.MemoryEntry, budget_tokens: u32) !?[]u8 {
     if (entries.len == 0) return null;
 
-    // Order by e-decay freshness rather than raw recency: entries arrive
-    // most-recent-first, but a higher-touch updated_at wins ties by score.
+    // Rank entries: 0.5 × e-decay freshness + 0.5 × topical similarity to
+    // the most recently updated memory (a cheap proxy for "what the user is
+    // currently about"). Scores are precomputed so the comparator stays
+    // allocation-free.
     const now = time_mod.nowMillis();
-    const SortCtx = struct {
-        now: i64,
-        fn lessThan(self: @This(), a: types.MemoryEntry, b: types.MemoryEntry) bool {
-            return decayScore(a.updated_at, self.now) > decayScore(b.updated_at, self.now);
+    var anchor_idx: usize = 0;
+    for (entries, 0..) |e, i| {
+        if (e.updated_at > entries[anchor_idx].updated_at) anchor_idx = i;
+    }
+    const anchor_vec: ?[]f32 = embedding.embed(allocator, entries[anchor_idx].content) catch null;
+    defer if (anchor_vec) |v| allocator.free(v);
+
+    const Rank = struct { idx: usize, score: f64 };
+    const ranks = try allocator.alloc(Rank, entries.len);
+    defer allocator.free(ranks);
+    for (entries, 0..) |e, i| {
+        var s: f64 = decayScore(e.updated_at, now);
+        if (anchor_vec) |a| {
+            if (embedding.embed(allocator, e.content) catch null) |ev| {
+                defer allocator.free(ev);
+                s = 0.5 * s + 0.5 * @as(f64, embedding.cosine(a, ev));
+            }
+        }
+        ranks[i] = .{ .idx = i, .score = s };
+    }
+    const byScore = struct {
+        fn lessThan(_: void, a: Rank, b: Rank) bool {
+            return a.score > b.score;
         }
     };
-    std.sort.pdq(types.MemoryEntry, @constCast(entries), SortCtx{ .now = now }, SortCtx.lessThan);
+    std.sort.pdq(Rank, ranks, {}, byScore.lessThan);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -47,7 +69,8 @@ pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.Mem
     var included: usize = 0;
 
     try writer.writeAll("Relevant memories from previous sessions:\n");
-    for (entries) |e| {
+    for (ranks) |r| {
+        const e = entries[r.idx];
         const name = e.name[0..@min(e.name.len, max_name)];
         const content = e.content[0..@min(e.content.len, max_content)];
         const line = std.fmt.bufPrint(&line_buf, "- [{s}] {s}: {s}\n", .{

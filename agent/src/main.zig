@@ -58,6 +58,7 @@ test {
     _ = @import("tools/registry.zig");
     _ = @import("tools/rule_parser.zig");
     _ = @import("tools/task_store.zig");
+    _ = @import("util/embedding.zig");
     _ = @import("util/binary_check.zig");
     _ = @import("util/cancel.zig");
     _ = @import("util/diff.zig");

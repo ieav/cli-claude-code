@@ -243,3 +243,12 @@
 ### N6b: checkpoint 目录自动创建
 - **状态**: ✅ 已完成
 - **描述**: file_history.zig 新增 dir_ensured 标志，首次 trackEdit 时调用 std.Io.Dir.cwd().createDirPath(io, ...) 自动创建 .ziv/checkpoints 目录。
+
+### P22: 增强清单清空（流式实时化 / 429 / 五项增强 / 跨平台 / zvm）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **流式输出实时化（原"待核实"项的完整解法）**: 悬案核实结论=REPL 从未消费 stream()（用 complete 非流式）。彻底修复：① `Provider.stream` 增加 ctx 参数（vtable+三后端）；② REPL 改流式调用，text delta **实时打印** + 聚合 tool_use/usage 为 REPL 自有响应（无 DOM arena、免深拷贝）；③ 根因修复——三后端读循环 `readSliceShort` 等 4KiB 缓冲凑满导致整响应攒批，改 `peekGreedy(1)` 增量消费。**mock 实测**：慢速 SSE 服务器 5 块（0~1.62s 分发），ziv 输出 +0.39/+0.79/+1.20/+1.60/+2.01s 逐块跟随（恒定 0.39s 传播延迟）。
+- **WebSearch 429 退避**: 429 → `error.RateLimited` → search() 退避 1s 重试一次；后端 URL 可经 `ZIV_DDGO_URL`/`ZIV_BRAVE_URL`/`ZIV_SEARXNG_URL` 覆盖（mock 可测）。实测：mock 首发 429 再 200（gzip DDG 页）→ 退避后成功返回结果。
+- **五项增强**: ① 注入向量相似度——新增 `util/embedding.zig`（64 维 hash 词袋、L2 归一），注入排序 = 0.5×e 衰减 + 0.5×与最新记忆余弦（预计算分数，比较器零分配）；② 决策链 7 阶段全埋点（补 context_assembly / tool_selection / response_postprocess / reflection_trigger 四步）；③ 反思 LLM 增强（provider 可达时 LLM 一句总结替代启发式 insights，启发式兜底与质量分来源不变）；④ 语义层 fact→entity 类型映射（technology/code_pattern/organization/custom/concept）；⑤ auto 模式接 LLM 分类器——ask 级操作交 LLMClassifier 判 allow/block（失败降级 allow），实测 mock LLM 回 ALLOW → /run Bash 直通。
+- **顺带修复**: `current_mode` 硬编码 `.default` 从不读配置（permission_mode 配置形同虚设）→ 改读 `settings.permission_mode`。
+- **③ 平台与工具链**: `zig build -Dtarget=x86_64-linux-musl` 与 `aarch64-linux-musl` 交叉编译全过（静态 ELF）；zvm 0.8.17 → 0.9.4。Linux 运行时留待实机（musl 静态链接兼容面广）。
+- **验证**: 全量测试绿；mock 实测三场景（流式逐块、429 退避、auto 分类）全过；REPL 冒烟正常。
