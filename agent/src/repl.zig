@@ -356,6 +356,46 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 logger.info("Tool /run: {s}", .{tool_name});
 
+                // Permission gate — /run goes through the same pipeline as
+                // agent-loop tool calls (previously it bypassed the mode
+                // entirely, letting Plan mode perform writes).
+                if (tools_mod.DefaultRegistry.findByName(tool_name)) |tool_def| {
+                    const perm_ctx = registry.PermissionContext{
+                        .mode = current_mode,
+                        .allow_rules = switcher.settings.allow_rules,
+                        .deny_rules = switcher.settings.deny_rules,
+                        .provider = switcher.getProvider() catch null,
+                        .allocator = allocator,
+                    };
+                    const decision = auth.checkToolPermission(tool_def, parsed, &perm_ctx);
+                    switch (decision) {
+                        .deny => |d| {
+                            try std.Io.Writer.print(w, "  [Permission denied: {s}]\n\n", .{d.message});
+                            try std.Io.File.Writer.flush(&file_writer);
+                            continue;
+                        },
+                        .ask => |a| {
+                            try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_name, a.message });
+                            try std.Io.File.Writer.flush(&file_writer);
+                            var ans_buf: [64]u8 = undefined;
+                            var ans_writer = std.Io.Writer.fixed(&ans_buf);
+                            _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
+                                try std.Io.Writer.writeAll(w, "\n  [Cancelled]\n\n");
+                                try std.Io.File.Writer.flush(&file_writer);
+                                continue;
+                            };
+                            r.toss(1);
+                            const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
+                            if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
+                                try std.Io.Writer.writeAll(w, "  [Denied by user]\n\n");
+                                try std.Io.File.Writer.flush(&file_writer);
+                                continue;
+                            }
+                        },
+                        .allow => {},
+                    }
+                }
+
                 // Backup file before modification (for /run commands)
                 var run_snap_id: ?[16]u8 = null;
                 if (isFileModifyingTool(tool_name)) {
