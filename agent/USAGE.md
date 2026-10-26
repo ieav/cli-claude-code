@@ -66,7 +66,11 @@ zig build install
 | `/context` | 显示当前上下文/token 用量 |
 | `/undo` | 撤销上一轮对话 |
 | `/history` | 显示操作历史记录 |
-| `/rewind` | 回滚到检查点 |
+| `/rewind` | 回滚到检查点（`[0]` = 撤销本会话全部文件改动；其余编号 = 回到该操作之后） |
+| **记忆 & 自学习** | |
+| `/memory` | 查看本会话注入的记忆条数与最近存储的记忆 |
+| `/research <topic>` | 网络自主研究：φ 生成多组查询并发搜索、精选方案并给出 ★ 推荐 |
+| `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链，定位低于 φ 置信度的环节并给建议 |
 
 ### 权限模式 (Permission Modes)
 
@@ -118,13 +122,16 @@ ziv> /run Grep {"pattern":"TODO","maxResults":10}
 ziv> /run FileEdit {"path":"test.txt","old_string":"hello","new_string":"world"}
 ziv> /run FileEdit {"path":"test.txt","old_string":"foo","new_string":"bar","replaceAll":true}
 
-# 网络搜索（API 待接入）
-ziv> /run WebSearch {"query":"zig programming language"}
+# 网络搜索（免 key 用 DuckDuckGo；设 BRAVE_API_KEY 自动切 Brave）
+ziv> /run WebSearch {"query":"zig programming language","maxResults":3}
+# → [1] 标题 / URL / 摘要 …
 
-# 任务管理
+# 任务管理（会话级任务存储，taskId 为数字）
 ziv> /run TaskCreate {"subject":"修复 bug #42","description":"修复登录验证问题"}
+# → Task #1 created
+ziv> /run TaskUpdate {"taskId":"1","status":"in_progress"}   # pending | in_progress | completed
 ziv> /run TaskList {}
-ziv> /run TaskUpdate {"taskId":"abc123","status":"completed"}
+# → Tasks (0/1 completed): #1 ◐ in_progress — 修复 bug #42
 
 # 向用户提问
 ziv> /run AskUserQuestion {"question":"要使用哪个配置？"}
@@ -362,7 +369,7 @@ comptime 泛型注册，零运行时开销。每个工具支持：
 
 `orchestration.zig` 实现智能工具调用分组：
 - `partitionToolCalls()` — 将并发安全的调用分组在一起
-- **安全工具并行执行**（FileRead、Glob、Grep 等）
+- **安全工具真并行执行**（e 上限线程池：FileRead、Glob、Grep 等；结果按原始调用顺序回收；池故障自动降级串行）
 - **不安全工具串行执行**（Bash、FileWrite、FileEdit 等）
 
 ```
@@ -447,16 +454,19 @@ auto 模式下的工具分类：
 
 ### 5.8 三层记忆系统
 
-| 层 | 存储 | 用途 |
-|----|------|------|
-| **工作记忆** | 内存 LRU | 当前会话上下文 |
-| **情景记忆** | SQLite | 历史交互记录 |
-| **语义记忆** | 知识图谱 | 提取的结构化知识 |
+| 层 | 存储 | 用途 | 状态 |
+|----|------|------|------|
+| **工作记忆** | 内存 LRU | 当前会话上下文 | ✅ 已接线（store 持有防御拷贝） |
+| **情景记忆** | SQLite (`.ziv/memory.db`) | 跨会话记忆 | ✅ 已接线（全链路见下） |
+| **语义记忆** | 知识图谱 | 提取的结构化知识 | ⚠️ API 就绪、暂无写入方 |
 
-附加子系统：
-- **反思引擎** — 定期分析交互质量，生成改进建议
-- **经验提取** — 从对话中提取事实（用户偏好、错误解决方案、技术事实）
-- **phi 浓缩** — 每次浓缩保留 61.8% 最重要的知识
+**情景记忆完整闭环（v0.3.x 已实现）**：
+- **提取**：`/quit`、`/clear` 时启发式扫描 user/assistant 消息（中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…），φ 浓缩只保重要性前 61.8% 后入库
+- **幂等**：id = 内容双 Wyhash，`INSERT OR REPLACE` —— 同一句话重复提及自动去重并刷新时间戳
+- **注入**：下次启动取最近 20 条，按 **e 衰减**（30 天半衰，`e^(-age/τ)`）排序，token 预算 800 截断后拼入 system prompt（ziv.log 可见 `[INF] memory: injected N entries`）
+- **查看**：`/memory` 命令
+
+**反思引擎（已接线）**：会话内维护查询窗口（≤20 条 + 工具/错误计数），每 10 轮或 π×10min 触发反思；`/quit` 时强制收尾。insights 以 `.feedback` 记忆入库，下会话自动注入——改进经验跨会话生效。
 
 ### 5.9 运行时检测 (8 条规则)
 
@@ -473,19 +483,20 @@ auto 模式下的工具分类：
 
 ### 5.10 自诊断引擎
 
-当用户质疑结果时，Ziv 会：
-1. 回溯决策链（7 个阶段：记忆检索 → 上下文组装 → 工具选择 → 工具执行 → LLM 生成 → 后处理 → 反思触发）
-2. 找到 confidence < phi 的弱步骤
-3. 生成诊断报告（问题定位 + 原因分析 + 改进建议）
+`/diagnose <你的质疑>` 触发。当前实现（轻量版）：
+1. 用**真实会话统计**构造决策链：记忆注入置信（注入 0 条 → 0.3）/ 工具错误率置信 / 生成置信
+2. SelfDiagnostic 找 confidence < phi 的弱步骤
+3. 输出 root cause + 改进建议，并与记忆系统真实联动（例：记忆库为空时会诊断出"检索环节薄弱"）
+
+> 已知限制：决策链为 3 步静态构造，agent loop 内逐步记录真实决策链是后续任务。
 
 ### 5.11 自主优化研究
 
-当用户要求"优化"、"寻找最佳方案"时：
-1. 用 LLM 生成搜索关键词
-2. 并发搜索多个引擎（Brave/SearXNG/DuckDuckGo）
-3. phi 浓缩筛选 top 61.8% 方案
-4. 兼容性评分 + 复杂度评估
-5. 生成方案对比报告，供用户选择
+`/research <topic>` 触发（已真实联网）：
+1. φ 生成 3 组查询（原词 / 意图修饰词 / 技术角度）
+2. 并发搜索（BRAVE_API_KEY 有则 Brave，否则 DuckDuckGo 免 key；~30s 预算）
+3. φ 浓缩筛选方案，兼容性 ×0.4 + 相关性 ×0.3 + 复杂度 ×0.3 加权评分
+4. 输出方案列表（★ 推荐 + 理由）
 
 ### 5.12 操作记录与回滚 (Checkpoint)
 
@@ -841,14 +852,29 @@ agent/
 
 ### 待完成
 - [x] EpisodicStore 参数化查询 (防 SQL 注入) — prepared statement + 注入往返测试
-- [ ] KnowledgeGraph 参数化查询
+- [x] KnowledgeGraph 参数化查询 — addNode/addEdge/pruneWeakEdges/nodeCount 全参数化且真实现
 - [x] MPSC Queue pop() 完整实现 (deinit 残留 tail 泄漏已修)
-- [ ] 流式输出优化 (边读边解析 SSE)
-- [ ] 跨平台测试
-- [ ] Checkpoint 目录自动创建（首次 trackEdit 时 .ziv/checkpoints 可能不存在）
-- [ ] 自动分类器 LLM 集成
-- [ ] WebSearch API 接入
-- [ ] 运行日志集成（util/log.zig 已实现但未在各模块调用）
+- [x] 流式输出优化 (边读边解析 SSE)
+- [x] Checkpoint 目录自动创建（trackEdit 首次调用时 createDirPath）
+- [x] WebSearch API 接入 — DDG 免 key 实测可用，BRAVE_API_KEY 自动切 Brave
+- [x] 运行日志集成（ziv.log：LLM/工具/记忆/反思/研究全链路 [INF] 日志）
+- [x] 权限规则模式匹配 — glob 匹配 command/path，表驱动测试 ×8
+- [x] 记忆闭环（提取→SQLite→重启注入→/memory）
+- [x] 反思引擎接入（N/π 触发 + 会话结束收尾，经验跨会话）
+- [x] 任务管理工具真实现（会话级任务存储）
+- [x] /research、/diagnose 命令
+
+### 待办（2026-10-26 盘点，详见 TODO.md P19）
+- [ ] `allocPrint` → `Allocator.print` 迁移（65 处，Zig 0.18 前必须）
+- [ ] repl 会话级 DOM 泄漏（CompleteResponse arena 因 history 引用暂不释放）
+- [ ] agent loop 接入并行编排（executeBatches 已实现但 REPL 仍串行执行工具）
+- [ ] 知识图谱写入方（semantic 层 API 就绪、暂无数据流）
+- [ ] /diagnose 真实决策链（现为 3 步静态构造）
+- [ ] 注入向量相似度检索（现为 e 衰减排序）
+- [ ] WebSearch 429 重试、Brave 路径实测（需 API key）
+- [ ] memory facade 错误上报（现对 episodic 失败仅 warning）
+- [ ] 跨平台测试（Linux）
+- [ ] 流式输出实时性实测核实
 
 ---
 
@@ -882,12 +908,12 @@ agent/
 
 **不配 API Key 也能用**：`/run` 直接执行工具不需要 LLM，文件读写、搜索、Bash 等工具都能正常工作。
 
-### 9.3 当前已知问题
+### 9.3 当前已知问题（2026-10-26 刷新）
 
 | 问题 | 影响 | 严重度 | 临时解决 |
 |------|------|--------|----------|
-| `.ziv/checkpoints/` 不会自动创建 | 备份静默失败，`/rewind` 无效 | 中 | 手动执行 `mkdir -p .ziv/checkpoints` |
-| WebSearch API 未接入 | `/run WebSearch` 不可用 | 低 | 使用 `/run Bash {"command":"curl ..."}` 替代 |
-| 流式输出非实时 | LLM 回复要等全部生成完才显示 | 低 | 暂无 |
-| uuid 模块未验证 | 影响记忆系统（框架阶段未实际调用） | 低 | 暂无 |
-| config 加载无崩溃保护 | settings.json 不存在时已容错（catch return），但格式错误时可能异常 | 低 | 确保 JSON 格式正确 |
+| repl 会话级 DOM 泄漏 | 每个 LLM 响应泄漏一块内存，长会话累积 | 中 | 重启会话；所有权手术在待办 |
+| `allocPrint` 弃用 API（65 处） | Zig 0.18 发布后编译失败 | 中（有期限） | 0.18 发布前完成迁移 |
+| 流式输出实时性未核实 | 文档口径矛盾（TODO 记已修，旧 USAGE 记非实时），未实测 | 低 | 实测后定论 |
+| WebSearch 无 429 重试 | 搜索限流时直接报错 | 低 | 稍后重试 |
+| `/rewind` 序号/y-N 在管道模式消费后续行 | 管道脚本中的交互式确认不适配 | 无（设计内） | 交互模式使用 |
