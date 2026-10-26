@@ -868,14 +868,14 @@ agent/
 ### 待办（2026-10-26 盘点，详见 TODO.md P19）
 - [x] `allocPrint` → `Allocator.print` 迁移（65 处全部完成，2026-10-26）
 - [x] repl 会话级 DOM 泄漏（history 深拷贝后立即释放响应 DOM，2026-10-26）
-- [ ] agent loop 接入并行编排（executeBatches 已实现但 REPL 仍串行执行工具）
-- [ ] 知识图谱写入方（semantic 层 API 就绪、暂无数据流）
-- [ ] /diagnose 真实决策链（现为 3 步静态构造）
-- [ ] 注入向量相似度检索（现为 e 衰减排序）
-- [ ] WebSearch 429 重试、Brave 路径实测（需 API key）
+- [x] agent loop 接入并行编排（两阶段权限门+线程池并行，2026-10-26）
+- [x] 知识图谱写入方（提取→节点+边+/knowledge，含多类型实体映射，2026-10-26/27）
+- [x] /diagnose 真实决策链（agent loop 7 阶段全埋点，live trace 优先）
+- [x] 注入向量相似度检索（64 维词袋嵌入 × e 衰减混合排序，2026-10-27）
+- [x] WebSearch 429 退避重试（2026-10-27）；Brave 实测仍需 API key
 - [x] memory facade 错误上抛（episodic 失败不再吞，2026-10-26）
-- [ ] 跨平台测试（Linux）
-- [ ] 流式输出实时性实测核实
+- [x] Linux 交叉编译（x86_64/aarch64-musl 静态 ELF 全过；实机运行待验）
+- [x] 流式输出实时化（REPL 接入 stream + peekGreedy 增量读，mock 实测逐块跟随，2026-10-27）
 
 ---
 
@@ -914,6 +914,4 @@ agent/
 | 问题 | 影响 | 严重度 | 临时解决 |
 |------|------|--------|----------|
 | ~~/clear 后 system prompt 残留旧记忆注入块~~ 已修复（2026-10-26：clear 时重建 system message，实测 token 252→182）|
-| 流式输出实时性未核实 | 文档口径矛盾（TODO 记已修，旧 USAGE 记非实时），未实测 | 低 | 实测后定论 |
-| WebSearch 无 429 重试 | 搜索限流时直接报错 | 低 | 稍后重试 |
 | `/rewind` 序号/y-N 在管道模式消费后续行 | 管道脚本中的交互式确认不适配 | 无（设计内） | 交互模式使用 |
