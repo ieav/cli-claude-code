@@ -29,19 +29,19 @@ pub const FileStateCache = struct {
 
     pub fn deinit(self: *Self) void {
         // Free cached content
-        var iter = self.ring.iterator();
+        var iter = self.ring.piIterator();
         while (iter.next()) |entry| {
-            self.allocator.free(entry.data.path);
-            self.allocator.free(entry.data.content);
+            self.allocator.free(entry.path);
+            self.allocator.free(entry.content);
         }
     }
 
     /// Get a cached file state by path. Returns null if not found.
     pub fn get(self: *Self, path: []const u8) ?FileState {
-        var iter = self.ring.iterator();
+        var iter = self.ring.piIterator();
         while (iter.next()) |entry| {
-            if (std.mem.eql(u8, entry.data.path, path)) {
-                return entry.data;
+            if (std.mem.eql(u8, entry.path, path)) {
+                return entry;
             }
         }
         return null;

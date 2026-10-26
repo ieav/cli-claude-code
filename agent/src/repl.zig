@@ -15,6 +15,17 @@ const config_mod = @import("config.zig");
 const util_time = @import("util/time.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const logger = @import("util/log.zig");
+const memory_mod = @import("memory/mod.zig");
+const injection_mod = @import("memory/injection.zig");
+const extraction_mod = @import("memory/extraction.zig");
+const reflection_mod = @import("memory/reflection.zig");
+const database_mod = @import("storage/database.zig");
+const math_mod = @import("math/mod.zig");
+const knowledge_search = @import("knowledge/search.zig");
+const researcher_mod = @import("research/optimization_researcher.zig");
+const env = @import("util/env.zig");
+const self_diagnostic = @import("runtime/self_diagnostic.zig");
+const decision_trace = @import("runtime/decision_trace.zig");
 const allocator = std.heap.smp_allocator;
 
 const MAX_AGENT_ITERATIONS: usize = 50;
@@ -183,10 +194,44 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var history = std.ArrayList(llm.Message).empty;
     defer history.deinit(allocator);
 
-    // Add system prompt as first message
+    // ──── Persistent memory (episodic tier, cross-session) ────
+    var injected_count: usize = 0;
+    std.Io.Dir.cwd().createDirPath(io, ".ziv") catch {};
+    var mem_db: ?database_mod.Database = blk: {
+        var db = database_mod.Database.init(allocator, ".ziv/memory.db") catch break :blk null;
+        db.runMigrations() catch {
+            logger.warning("memory: migrations failed, memory disabled", .{});
+            db.deinit();
+            break :blk null;
+        };
+        break :blk db;
+    };
+    defer if (mem_db) |*db| db.deinit();
+    var mem_sys: ?memory_mod.MemorySystem = if (mem_db != null)
+        memory_mod.MemorySystem.init(allocator, &mem_db.?)
+    else
+        null;
+    defer if (mem_sys) |*ms| ms.deinit();
+
+    // Add system prompt as first message, appending cross-session memories
+    // recovered from .ziv/memory.db (most recent first, token-budgeted).
     const sys_prompt = switcher.settings.system_prompt orelse system_prompt_mod.default_system_prompt;
-    var sys_blocks = try allocator.alloc(llm.ContentBlock, 1);
+    var memory_block: ?[]u8 = null;
+    defer if (memory_block) |mb| allocator.free(mb);
+    if (mem_sys) |*ms| {
+        if (ms.episodic_mem.retrieveRecent(20) catch null) |entries| {
+            defer ms.episodic_mem.freeEntries(entries);
+            memory_block = injection_mod.buildMemoryBlock(allocator, entries, 800) catch null;
+            if (memory_block != null) {
+                injected_count = entries.len;
+                logger.info("memory: injected {d} entries into system prompt", .{entries.len});
+            }
+        }
+    }
+    const sys_block_count: usize = if (memory_block != null) 2 else 1;
+    var sys_blocks = try allocator.alloc(llm.ContentBlock, sys_block_count);
     sys_blocks[0] = .{ .text = sys_prompt };
+    if (memory_block) |mb| sys_blocks[1] = .{ .text = mb };
     try history.append(allocator, .{
         .role = .system,
         .content = sys_blocks,
@@ -196,6 +241,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // Session token tracking
     var total_input_tokens: u64 = 0;
     var total_output_tokens: u64 = 0;
+
+    // ──── Reflection window (M4: periodic self-review) ────
+    var reflector = reflection_mod.ReflectionEngine.init(allocator);
+    defer reflector.deinit();
+    var window_queries: std.ArrayList([]u8) = .empty;
+    defer {
+        for (window_queries.items) |q| allocator.free(q);
+        window_queries.deinit(allocator);
+    }
+    var window_tools: u32 = 0;
+    var window_errors: u32 = 0;
 
     try std.Io.Writer.writeAll(w,
         \\Type your message (or /help for commands):
@@ -242,6 +298,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // ──── Meta commands ────
         if (std.mem.startsWith(u8, input, "/")) {
             if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q") or std.mem.eql(u8, input, "/exit")) {
+                // M4: session-end reflection on whatever the window still holds.
+                if (mem_sys != null and window_queries.items.len > 0) {
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w);
+                }
+                if (mem_sys) |*ms| extractSessionMemories(ms, &history, w) catch {};
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
@@ -352,6 +413,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
+                if (mem_sys) |*ms| extractSessionMemories(ms, &history, w) catch {};
                 clearHistory(&history, sys_prompt);
                 message_count = 0;
                 total_input_tokens = 0;
@@ -362,6 +424,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 continue;
             } else if (std.mem.eql(u8, input, "/context")) {
                 try showContext(&history, total_input_tokens, total_output_tokens, w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/memory")) {
+                try printMemoryStatus(if (mem_sys) |*ms| ms else null, injected_count, w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.startsWith(u8, input, "/research ")) {
+                const topic = std.mem.trim(u8, input["/research ".len..], " \t");
+                if (topic.len == 0) {
+                    try std.Io.Writer.writeAll(w, "  Usage: /research <topic>\n\n");
+                } else {
+                    try runResearch(topic, allocator, io, w);
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.startsWith(u8, input, "/diagnose")) {
+                const rest = if (input.len > "/diagnose".len) input["/diagnose".len..] else "";
+                const concern = std.mem.trim(u8, rest, " \t");
+                if (concern.len == 0) {
+                    try std.Io.Writer.writeAll(w, "  Usage: /diagnose <your concern about the last answer>\n\n");
+                } else {
+                    try runDiagnose(concern, injected_count, window_tools, window_errors, allocator, w);
+                }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/undo")) {
@@ -420,6 +505,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         try std.Io.Writer.print(w, "\n  [Processing: \"{s}\"]\n", .{input});
         try std.Io.File.Writer.flush(&file_writer);
+
+        // Track query for the reflection window (cap at 20; drop oldest)
+        {
+            const q = try allocator.dupe(u8, input);
+            errdefer allocator.free(q);
+            try window_queries.append(allocator, q);
+            if (window_queries.items.len > 20) {
+                const old = window_queries.orderedRemove(0);
+                allocator.free(old);
+            }
+        }
 
         // Append user message to history
         var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
@@ -583,10 +679,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                 continue;
                             }
                             // Approved — fall through to execute
-                            try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
+                            const tool_errored = try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
+                            window_tools += 1;
+                            if (tool_errored) window_errors += 1;
                         },
                         .allow => {
-                            try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
+                            const tool_errored = try executeAndRecord(tc, allocator, io, &log, &fhist, &result_blocks, w, &file_writer);
+                            window_tools += 1;
+                            if (tool_errored) window_errors += 1;
                         },
                     }
                 }
@@ -611,12 +711,246 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             try std.Io.Writer.print(w, "  [Agent loop limit ({d}) reached]\n", .{MAX_AGENT_ITERATIONS});
         }
 
+        // M4: periodic reflection on the query window (every N exchanges
+        // or after a π-spaced interval; see ReflectionEngine.shouldReflect).
+        if (mem_sys != null and reflector.shouldReflect()) {
+            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w);
+        }
+
         try std.Io.Writer.writeAll(w, "\n");
         try std.Io.File.Writer.flush(&file_writer);
     }
 }
 
 /// Check if a tool is likely to modify files (and should be backed up).
+/// Extract memorable facts from this session and persist them to the
+/// episodic tier, so the next session can inject them (T3.1).
+/// φ condensation keeps only the top 61.8% of candidates by importance.
+fn extractSessionMemories(mem: *memory_mod.MemorySystem, history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
+    var engine = extraction_mod.ExtractionEngine.init(mem.allocator);
+    defer engine.deinit();
+
+    // Collect candidates across the whole session first.
+    var candidates: std.ArrayList(extraction_mod.ExtractedFact) = .empty;
+    defer {
+        for (candidates.items) |f| mem.allocator.free(f.content);
+        candidates.deinit(mem.allocator);
+    }
+    for (history.items) |msg| {
+        if (msg.role != .user and msg.role != .assistant) continue;
+        for (msg.content) |block| {
+            if (block != .text) continue;
+            const facts = engine.extractFromMessage(@tagName(msg.role), block.text) catch continue;
+            defer mem.allocator.free(facts);
+            for (facts) |f| {
+                if (f.content.len < 8) {
+                    mem.allocator.free(f.content);
+                    continue; // skip echoes and short noise
+                }
+                try candidates.append(mem.allocator, f);
+            }
+        }
+    }
+
+    // φ: keep the top condensationTarget(n) by importance.
+    const target = math_mod.condensationTarget(candidates.items.len);
+    const ByImportance = struct {
+        fn lessThan(_: void, a: extraction_mod.ExtractedFact, b: extraction_mod.ExtractedFact) bool {
+            return a.importance > b.importance;
+        }
+    };
+    std.sort.pdq(extraction_mod.ExtractedFact, candidates.items, {}, ByImportance.lessThan);
+
+    var stored: usize = 0;
+    for (candidates.items[0..target]) |f| {
+        const now = util_time.nowMillis();
+        mem.store(.{
+            .id = injection_mod.memoryId(f.content),
+            .mem_type = switch (f.fact_type) {
+                .user_preference => .user,
+                .project_context, .technical_fact, .error_solution, .pattern_observed => .project,
+            },
+            .name = f.content[0..@min(48, f.content.len)],
+            .description = @tagName(f.fact_type),
+            .content = f.content,
+            .access_count = 0,
+            .created_at = now,
+            .updated_at = now,
+        }) catch continue;
+        stored += 1;
+    }
+    if (stored > 0) {
+        try w.print("  Saved {d} memories for future sessions.\n", .{stored});
+    }
+}
+
+/// M4: run a reflection pass over the query window and persist the insight
+/// as a feedback memory. Resets the window.
+fn runReflection(
+    reflector: *reflection_mod.ReflectionEngine,
+    mem: *memory_mod.MemorySystem,
+    window_queries: *std.ArrayList([]u8),
+    window_tools: *u32,
+    window_errors: *u32,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+) void {
+    const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
+
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "reflection q={d} tools={d}", .{ window_queries.items.len, window_tools.* }) catch "reflection";
+    const now = util_time.nowMillis();
+    mem.store(.{
+        .id = injection_mod.memoryId(reflection.insights),
+        .mem_type = .feedback,
+        .name = name,
+        .description = @tagName(reflection.trigger),
+        .content = reflection.insights,
+        .access_count = 0,
+        .created_at = now,
+        .updated_at = now,
+    }) catch {};
+    logger.info("reflection: quality={d:.2} insights stored", .{reflection.quality_score});
+    w.print("  [Reflection] {s}\n", .{reflection.insights}) catch {};
+
+    // Reset the window.
+    for (window_queries.items) |q| alloc.free(q);
+    window_queries.clearRetainingCapacity();
+    window_tools.* = 0;
+    window_errors.* = 0;
+}
+
+/// M4: /memory — show what was injected this session and what is stored.
+fn printMemoryStatus(mem_sys: ?*memory_mod.MemorySystem, injected_count: usize, w: *std.Io.Writer) !void {
+    if (mem_sys == null) {
+        try std.Io.Writer.writeAll(w, "  Memory disabled (database unavailable).\n\n");
+        return;
+    }
+    const ms: *memory_mod.MemorySystem = mem_sys.?;
+    try std.Io.Writer.print(w, "  Memory: injected {d} entries into this session's system prompt\n", .{injected_count});
+
+    const entries = ms.episodic_mem.retrieveRecent(5) catch {
+        try std.Io.Writer.writeAll(w, "  (failed to read memory store)\n\n");
+        return;
+    };
+    defer ms.episodic_mem.freeEntries(entries);
+    if (entries.len == 0) {
+        try std.Io.Writer.writeAll(w, "  Store is empty — memories are extracted when you /quit or /clear.\n\n");
+        return;
+    }
+    try std.Io.Writer.print(w, "  Most recent {d} stored:\n", .{entries.len});
+    for (entries) |e| {
+        const name = e.name[0..@min(e.name.len, 60)];
+        try w.print("    [{s}] {s}\n", .{ @tagName(e.mem_type), name });
+    }
+    try std.Io.Writer.writeAll(w, "\n");
+}
+
+/// M8: /research — run the φ-curated optimization researcher over the web
+/// (same backend selection as the WebSearch tool) and print its report.
+fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *std.Io.Writer) !void {
+    try std.Io.Writer.writeAll(w, "  Researching (φ-optimized queries, ~30s budget)…\n");
+
+    const brave_key = env.get("BRAVE_API_KEY");
+    const backend: knowledge_search.SearchBackend = if (brave_key != null) .brave else .duckduckgo;
+    var ws = knowledge_search.WebSearch.init(alloc, io, backend, if (brave_key) |k| try alloc.dupe(u8, k) else null);
+    defer ws.deinit();
+
+    var researcher = researcher_mod.OptimizationResearcher.init(alloc, &ws);
+    var result = researcher.research(topic, .solve_problem) catch |err| {
+        try std.Io.Writer.print(w, "  Research failed: {s}\n\n", .{@errorName(err)});
+        return;
+    };
+    defer researcher.deinit(&result);
+
+    try std.Io.Writer.print(w, "  Sources: {d} | candidates: {d} | {d}ms\n", .{ result.sources_searched, result.candidates_found, result.search_duration_ms });
+    for (result.top_solutions, 0..) |sol, i| {
+        const marker: []const u8 = if (i == result.recommendation_index) " ★ recommended" else "";
+        try std.Io.Writer.print(w, "\n  [{d}] {s}{s}\n      {s}\n      source: {s}\n", .{ i + 1, sol.name, marker, sol.description, sol.source });
+    }
+    if (result.reasoning.len > 0) {
+        try std.Io.Writer.print(w, "\n  {s}\n", .{result.reasoning});
+    }
+    try std.Io.Writer.writeAll(w, "\n");
+}
+
+/// M8: /diagnose — build a lightweight decision trace from real session
+/// stats and run the self-diagnostic engine against the user's concern.
+fn runDiagnose(
+    concern: []const u8,
+    injected_count: usize,
+    window_tools: u32,
+    window_errors: u32,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+) !void {
+    // DecisionTrace takes ownership of query (freed in deinit) — dupe it.
+    var trace = decision_trace.DecisionTrace.init(alloc, try alloc.dupe(u8, concern));
+    defer trace.deinit();
+
+    // Step 1: memory retrieval — confidence drops when nothing was injected.
+    const mem_conf: f64 = if (injected_count > 0) 0.8 else 0.3;
+    try trace.addStep(.{
+        .step_id = 1,
+        .phase = .memory_retrieval,
+        .timestamp = util_time.nowMillis(),
+        .input = try alloc.dupe(u8, concern),
+        .output = try std.fmt.allocPrint(alloc, "injected={d}", .{injected_count}),
+        .reasoning = try alloc.dupe(u8, "recency-ranked e-decay injection"),
+        .confidence = mem_conf,
+        .duration_ms = 0,
+        .alternatives = &.{},
+        .dependencies = &.{},
+    });
+    // Step 2: tool execution — confidence tracks the error rate.
+    const tool_conf: f64 = if (window_tools == 0)
+        0.9
+    else
+        1.0 - @as(f64, @floatFromInt(window_errors)) / @as(f64, @floatFromInt(window_tools));
+    try trace.addStep(.{
+        .step_id = 2,
+        .phase = .tool_execution,
+        .timestamp = util_time.nowMillis(),
+        .input = try alloc.dupe(u8, "session tool window"),
+        .output = try std.fmt.allocPrint(alloc, "tools={d} errors={d}", .{ window_tools, window_errors }),
+        .reasoning = try alloc.dupe(u8, "permission pipeline + thread pool"),
+        .confidence = tool_conf,
+        .duration_ms = 0,
+        .alternatives = &.{},
+        .dependencies = &.{},
+    });
+    // Step 3: LLM generation.
+    try trace.addStep(.{
+        .step_id = 3,
+        .phase = .llm_generation,
+        .timestamp = util_time.nowMillis(),
+        .input = try alloc.dupe(u8, "history + system prompt"),
+        .output = try alloc.dupe(u8, "assistant message"),
+        .reasoning = try alloc.dupe(u8, "provider stream + tool_use loop"),
+        .confidence = 0.9,
+        .duration_ms = 0,
+        .alternatives = &.{},
+        .dependencies = &.{},
+    });
+    trace.complete();
+
+    var diag = self_diagnostic.SelfDiagnostic.init(alloc);
+    const report = diag.diagnose(&trace, concern) catch {
+        try std.Io.Writer.writeAll(w, "  Diagnosis failed.\n\n");
+        return;
+    };
+    defer report.free(alloc);
+
+    try std.Io.Writer.print(w, "  Diagnosis ({d} gaps, weakest confidence {d:.2}):\n", .{ report.identified_gaps.len, report.trace_summary.weakest_confidence });
+    if (report.root_cause) |rc| {
+        try std.Io.Writer.print(w, "  Root cause (step {d}): {s}\n", .{ rc.step_id, rc.description });
+    }
+    for (report.suggestions) |s| {
+        try std.Io.Writer.print(w, "  → {s}\n", .{s.suggestion});
+    }
+    try std.Io.Writer.writeAll(w, "\n");
+}
+
 fn isFileModifyingTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "FileWrite") or
         std.mem.eql(u8, tool_name, "FileEdit") or
@@ -634,7 +968,7 @@ fn executeAndRecord(
     result_blocks: *std.ArrayList(llm.ContentBlock),
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
-) !void {
+) !bool {
     try std.Io.Writer.print(w, "  [Executing: {s}]\n", .{tc.name});
     try std.Io.File.Writer.flush(file_writer);
     logger.info("Tool execute: {s}", .{tc.name});
@@ -662,7 +996,7 @@ fn executeAndRecord(
             .is_error = true,
         } });
         _ = log.record(tc.name, "execution", "error", null, false) catch {};
-        return;
+        return true;
     };
 
     // Truncate large outputs for history — must dupe before freeing
@@ -688,6 +1022,7 @@ fn executeAndRecord(
     }
     // If not truncated, content_for_history == result.output; ownership moved into history
     try std.Io.File.Writer.flush(file_writer);
+    return result.is_error;
 }
 
 // ──── Conversation management helpers ────
@@ -779,7 +1114,7 @@ fn showContext(history: *std.ArrayList(llm.Message), total_in: u64, total_out: u
     try std.Io.Writer.print(w, "  Messages: {d} system, {d} user, {d} assistant, {d} tool\n", .{
         counts[0], counts[1], counts[2], counts[3],
     });
-    try std.Io.Writer.print(w, "  Compaction threshold: {d} tokens (61.8%%)\n", .{threshold});
+    try std.Io.Writer.print(w, "  Compaction threshold: {d} tokens (61.8%)\n", .{threshold});
     try std.Io.Writer.print(w, "  Session total: {d} in / {d} out tokens\n\n", .{ total_in, total_out });
 }
 
@@ -859,6 +1194,7 @@ fn rewindOperation(
     }
 
     try std.Io.Writer.print(w, "  Rollback points ({d}):\n", .{rollback_points.len});
+    try std.Io.Writer.writeAll(w, "    [0] Session start (undo all file changes)\n");
     for (rollback_points, 0..) |rp, i| {
         try std.Io.Writer.print(w, "    [{d}] {s} (files: {d})\n", .{ i + 1, rp.tool_name, rp.files_affected });
     }
@@ -882,12 +1218,16 @@ fn rewindOperation(
         try std.Io.Writer.writeAll(w, "  Invalid selection.\n\n");
         return;
     };
-    if (idx < 1 or idx > rollback_points.len) {
+    if (idx > rollback_points.len) {
         try std.Io.Writer.writeAll(w, "  Invalid selection.\n\n");
         return;
     }
 
-    const target_op_id = rollback_points[idx - 1].op_id;
+    // [0] rolls everything back to the session start state.
+    const target_op_id = if (idx == 0)
+        rollback_mod.session_start_op_id
+    else
+        rollback_points[idx - 1].op_id;
 
     // Preview first
     const preview = engine.previewRollback(target_op_id) catch {
@@ -1254,6 +1594,9 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
         \\  /rewind           Rollback to a checkpoint
+        \\  /memory           Show injected and stored memories
+        \\  /research <topic> Web research with phi-curated solutions
+        \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
         \\
         \\Models (use /model to switch):
         \\  Claude:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5

@@ -80,6 +80,12 @@ pub fn PiRingBuffer(comptime T: type, comptime capacity: usize) type {
             return .{ .ring = self };
         }
 
+        /// Oldest item when the ring is full. `head` is the next overwrite slot,
+        /// which is also the oldest entry once the ring wraps.
+        pub fn getOldest(self: *const Self) T {
+            return self.buffer[self.head].data;
+        }
+
         pub fn isFull(self: *const Self) bool {
             return self.count >= capacity;
         }

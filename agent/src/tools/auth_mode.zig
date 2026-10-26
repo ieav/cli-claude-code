@@ -4,6 +4,7 @@ const std = @import("std");
 const registry = @import("registry.zig");
 const sanitization = @import("../util/sanitization.zig");
 const classifier = @import("classifier.zig");
+const glob_match = @import("../util/glob_match.zig");
 
 // Re-export from registry
 pub const PermissionMode = registry.PermissionMode;
@@ -43,14 +44,17 @@ pub fn checkToolPermission(
     input: std.json.Value,
     ctx: *const PermissionContext,
 ) PermissionDecision {
-    // Step 1a: Check deny rules — blanket deny
+    // Step 1a: Check deny rules. A rule without a pattern denies the tool
+    // outright; a rule with a pattern only denies when the input matches it.
     for (ctx.deny_rules) |rule| {
         if (tool.matchesName(rule.tool_name)) {
             if (rule.content_pattern) |pattern| {
-                // Content-specific deny
-                _ = pattern; // TODO: match against input
+                if (inputMatchesPattern(input, pattern)) {
+                    return .{ .deny = .{ .message = "denied by rule (pattern match)" } };
+                }
+            } else {
+                return .{ .deny = .{ .message = "denied by rule" } };
             }
-            return .{ .deny = .{ .message = "denied by rule" } };
         }
     }
 
@@ -109,18 +113,29 @@ pub fn checkToolPermission(
         },
     }
 
-    // Step 2b: Check allow rules
+    // Step 2b: Check allow rules. Pattern rules only allow on match; a
+    // non-matching pattern falls through to the default ask below.
     for (ctx.allow_rules) |rule| {
         if (tool.matchesName(rule.tool_name)) {
             if (rule.content_pattern) |pattern| {
-                _ = pattern; // TODO: match against input
+                if (inputMatchesPattern(input, pattern)) return .allow;
+            } else {
+                return .allow;
             }
-            return .allow;
         }
     }
 
     // Step 3: Default to ask
     return .{ .ask = .{ .message = "permission required" } };
+}
+
+/// Match a rule's content pattern against the operative input field
+/// (command for Bash, path for file tools). Glob syntax via glob_match.
+fn inputMatchesPattern(input: std.json.Value, pattern: []const u8) bool {
+    const target = registry.getStringField(input, "command") orelse
+        registry.getStringField(input, "path") orelse
+        return false;
+    return glob_match.match(pattern, target);
 }
 
 /// Check if the input contains references to protected paths.
@@ -148,7 +163,7 @@ test "checkToolPermission bypass mode" {
         .allow_rules = &.{},
         .deny_rules = &.{},
     };
-    const decision = checkToolPermission(&registry.bash_tool, .{}, &ctx);
+    const decision = checkToolPermission(&registry.bash_tool, .null, &ctx);
     try std.testing.expect(decision == .allow);
 }
 
@@ -158,9 +173,68 @@ test "checkToolPermission plan mode blocks writes" {
         .allow_rules = &.{},
         .deny_rules = &.{},
     };
-    const decision = checkToolPermission(&registry.file_write_tool, .{}, &ctx);
+    const decision = checkToolPermission(&registry.file_write_tool, .null, &ctx);
     switch (decision) {
         .deny => {},
         else => return error.UnexpectedDecision,
+    }
+}
+
+test "content patterns: table-driven deny/allow matching" {
+    // Each case: (rule pattern, command, expected decision tag)
+    const Case = struct { pattern: ?[]const u8, command: ?[]const u8, want: enum { deny, allow, ask } };
+    const cases = [_]Case{
+        // Deny rules (blanket + pattern)
+        .{ .pattern = null, .command = "ls", .want = .deny }, // blanket deny
+        .{ .pattern = "rm *", .command = "rm -rf /tmp/x", .want = .deny }, // pattern hit
+        .{ .pattern = "rm *", .command = "ls -la", .want = .ask }, // pattern miss -> falls to ask
+        .{ .pattern = "git push*", .command = "git push origin main", .want = .deny },
+        // Allow rules
+        .{ .pattern = null, .command = "echo hi", .want = .allow }, // blanket allow
+        .{ .pattern = "git status*", .command = "git status -s", .want = .allow },
+        .{ .pattern = "git status*", .command = "git push", .want = .ask }, // miss -> default ask
+        .{ .pattern = "cat *", .command = null, .want = .ask }, // no command field -> cannot match pattern
+    };
+
+    for (cases, 0..) |c, i| {
+        var input: std.json.Value = .null;
+        var obj: std.json.ObjectMap = .empty;
+        defer obj.deinit(std.testing.allocator);
+        if (c.command) |cmd| {
+            try obj.put(std.testing.allocator, "command", .{ .string = cmd });
+            input = .{ .object = obj };
+        }
+
+        const deny_rules = [_]registry.PermissionRule{.{
+            .source = .user_settings,
+            .behavior = .deny,
+            .tool_name = "Bash",
+            .content_pattern = c.pattern,
+        }};
+        const allow_rules = [_]registry.PermissionRule{.{
+            .source = .user_settings,
+            .behavior = .allow,
+            .tool_name = "Bash",
+            .content_pattern = c.pattern,
+        }};
+
+        // Interpret want: deny cases use ctx with deny_rules, others allow_rules.
+        const use_deny = c.want == .deny;
+        const ctx = PermissionContext{
+            .mode = .default,
+            .allow_rules = if (use_deny) &.{} else &allow_rules,
+            .deny_rules = if (use_deny) &deny_rules else &.{},
+        };
+        const decision = checkToolPermission(&registry.bash_tool, input, &ctx);
+        const got: []const u8 = switch (decision) {
+            .deny => "deny",
+            .allow => "allow",
+            .ask => "ask",
+        };
+        const want_str = @tagName(c.want);
+        std.testing.expectEqualStrings(want_str, got) catch |err| {
+            std.debug.print("case {d}: pattern={?s} command={?s} want={s} got={s}\n", .{ i, c.pattern, c.command, want_str, got });
+            return err;
+        };
     }
 }

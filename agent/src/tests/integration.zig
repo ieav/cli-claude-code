@@ -2,6 +2,7 @@
 /// Tests use real SQLite databases and exercise full code paths.
 const std = @import("std");
 const time_mod = @import("../util/time.zig");
+const fs_ops = @import("../util/fs_ops.zig");
 const database = @import("../storage/database.zig");
 const episodic = @import("../memory/episodic.zig");
 const types = @import("../memory/types.zig");
@@ -48,7 +49,7 @@ test "quoteString SQL injection attempt" {
 test "EpisodicStore store and touch" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_episodic_test_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();
@@ -80,7 +81,7 @@ test "EpisodicStore store and touch" {
 test "EpisodicStore store with special characters" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_episodic_special_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();
@@ -114,7 +115,7 @@ test "EpisodicStore store with special characters" {
 test "KnowledgeGraph addNode returns valid row ID" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_kg_rowid_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();
@@ -131,7 +132,7 @@ test "KnowledgeGraph addNode returns valid row ID" {
 test "KnowledgeGraph addNode with SQL-special characters" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_kg_sql_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();
@@ -152,7 +153,7 @@ test "KnowledgeGraph addNode with SQL-special characters" {
 test "KnowledgeGraph pruneWeakEdges" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_kg_prune_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();
@@ -177,17 +178,13 @@ test "KnowledgeGraph pruneWeakEdges" {
 test "DecisionTrace addStep and getSteps" {
     const allocator = std.testing.allocator;
     const query = try allocator.dupe(u8, "test query");
-    defer allocator.free(query);
 
     var trace = decision.DecisionTrace.init(allocator, query);
     defer trace.deinit();
 
     const input = try allocator.dupe(u8, "input");
-    defer allocator.free(input);
     const output = try allocator.dupe(u8, "output");
-    defer allocator.free(output);
     const reasoning = try allocator.dupe(u8, "because");
-    defer allocator.free(reasoning);
 
     try trace.addStep(.{
         .step_id = 1,
@@ -208,18 +205,14 @@ test "DecisionTrace addStep and getSteps" {
 test "DecisionTrace findWeakSteps filters by threshold" {
     const allocator = std.testing.allocator;
     const query = try allocator.dupe(u8, "test");
-    defer allocator.free(query);
 
     var trace = decision.DecisionTrace.init(allocator, query);
     defer trace.deinit();
 
     // Add a strong step (confidence 0.9)
     const strong_input = try allocator.dupe(u8, "s_in");
-    defer allocator.free(strong_input);
     const strong_output = try allocator.dupe(u8, "s_out");
-    defer allocator.free(strong_output);
     const strong_reason = try allocator.dupe(u8, "s_reason");
-    defer allocator.free(strong_reason);
 
     try trace.addStep(.{
         .step_id = 1,
@@ -236,11 +229,8 @@ test "DecisionTrace findWeakSteps filters by threshold" {
 
     // Add a weak step (confidence 0.3)
     const weak_input = try allocator.dupe(u8, "w_in");
-    defer allocator.free(weak_input);
     const weak_output = try allocator.dupe(u8, "w_out");
-    defer allocator.free(weak_output);
     const weak_reason = try allocator.dupe(u8, "w_reason");
-    defer allocator.free(weak_reason);
 
     try trace.addStep(.{
         .step_id = 2,
@@ -257,6 +247,7 @@ test "DecisionTrace findWeakSteps filters by threshold" {
 
     // φ threshold ~0.618: only the weak step should be found
     const weak = trace.findWeakSteps(0.618);
+    defer std.testing.allocator.free(weak);
     try std.testing.expectEqual(@as(usize, 1), weak.len);
     try std.testing.expectEqual(@as(u32, 2), weak[0].step_id);
 }
@@ -264,7 +255,6 @@ test "DecisionTrace findWeakSteps filters by threshold" {
 test "DecisionTrace totalDurationMs" {
     const allocator = std.testing.allocator;
     const query = try allocator.dupe(u8, "test");
-    defer allocator.free(query);
 
     var trace = decision.DecisionTrace.init(allocator, query);
     defer trace.deinit();
@@ -280,17 +270,13 @@ test "DecisionTrace totalDurationMs" {
 test "DecisionTrace getStepByPhase" {
     const allocator = std.testing.allocator;
     const query = try allocator.dupe(u8, "test");
-    defer allocator.free(query);
 
     var trace = decision.DecisionTrace.init(allocator, query);
     defer trace.deinit();
 
     const inp = try allocator.dupe(u8, "in");
-    defer allocator.free(inp);
     const out = try allocator.dupe(u8, "out");
-    defer allocator.free(out);
     const reason = try allocator.dupe(u8, "r");
-    defer allocator.free(reason);
 
     try trace.addStep(.{
         .step_id = 1,
@@ -423,6 +409,13 @@ test "SSEParser multi-event" {
 
     const events = parser.drain();
     defer std.testing.allocator.free(events);
+    defer {
+        for (events) |ev| {
+            if (ev.event) |s| std.testing.allocator.free(s);
+            if (ev.data) |s| std.testing.allocator.free(s);
+            if (ev.id) |s| std.testing.allocator.free(s);
+        }
+    }
     try std.testing.expectEqualStrings("hello", events[0].data.?);
     try std.testing.expectEqualStrings("world", events[1].data.?);
 }
@@ -450,6 +443,13 @@ test "SSEParser ignores comments" {
 
     const events = parser.drain();
     defer std.testing.allocator.free(events);
+    defer {
+        for (events) |ev| {
+            if (ev.event) |s| std.testing.allocator.free(s);
+            if (ev.data) |s| std.testing.allocator.free(s);
+            if (ev.id) |s| std.testing.allocator.free(s);
+        }
+    }
     try std.testing.expectEqualStrings("pong", events[0].data.?);
 }
 
@@ -481,6 +481,13 @@ test "SSEParser retry field" {
 
     const events = parser.drain();
     defer std.testing.allocator.free(events);
+    defer {
+        for (events) |ev| {
+            if (ev.event) |s| std.testing.allocator.free(s);
+            if (ev.data) |s| std.testing.allocator.free(s);
+            if (ev.id) |s| std.testing.allocator.free(s);
+        }
+    }
     try std.testing.expect(events[0].retry != null);
     try std.testing.expectEqual(@as(u32, 5000), events[0].retry.?);
 }
@@ -490,7 +497,7 @@ test "SSEParser retry field" {
 test "Database full migration round-trip" {
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_full_migration_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();

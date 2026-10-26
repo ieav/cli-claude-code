@@ -221,12 +221,14 @@ pub fn ToolRegistry(comptime tools: []const ToolDefinition) type {
 
 /// Extract a string field from JSON input.
 pub fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {
+    if (input != .object) return null;
     const obj = input.object.get(key) orelse return null;
     return obj.string;
 }
 
 /// Extract an integer field from JSON input.
 pub fn getIntField(input: std.json.Value, key: []const u8) ?i64 {
+    if (input != .object) return null;
     const obj = input.object.get(key) orelse return null;
     return switch (obj) {
         .integer => |v| v,
@@ -252,7 +254,7 @@ fn bashIsConcurrencySafe(_: std.json.Value) bool {
 
 /// Bash tool: destructive if command contains rm, dd, mkfs, etc.
 fn bashIsDestructive(input: std.json.Value) bool {
-    const cmd = getStringField(input, "command") orelse return true;
+    const cmd = getStringField(input, "command") orelse return false; // malformed input is rejected by validateInput, not here
     const dangerous_cmds = [_][]const u8{ "rm ", "rmdir", "dd ", "mkfs.", "format", "> /dev/", "chmod 000", "chown root" };
     for (dangerous_cmds) |dc| {
         if (std.mem.indexOf(u8, cmd, dc) != null) return true;
@@ -496,9 +498,9 @@ test "ToolDefinition matchesName" {
 }
 
 test "ToolDefinition concurrency safety" {
-    try std.testing.expect(!bash_tool.isConcurrencySafe(.{}));
-    try std.testing.expect(file_read_tool.isConcurrencySafe(.{}));
-    try std.testing.expect(!file_write_tool.isConcurrencySafe(.{}));
+    try std.testing.expect(!bash_tool.isConcurrencySafe(.null));
+    try std.testing.expect(file_read_tool.isConcurrencySafe(.null));
+    try std.testing.expect(!file_write_tool.isConcurrencySafe(.null));
 }
 
 test "ToolDefinition destructive detection" {

@@ -7,19 +7,19 @@ const uuid = @import("uuid.zig");
 pub fn create(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
     const id = try uuid.shortId(allocator);
     defer allocator.free(id);
-    const name = try std.fmt.allocPrint(allocator, "{s}_{s}{s}", .{ prefix, id, suffix });
-    errdefer allocator.free(name);
+    const path = try std.fmt.allocPrint(allocator, "/tmp/{s}_{s}{s}", .{ prefix, id, suffix });
+    errdefer allocator.free(path);
 
-    // Create the temp directory if needed
-    const tmp_dir = std.fs.cwd().makeOpenPath("/tmp", .{}) catch
-        std.fs.cwd().makeOpenPath("./tmp", .{}) catch
-        return error.TempDirFailed;
+    var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
 
-    // Create the file
-    const file = tmp_dir.createFile(name, .{}) catch return error.TempCreateFailed;
-    file.close();
+    // Ensure /tmp exists, then create the file by absolute path
+    std.Io.Dir.cwd().createDirPath(io, "/tmp") catch {};
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return error.TempCreateFailed;
+    file.close(io);
 
-    return std.fmt.allocPrint(allocator, "/tmp/{s}", .{name});
+    return path;
 }
 
 /// Create a temporary directory with a unique name. Returns the path.
@@ -30,22 +30,30 @@ pub fn createDir(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     const name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, id });
     errdefer allocator.free(name);
 
-    std.fs.cwd().makePath(std.fmt.comptimePrint("/tmp/", .{})) catch {};
+    var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
 
     const path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{name});
-    std.fs.cwd().makePath(path) catch return error.TempDirCreateFailed;
+    std.Io.Dir.cwd().createDirPath(io, path) catch return error.TempDirCreateFailed;
     return path;
 }
 
 /// Write data to a temporary file. Returns the path.
-/// Caller owns the returned path slice.
 pub fn writeAll(allocator: std.mem.Allocator, prefix: []const u8, data: []const u8) ![]u8 {
     const path = try create(allocator, prefix, ".tmp");
     errdefer allocator.free(path);
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+    var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw: std.Io.File.Writer = .init(file, io, &buf);
+    try fw.interface.writeAll(data);
+    try fw.interface.flush();
 
     return path;
 }
@@ -54,7 +62,9 @@ test "tempfile create" {
     const alloc = std.testing.allocator;
     const path = try create(alloc, "ziv_test", ".txt");
     defer {
-        std.fs.cwd().deleteFile(path) catch {};
+        var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        defer io_state.deinit();
+        std.Io.Dir.cwd().deleteFile(io_state.io(), path) catch {};
         alloc.free(path);
     }
     try std.testing.expect(path.len > 0);

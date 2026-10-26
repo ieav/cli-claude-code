@@ -2,6 +2,7 @@
 /// Manages connections, migrations, and prepared statements.
 const std = @import("std");
 const time_mod = @import("../util/time.zig");
+const fs_ops = @import("../util/fs_ops.zig");
 
 const c = @import("sqlite_c.zig");
 
@@ -14,12 +15,12 @@ pub const Database = struct {
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
         var db: ?*c.sqlite3 = null;
-        const path_c = try allocator.dupeZ(u8, path);
+        const path_c = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_c);
 
         const rc = c.sqlite3_open(path_c.ptr, &db);
         if (rc != c.SQLITE_OK) {
-            if (db) |d| c.sqlite3_close(d);
+            if (db) |d| _ = c.sqlite3_close(d);
             return error.DatabaseOpenFailed;
         }
 
@@ -47,10 +48,16 @@ pub const Database = struct {
         return c.sqlite3_last_insert_rowid(db);
     }
 
+    /// Rows changed by the most recent INSERT/UPDATE/DELETE on this connection.
+    pub fn changes(self: *Self) c_int {
+        const db = self.db orelse return 0;
+        return c.sqlite3_changes(db);
+    }
+
     /// Execute a raw SQL statement (no return data).
     pub fn exec(self: *Self, sql: []const u8) !void {
         const db = self.db orelse return error.DatabaseNotOpen;
-        const sql_c = try self.allocator.dupeZ(u8, sql);
+        const sql_c = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_c);
 
         var err_msg: ?[*:0]u8 = null;
@@ -74,7 +81,7 @@ pub const Database = struct {
 
         const step_rc = c.sqlite3_step(stmt);
         if (step_rc == c.SQLITE_ROW) {
-            const text = c.sqlite3_column_text(stmt, 0);
+            const text = c.sqlite3_column_text(stmt, 0) orelse return false;
             return std.mem.eql(u8, std.mem.sliceTo(text, 0), "ok");
         }
         return false;
@@ -187,10 +194,76 @@ pub const Database = struct {
     }
 };
 
+/// Prepared statement wrapper. SQL parameters are bound by index (?1, ?2, ...)
+/// so user-controlled data never touches the SQL text itself.
+pub const Statement = struct {
+    allocator: std.mem.Allocator,
+    stmt: *c.sqlite3_stmt,
+    db: *Database,
+
+    const Self = @This();
+
+    pub fn prepare(allocator: std.mem.Allocator, db: *Database, sql: []const u8) !Self {
+        const raw = db.db orelse return error.DatabaseNotOpen;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(raw, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return error.StatementPrepareFailed;
+        return .{ .allocator = allocator, .stmt = stmt.?, .db = db };
+    }
+
+    pub fn bindText(self: Self, idx: c_int, text: []const u8) void {
+        _ = c.sqlite3_bind_text(self.stmt, idx, text.ptr, @intCast(text.len), c.SQLITE_STATIC);
+    }
+
+    pub fn bindInt64(self: Self, idx: c_int, value: i64) void {
+        _ = c.sqlite3_bind_int64(self.stmt, idx, value);
+    }
+
+    pub fn bindFloat(self: Self, idx: c_int, value: f64) void {
+        _ = c.sqlite3_bind_double(self.stmt, idx, value);
+    }
+
+    pub fn bindBlob(self: Self, idx: c_int, bytes: []const u8) void {
+        _ = c.sqlite3_bind_blob(self.stmt, idx, bytes.ptr, @intCast(bytes.len), c.SQLITE_STATIC);
+    }
+
+    /// Returns true when a row is available, false when iteration is done.
+    pub fn step(self: Self) !bool {
+        const rc = c.sqlite3_step(self.stmt);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return error.StatementStepFailed;
+    }
+
+    /// Returned slice points into SQLite's internal buffer; copy it before
+    /// the next step()/finalize() call.
+    pub fn columnText(self: Self, idx: c_int) []const u8 {
+        const ptr = c.sqlite3_column_text(self.stmt, idx) orelse return &.{};
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.stmt, idx));
+        return ptr[0..len];
+    }
+
+    /// Same lifetime caveat as columnText.
+    pub fn columnBlob(self: Self, idx: c_int) []const u8 {
+        const ptr = c.sqlite3_column_blob(self.stmt, idx) orelse return &.{};
+        const len: usize = @intCast(c.sqlite3_column_bytes(self.stmt, idx));
+        const bytes: [*]const u8 = @ptrCast(ptr);
+        return bytes[0..len];
+    }
+
+    pub fn columnInt64(self: Self, idx: c_int) i64 {
+        return c.sqlite3_column_int64(self.stmt, idx);
+    }
+
+    pub fn finalize(self: Self) void {
+        _ = c.sqlite3_finalize(self.stmt);
+    }
+};
+
 test "Database init and migration" {
     var tmp_dir_name: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp_dir_name, "/tmp/zage_test_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try Database.init(std.testing.allocator, path);
     defer db.deinit();

@@ -27,7 +27,7 @@ pub fn sha256Hex(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 /// Caller owns the returned slice.
 pub fn fingerprint(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     const digest = sha256(data);
-    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(digest[0..8])});
+    return std.fmt.allocPrint(allocator, "{x}", .{digest[0..8]});
 }
 
 /// Compute SHA-256 of a file's contents.
@@ -54,7 +54,7 @@ test "sha256 known" {
     const digest = sha256("hello");
     // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     try std.testing.expectEqual(@as(u8, 0x2c), digest[0]);
-    try std.testing.expectEqual(@as(u8, 0x24), digest[1]);
+    try std.testing.expectEqual(@as(u8, 0xf2), digest[1]);
 }
 
 test "sha256Hex" {

@@ -57,6 +57,8 @@ pub fn MPSCQueue(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             // Drain remaining nodes
             while (self.pop()) |_| {}
+            // The final tail (now empty) is a real node, not the original stub.
+            if (self.tail != self.stub) self.allocator.destroy(self.tail);
             // Free the stub
             self.allocator.destroy(self.stub);
         }

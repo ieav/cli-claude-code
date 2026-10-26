@@ -123,8 +123,10 @@ pub fn estimateTokens(text: []const u8) u32 {
 }
 
 test "writeJsonString escapes correctly" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
-    try writeJsonString(buf.writer(), "hello \"world\"\nnew line");
-    try std.testing.expectEqualStrings("\"hello \\\"world\\\"\\nnew line\"", buf.items);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeJsonString(&aw.writer, "hello \"world\"\nnew line");
+    var list = aw.toArrayList();
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("\"hello \\\"world\\\"\\nnew line\"", list.items);
 }

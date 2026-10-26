@@ -25,7 +25,7 @@ pub extern fn sqlite3_free(ptr: ?*anyopaque) void;
 pub extern fn sqlite3_last_insert_rowid(db: ?*sqlite3) i64;
 pub extern fn sqlite3_prepare_v2(
     db: ?*sqlite3,
-    z_sql: [*:0]const u8,
+    z_sql: [*]const u8,
     n_byte: c_int,
     pp_stmt: *?*sqlite3_stmt,
     pz_tail: ?*?[*:0]const u8,
@@ -33,3 +33,23 @@ pub extern fn sqlite3_prepare_v2(
 pub extern fn sqlite3_finalize(stmt: ?*sqlite3_stmt) c_int;
 pub extern fn sqlite3_step(stmt: ?*sqlite3_stmt) c_int;
 pub extern fn sqlite3_column_text(stmt: ?*sqlite3_stmt, i_col: c_int) ?[*:0]const u8;
+
+// Destructor callback for bound values.
+pub const Destructor = ?*const fn (?*anyopaque) callconv(.c) void;
+
+/// SQLITE_STATIC: keep the caller's pointer as-is. Safe here because the
+/// Statement wrapper binds and steps within a single call frame, so every
+/// bound value outlives the statement. (The -1 SQLITE_TRANSIENT trick is not
+/// expressible with 0.17's @ptrFromInt alignment checks.)
+pub const SQLITE_STATIC: Destructor = null;
+
+pub extern fn sqlite3_bind_text(stmt: ?*sqlite3_stmt, idx: c_int, text: [*]const u8, n: c_int, destructor: Destructor) c_int;
+pub extern fn sqlite3_bind_int64(stmt: ?*sqlite3_stmt, idx: c_int, value: i64) c_int;
+pub extern fn sqlite3_bind_blob(stmt: ?*sqlite3_stmt, idx: c_int, ptr: ?*const anyopaque, n: c_int, destructor: Destructor) c_int;
+pub extern fn sqlite3_column_int64(stmt: ?*sqlite3_stmt, i_col: c_int) i64;
+pub extern fn sqlite3_column_blob(stmt: ?*sqlite3_stmt, i_col: c_int) ?*const anyopaque;
+pub extern fn sqlite3_column_bytes(stmt: ?*sqlite3_stmt, i_col: c_int) c_int;
+
+/// Number of rows modified by the most recent INSERT/UPDATE/DELETE.
+pub extern fn sqlite3_changes(db: ?*sqlite3) c_int;
+pub extern fn sqlite3_bind_double(stmt: ?*sqlite3_stmt, idx: c_int, value: f64) c_int;

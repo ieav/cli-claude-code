@@ -8,6 +8,11 @@ const platform = @import("platform.zig");
 pub fn findExecutable(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     const path_var = env.pathEnv() orelse return null;
 
+    var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    const cwd = std.Io.Dir.cwd();
+
     var it = std.mem.splitSequence(u8, path_var, ":");
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
@@ -15,7 +20,7 @@ pub fn findExecutable(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
         errdefer allocator.free(full_path);
 
         // Check if file exists and is executable
-        std.fs.cwd().access(full_path, .{}) catch {
+        cwd.access(io, full_path, .{}) catch {
             allocator.free(full_path);
             continue;
         };
@@ -27,12 +32,18 @@ pub fn findExecutable(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
 /// Check if a command exists in PATH.
 pub fn commandExists(name: []const u8) bool {
     const path_var = env.pathEnv() orelse return false;
+
+    var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    const cwd = std.Io.Dir.cwd();
+
     var it = std.mem.splitSequence(u8, path_var, ":");
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const full_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
-        std.fs.cwd().access(full_path, .{}) catch continue;
+        cwd.access(io, full_path, .{}) catch continue;
         return true;
     }
     return false;

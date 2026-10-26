@@ -1,5 +1,4 @@
 /// Built-in runtime detection rules — 8 rules with φ/e thresholds.
-
 const std = @import("std");
 const math = @import("../math/mod.zig");
 const rules = @import("rules.zig");
@@ -10,7 +9,6 @@ pub fn checkMemory(ctx: *rules.RuntimeContext) rules.CheckResult {
     const ratio = @as(f64, @floatFromInt(ctx.memory_used_bytes)) / @as(f64, @floatFromInt(ctx.memory_limit_bytes));
     const pressure = math.sigmoid(2.0 * (ratio - 0.7));
     if (pressure > 0.8) {
-        const target = math.condensationTarget(ctx.memory_entry_count);
         return .{
             .fail = .{
                 .rule_id = "mem_usage_high",
@@ -182,10 +180,10 @@ pub const builtin_rules = &[_]rules.RuntimeRule{
     .{ .id = "api_rate_limit", .name = "API 限速", .severity = .warning, .check_fn = checkApiRate },
     .{ .id = "storage_corruption", .name = "存储完整性", .severity = .critical, .check_fn = checkStorage },
     .{ .id = "context_overflow", .name = "上下文溢出", .severity = .warning, .check_fn = checkContextOverflow },
-    .{ .id = "task_health", .name = "任务健康", .severity = .error, .check_fn = checkTaskHealth },
-    .{ .id = "network_connectivity", .name = "网络连通", .severity = .error, .check_fn = checkNetwork },
+    .{ .id = "task_health", .name = "任务健康", .severity = .@"error", .check_fn = checkTaskHealth },
+    .{ .id = "network_connectivity", .name = "网络连通", .severity = .@"error", .check_fn = checkNetwork },
     .{ .id = "concurrency_pressure", .name = "并发压力", .severity = .warning, .check_fn = checkConcurrency },
-    .{ .id = "decision_quality", .name = "决策质量", .severity = .error, .check_fn = checkDecisionQuality },
+    .{ .id = "decision_quality", .name = "决策质量", .severity = .@"error", .check_fn = checkDecisionQuality },
 };
 
 test "builtin_rules: all rules are defined" {
@@ -194,31 +192,43 @@ test "builtin_rules: all rules are defined" {
 
 test "checkContextOverflow triggers at φ threshold" {
     var ctx: rules.RuntimeContext = .{
-        .memory_used_bytes = 0, .memory_limit_bytes = 0, .memory_entry_count = 0,
-        .api_calls_last_minute = 0, .api_rate_limit = 0,
+        .memory_used_bytes = 0,
+        .memory_limit_bytes = 0,
+        .memory_entry_count = 0,
+        .api_calls_last_minute = 0,
+        .api_rate_limit = 0,
         .db_integrity_ok = true,
-        .current_tokens = 7000, .max_tokens = 10000,
-        .task_failed_count = 0, .task_total_count = 0,
+        .current_tokens = 7000,
+        .max_tokens = 10000,
+        .task_failed_count = 0,
+        .task_total_count = 0,
         .network_timeout_count = 0,
-        .active_tasks = 0, .max_concurrent_tasks = 0,
+        .active_tasks = 0,
+        .max_concurrent_tasks = 0,
     };
     // 7000/10000 = 0.7 > φ ≈ 0.618
     const result = checkContextOverflow(&ctx);
     switch (result) {
         .fail => |f| try std.testing.expectEqualStrings("context_overflow", f.rule_id),
-        .pass => return std.testing.fail("expected fail"),
+        .pass => return error.TestUnexpectedResult,
     }
 }
 
 test "checkContextOverflow passes below φ threshold" {
     var ctx: rules.RuntimeContext = .{
-        .memory_used_bytes = 0, .memory_limit_bytes = 0, .memory_entry_count = 0,
-        .api_calls_last_minute = 0, .api_rate_limit = 0,
+        .memory_used_bytes = 0,
+        .memory_limit_bytes = 0,
+        .memory_entry_count = 0,
+        .api_calls_last_minute = 0,
+        .api_rate_limit = 0,
         .db_integrity_ok = true,
-        .current_tokens = 5000, .max_tokens = 10000,
-        .task_failed_count = 0, .task_total_count = 0,
+        .current_tokens = 5000,
+        .max_tokens = 10000,
+        .task_failed_count = 0,
+        .task_total_count = 0,
         .network_timeout_count = 0,
-        .active_tasks = 0, .max_concurrent_tasks = 0,
+        .active_tasks = 0,
+        .max_concurrent_tasks = 0,
     };
     // 5000/10000 = 0.5 < φ
     const result = checkContextOverflow(&ctx);

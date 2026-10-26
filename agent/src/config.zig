@@ -96,10 +96,14 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, allocator, std.Io.Limit.limited(1024 * 1024)) catch return;
     defer allocator.free(contents);
 
-    const value = json_helpers.parse(allocator, contents) catch return;
+    const parsed = json_helpers.parse(allocator, contents) catch return;
+    defer parsed.deinit();
+    const value = parsed.value;
 
+    // NOTE: every string assigned below must be duped — slices into `parsed`
+    // dangle after this function returns (the DOM is freed by defer above).
     if (json_helpers.getString(value, "default_model")) |model| {
-        settings.default_model = model;
+        settings.default_model = try allocator.dupe(u8, model);
     }
     if (json_helpers.getInt(value, "max_tokens")) |mt| {
         if (mt > 0 and mt <= 128000) {
@@ -117,14 +121,14 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
 
     // Parse API keys
     if (json_helpers.getObject(value, "api_keys")) |keys| {
-        if (json_helpers.getString(keys, "openai")) |k| settings.api_keys.openai = k;
-        if (json_helpers.getString(keys, "anthropic")) |k| settings.api_keys.anthropic = k;
-        if (json_helpers.getString(keys, "brave")) |k| settings.api_keys.brave_api_key = k;
+        if (json_helpers.getString(keys, "openai")) |k| settings.api_keys.openai = try allocator.dupe(u8, k);
+        if (json_helpers.getString(keys, "anthropic")) |k| settings.api_keys.anthropic = try allocator.dupe(u8, k);
+        if (json_helpers.getString(keys, "brave")) |k| settings.api_keys.brave_api_key = try allocator.dupe(u8, k);
     }
 
     // Parse system prompt
     if (json_helpers.getString(value, "system_prompt")) |sp| {
-        settings.system_prompt = sp;
+        settings.system_prompt = try allocator.dupe(u8, sp);
     }
 }
 

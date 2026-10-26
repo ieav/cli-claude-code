@@ -12,7 +12,7 @@ pub const TaskPriority = enum(u8) {
     background = 4,
 };
 
-pub const TaskStatus = enum {
+pub const TaskStatus = enum(u8) {
     pending,
     running,
     completed,
@@ -45,8 +45,6 @@ pub const ThreadPool = struct {
     total_completed: std.atomic.Value(usize),
     total_failed: std.atomic.Value(usize),
     shutdown: std.atomic.Value(bool),
-    notify: std.Thread.Condition,
-    mutex: std.Thread.Mutex,
     max_concurrent: usize,
     next_task_id: std.atomic.Value(u64),
 
@@ -66,8 +64,6 @@ pub const ThreadPool = struct {
             .total_completed = std.atomic.Value(usize).init(0),
             .total_failed = std.atomic.Value(usize).init(0),
             .shutdown = std.atomic.Value(bool).init(false),
-            .notify = .{},
-            .mutex = .{},
             .max_concurrent = max_concurrent,
             .next_task_id = std.atomic.Value(u64).init(0),
         };
@@ -84,9 +80,6 @@ pub const ThreadPool = struct {
 
     pub fn deinit(self: *Self) void {
         self.shutdown.store(true, .release);
-        self.mutex.lock();
-        self.notify.broadcast();
-        self.mutex.unlock();
 
         for (self.threads) |t| {
             t.join();
@@ -102,10 +95,6 @@ pub const ThreadPool = struct {
         if (!self.queue.push(task)) {
             return error.QueueFull;
         }
-
-        self.mutex.lock();
-        self.notify.signal();
-        self.mutex.unlock();
     }
 
     pub fn cancel(self: *Self, task_id: u64) bool {
@@ -141,7 +130,7 @@ pub const ThreadPool = struct {
                 }
 
                 task.status.store(.running, .release);
-                task.execute_fn(self.allocator, task.ctx) catch {
+                task.execute_fn(&self.allocator, task.ctx) catch {
                     task.status.store(.failed, .release);
                     _ = self.total_failed.fetchAdd(1, .monotonic);
                     continue;
@@ -150,10 +139,11 @@ pub const ThreadPool = struct {
                 task.status.store(.completed, .release);
                 _ = self.total_completed.fetchAdd(1, .monotonic);
             } else {
-                // Wait for notification
-                self.mutex.lock();
-                self.notify.wait(&self.mutex, 1 * std.time.ns_per_ms);
-                self.mutex.unlock();
+                // Queue empty: poll. The MPSC queue is lock-free, so a short
+                // sleep-then-retry replaces the old mutex/condition wait
+                // (Zig 0.17 moved Condition into std.Io).
+                var req: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.c.nanosleep(&req, null);
             }
         }
     }

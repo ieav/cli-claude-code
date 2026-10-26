@@ -9,7 +9,7 @@ pub const Os = enum {
     unknown,
 
     pub fn current() Os {
-        return switch (std.Target.current.os.tag) {
+        return switch (@import("builtin").target.os.tag) {
             .linux => .linux,
             .macos => .macos,
             .windows => .windows,

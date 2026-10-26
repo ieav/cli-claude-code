@@ -47,10 +47,12 @@ pub const SSEParser = struct {
         return self.events.items.len - count_before;
     }
 
-    /// Get and drain all parsed events.
+    /// Get and drain all parsed events. Ownership of the events and their
+    /// strings moves to the caller: free each string, then the slice itself.
     pub fn drain(self: *Self) []SSEEvent {
         const items = self.events.items;
-        const result = self.allocator.dupe(SSEEvent, items) catch &.{};
+        if (items.len == 0) return &.{};
+        const result = self.allocator.dupe(SSEEvent, items) catch return &.{};
         self.events.shrinkRetainingCapacity(0);
         return @constCast(result);
     }
@@ -62,7 +64,9 @@ pub const SSEParser = struct {
             if (boundary == null) break;
 
             const event_bytes = buf[0..boundary.?];
-            buf = buf[boundary.? + 2 ..];
+            // Separator is "\n\n" or "\r\n\r\n"; skip its full width.
+            const sep_len: usize = if (buf[boundary.?] == '\r') 4 else 2;
+            buf = buf[boundary.? + sep_len ..];
 
             var event = SSEEvent{};
             var lines = std.mem.splitSequence(u8, event_bytes, "\n");
@@ -107,8 +111,8 @@ pub const SSEParser = struct {
     fn findDoubleNewline(buf: []const u8) ?usize {
         var i: usize = 0;
         while (i + 1 < buf.len) : (i += 1) {
-            if (buf[i] == '\n' and buf[i + 1] == '\n') return i + 2;
-            if (buf[i] == '\r' and i + 2 < buf.len and buf[i + 1] == '\n' and buf[i + 2] == '\r') return i + 4;
+            if (buf[i] == '\n' and buf[i + 1] == '\n') return i;
+            if (buf[i] == '\r' and i + 3 < buf.len and buf[i + 1] == '\n' and buf[i + 2] == '\r' and buf[i + 3] == '\n') return i;
         }
         return null;
     }

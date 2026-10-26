@@ -1,6 +1,7 @@
 /// Memory system coordinator — dispatches across working/episodic/semantic tiers.
 const std = @import("std");
 const time_mod = @import("../util/time.zig");
+const fs_ops = @import("../util/fs_ops.zig");
 const types = @import("types.zig");
 const working = @import("working.zig");
 const episodic = @import("episodic.zig");
@@ -55,7 +56,7 @@ test "MemorySystem store and retrieve" {
     // Note: requires a temp database
     var tmp: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&tmp, "/tmp/zage_mem_test_{d}.db", .{time_mod.nowMillis()}) catch return;
-    defer std.posix.unlink(path) catch {};
+    defer _ = fs_ops.deleteFile(path);
 
     var db = try database.Database.init(std.testing.allocator, path);
     defer db.deinit();

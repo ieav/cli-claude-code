@@ -1,12 +1,11 @@
 /// Runtime detection rules — check system health and identify issues.
 /// Each rule produces a CheckResult with suggested fixes.
-
 const std = @import("std");
 
 pub const RuleSeverity = enum {
     info,
     warning,
-    error,
+    @"error",
     critical,
 };
 

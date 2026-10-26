@@ -48,7 +48,7 @@ pub const EventBus = struct {
     pub fn deinit(self: *Self) void {
         var iter = self.handlers.iterator();
         while (iter.next()) |entry| {
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.handlers.deinit();
     }
@@ -56,9 +56,9 @@ pub const EventBus = struct {
     pub fn subscribe(self: *Self, event_type: EventType, handler: EventHandler) !void {
         const result = try self.handlers.getOrPut(event_type);
         if (!result.found_existing) {
-            result.value_ptr.* = std.ArrayList(EventHandler).init(self.allocator);
+            result.value_ptr.* = std.ArrayList(EventHandler).empty;
         }
-        try result.value_ptr.append(handler);
+        try result.value_ptr.append(self.allocator, handler);
     }
 
     pub fn emit(self: *Self, event_type: EventType, message: []const u8) void {

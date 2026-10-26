@@ -112,7 +112,14 @@ pub const ClaudeProvider = struct {
 
             _ = sse_parser.feed(chunk_buf[0..n]) catch {};
             const events = sse_parser.drain();
-            defer self.allocator.free(events);
+            defer {
+                for (events) |evt| {
+                    if (evt.event) |s| self.allocator.free(s);
+                    if (evt.data) |s| self.allocator.free(s);
+                    if (evt.id) |s| self.allocator.free(s);
+                }
+                self.allocator.free(events);
+            }
 
             for (events) |evt| {
                 if (evt.data) |data| {
@@ -318,7 +325,14 @@ pub const ClaudeProvider = struct {
     }
 
     fn parseResponse(self: *Self, body: []const u8) !provider.CompleteResponse {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
+        // Parse into a response-owned arena so free() can release the DOM.
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch
             return provider.ProviderError.InvalidRequest;
 
         // Check for Anthropic error format
@@ -384,6 +398,7 @@ pub const ClaudeProvider = struct {
             .content = try content_blocks.toOwnedSlice(self.allocator),
             .usage = usage,
             .stop_reason = stop_reason,
+            .dom_arena = arena,
         };
     }
 };
@@ -464,12 +479,7 @@ test "Claude parseResponse extracts text content" {
         \\{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"Hello from Claude!"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}
     ;
     const resp = try p.parseResponse(response_json);
-    defer {
-        for (resp.content) |b| {
-            if (b == .text) std.testing.allocator.free(b.text);
-        }
-        std.testing.allocator.free(resp.content);
-    }
+    defer resp.free(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), resp.content.len);
     try std.testing.expectEqualStrings("Hello from Claude!", resp.content[0].text);
@@ -489,15 +499,7 @@ test "Claude parseResponse handles tool_use" {
         \\{"id":"msg_456","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}],"model":"claude-sonnet-4-6","stop_reason":"tool_use","usage":{"input_tokens":20,"output_tokens":15}}
     ;
     const resp = try p.parseResponse(response_json);
-    defer {
-        for (resp.content) |b| {
-            if (b == .tool_use) {
-                std.testing.allocator.free(b.tool_use.id);
-                std.testing.allocator.free(b.tool_use.name);
-            }
-        }
-        std.testing.allocator.free(resp.content);
-    }
+    defer resp.free(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), resp.content.len);
     try std.testing.expect(resp.content[0] == .tool_use);

@@ -51,7 +51,8 @@ pub fn goldenSectionSearch(
 /// Each condensation pass reduces to φ ≈ 61.8% of original.
 pub fn condensationTarget(original_count: usize) usize {
     if (original_count == 0) return 0;
-    const target = @round(@as(f64, @floatFromInt(original_count)) * constants.PHI);
+    // Floor (truncate): the common denominator of all phi tests (61.8 -> 61).
+    const target = @as(f64, @floatFromInt(original_count)) * constants.PHI;
     return @max(1, @as(usize, @intFromFloat(target)));
 }
 
@@ -70,7 +71,7 @@ pub fn pruningThreshold(max_weight: f64) f64 {
 }
 
 /// Optimal dimension after golden ratio compression.
-/// e.g., 1536 → 950 (preserving ~61.8% of dimensions).
+/// e.g., 1536 → 949 (preserving ~61.8% of dimensions; round, not ceil).
 pub fn compressedDimension(original_dim: usize) usize {
     return condensationTarget(original_dim);
 }
@@ -114,7 +115,8 @@ test "goldenSectionSearch finds minimum" {
 
 test "condensationTarget" {
     try std.testing.expectEqual(@as(usize, 618), condensationTarget(1000));
-    try std.testing.expectEqual(@as(usize, 62), condensationTarget(100));
+    // Floor semantics: 100 x 0.618 = 61.8 -> 61 (matches compaction's test).
+    try std.testing.expectEqual(@as(usize, 61), condensationTarget(100));
     try std.testing.expectEqual(@as(usize, 1), condensationTarget(1));
     try std.testing.expectEqual(@as(usize, 0), condensationTarget(0));
 }
@@ -131,5 +133,5 @@ test "pruningThreshold" {
 }
 
 test "compressedDimension" {
-    try std.testing.expectEqual(@as(usize, 950), compressedDimension(1536));
+    try std.testing.expectEqual(@as(usize, 949), compressedDimension(1536));
 }

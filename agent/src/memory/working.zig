@@ -12,7 +12,7 @@ pub const WorkingMemory = struct {
     pub fn init(allocator: std.mem.Allocator, max_entries: usize) Self {
         return .{
             .allocator = allocator,
-            .entries = std.ArrayList(types.MemoryEntry).init(allocator),
+            .entries = std.ArrayList(types.MemoryEntry).empty,
             .max_entries = max_entries,
         };
     }
@@ -23,10 +23,19 @@ pub const WorkingMemory = struct {
             self.allocator.free(entry.description);
             self.allocator.free(entry.content);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     pub fn store(self: *Self, entry: types.MemoryEntry) !void {
+        // Take defensive copies; WorkingMemory owns its strings, so callers
+        // may pass literals.
+        var owned = entry;
+        owned.name = try self.allocator.dupe(u8, entry.name);
+        errdefer self.allocator.free(owned.name);
+        owned.description = try self.allocator.dupe(u8, entry.description);
+        errdefer self.allocator.free(owned.description);
+        owned.content = try self.allocator.dupe(u8, entry.content);
+
         // Evict oldest if at capacity
         if (self.entries.items.len >= self.max_entries) {
             const old = self.entries.orderedRemove(0);
@@ -34,7 +43,7 @@ pub const WorkingMemory = struct {
             self.allocator.free(old.description);
             self.allocator.free(old.content);
         }
-        try self.entries.append(entry);
+        try self.entries.append(self.allocator, owned);
     }
 
     pub fn retrieve(self: *Self, query: []const u8, max_results: usize) []const types.MemoryEntry {

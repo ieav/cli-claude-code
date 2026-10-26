@@ -75,7 +75,7 @@ pub const RuntimeMonitor = struct {
                 .pass => {},
                 .fail => |info| {
                     _ = self.total_failures.fetchAdd(1, .monotonic);
-                    try failures.append(info);
+                    try failures.append(self.allocator, info);
 
                     // Emit event if bus is available
                     if (self.event_bus_ref) |bus| {
@@ -97,8 +97,8 @@ pub const RuntimeMonitor = struct {
 
     fn monitorLoop(self: *Self) void {
         while (self.running.load(.monotonic)) {
-            var failures = std.ArrayList(rules.FailedCheck).init(self.allocator);
-            defer failures.deinit();
+            var failures = std.ArrayList(rules.FailedCheck).empty;
+            defer failures.deinit(self.allocator);
 
             self.runChecks(&failures) catch continue;
 
@@ -109,7 +109,8 @@ pub const RuntimeMonitor = struct {
                 }
             }
 
-            std.time.sleep(self.check_interval_ms * std.time.ns_per_ms);
+            var req: std.c.timespec = .{ .sec = 0, .nsec = @intCast(self.check_interval_ms * std.time.ns_per_ms) };
+            _ = std.c.nanosleep(&req, null);
         }
     }
 };
@@ -124,8 +125,8 @@ test "RuntimeMonitor runChecks" {
     var monitor = RuntimeMonitor.init(std.testing.allocator);
 
     // Default context should pass all checks
-    var failures = std.ArrayList(rules.FailedCheck).init(std.testing.allocator);
-    defer failures.deinit();
+    var failures = std.ArrayList(rules.FailedCheck).empty;
+    defer failures.deinit(std.testing.allocator);
 
     try monitor.runChecks(&failures);
     try std.testing.expectEqual(@as(usize, 0), failures.items.len);

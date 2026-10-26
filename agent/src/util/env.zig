@@ -31,9 +31,9 @@ pub fn getInt(key: []const u8, comptime T: type, default: T) T {
 pub fn getBool(key: []const u8, default: bool) bool {
     const val = get(key) orelse return default;
     if (std.mem.eql(u8, val, "1")) return true;
-    if (std.mem.eqlCaseInsensitiveASCII(val, "true")) return true;
-    if (std.mem.eqlCaseInsensitiveASCII(val, "yes")) return true;
-    if (std.mem.eqlCaseInsensitiveASCII(val, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(val, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(val, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(val, "on")) return true;
     return false;
 }
 

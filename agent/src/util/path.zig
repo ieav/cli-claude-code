@@ -2,9 +2,10 @@
 const std = @import("std");
 
 /// Get the file extension (including dot) from a path, or null if none.
+/// Uses the first dot so compound extensions stay whole: "a.tar.gz" -> ".tar.gz".
 pub fn extension(path: []const u8) ?[]const u8 {
     const basename = std.fs.path.basename(path);
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return null;
+    const dot = std.mem.indexOfScalar(u8, basename, '.') orelse return null;
     if (dot == 0) return null; // hidden files like .gitignore
     return basename[dot..];
 }

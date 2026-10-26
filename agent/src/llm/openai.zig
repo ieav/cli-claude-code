@@ -112,7 +112,14 @@ pub const OpenAIProvider = struct {
 
             _ = sse_parser.feed(chunk_buf[0..n]) catch {};
             const events = sse_parser.drain();
-            defer self.allocator.free(events);
+            defer {
+                for (events) |evt| {
+                    if (evt.event) |s| self.allocator.free(s);
+                    if (evt.data) |s| self.allocator.free(s);
+                    if (evt.id) |s| self.allocator.free(s);
+                }
+                self.allocator.free(events);
+            }
 
             for (events) |evt| {
                 if (evt.data) |data| {
@@ -287,7 +294,14 @@ pub const OpenAIProvider = struct {
     }
 
     fn parseResponse(self: *Self, body: []const u8) !provider.CompleteResponse {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
+        // Parse into a response-owned arena so free() can release the DOM.
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch
             return provider.ProviderError.InvalidRequest;
 
         const choices = parsed.object.get("choices") orelse return provider.ProviderError.InvalidRequest;
@@ -344,6 +358,7 @@ pub const OpenAIProvider = struct {
             .content = try content_blocks.toOwnedSlice(self.allocator),
             .usage = usage,
             .stop_reason = stop_reason,
+            .dom_arena = arena,
         };
     }
 
@@ -461,12 +476,7 @@ test "OpenAI parseResponse extracts content and usage" {
         \\{"id":"chatcmpl-123","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}
     ;
     const resp = try p.parseResponse(body);
-    defer {
-        for (resp.content) |b| {
-            if (b == .text) std.testing.allocator.free(b.text);
-        }
-        std.testing.allocator.free(resp.content);
-    }
+    defer resp.free(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), resp.content.len);
     try std.testing.expectEqualStrings("Hi there!", resp.content[0].text);

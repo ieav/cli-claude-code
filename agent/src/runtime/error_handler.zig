@@ -52,23 +52,23 @@ fn analyzeError(allocator: std.mem.Allocator, code: []const u8, message: []const
 }
 
 fn suggestFixes(allocator: std.mem.Allocator, code: []const u8) ![]const FixOption {
-    var fixes = std.ArrayList(FixOption).init(allocator);
-    defer fixes.deinit();
+    var fixes = std.ArrayList(FixOption).empty;
+    defer fixes.deinit(allocator);
 
     if (std.mem.eql(u8, code, "network_timeout")) {
-        try fixes.append(.{ .index = 1, .description = "重试（推荐）", .is_recommended = true });
-        try fixes.append(.{ .index = 2, .description = "切换到本地模型", .is_recommended = false });
-        try fixes.append(.{ .index = 3, .description = "启用离线模式", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 1, .description = "重试（推荐）", .is_recommended = true });
+        try fixes.append(allocator, .{ .index = 2, .description = "切换到本地模型", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 3, .description = "启用离线模式", .is_recommended = false });
     } else if (std.mem.eql(u8, code, "api_rate_limit")) {
-        try fixes.append(.{ .index = 1, .description = "暂停后台任务（推荐）", .is_recommended = true });
-        try fixes.append(.{ .index = 2, .description = "降低调用频率", .is_recommended = false });
-        try fixes.append(.{ .index = 3, .description = "切换到本地模型", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 1, .description = "暂停后台任务（推荐）", .is_recommended = true });
+        try fixes.append(allocator, .{ .index = 2, .description = "降低调用频率", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 3, .description = "切换到本地模型", .is_recommended = false });
     } else if (std.mem.eql(u8, code, "context_overflow")) {
-        try fixes.append(.{ .index = 1, .description = "φ 浓缩对话（推荐）", .is_recommended = true });
-        try fixes.append(.{ .index = 2, .description = "开始新会话", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 1, .description = "φ 浓缩对话（推荐）", .is_recommended = true });
+        try fixes.append(allocator, .{ .index = 2, .description = "开始新会话", .is_recommended = false });
     } else {
-        try fixes.append(.{ .index = 1, .description = "重试", .is_recommended = true });
-        try fixes.append(.{ .index = 2, .description = "跳过", .is_recommended = false });
+        try fixes.append(allocator, .{ .index = 1, .description = "重试", .is_recommended = true });
+        try fixes.append(allocator, .{ .index = 2, .description = "跳过", .is_recommended = false });
     }
 
     return allocator.dupe(FixOption, fixes.items);

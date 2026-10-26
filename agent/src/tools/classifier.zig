@@ -130,7 +130,10 @@ test "classifier safe tools" {
 }
 
 test "classifier blocks destructive" {
-    const result = classify(&registry.bash_tool, .{});
+    var cmd_obj: std.json.ObjectMap = .empty;
+    defer cmd_obj.deinit(std.testing.allocator);
+    try cmd_obj.put(std.testing.allocator, "command", .{ .string = "rm -rf /" });
+    const result = classify(&registry.bash_tool, .{ .object = cmd_obj });
     switch (result) {
         .block => {},
         else => return error.ExpectedBlock,

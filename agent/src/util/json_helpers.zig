@@ -53,9 +53,10 @@ pub fn getObject(value: std.json.Value, key: []const u8) ?std.json.Value {
     };
 }
 
-/// Parse a JSON string into a Value. Caller must free via allocator.
-pub fn parse(allocator: std.mem.Allocator, json_str: []const u8) !std.json.Value {
-    return std.json.parseFromSliceLeaky(std.json.Value, allocator, json_str, .{});
+/// Parse a JSON string into a Value. Returns a Parsed wrapper; call
+/// `parsed.deinit()` to free the DOM.
+pub fn parse(allocator: std.mem.Allocator, json_str: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
 }
 
 /// Serialize a JSON Value to a string. Caller owns the returned slice.
@@ -76,9 +77,11 @@ pub fn serializePretty(allocator: std.mem.Allocator, value: std.json.Value) ![]u
 
 test "getString" {
     const alloc = std.testing.allocator;
-    const v = try parse(alloc,
+    const parsed = try parse(alloc,
         \\{"name":"test","count":42,"active":true}
     );
+    defer parsed.deinit();
+    const v = parsed.value;
     try std.testing.expectEqualStrings("test", getString(v, "name").?);
     try std.testing.expectEqual(@as(i64, 42), getInt(v, "count").?);
     try std.testing.expectEqual(true, getBool(v, "active").?);

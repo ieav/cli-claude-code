@@ -30,7 +30,7 @@ pub const ToolResultBlock = struct {
 
 pub const Message = struct {
     role: MessageRole,
-    content: []ContentBlock,
+    content: []const ContentBlock,
     timestamp: i64,
 };
 
@@ -41,9 +41,23 @@ pub const CompleteOptions = struct {
 };
 
 pub const CompleteResponse = struct {
-    content: []ContentBlock,
+    content: []const ContentBlock,
     usage: Usage,
     stop_reason: StopReason,
+    /// Owns the JSON DOM that backs the string slices in `content`.
+    /// Providers that parse with this arena must keep it alive as long as
+    /// any content slice is readable; call free() to release everything.
+    dom_arena: ?*std.heap.ArenaAllocator = null,
+
+    /// Free the content slice and the backing DOM arena.
+    /// Note: any slices copied out of `content` dangle after this call.
+    pub fn free(self: @This(), allocator: std.mem.Allocator) void {
+        if (self.content.len > 0) allocator.free(@constCast(self.content));
+        if (self.dom_arena) |a| {
+            a.deinit();
+            allocator.destroy(a);
+        }
+    }
 
     pub const StopReason = enum {
         end_turn,

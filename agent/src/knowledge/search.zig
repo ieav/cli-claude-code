@@ -268,9 +268,44 @@ pub const WebSearch = struct {
     fn readResponseBody(self: *Self, response: *std.http.Client.Response) ![]u8 {
         var transfer_buf: [8192]u8 = undefined;
         const reader = response.reader(&transfer_buf);
-        const content_length = response.head.content_length orelse 1024 * 64;
-        const body = try reader.readAlloc(self.allocator, content_length);
-        return body;
+        const raw = try readAllCapped(reader, self.allocator);
+        errdefer self.allocator.free(raw);
+
+        // Decompress transparently. Some servers (DDG over HTTP/1.1) send
+        // gzip bodies WITHOUT a Content-Encoding header, so sniff the magic
+        // bytes in addition to trusting the header.
+        const container: ?std.compress.flate.Container = if (response.head.content_encoding == .gzip or
+            (raw.len >= 2 and raw[0] == 0x1f and raw[1] == 0x8b))
+            .gzip
+        else if (response.head.content_encoding == .deflate)
+            .zlib
+        else
+            null;
+
+        if (container) |c| {
+            defer self.allocator.free(raw);
+            var in_reader = std.Io.Reader.fixed(raw);
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var d = std.compress.flate.Decompress.init(&in_reader, c, &window);
+            return readAllCapped(&d.reader, self.allocator);
+        }
+        return raw;
+    }
+
+    /// Read a body chunk-by-chunk instead of allocRemaining: some servers
+    /// (DDG) close the stream without the standard chunked terminator, which
+    /// makes allocRemaining fail even though the body arrived intact.
+    /// Keep whatever was read; cap at 4 MB.
+    fn readAllCapped(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(allocator);
+        var chunk: [8192]u8 = undefined;
+        while (list.items.len < 4 * 1024 * 1024) {
+            const n = reader.readSliceShort(&chunk) catch break;
+            if (n == 0) break;
+            try list.appendSlice(allocator, chunk[0..n]);
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     /// Parse DuckDuckGo HTML response to extract results.
@@ -280,8 +315,10 @@ pub const WebSearch = struct {
         var pos: usize = 0;
 
         while (pos < html.len and results.items.len < max_results) {
-            const title_marker = "<a class=\"result__a\"";
-            const title_start = std.mem.indexOfPos(u8, html, pos, title_marker) orelse break;
+            // DDG renders result links as <a rel="nofollow" class="result__a" href="…">
+            // — attribute order varies, so match on the class alone.
+            const class_marker = "class=\"result__a\"";
+            const title_start = std.mem.indexOfPos(u8, html, pos, class_marker) orelse break;
             const href_start = std.mem.indexOfPos(u8, html, title_start, "href=\"") orelse break;
             const href_begin = href_start + 6;
             const href_end = std.mem.indexOfScalar(u8, html[href_begin..], '"') orelse break;
@@ -325,8 +362,9 @@ pub const WebSearch = struct {
 
     /// URL-encode a query string for use in search URLs.
     pub fn urlEncode(self: *Self, input: []const u8) ![]u8 {
-        var buf = std.ArrayList(u8).empty;
-        const writer = buf.writer(self.allocator);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
 
         for (input) |c| {
             switch (c) {
@@ -341,7 +379,8 @@ pub const WebSearch = struct {
                 },
             }
         }
-        return buf.toOwnedSlice(self.allocator);
+        var list = aw.toArrayList();
+        return list.toOwnedSlice(self.allocator);
     }
 
     /// Generate search keywords from a user query using φ condensation.

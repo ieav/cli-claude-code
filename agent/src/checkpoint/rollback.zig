@@ -27,6 +27,9 @@ pub const RollbackPreview = struct {
     operations_to_undo: usize,
 };
 
+/// Sentinel op_id meaning "roll back everything (session start state)".
+pub const session_start_op_id: [16]u8 = @splat(0);
+
 pub const RollbackEngine = struct {
     history: *file_history.FileHistoryState,
     op_log: *op_log.OperationLog,
@@ -77,18 +80,25 @@ pub const RollbackEngine = struct {
             .operations_to_undo = 0,
         };
 
-        // Find target operation index
+        // Find target operation index. The all-zero sentinel means
+        // "undo everything back to the session start state".
         var target_idx: ?usize = null;
-        for (self.op_log.records.items, 0..) |rec, i| {
-            if (std.mem.eql(u8, &rec.op_id, &target_op_id)) {
-                target_idx = i;
-                break;
+        if (std.mem.eql(u8, &target_op_id, &session_start_op_id)) {
+            target_idx = std.math.maxInt(usize);
+        }
+        if (target_idx == null) {
+            for (self.op_log.records.items, 0..) |rec, i| {
+                if (std.mem.eql(u8, &rec.op_id, &target_op_id)) {
+                    target_idx = i;
+                    break;
+                }
             }
         }
         if (target_idx == null) return error.OperationNotFound;
 
         // Count operations and files from target+1 to end
-        var i: usize = target_idx.? + 1;
+        const start_idx: usize = if (target_idx.? == std.math.maxInt(usize)) 0 else target_idx.? + 1;
+        var i: usize = start_idx;
         while (i < self.op_log.records.items.len) : (i += 1) {
             const rec = self.op_log.records.items[i];
             preview.operations_to_undo += 1;
@@ -121,19 +131,26 @@ pub const RollbackEngine = struct {
         var error_list = std.ArrayList(RollbackError).empty;
         defer error_list.deinit(self.allocator);
 
-        // Find target operation
+        // Find target operation. The all-zero sentinel means
+        // "undo everything back to the session start state".
         var target_idx: ?usize = null;
-        for (self.op_log.records.items, 0..) |rec, i| {
-            if (std.mem.eql(u8, &rec.op_id, &target_op_id)) {
-                target_idx = i;
-                break;
+        if (std.mem.eql(u8, &target_op_id, &session_start_op_id)) {
+            target_idx = std.math.maxInt(usize);
+        }
+        if (target_idx == null) {
+            for (self.op_log.records.items, 0..) |rec, i| {
+                if (std.mem.eql(u8, &rec.op_id, &target_op_id)) {
+                    target_idx = i;
+                    break;
+                }
             }
         }
         if (target_idx == null) return error.OperationNotFound;
 
         // Restore snapshots in reverse order (latest first)
+        const start_idx: usize = if (target_idx.? == std.math.maxInt(usize)) 0 else target_idx.? + 1;
         var ri: usize = self.op_log.records.items.len;
-        while (ri > target_idx.? + 1) {
+        while (ri > start_idx) {
             ri -= 1;
             const rec = self.op_log.records.items[ri];
 
@@ -159,8 +176,11 @@ pub const RollbackEngine = struct {
             }
         }
 
-        // Remove undone operations from log
-        while (self.op_log.records.items.len > target_idx.? + 1) {
+        // Remove undone operations from log. For the session-start sentinel
+        // (maxInt) everything is undone; compute the keep-count without the
+        // maxInt+1 overflow.
+        const keep_count: usize = if (target_idx.? == std.math.maxInt(usize)) 0 else target_idx.? + 1;
+        while (self.op_log.records.items.len > keep_count) {
             const removed = self.op_log.records.pop() orelse break;
             self.allocator.free(removed.tool_name);
             self.allocator.free(removed.input);

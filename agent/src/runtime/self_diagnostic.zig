@@ -34,6 +34,13 @@ pub const DiagnosisReport = struct {
     root_cause: ?*const LogicGap,
     suggestions: []const ImprovementSuggestion,
     trace_summary: TraceSummary,
+
+    /// Free the heap-owned parts. Suggestion strings are static literals.
+    pub fn free(self: @This(), allocator: std.mem.Allocator) void {
+        for (self.identified_gaps) |g| allocator.free(g.description);
+        allocator.free(self.identified_gaps);
+        allocator.free(self.suggestions);
+    }
 };
 
 pub const TraceSummary = struct {
@@ -58,8 +65,8 @@ pub const SelfDiagnostic = struct {
         trace: *const decision_trace.DecisionTrace,
         user_concern: []const u8,
     ) !DiagnosisReport {
-        var gaps = std.ArrayList(LogicGap).init(self.allocator);
-        defer gaps.deinit();
+        var gaps = std.ArrayList(LogicGap).empty;
+        defer gaps.deinit(self.allocator);
 
         var weakest_confidence: f64 = 1.0;
         var weakest_step: ?u32 = null;
@@ -68,7 +75,7 @@ pub const SelfDiagnostic = struct {
         for (trace.getSteps()) |step| {
             // Check 1: Confidence below φ threshold
             if (step.confidence < math.constants.PHI) {
-                try gaps.append(.{
+                try gaps.append(self.allocator, .{
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .insufficient_depth,
@@ -89,7 +96,7 @@ pub const SelfDiagnostic = struct {
 
             // Check 2: Very long duration may indicate stuck/inefficient
             if (step.duration_ms > 30_000) {
-                try gaps.append(.{
+                try gaps.append(self.allocator, .{
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .wrong_decision,
@@ -104,7 +111,7 @@ pub const SelfDiagnostic = struct {
 
             // Check 3: Empty output suggests a gap
             if (step.output.len == 0 and step.input.len > 0) {
-                try gaps.append(.{
+                try gaps.append(self.allocator, .{
                     .step_id = step.step_id,
                     .phase = step.phase,
                     .gap_type = .context_lost,
@@ -118,25 +125,26 @@ pub const SelfDiagnostic = struct {
             }
         }
 
-        // Find root cause (highest severity gap)
-        var root_cause: ?*const LogicGap = null;
+        // Find root cause (highest severity gap). Track the index: a pointer
+        // into gaps.items would dangle once the list is freed.
+        var root_cause_idx: ?usize = null;
         var max_severity: f64 = 0;
-        for (gaps.items) |*g| {
+        for (gaps.items, 0..) |*g, i| {
             if (g.severity > max_severity) {
                 max_severity = g.severity;
-                root_cause = g;
+                root_cause_idx = i;
             }
         }
 
         // Generate suggestions based on gaps
-        var suggestions = std.ArrayList(ImprovementSuggestion).init(self.allocator);
-        defer suggestions.deinit();
+        var suggestions = std.ArrayList(ImprovementSuggestion).empty;
+        defer suggestions.deinit(self.allocator);
 
         if (gaps.items.len > 0) {
             for (gaps.items) |gap| {
                 switch (gap.gap_type) {
                     .insufficient_depth => {
-                        try suggestions.append(.{
+                        try suggestions.append(self.allocator, .{
                             .for_phase = gap.phase,
                             .suggestion = "增加该阶段的信息检索范围",
                             .auto_applicable = true,
@@ -144,7 +152,7 @@ pub const SelfDiagnostic = struct {
                         });
                     },
                     .context_lost => {
-                        try suggestions.append(.{
+                        try suggestions.append(self.allocator, .{
                             .for_phase = gap.phase,
                             .suggestion = "检查上下文传递是否有断裂",
                             .auto_applicable = false,
@@ -152,7 +160,7 @@ pub const SelfDiagnostic = struct {
                         });
                     },
                     .wrong_decision => {
-                        try suggestions.append(.{
+                        try suggestions.append(self.allocator, .{
                             .for_phase = gap.phase,
                             .suggestion = "检查工具选择逻辑",
                             .auto_applicable = false,
@@ -164,14 +172,24 @@ pub const SelfDiagnostic = struct {
             }
         }
 
-        // Own the slices
-        const owned_gaps = try self.allocator.dupe(LogicGap, gaps.items);
+        // Own the slices. Deep-copy gap descriptions first — a shallow dupe
+        // would leave owned_gaps pointing at the strings freed below. Only
+        // the filled prefix may be freed on the error path.
+        const owned_gaps = try self.allocator.alloc(LogicGap, gaps.items.len);
+        var filled: usize = 0;
+        errdefer for (owned_gaps[0..filled]) |g| self.allocator.free(g.description);
+        for (gaps.items, 0..) |g, i| {
+            owned_gaps[i] = g;
+            owned_gaps[i].description = try self.allocator.dupe(u8, g.description);
+            filled = i + 1;
+        }
+        for (gaps.items) |g| self.allocator.free(g.description);
         const owned_suggestions = try self.allocator.dupe(ImprovementSuggestion, suggestions.items);
 
         return DiagnosisReport{
             .user_concern = user_concern,
             .identified_gaps = owned_gaps,
-            .root_cause = root_cause,
+            .root_cause = if (root_cause_idx) |i| &owned_gaps[i] else null,
             .suggestions = owned_suggestions,
             .trace_summary = .{
                 .total_steps = trace.getSteps().len,
@@ -194,9 +212,9 @@ test "SelfDiagnostic identifies low confidence steps" {
         .step_id = 1,
         .phase = .memory_retrieval,
         .timestamp = 0,
-        .input = "query",
-        .output = "results",
-        .reasoning = "searched memory",
+        .input = try allocator.dupe(u8, "query"),
+        .output = try allocator.dupe(u8, "results"),
+        .reasoning = try allocator.dupe(u8, "searched memory"),
         .confidence = 0.3, // Below φ
         .duration_ms = 100,
         .alternatives = &.{},
@@ -207,19 +225,18 @@ test "SelfDiagnostic identifies low confidence steps" {
         .step_id = 2,
         .phase = .llm_generation,
         .timestamp = 0,
-        .input = "context",
-        .output = "response",
-        .reasoning = "generated",
+        .input = try allocator.dupe(u8, "context"),
+        .output = try allocator.dupe(u8, "response"),
+        .reasoning = try allocator.dupe(u8, "generated"),
         .confidence = 0.9,
         .duration_ms = 200,
         .alternatives = &.{},
-        .dependencies = &.{1},
+        .dependencies = try allocator.dupe(u32, &.{1}),
     });
 
     trace.complete();
     const report = try diag.diagnose(&trace, "why did you miss X?");
-    defer allocator.free(report.identified_gaps);
-    defer allocator.free(report.suggestions);
+    defer report.free(allocator);
 
     try std.testing.expect(report.identified_gaps.len >= 1);
     try std.testing.expect(report.root_cause != null);

@@ -13,6 +13,76 @@ pub const util = @import("util/mod.zig");
 pub const checkpoint = @import("checkpoint/mod.zig");
 pub const integration_tests = @import("tests/integration.zig");
 
+// Collect every module's tests into the test build. The `pub const` imports
+// above are lazily analyzed (nothing references them in test mode), so
+// without this block `zig build test` silently runs zero tests. Files are
+// listed individually: `_ = @import("x/mod.zig")` does NOT transitively
+// collect tests from x's submodules (pub consts stay lazily analyzed).
+test {
+    _ = @import("knowledge/graph.zig");
+    _ = @import("knowledge/search.zig");
+    _ = @import("llm/claude.zig");
+    _ = @import("llm/compaction.zig");
+    _ = @import("llm/message.zig");
+    _ = @import("llm/mod.zig");
+    _ = @import("llm/ollama.zig");
+    _ = @import("llm/openai.zig");
+    _ = @import("llm/streaming.zig");
+    _ = @import("math/constants.zig");
+    _ = @import("math/e_growth.zig");
+    _ = @import("math/phi_condense.zig");
+    _ = @import("math/pi_ring.zig");
+    _ = @import("memory/episodic.zig");
+    _ = @import("memory/extraction.zig");
+    _ = @import("memory/injection.zig");
+    _ = @import("memory/memory.zig");
+    _ = @import("memory/reflection.zig");
+    _ = @import("memory/working.zig");
+    _ = @import("research/optimization_researcher.zig");
+    _ = @import("runtime/builtin_rules.zig");
+    _ = @import("runtime/error_handler.zig");
+    _ = @import("runtime/monitor.zig");
+    _ = @import("runtime/self_diagnostic.zig");
+    _ = @import("storage/database.zig");
+    _ = @import("storage/vector.zig");
+    _ = @import("task/cron.zig");
+    _ = @import("task/event_bus.zig");
+    _ = @import("task/mpsc_queue.zig");
+    _ = @import("task/thread_pool.zig");
+    _ = @import("tests/integration.zig");
+    _ = @import("tools/auth_mode.zig");
+    _ = @import("tools/classifier.zig");
+    _ = @import("tools/denial_tracker.zig");
+    _ = @import("tools/orchestration.zig");
+    _ = @import("tools/registry.zig");
+    _ = @import("tools/rule_parser.zig");
+    _ = @import("tools/task_store.zig");
+    _ = @import("util/binary_check.zig");
+    _ = @import("util/cancel.zig");
+    _ = @import("util/diff.zig");
+    _ = @import("util/env.zig");
+    _ = @import("util/file_cache.zig");
+    _ = @import("util/find_executable.zig");
+    _ = @import("util/format.zig");
+    _ = @import("util/fs_ops.zig");
+    _ = @import("util/glob_match.zig");
+    _ = @import("util/hash.zig");
+    _ = @import("util/json_helpers.zig");
+    _ = @import("util/lockfile.zig");
+    _ = @import("util/memoize.zig");
+    _ = @import("util/path.zig");
+    _ = @import("util/platform.zig");
+    _ = @import("util/sanitization.zig");
+    _ = @import("util/semver.zig");
+    _ = @import("util/shell_quote.zig");
+    _ = @import("util/string_utils.zig");
+    _ = @import("util/system_dirs.zig");
+    _ = @import("util/tempfile.zig");
+    _ = @import("util/time.zig");
+    _ = @import("util/tokens.zig");
+    _ = @import("util/uuid.zig");
+}
+
 pub fn main() !void {
     // Create I/O context (Zig 0.16 Threaded Io)
     var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});

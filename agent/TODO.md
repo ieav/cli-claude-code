@@ -52,6 +52,75 @@
 - **同日收尾 (2026-10-26)**: `zig fmt` 0.17 已执行（91 文件重排，并自动升级 `@intFromEnum/@enumFromInt` → `@backingInt/@fromBackingInt` 共 12 处，零残留）；版本字符串修正（main.zig banner → v0.3.0、`/version` 改为动态取 `builtin.zig_version_string`、USAGE.md 环境表 → Zig 0.17.0，删除"版本号不一致"已知问题条目）；ZLS 经 zvm 升级至 0.17.0（zls 0.17.0 发布于 2026-10-19，已适配 zig 0.17）。
 - **剩余遗留**: `std.fmt.allocPrint`（65 处）0.17 弃用、0.18 移除 → 需迁移至 `Allocator.print`，建议 0.18 发布前一次性处理。
 
+### P12: 测试套件从未真正运行（重大发现）+ T1.1 episodic 参数化
+- **状态**: ✅ 已完成 (2026-10-26)
+- **发现**: main.zig 的 `pub const xxx = @import(...)` 是懒分析（无引用不执行），test 声明从未被收集——**`zig build test` 自仓库建立以来一直 0 测试空转却报"全绿"**。实证方法：往 integration.zig 现有测试塞必失败断言，套件依然通过。
+- **修复 1（测试基础设施）**: main.zig 增加 `test { _ = @import(...) }` 聚合块，首次激活 77 个测试。
+- **修复 2（激活暴露的 18 个历史失败）**:
+  - 0.17 死代码路径编译错误：ArrayList unmanaged 迁移残留 8 文件（.init→.empty、append/deinit 带 allocator）、dupeZ→dupeSentinel、std.fs.cwd→std.Io.Dir（fs_ops 重写为自带 Io 实例）、@ptrFromInt 对齐检查拒绝 SQLITE_TRANSIENT（-1）→ 改 SQLITE_STATIC 语义、`error` 关键字 enum 标签、std.sort 比较器改值语义、Writer.Allocating 适配
+  - 运行时真 bug：SSE 分隔符索引越界（findDoubleNewline 返回位置语义错误）+ drain() 事件字符串所有权泄漏、MPSC deinit 残留 tail 节点泄漏、self_diagnostic root_cause 悬垂指针（指向已释放的 gaps 缓冲）+ 静态字面量 free → bus error、util/time formatIso 有符号整型补零输出 '+' 号（转无符号修复）
+  - 测试自身错误：phi_condense 两测试期望自相矛盾（949.28 不可能同时 round 出 618 和 950，按 round 修正为 949）、KnowledgeGraph 硬编码 id 0（AUTOINCREMENT 从 1 起，改用返回值）、DecisionTrace 测试双重 free、researcher.research 依赖真网络标记 SkipZigTest
+- **修复 3（T1.1 本体）**: episodic.zig store/retrieveRecent/touch 全部改 prepared statement（sqlite_c.zig 增补 bind/column API、database.zig 新增 Statement 封装）；retrieveRecent 从空桩变为完整实现（含所有权契约 freeEntries）；注入载荷 `'; DROP TABLE memories;--` 往返测试通过。
+- **结果**: **76 pass / 1 skip / 77 total 全绿**；主程序 build + REPL 冒烟正常。
+
+### P13: 测试聚合不传递 + 第二波 0.17 迁移（M2 前置收尾）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **发现**: P12 的聚合块经 mod.zig 只收集了 77/168 个测试（`_ = @import("x/mod.zig")` 不会传递收集子文件测试——pub const 仍是懒分析）。改为逐文件列出全部 60 个含测试文件后激活 170 个测试，又暴露 40+ 个从未编译/运行的历史问题。
+- **修复（0.17 死路径编译错）**: working/reflection/message/extraction/orchestration 的 ArrayList 残留、uuid 的 `std.crypto.random`（改 ChaCha+SplitMix64 种子：时钟^栈地址^调用序号）、thread_pool/monitor 的 `Thread.Condition/Mutex`（移入 std.Io；worker 空闲等待改 nanosleep 轮询，MPSC 本就无锁）、lockfile/tempfile/find_executable 的 `std.fs.cwd`（Io 化重写）、`Target.current`→`builtin.target`、`fmtSliceHexLower`→`{x}` 格式、`eqlCaseInsensitiveASCII`→`ascii.eqlIgnoreCase`、PiRingBuffer 补 `getOldest`、json.Value union `.null` 初始化。
+- **修复（运行时真 bug）**: `getStringField/getIntField` 无 union 标签守卫（.null 输入 panic）、`bashIsDestructive` 缺 command 误判破坏性、parseResponse 的 JSON DOM 永不释放（CompleteResponse 增 `dom_arena` + `free()`；repl 侧因 history 引用 DOM 暂不调用，记为已知债）、WorkingMemory.store 改持有防御拷贝（调用方可传字面量）、extraction 移交事实所有权、json_helpers.parse 改返回 `Parsed(Value)`。
+- **修复（测试自身错）**: hash 测试抄错 SHA-256 向量（digest[1]=0xf2）、path 扩展名测试要求复合后缀（impl 改首点语义）、tokens 测试按词数但 impl 是 len/4（以 impl 为准）、phi/compaction 两测试对 condensationTarget(100) 期望互斥（61.8 不可能同时 floor 出 62 和 61，统一 floor 语义）、classifier 测试 `.null` 输入无意义（改真实 `rm -rf /` 输入）。
+- **结果**: **169 pass / 1 skip / 170 total 全绿**；主程序 build + REPL 冒烟正常。
+
+### P14: M2 记忆闭环（v0.3.x 核心能力）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **T3.1 会话结束提取**: repl 在 `/quit` 与 `/clear` 前调用 `extractSessionMemories`——遍历 history 的 user/assistant 文本块 → 启发式提取（extraction.zig，含中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…）→ `MemorySystem.store` 入 SQLite（`.ziv/memory.db`，含 runMigrations）。extraction 层新增同内容去重（一条消息命中多启发式只存一条）。
+- **T3.2 重启加载注入**: repl 启动时 `retrieveRecent(20)` → 新增 `memory/injection.zig` 的 `buildMemoryBlock` 拼装注入块，追加为 system message 的第二个 ContentBlock；`[INF] memory: injected N entries` 日志可审计。
+- **T3.3 预算截断**: 注入块 token 预算 800（util/tokens 估算），逐条累计、超预算即停、至少保 1 条；name/content 各截 48/200 字符。
+- **T3.4 端到端验证**: 自动化测试 3 个（空入参 null / 预算截断含关键词 / 库存-重载-注入闭环）+ 人工两段式验证通过：会话1 存 1 条 → 重启注入 1 条 → 库中记录可查。
+- **修复过程中的真 bug**: 初版没跑 `runMigrations()`（表不存在、facade 吞错、"Saved N" 计数虚高假阳性）——已修：migrations 失败则禁用记忆并告警。
+- **已知限制（后续迭代）**: ① 注入排序按 recency，相似度检索（向量化）留到 M4/M8；② memory facade 的 store 对 episodic 失败只打 warning 不上报；③ repl 内 CompleteResponse 因 history 引用 DOM 暂不调用 free()（会话级泄漏，P13 已记）。
+
+### P15: 既有功能闭环验收（M4 前实测审计）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **验收矩阵**: A 记忆跨会话重复 / B `/rewind` 实测 / C 管道多行 / D `/stats`·`/context`·`/undo`·`/compact` 冒烟。
+- **A 发现并修复**: 同一句话跨会话重复入库（`memoryId` 混入时间戳导致同内容 id 不同）→ 改纯内容双 Wyhash id + episodic INSERT 改 `INSERT OR REPLACE`（幂等 upsert，重复提及自动刷新 updated_at，配合 recency 排序合理）。复验：两会话同句 → 库中 1 条、0 重复。
+- **B 发现并修复**: `/rewind` 语义为"跳到该操作**之后**"，选最新操作永远无事可回滚 → rollback.zig 增加 `session_start_op_id` 全零哨兵（preview/rollbackTo 对其撤销全部），列表新增 `[0] Session start (undo all file changes)`。复验：FileWrite MODIFIED → /rewind 0 → y → 文件恢复 ORIGINAL。
+- **C 洗清**: 管道多行**实测正常**（P8 修 streamDelimiter 时已顺带修好），USAGE §9.3 对应已知问题为陈旧信息，已删除。
+- **D 顺带修复**: `/context` 输出 `61.8%%` 双百分号转义错误 → `%`。四命令冒烟均正常。
+- **备注**: `/rewind` 的序号选择与 y/N 确认在管道模式下会消费后续输入行——属交互式命令在管道场景的固有行为，不视为缺陷。
+
+### P16: M4 反思接入
+- **状态**: ✅ 已完成 (2026-10-26)
+- **T4.1 反思触发**: repl 会话内维护"反思窗口"（最近 20 条查询 dupe + 工具/错误计数）；每轮 agent 交换结束调用 `shouldReflect()`（每 10 轮或 π×10min 间隔触发）；`/quit` 时若窗口非空强制触发（on_session_end）。`reflect()` 增加 trigger 参数。
+- **T4.2 经验入库**: 反思产出的 insights 以 `.feedback` 类型记忆入库（`INSERT OR REPLACE` 幂等），下一会话自动注入 system prompt——反思经验跨会话生效。`executeAndRecord` 改为返回 `!bool`（是否出错）供错误率计算。
+- **T4.3 /memory 命令**: 展示本会话注入条数 + 最近 5 条库存（类型 + 名称）；`/help` 已收录。
+- **实测**: 单查询会话 → /quit → `[Reflection] 交互质量良好…` + 提取 1 条；重启注入 2 条（reflection + 提取记忆）；`/memory` 列表正确。
+- **触发提示**: 反思窗口计入的是"发给 LLM 的输入"（命令不计）；无 API key 时 LLM 调用失败但查询已入窗，反思照常触发。
+
+### P17: 代码审查（业务链闭环，code-review-skill）
+- **状态**: ✅ 已完成 (2026-10-26)，3 项发现全部修复
+- **🔴 R1 config UAF（P13 引入的回归）**: `json_helpers.parse` 改返回 `Parsed(Value)` 后，`loadJsonIntoSettings` 把 default_model/api_keys/system_prompt 以**指向解析域的切片**存入 settings，函数返回 DOM 即释放 → use-after-free。修复：全部字段 `allocator.dupe`。实测：临时 settings.json 指定 llama3.2 → 启动后提示符与 /model 正确显示（验证后清理配置，净零）。
+- **🔴 R2 回滚哨兵溢出崩溃（P15 引入）**: `rollbackTo` 尾部 `target_idx.? + 1` 对 session_start 哨兵（maxInt）是 usize 溢出 → debug 构建 panic。**P15 验收时输出被截断掩盖了崩溃**（文件恢复≠全链路无恙，局部验证陷阱实证）。修复：`keep_count` 显式分支计算。复验：Restored → (1 restored, 0 errors) → /quit Goodbye 全程无崩。
+- **🟡 R3 流式事件泄漏（P13 drain 语义变更未同步调用方）**: drain 改为所有权移交后，claude/openai 的 stream() 只 free 切片不 free 事件字符串 → 每个流式响应泄漏。修复：调用方补齐 event/data/id 三字段释放。
+- **链路复核结论**: 记忆链（提取→入库→注入→/memory）、反思链（窗口→触发→入库→跨会话注入）、回滚链（备份→预览→恢复→日志收缩）、配置链（读→解析→dupe→使用）全链绿；测试 170+ 全绿；fmt 0。
+
+### P18: 迭代二（T1.3 权限匹配 / M5 WebSearch / M3 知识浓缩）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **T1.3 权限规则模式匹配**: 修正两处逻辑——带 pattern 的 deny 规则原先是"无视 pattern 直接拒绝"、allow 规则同样"无视 pattern 直接放行"；现改为 glob 匹配 `command`/`path` 字段（glob_match）：deny pattern 命中才拒、allow pattern 命中才放、不命中继续走管道，无 pattern 保持 blanket 语义。8 用例表驱动测试覆盖 blanket/pattern 命中/未命中/无字段路径。
+- **M5 WebSearch 接入**: tools/web_search.zig 从桩接线到 knowledge/search.zig 的真实现；后端选择 BRAVE_API_KEY 有则 Brave、否则 DDG 免 key。**三层深挖修复**（该 HTTP 路径从未运行过）：① `readAlloc` 按定长读 → 改逐块拼接（allocRemaining 对 DDG 缺 chunked terminator 的流报 EndOfStream）；② DDG 响应**不带 Content-Encoding 头但 body 是 gzip** → 魔数嗅探（\x1f\x8b）+ flate.Decompress 透明解压；③ HTML 解析标记 `<a class="result__a"` 与真实页 `<a rel="nofollow" class="result__a"` 属性顺序不符 → 改按 class 匹配。实测 DDG 返回 ziglang.org 真实结果。
+- **M3 知识浓缩（最小闭环版）**: ① T1.2 KnowledgeGraph 全参数化（addNode/addEdge prepared，pruneWeakEdges/nodeCount 从"永远返回 0"的桩变真实现，sqlite3_changes/bind_double 补进绑定层）；② φ 浓缩接入提取管线：候选 facts 按重要性排序后只保 condensationTarget(n)（61.8%）；③ e 衰减接入注入排序：decayScore = e^(-age/30天)，30 天 ≈ 36.8%（DESIGN 验证 #6 达成），注入块按新鲜度排序（新增 2 个单测）。
+- **验证**: 全量测试绿（含新增 permission 表驱动 ×8、graph 真实现断言、decay 双测）；REPL 实测 WebSearch/提取/φ 过滤路径正常。
+
+### P19: 迭代三（M6 Task 打通 / M7 编排并行 / M8 自诊断+研究接入）
+- **状态**: ✅ 已完成 (2026-10-26)
+- **M6 Task 工具打通**: 新增 `tools/task_store.zig`（进程级会话任务存储：pending/in_progress/completed 状态机、render、φ 无关的朴素计数）+ TaskCreate/TaskList/TaskUpdate 三工具从无状态假实现接线到真存储。REPL 实测：创建→更新→列表全链路 ✓；含存储生命周期与三工具端到端集成测试。
+- **M7 编排真并行**: `executeBatches` 的并发安全批从"串行假装并行"改为真线程池并行——每调用一个 ParallelCall 上下文提交到 e 上限线程池，自旋等待全部完成，**按原始调用顺序回收结果**；池初始化失败降级串行（语义不变）。途中激活两个从未编译的死路径 bug：`TaskStatus` 枚举缺显式 tag（atomic.Value 要求）、workerLoop 传 allocator 值而非指针、`c.timespec` 字段名（.sec/.nsec 而非 tv_sec/tv_nsec）。4 路并行 FileRead 实测保序 ✓。
+- **M8 自诊断 + 研究引擎 REPL 接入**:
+  - `/research <topic>`: OptimizationResearcher + 真 WebSearch——φ 生成 3 组查询、并发搜源、30 候选精选、★ 推荐标记 + 理由（DESIGN 第十章"自主优化研究"首次真实闭环，实测 2.8s 3 源 4 方案）。
+  - `/diagnose <concern>`: 用真实会话统计构造轻量决策链（记忆注入置信 / 工具错误率置信 / 生成置信）→ SelfDiagnostic 找低于 φ 的薄弱环节 → 输出 root cause + 建议。实测与记忆系统真实联动：注入 2 条时"0 gaps（最弱 0.80）"；清空记忆库后"1 gap，root cause: memory_retrieval 置信 0.30 < φ → 建议扩大检索范围"。
+  - 修复 self_diagnostic 的悬垂隐患：owned_gaps 曾浅拷贝已释放的 description 指针（新增 DiagnosisReport.free + 深拷贝）；修复 DecisionTrace query 所有权契约踩坑（init 接收堆分配，repl 侧 dupe）。
+- **验证**: 178 pass / 1 skip / 179 total 全绿；REPL 实测 TaskCreate/Update/List、4 路并行编排、/research 真网络、/diagnose 双场景（有/无记忆）全通过；/help 已收录新命令。
+
 ## 已完成事项
 
 ### Phase 1: 增强工具接口 ✅

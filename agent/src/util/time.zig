@@ -48,12 +48,13 @@ pub fn formatIso(allocator: std.mem.Allocator, timestamp_ms: i64) ![]u8 {
     const second = @rem(time_of_day, 60);
 
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year,
-        month + 1,
-        day,
-        hour,
-        minute,
-        second,
+        // Unsigned: 0.17 emits a '+' sign for zero-padded signed integers.
+        @as(u32, @intCast(year)),
+        @as(u32, @intCast(month + 1)),
+        @as(u32, @intCast(day)),
+        @as(u32, @intCast(hour)),
+        @as(u32, @intCast(minute)),
+        @as(u32, @intCast(second)),
     });
 }
 

@@ -12,26 +12,34 @@ pub const LockFile = struct {
     pub fn acquire(self: *Self) !void {
         if (self.held) return;
 
+        var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        defer io_state.deinit();
+        const io = io_state.io();
+
         // Try to create the lock file exclusively
-        const file = std.fs.cwd().createFile(self.path, .{
+        var file = std.Io.Dir.cwd().createFile(io, self.path, .{
             .exclusive = true,
             .truncate = false,
         }) catch |err| switch (err) {
             error.PathAlreadyExists => return error.AlreadyLocked,
             else => return err,
         };
-        defer file.close();
+        defer file.close(io);
 
-        // Write PID to lock file
-        const writer = file.writer();
-        writer.print("{d}", .{std.posix.getpid()}) catch {};
+        // Write thread id to lock file
+        var buf: [32]u8 = undefined;
+        var fw: std.Io.File.Writer = .init(file, io, &buf);
+        fw.interface.print("{d}", .{std.Thread.getCurrentId()}) catch {};
+        fw.interface.flush() catch {};
         self.held = true;
     }
 
     /// Release the lock by deleting the lock file.
     pub fn release(self: *Self) void {
         if (!self.held) return;
-        std.fs.cwd().deleteFile(self.path) catch {};
+        var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        defer io_state.deinit();
+        std.Io.Dir.cwd().deleteFile(io_state.io(), self.path) catch {};
         self.held = false;
     }
 

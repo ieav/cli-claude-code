@@ -27,7 +27,7 @@ pub const ExtractionEngine = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .extracted_facts = std.ArrayList(ExtractedFact).init(allocator),
+            .extracted_facts = std.ArrayList(ExtractedFact).empty,
         };
     }
 
@@ -35,7 +35,7 @@ pub const ExtractionEngine = struct {
         for (self.extracted_facts.items) |f| {
             self.allocator.free(f.content);
         }
-        self.extracted_facts.deinit();
+        self.extracted_facts.deinit(self.allocator);
     }
 
     /// Extract facts from a conversation turn.
@@ -46,8 +46,18 @@ pub const ExtractionEngine = struct {
             return &.{};
         }
 
-        var facts = std.ArrayList(ExtractedFact).init(self.allocator);
-        defer facts.deinit();
+        var facts = std.ArrayList(ExtractedFact).empty;
+        defer facts.deinit(self.allocator);
+        // Deduplicate identical content: one message can hit several
+        // heuristics (e.g. a preference that also names a technology).
+        const alreadySeen = struct {
+            fn check(list: []const ExtractedFact, text: []const u8) bool {
+                for (list) |f| {
+                    if (std.mem.eql(u8, f.content, text)) return true;
+                }
+                return false;
+            }
+        };
 
         // Heuristic: detect preference statements
         if (std.mem.indexOf(u8, content, "prefer") != null or
@@ -57,11 +67,13 @@ pub const ExtractionEngine = struct {
             std.mem.indexOf(u8, content, "总是") != null or
             std.mem.indexOf(u8, content, "喜欢") != null)
         {
-            try facts.append(.{
-                .content = try self.allocator.dupe(u8, content),
-                .fact_type = .user_preference,
-                .importance = 0.9,
-            });
+            if (!alreadySeen.check(facts.items, content)) {
+                try facts.append(self.allocator, .{
+                    .content = try self.allocator.dupe(u8, content),
+                    .fact_type = .user_preference,
+                    .importance = 0.9,
+                });
+            }
         }
 
         // Heuristic: detect error solutions
@@ -70,11 +82,13 @@ pub const ExtractionEngine = struct {
             std.mem.indexOf(u8, content, "解决") != null or
             std.mem.indexOf(u8, content, "修复") != null)
         {
-            try facts.append(.{
-                .content = try self.allocator.dupe(u8, content),
-                .fact_type = .error_solution,
-                .importance = 0.8,
-            });
+            if (!alreadySeen.check(facts.items, content)) {
+                try facts.append(self.allocator, .{
+                    .content = try self.allocator.dupe(u8, content),
+                    .fact_type = .error_solution,
+                    .importance = 0.8,
+                });
+            }
         }
 
         // Heuristic: detect technical facts (code, patterns)
@@ -83,15 +97,19 @@ pub const ExtractionEngine = struct {
             std.mem.indexOf(u8, content, "const ") != null or
             std.mem.indexOf(u8, content, "zig") != null)
         {
-            try facts.append(.{
-                .content = try self.allocator.dupe(u8, content),
-                .fact_type = .technical_fact,
-                .importance = 0.7,
-            });
+            if (!alreadySeen.check(facts.items, content)) {
+                try facts.append(self.allocator, .{
+                    .content = try self.allocator.dupe(u8, content),
+                    .fact_type = .technical_fact,
+                    .importance = 0.7,
+                });
+            }
         }
 
         if (facts.items.len == 0) return &.{};
-        return try self.allocator.dupe(ExtractedFact, facts.items);
+        // Transfer the fact dupes (and their strings) to the caller wholesale;
+        // a dupe of items here would leak the per-fact content copies.
+        return try facts.toOwnedSlice(self.allocator);
     }
 
     /// Condense extracted facts using φ ratio.
@@ -136,7 +154,11 @@ test "ExtractionEngine detects preferences" {
     defer engine.deinit();
 
     const facts = try engine.extractFromMessage("user", "我 prefer 使用 Zig 而不是 Rust");
-    defer std.testing.allocator.free(facts);
+    defer {
+        // extractFromMessage hands over ownership of each fact's content.
+        for (facts) |f| std.testing.allocator.free(f.content);
+        std.testing.allocator.free(facts);
+    }
 
     try std.testing.expect(facts.len >= 1);
     try std.testing.expect(facts[0].fact_type == .user_preference);
@@ -150,7 +172,7 @@ test "ExtractionEngine condense with φ ratio" {
     for (0..10) |i| {
         const content = try std.fmt.allocPrint(std.testing.allocator, "fact {d}", .{i});
         defer std.testing.allocator.free(content);
-        try engine.extracted_facts.append(.{
+        try engine.extracted_facts.append(std.testing.allocator, .{
             .content = try std.testing.allocator.dupe(u8, content),
             .fact_type = .technical_fact,
             .importance = @as(f64, @floatFromInt(i)) / 10.0,

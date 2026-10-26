@@ -45,7 +45,7 @@ pub const DecisionTrace = struct {
         return .{
             .allocator = allocator,
             .query = query,
-            .steps = std.ArrayList(DecisionStep).init(allocator),
+            .steps = std.ArrayList(DecisionStep).empty,
             .started_at = time_mod.nowMillis(),
             .completed_at = null,
         };
@@ -63,12 +63,12 @@ pub const DecisionTrace = struct {
             self.allocator.free(step.alternatives);
             self.allocator.free(step.dependencies);
         }
-        self.steps.deinit();
+        self.steps.deinit(self.allocator);
         self.allocator.free(self.query);
     }
 
     pub fn addStep(self: *Self, step: DecisionStep) !void {
-        try self.steps.append(step);
+        try self.steps.append(self.allocator, step);
     }
 
     pub fn complete(self: *Self) void {
@@ -88,11 +88,11 @@ pub const DecisionTrace = struct {
 
     /// Find all steps with confidence below the golden ratio threshold.
     pub fn findWeakSteps(self: *const Self, threshold: f64) []const DecisionStep {
-        var result = std.ArrayList(usize).init(self.allocator);
-        defer result.deinit();
+        var result = std.ArrayList(usize).empty;
+        defer result.deinit(self.allocator);
         for (self.steps.items, 0..) |step, i| {
             if (step.confidence < threshold) {
-                result.append(i) catch break;
+                result.append(self.allocator, i) catch break;
             }
         }
         if (result.items.len == 0) return &.{};

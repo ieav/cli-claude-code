@@ -45,7 +45,8 @@ pub const TokenBudget = struct {
 
 test "estimateTokens" {
     try std.testing.expectEqual(@as(u32, 1), estimateTokens("hi"));
-    try std.testing.expectEqual(@as(u32, 3), estimateTokens("hello world test"));
+    // ceil(16/4): len/4 heuristic, not word count
+    try std.testing.expectEqual(@as(u32, 4), estimateTokens("hello world test"));
 }
 
 test "TokenBudget" {

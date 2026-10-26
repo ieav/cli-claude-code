@@ -840,9 +840,9 @@ agent/
 - [x] LLM Provider 工厂 + 自动后端检测
 
 ### 待完成
-- [ ] EpisodicStore 参数化查询 (防 SQL 注入)
+- [x] EpisodicStore 参数化查询 (防 SQL 注入) — prepared statement + 注入往返测试
 - [ ] KnowledgeGraph 参数化查询
-- [ ] MPSC Queue pop() 完整实现
+- [x] MPSC Queue pop() 完整实现 (deinit 残留 tail 泄漏已修)
 - [ ] 流式输出优化 (边读边解析 SSE)
 - [ ] 跨平台测试
 - [ ] Checkpoint 目录自动创建（首次 trackEdit 时 .ziv/checkpoints 可能不存在）
@@ -889,6 +889,5 @@ agent/
 | `.ziv/checkpoints/` 不会自动创建 | 备份静默失败，`/rewind` 无效 | 中 | 手动执行 `mkdir -p .ziv/checkpoints` |
 | WebSearch API 未接入 | `/run WebSearch` 不可用 | 低 | 使用 `/run Bash {"command":"curl ..."}` 替代 |
 | 流式输出非实时 | LLM 回复要等全部生成完才显示 | 低 | 暂无 |
-| 管道输入只处理第一行 | `echo "cmd1\ncmd2" \| ziv` 只执行 cmd1 | 低 | 逐条执行，或等修复 |
 | uuid 模块未验证 | 影响记忆系统（框架阶段未实际调用） | 低 | 暂无 |
 | config 加载无崩溃保护 | settings.json 不存在时已容错（catch return），但格式错误时可能异常 | 低 | 确保 JSON 格式正确 |

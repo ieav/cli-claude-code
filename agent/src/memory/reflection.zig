@@ -37,7 +37,7 @@ pub const ReflectionEngine = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .reflections = std.ArrayList(Reflection).init(allocator),
+            .reflections = std.ArrayList(Reflection).empty,
             .query_count = std.atomic.Value(usize).init(0),
             .last_reflection_at = std.atomic.Value(i64).init(0),
         };
@@ -50,7 +50,7 @@ pub const ReflectionEngine = struct {
             self.allocator.free(r.insights);
             self.allocator.free(r.action_items);
         }
-        self.reflections.deinit();
+        self.reflections.deinit(self.allocator);
     }
 
     /// Called after each query. Returns true if reflection should be triggered.
@@ -74,6 +74,7 @@ pub const ReflectionEngine = struct {
         recent_queries: []const []const u8,
         recent_tools_used: u32,
         recent_errors: u32,
+        trigger: ReflectionTrigger,
     ) !?Reflection {
         if (recent_queries.len == 0) return null;
 
@@ -121,7 +122,7 @@ pub const ReflectionEngine = struct {
 
         const reflection = Reflection{
             .id = std.mem.zeroes([16]u8),
-            .trigger = .on_timer,
+            .trigger = trigger,
             .input_summary = try self.allocator.dupe(u8, summary_buf.items),
             .decisions_made = try std.fmt.allocPrint(self.allocator, "queries={d} tools={d} errors={d}", .{ recent_queries.len, recent_tools_used, recent_errors }),
             .insights = try self.allocator.dupe(u8, insights_buf.items),
@@ -130,7 +131,7 @@ pub const ReflectionEngine = struct {
             .created_at = time_mod.nowMillis(),
         };
 
-        try self.reflections.append(reflection);
+        try self.reflections.append(self.allocator, reflection);
         self.last_reflection_at.store(reflection.created_at, .release);
 
         return reflection;
@@ -190,7 +191,7 @@ test "ReflectionEngine reflect produces insights" {
     defer engine.deinit();
 
     const queries = &[_][]const u8{ "query1", "query2" };
-    const result = try engine.reflect(queries, 5, 0);
+    const result = try engine.reflect(queries, 5, 0, .on_timer);
     try std.testing.expect(result != null);
     try std.testing.expect(engine.reflectionCount() == 1);
 }
