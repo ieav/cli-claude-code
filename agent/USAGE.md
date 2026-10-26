@@ -865,14 +865,14 @@ agent/
 - [x] /research、/diagnose 命令
 
 ### 待办（2026-10-26 盘点，详见 TODO.md P19）
-- [ ] `allocPrint` → `Allocator.print` 迁移（65 处，Zig 0.18 前必须）
-- [ ] repl 会话级 DOM 泄漏（CompleteResponse arena 因 history 引用暂不释放）
+- [x] `allocPrint` → `Allocator.print` 迁移（65 处全部完成，2026-10-26）
+- [x] repl 会话级 DOM 泄漏（history 深拷贝后立即释放响应 DOM，2026-10-26）
 - [ ] agent loop 接入并行编排（executeBatches 已实现但 REPL 仍串行执行工具）
 - [ ] 知识图谱写入方（semantic 层 API 就绪、暂无数据流）
 - [ ] /diagnose 真实决策链（现为 3 步静态构造）
 - [ ] 注入向量相似度检索（现为 e 衰减排序）
 - [ ] WebSearch 429 重试、Brave 路径实测（需 API key）
-- [ ] memory facade 错误上报（现对 episodic 失败仅 warning）
+- [x] memory facade 错误上抛（episodic 失败不再吞，2026-10-26）
 - [ ] 跨平台测试（Linux）
 - [ ] 流式输出实时性实测核实
 
@@ -912,8 +912,6 @@ agent/
 
 | 问题 | 影响 | 严重度 | 临时解决 |
 |------|------|--------|----------|
-| repl 会话级 DOM 泄漏 | 每个 LLM 响应泄漏一块内存，长会话累积 | 中 | 重启会话；所有权手术在待办 |
-| `allocPrint` 弃用 API（65 处） | Zig 0.18 发布后编译失败 | 中（有期限） | 0.18 发布前完成迁移 |
 | 流式输出实时性未核实 | 文档口径矛盾（TODO 记已修，旧 USAGE 记非实时），未实测 | 低 | 实测后定论 |
 | WebSearch 无 429 重试 | 搜索限流时直接报错 | 低 | 稍后重试 |
 | `/rewind` 序号/y-N 在管道模式消费后续行 | 管道脚本中的交互式确认不适配 | 无（设计内） | 交互模式使用 |
