@@ -38,12 +38,18 @@ pub fn readKey(r: *std.Io.Reader) !Key {
     };
     if (c != 0x1b) return parseKey(c);
 
-    if (is_tty) {
-        // Distinguish a lone ESC from an escape sequence: poll stdin for
-        // 25ms — arrow keys deliver the remaining bytes within that window.
-        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        const ready = std.c.poll(&pfd, 1, 25);
-        if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return .quit;
+    // Arrow keys arrive as ESC [ A all at once — one underlying read pulls
+    // all three bytes into the reader's own buffer. Check that buffer FIRST;
+    // only when it is empty do we poll the fd to distinguish a lone ESC
+    // (user pressed Esc alone) from a sequence split across reads.
+    // Polling the fd while bytes sit in the buffer misread every arrow key
+    // as a lone ESC — the on-TTY bug where arrow navigation "didn't work".
+    if (r.bufferedLen() == 0) {
+        if (is_tty) {
+            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+            const ready = std.c.poll(&pfd, 1, 25);
+            if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return .quit;
+        }
     }
 
     const next = r.takeByte() catch return .quit;
@@ -171,4 +177,15 @@ test "readKey parses arrow sequences from buffered input (non-tty path)" {
     // Lone ESC at end of stream: takeByte hits EOF -> quit.
     var esc_only = std.Io.Reader.fixed("\x1b");
     try std.testing.expect((try readKey(&esc_only)) == .quit);
+}
+
+test "readKey resolves buffered arrows in tty mode without polling the fd" {
+    // The real-terminal case that broke arrow keys: the whole ESC [ A
+    // sequence sits in the reader buffer while the fd has no pending
+    // bytes — poll would time out and misread it as a lone ESC.
+    is_tty = true;
+    var seq = std.Io.Reader.fixed("\x1b[A\x1b[B");
+    try std.testing.expect((try readKey(&seq)) == .up);
+    try std.testing.expect((try readKey(&seq)) == .down);
+    is_tty = false;
 }
