@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.json /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.md /Users/ieav/projects/claude-code-cli/claude-code-i-main/*.yaml)",
+      "Bash(wc -l /private/tmp/claude-501/-Users-ieav-projects-claude-code-cli-claude-code-i-main/32cc1607-66ed-4b2d-af56-8fa0fc05a243/tasks/*.output)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "WebSearch",
+      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")",
+      "Bash(zig version:*)",
+      "Bash(zig build:*)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(zig run:*)",
+      "Bash(printf \"/version\\\\n/quit\\\\n\")",
+      "Bash(printf \"/version\\\\n/help\\\\n/stats\\\\n/quit\\\\n\")",
+      "Bash(printf \"/tools\\\\n/run Bash {\\\\\"command\\\\\":\\\\\"echo hello from zage\\\\\"}\\\\n/run FileWrite {\\\\\"path\\\\\":\\\\\"/tmp/zage_test.txt\\\\\",\\\\\"content\\\\\":\\\\\"Hello Zage!\\\\\\\\nLine 2\\\\\\\\nLine 3\\\\\"}\\\\n/run FileRead {\\\\\"path\\\\\":\\\\\"/tmp/zage_test.txt\\\\\"}\\\\n/quit\\\\n\")",
+      "Bash(printf '/run Bash {\"command\":\"echo hello\"}\\\\n/quit\\\\n')",
+      "Bash(printf '/run FileWrite {\"path\":\"/tmp/zage_test.txt\",\"content\":\"Hello Zage\\\\\\\\nLine 2\"}\\\\n/run FileRead {\"path\":\"/tmp/zage_test.txt\"}\\\\n/quit\\\\n')",
+      "Bash(curl -sL \"https://www.sqlite.org/2024/sqlite-amalgamation-3470000.zip\" -o /tmp/sqlite.zip)",
+      "Bash(unzip -o /tmp/sqlite.zip)",
+      "Bash(mv sqlite-amalgamation-3470000/* .)",
+      "Bash(rm -rf sqlite-amalgamation-3470000)",
+      "Bash(mkdir -p /Users/ieav/projects/claude-code-cli/claude-code-i-main/agent/deps/sqlite3)",
+      "Read(//private/tmp/**)",
+      "Bash(curl -sL \"https://www.sqlite.org/2024/sqlite-amalgamation-3470000.zip\" -o sqlite.zip)",
+      "Bash(unzip -o sqlite.zip)",
+      "Bash(cp sqlite-amalgamation-3470000/sqlite3.c sqlite-amalgamation-3470000/sqlite3.h /Users/ieav/projects/claude-code-cli/claude-code-i-main/agent/deps/sqlite3/)",
+      "Bash(printf \"/version\\\\n/tools\\\\n/quit\\\\n\")"
+    ]
+  }
+}

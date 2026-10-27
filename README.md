@@ -1,6 +1,6 @@
 # Claude Code CLI - 项目技术文档
 
-> **Claude Code CLI** 是 Anthropic 官方推出的命令行 AI 助手工具，本仓库包含其核心源代码和技术文档。
+> **Claude Code CLI** 是 Anthropic 官方推出的命令行 AI 助手工具
 
 ---
 
