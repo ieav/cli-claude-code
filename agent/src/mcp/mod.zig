@@ -3,6 +3,8 @@ const std = @import("std");
 
 pub const jsonrpc = @import("jsonrpc.zig");
 pub const stdio = @import("stdio.zig");
+pub const session = @import("session.zig");
+pub const config = @import("config.zig");
 
 pub const protocol_version = "2025-06-18";
 pub const client_info = "ziv/0.5.0";
@@ -10,6 +12,8 @@ pub const client_info = "ziv/0.5.0";
 test {
     _ = jsonrpc;
     _ = stdio;
+    _ = session;
+    _ = config;
 }
 
 // T2.2 spike: full handshake against a mock MCP server over stdio.

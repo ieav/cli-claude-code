@@ -12,6 +12,7 @@ const lineinput = @import("util/lineinput.zig");
 const slash_cmds = @import("util/slash_commands.zig");
 const runtime_registry = @import("tools/runtime_registry.zig");
 const skills_mod = @import("skills/mod.zig");
+const mcp_mod = @import("mcp/mod.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -250,6 +251,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     else
         null;
 
+    // MCP (T3/T4/M6): mcp.json config + live stdio sessions. Tools are
+    // bridged into the runtime registry as mcp__<server>__<tool> on connect.
+    var mcp_cfg = mcp_mod.config.McpConfig.init(allocator, io);
+    defer mcp_cfg.deinit();
+    mcp_cfg.load();
+    var mcp_sessions = std.ArrayList(*mcp_mod.session.McpSession).empty;
+    defer {
+        for (mcp_sessions.items) |sess| {
+            sess.disconnect(io);
+            sess.deinit();
+            allocator.destroy(sess);
+        }
+        mcp_sessions.deinit(allocator);
+    }
+
     // Skills (T7/T8): SKILL.md packs from ~/.config/ziv/skills + ./.ziv/skills.
     var skill_loader = skills_mod.loader.SkillLoader.init(allocator, io);
     defer skill_loader.deinit();
@@ -379,6 +395,74 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 break;
             } else if (std.mem.eql(u8, input, "/help") or std.mem.eql(u8, input, "/h")) {
                 try printHelp(w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.startsWith(u8, input, "/mcp")) {
+                const rest_mcp = std.mem.trim(u8, input[4..], " \t");
+                if (rest_mcp.len == 0 or std.mem.eql(u8, rest_mcp, "list")) {
+                    if (mcp_cfg.servers.items.len == 0) {
+                        try std.Io.Writer.writeAll(w, "  No MCP servers configured. /mcp install <name> | /mcp add <name> <command>\n\n");
+                    } else {
+                        try std.Io.Writer.writeAll(w, "  MCP servers:\n");
+                        for (mcp_cfg.servers.items) |srv| {
+                            const sess = findMcpSession(mcp_sessions.items, srv.name);
+                            const state = if (sess) |ss| (if (ss.connected) "connected" else "down") else "off";
+                            try std.Io.Writer.print(w, "    {s} [{s}] — {s}\n", .{ srv.name, state, srv.command });
+                        }
+                        try std.Io.Writer.writeAll(w, "\n");
+                    }
+                } else if (std.mem.startsWith(u8, rest_mcp, "install ")) {
+                    const want = std.mem.trim(u8, rest_mcp[8..], " \t");
+                    var found = false;
+                    for (mcp_mod.config.McpConfig.known_servers) |ks| {
+                        if (std.mem.eql(u8, ks.name, want)) {
+                            try mcp_cfg.upsert(ks.name, ks.command);
+                            try std.Io.Writer.print(w, "  Installed {s} -> {s}\n  Connect with: /mcp connect {s}\n\n", .{ ks.name, ks.command, ks.name });
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) try std.Io.Writer.print(w, "  Unknown package '{s}'. Known: playwright, filesystem, memory, fetch, sequential-thinking\n\n", .{want});
+                } else if (std.mem.startsWith(u8, rest_mcp, "add ")) {
+                    const args_str = std.mem.trim(u8, rest_mcp[4..], " \t");
+                    const sp = std.mem.indexOfScalar(u8, args_str, ' ') orelse {
+                        try std.Io.Writer.writeAll(w, "  Usage: /mcp add <name> <command...>\n\n");
+                        try std.Io.File.Writer.flush(&file_writer);
+                        continue;
+                    };
+                    try mcp_cfg.upsert(args_str[0..sp], std.mem.trim(u8, args_str[sp + 1 ..], " \t"));
+                    try std.Io.Writer.print(w, "  Added. Connect with: /mcp connect {s}\n\n", .{args_str[0..sp]});
+                } else if (std.mem.startsWith(u8, rest_mcp, "remove ")) {
+                    const want = std.mem.trim(u8, rest_mcp[7..], " \t");
+                    if (findMcpSession(mcp_sessions.items, want)) |sess| {
+                        mcp_mod.session.unbridgeSessionTools(sess, &reg);
+                        sess.disconnect(io);
+                    }
+                    if (mcp_cfg.remove(want)) {
+                        try std.Io.Writer.print(w, "  Removed {s}\n\n", .{want});
+                    } else {
+                        try std.Io.Writer.print(w, "  No such server: {s}\n\n", .{want});
+                    }
+                } else if (std.mem.startsWith(u8, rest_mcp, "connect ")) {
+                    const want = std.mem.trim(u8, rest_mcp[8..], " \t");
+                    const entry = mcp_cfg.find(want) orelse {
+                        try std.Io.Writer.print(w, "  No such server: {s} (see /mcp list)\n\n", .{want});
+                        try std.Io.File.Writer.flush(&file_writer);
+                        continue;
+                    };
+                    try connectMcpServer(entry, &mcp_sessions, &reg, allocator, io, w, &file_writer);
+                } else if (std.mem.startsWith(u8, rest_mcp, "disconnect ")) {
+                    const want = std.mem.trim(u8, rest_mcp[11..], " \t");
+                    if (findMcpSession(mcp_sessions.items, want)) |sess| {
+                        mcp_mod.session.unbridgeSessionTools(sess, &reg);
+                        sess.disconnect(io);
+                        try std.Io.Writer.print(w, "  {s} disconnected\n\n", .{want});
+                    } else {
+                        try std.Io.Writer.print(w, "  {s} was not connected\n\n", .{want});
+                    }
+                } else {
+                    try std.Io.Writer.writeAll(w, "  Usage: /mcp [list|install|add|remove|connect|disconnect] ...\n\n");
+                }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/skills")) {
@@ -1441,6 +1525,54 @@ fn entityTypeForFact(f: extraction_mod.FactType) knowledge_graph.EntityType {
         .error_solution => .custom,
         .project_context => .organization,
     };
+}
+
+fn findMcpSession(sessions: []*mcp_mod.session.McpSession, name: []const u8) ?*mcp_mod.session.McpSession {
+    for (sessions) |sess| {
+        if (std.mem.eql(u8, sess.name, name)) return sess;
+    }
+    return null;
+}
+
+/// Spawn + handshake + bridge one server's tools into the runtime registry.
+fn connectMcpServer(
+    entry: *mcp_mod.config.ServerEntry,
+    sessions: *std.ArrayList(*mcp_mod.session.McpSession),
+    reg: *runtime_registry.RuntimeRegistry,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+) !void {
+    if (findMcpSession(sessions.items, entry.name)) |existing| {
+        if (existing.connected) {
+            try std.Io.Writer.print(w, "  {s} already connected ({d} tools)\n\n", .{ entry.name, existing.tool_names.items.len });
+            return;
+        }
+    }
+    const argv = mcp_mod.config.splitCommand(alloc, entry.command) catch {
+        try std.Io.Writer.writeAll(w, "  Failed to parse command\n\n");
+        return;
+    };
+    defer alloc.free(argv);
+
+    const sess = try alloc.create(mcp_mod.session.McpSession);
+    errdefer alloc.destroy(sess);
+    sess.* = .{ .allocator = alloc, .name = try alloc.dupe(u8, entry.name) };
+    errdefer alloc.free(sess.name);
+    sess.connect(io, .{ .name = entry.name, .argv = argv }) catch |err| {
+        try std.Io.Writer.print(w, "  Connect failed: {s}\n  (command: {s})\n\n", .{ @errorName(err), entry.command });
+        sess.deinit();
+        alloc.free(sess.name);
+        alloc.destroy(sess);
+        try std.Io.File.Writer.flush(file_writer);
+        return;
+    };
+    try sessions.append(allocator, sess);
+    mcp_mod.session.bridgeSessionTools(sess, reg) catch {};
+    logger.info("mcp: {s} connected ({d} tools bridged)", .{ entry.name, sess.tool_names.items.len });
+    try std.Io.Writer.print(w, "  {s} connected: {d} tools available as mcp__{s}__*\n\n", .{ entry.name, sess.tool_names.items.len, entry.name });
+    try std.Io.File.Writer.flush(file_writer);
 }
 
 /// Shared permission gate for the agent loop and /run.
