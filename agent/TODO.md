@@ -252,3 +252,10 @@
 - **顺带修复**: `current_mode` 硬编码 `.default` 从不读配置（permission_mode 配置形同虚设）→ 改读 `settings.permission_mode`。
 - **③ 平台与工具链**: `zig build -Dtarget=x86_64-linux-musl` 与 `aarch64-linux-musl` 交叉编译全过（静态 ELF）；zvm 0.8.17 → 0.9.4。Linux 运行时留待实机（musl 静态链接兼容面广）。
 - **验证**: 全量测试绿；mock 实测三场景（流式逐块、429 退避、auto 分类）全过；REPL 冒烟正常。
+
+### P23: /config 与 /model 交互式改造（方向键菜单）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **新增 `util/menu.zig`**: 通用方向键菜单引擎——raw 终端模式（termios；非 TTY 管道自动降级逐字节读，可脚本化测试）、↑↓/vim jk 移动、Enter 确认、q/Esc 取消、数字 1-9 跳转、ANSI 重绘（❯ 高亮）。
+- **/config 重写**: 主菜单（API Keys/默认模型/最大 tokens/权限模式/检查点/系统提示词/退出）全部方向键导航；权限模式与模型子菜单也是 select；**每项修改立即自动保存** settings.json（autoSaveSettings）；API Keys 子菜单菜单化+掩码显示。
+- **/model 交互式**: 无参 `/model` 弹模型选择菜单（9 个已知模型+当前●标记+取消），Enter 运行时切换并保存 default_model；`/model <name>` 命令式保留。
+- **实测（管道注入 ESC 序列）**: `/config ↓ Enter ↓ Enter` → 默认模型切 claude-sonnet-4-6 → settings.json 自动落盘 ✓；`/model ↓ Enter` → 已选+key 缺失正确提示 ✓。测试配置已净零清理。

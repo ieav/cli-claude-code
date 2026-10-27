@@ -7,6 +7,7 @@ const tools_mod = @import("tools/mod.zig");
 const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
 const classifier_mod = @import("tools/classifier.zig");
+const menu = @import("util/menu.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -402,8 +403,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/model") or std.mem.eql(u8, input, "/models")) {
-                // Show current model + available models
-                try printModelInfo(w, &switcher);
+                // Interactive model picker (arrow keys + Enter); q shows the
+                // plain text listing instead.
+                try runModelPicker(w, r, &file_writer, &switcher, io);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.startsWith(u8, input, "/model ")) {
@@ -1717,6 +1719,17 @@ fn rewindOperation(
 
 // ──── Interactive config menu ────
 
+fn autoSaveSettings(w: *std.Io.Writer, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, alloc: std.mem.Allocator, io: std.Io) void {
+    config_mod.saveSettings(&switcher.settings, alloc, io) catch |err| {
+        w.print("  保存失败: {any}\n", .{err}) catch {};
+        return;
+    };
+    w.writeAll("  ✓ 已自动保存\n") catch {};
+    std.Io.File.Writer.flush(file_writer) catch {};
+}
+
+/// Arrow-key driven configuration menu. Every change auto-saves to
+/// ~/.config/ziv/settings.json immediately.
 fn runConfigMenu(
     w: *std.Io.Writer,
     r: *std.Io.Reader,
@@ -1725,145 +1738,99 @@ fn runConfigMenu(
     alloc: std.mem.Allocator,
     io: std.Io,
 ) !void {
-    var dirty = false;
-
     while (true) {
-        // Main menu
-        try std.Io.Writer.writeAll(w, "\n=== Ziv Configuration ===\n");
-        try std.Io.Writer.print(w, "  1. API Keys\n", .{});
-        try std.Io.Writer.print(w, "  2. Default model       : {s}\n", .{switcher.settings.default_model});
-        try std.Io.Writer.print(w, "  3. Max tokens          : {d}\n", .{switcher.settings.max_tokens});
-        try std.Io.Writer.print(w, "  4. Permission mode     : {s}\n", .{auth.modeLabel(switcher.settings.permission_mode)});
-        try std.Io.Writer.print(w, "  5. Checkpointing       : {s}\n", .{if (switcher.settings.checkpointing_enabled) "on" else "off"});
-        const sp_display = if (switcher.settings.system_prompt != null) "(custom)" else "(default)";
-        try std.Io.Writer.print(w, "  6. System prompt       : {s}\n", .{sp_display});
-        try std.Io.Writer.writeAll(w, "  7. Save & Exit\n");
-        try std.Io.Writer.writeAll(w, "  8. Exit without saving\n");
-        try std.Io.Writer.writeAll(w, "\n  Select [1-8]: ");
-        try std.Io.File.Writer.flush(file_writer);
+        var b1: [64]u8 = undefined;
+        var b2: [64]u8 = undefined;
+        var b3: [64]u8 = undefined;
+        var b4: [64]u8 = undefined;
+        var b5: [64]u8 = undefined;
+        const items = [_][]const u8{
+            "API Keys",
+            try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
+            try_std_fmt(&b2, "最大 tokens: {d}", .{switcher.settings.max_tokens}),
+            try_std_fmt(&b3, "权限模式: {s}", .{auth.modeLabel(switcher.settings.permission_mode)}),
+            try_std_fmt(&b4, "检查点: {s}", .{if (switcher.settings.checkpointing_enabled) "开" else "关"}),
+            try_std_fmt(&b5, "系统提示词: {s}", .{if (switcher.settings.system_prompt != null) "(自定义)" else "(默认)"}),
+            "退出",
+        };
+        const picked = (menu.select(w, r, file_writer, "=== Ziv 配置 ===", &items, 0) catch break) orelse break;
 
-        var buf: [4096]u8 = undefined;
-        var bw = std.Io.Writer.fixed(&buf);
-        const n = std.Io.Reader.streamDelimiter(r, &bw, '\n') catch break;
-        r.toss(1);
-        const sel = std.mem.trim(u8, buf[0..n], " \t\r\n");
-
-        if (std.mem.eql(u8, sel, "1")) {
-            try runApiKeysMenu(w, r, file_writer, switcher, alloc);
-            dirty = true;
-        } else if (std.mem.eql(u8, sel, "2")) {
-            try std.Io.Writer.writeAll(w, "  Enter default model: ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [256]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
-                switcher.settings.default_model = try alloc.dupe(u8, val);
-                dirty = true;
-            }
-        } else if (std.mem.eql(u8, sel, "3")) {
-            try std.Io.Writer.writeAll(w, "  Enter max tokens (1-128000): ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [32]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
+        switch (picked) {
+            0 => try runApiKeysMenu(w, r, file_writer, switcher, alloc, io),
+            1 => try configPickModel(w, r, file_writer, switcher, alloc, io),
+            2 => {
+                var vbuf: [32]u8 = undefined;
+                const val = menu.readLine(r, w, file_writer, "  最大 tokens (1-128000): ", &vbuf) catch continue;
+                if (val.len == 0) continue;
                 const mt = std.fmt.parseInt(u32, val, 10) catch {
-                    try std.Io.Writer.writeAll(w, "  Invalid number.\n");
+                    try std.Io.Writer.writeAll(w, "  无效数字\n");
                     continue;
                 };
                 if (mt > 0 and mt <= 128000) {
                     switcher.settings.max_tokens = mt;
-                    dirty = true;
-                } else {
-                    try std.Io.Writer.writeAll(w, "  Value out of range.\n");
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                } else try std.Io.Writer.writeAll(w, "  超出范围\n");
+            },
+            3 => {
+                const mode_items = [_][]const u8{ "Default — 危险操作询问", "Accept Edits — 自动接受编辑", "Plan — 只读", "Bypass — 跳过检查", "Don't Ask — 自动拒绝", "Auto — LLM 分类" };
+                const mode_map = [_]auth.PermissionMode{ .default, .accept_edits, .plan, .bypass, .dont_ask, .auto };
+                const mp = (menu.select(w, r, file_writer, "选择权限模式:", &mode_items, 0) catch continue) orelse continue;
+                switcher.settings.permission_mode = mode_map[mp];
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+            },
+            4 => {
+                switcher.settings.checkpointing_enabled = !switcher.settings.checkpointing_enabled;
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+            },
+            5 => {
+                const sp_items = [_][]const u8{ "输入自定义提示词", "恢复默认", "返回" };
+                const sp = (menu.select(w, r, file_writer, "系统提示词:", &sp_items, 0) catch continue) orelse continue;
+                if (sp == 0) {
+                    var pbuf: [4096]u8 = undefined;
+                    const pval = menu.readLine(r, w, file_writer, "  提示词内容: ", &pbuf) catch continue;
+                    if (pval.len > 0) {
+                        switcher.settings.system_prompt = try alloc.dupe(u8, pval);
+                        autoSaveSettings(w, file_writer, switcher, alloc, io);
+                    }
+                } else if (sp == 1) {
+                    switcher.settings.system_prompt = null;
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
                 }
-            }
-        } else if (std.mem.eql(u8, sel, "4")) {
-            try std.Io.Writer.writeAll(w,
-                \\  Select permission mode:
-                \\    1. Default      — Ask for dangerous operations
-                \\    2. Accept Edits — Auto-accept file edits
-                \\    3. Plan         — Read-only mode
-                \\    4. Bypass       — Skip all permission checks
-                \\    5. Don't Ask    — Auto-deny prompts
-                \\    6. Auto         — LLM-classified (future)
-                \\
-            );
-            try std.Io.Writer.writeAll(w, "  Select [1-6]: ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [16]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len == 1) {
-                const mode: ?auth.PermissionMode = switch (val[0]) {
-                    '1' => .default,
-                    '2' => .accept_edits,
-                    '3' => .plan,
-                    '4' => .bypass,
-                    '5' => .dont_ask,
-                    '6' => .auto,
-                    else => null,
-                };
-                if (mode) |m| {
-                    switcher.settings.permission_mode = m;
-                    dirty = true;
-                }
-            }
-        } else if (std.mem.eql(u8, sel, "5")) {
-            switcher.settings.checkpointing_enabled = !switcher.settings.checkpointing_enabled;
-            try std.Io.Writer.print(w, "  Checkpointing: {s}\n", .{if (switcher.settings.checkpointing_enabled) "on" else "off"});
-            dirty = true;
-        } else if (std.mem.eql(u8, sel, "6")) {
-            try std.Io.Writer.writeAll(w, "  1. Enter custom system prompt\n");
-            try std.Io.Writer.writeAll(w, "  2. Reset to default\n");
-            try std.Io.Writer.writeAll(w, "  3. Back\n");
-            try std.Io.Writer.writeAll(w, "  Select [1-3]: ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [16]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (std.mem.eql(u8, val, "1")) {
-                try std.Io.Writer.writeAll(w, "  Enter system prompt: ");
-                try std.Io.File.Writer.flush(file_writer);
-                var pbuf: [4096]u8 = undefined;
-                var pw = std.Io.Writer.fixed(&pbuf);
-                const pn = std.Io.Reader.streamDelimiter(r, &pw, '\n') catch continue;
-                r.toss(1);
-                const pval = std.mem.trim(u8, pbuf[0..pn], " \t\r\n");
-                if (pval.len > 0) {
-                    switcher.settings.system_prompt = try alloc.dupe(u8, pval);
-                    dirty = true;
-                }
-            } else if (std.mem.eql(u8, val, "2")) {
-                switcher.settings.system_prompt = null;
-                dirty = true;
-                try std.Io.Writer.writeAll(w, "  Reset to default.\n");
-            }
-        } else if (std.mem.eql(u8, sel, "7")) {
-            // Save & Exit
-            config_mod.saveSettings(&switcher.settings, alloc, io) catch |err| {
-                try std.Io.Writer.print(w, "  Error saving: {}\n", .{err});
-                try std.Io.File.Writer.flush(file_writer);
-                continue;
-            };
-            try std.Io.Writer.writeAll(w, "  Settings saved to ~/.config/ziv/settings.json\n\n");
-            break;
-        } else if (std.mem.eql(u8, sel, "8") or sel.len == 0) {
-            if (dirty) {
-                try std.Io.Writer.writeAll(w, "  Changes discarded.\n\n");
-            }
-            break;
+            },
+            6 => break,
+            else => {},
         }
     }
+    try std.Io.Writer.writeAll(w, "\n");
+}
+
+fn try_std_fmt(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.bufPrint(buf, fmt, args) catch fmt;
+}
+
+/// Default-model picker shared by /config: known models + custom entry.
+fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, alloc: std.mem.Allocator, io: std.Io) !void {
+    var labels: [llm.KNOWN_MODELS.len + 2][]const u8 = undefined;
+    for (&llm.KNOWN_MODELS, 0..) |entry, i| {
+        const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.settings.default_model)) " ●" else "";
+        labels[i] = try std.fmt.allocPrint(alloc, "{s:<20} {s}{s}", .{ entry.name, entry.description, marker });
+    }
+    labels[llm.KNOWN_MODELS.len] = "自定义…（手动输入）";
+    labels[llm.KNOWN_MODELS.len + 1] = "取消";
+    defer for (labels[0..llm.KNOWN_MODELS.len]) |l| alloc.free(l);
+
+    const picked = (menu.select(w, r, file_writer, "选择默认模型:", &labels, 0) catch return) orelse return;
+    if (picked == llm.KNOWN_MODELS.len + 1) return;
+    if (picked == llm.KNOWN_MODELS.len) {
+        var vbuf: [128]u8 = undefined;
+        const val = menu.readLine(r, w, file_writer, "  模型名: ", &vbuf) catch return;
+        if (val.len == 0) return;
+        switcher.settings.default_model = try alloc.dupe(u8, val);
+        autoSaveSettings(w, file_writer, switcher, alloc, io);
+        return;
+    }
+    switcher.settings.default_model = try alloc.dupe(u8, llm.KNOWN_MODELS[picked].name);
+    autoSaveSettings(w, file_writer, switcher, alloc, io);
 }
 
 fn runApiKeysMenu(
@@ -1872,95 +1839,37 @@ fn runApiKeysMenu(
     file_writer: *std.Io.File.Writer,
     switcher: *ModelSwitcher,
     alloc: std.mem.Allocator,
+    io: std.Io,
 ) !void {
     while (true) {
-        try std.Io.Writer.writeAll(w, "\n=== API Keys ===\n");
-
-        // OpenAI
-        if (switcher.settings.api_keys.openai) |k| {
-            try std.Io.Writer.print(w, "  1. OpenAI API Key     : {s}\n", .{maskKey(k)});
-        } else {
-            try std.Io.Writer.writeAll(w, "  1. OpenAI API Key     : (not set)\n");
+        var b1: [80]u8 = undefined;
+        var b2: [80]u8 = undefined;
+        var b3: [80]u8 = undefined;
+        const items = [_][]const u8{
+            try_std_fmt(&b1, "OpenAI Key: {s}", .{if (switcher.settings.api_keys.openai) |k| maskKey(k) else "(未设置)"}),
+            try_std_fmt(&b2, "Anthropic Key: {s}", .{if (switcher.settings.api_keys.anthropic) |k| maskKey(k) else "(未设置)"}),
+            try_std_fmt(&b3, "Brave Key: {s}", .{if (switcher.settings.api_keys.brave_api_key) |k| maskKey(k) else "(未设置)"}),
+            "返回",
+        };
+        const picked = (menu.select(w, r, file_writer, "=== API Keys ===", &items, 0) catch break) orelse break;
+        const prompts = [_][]const u8{ "  OpenAI API Key (回车保留): ", "  Anthropic API Key (回车保留): ", "  Brave API Key (回车保留): " };
+        if (picked >= 3) break;
+        var vbuf: [256]u8 = undefined;
+        const val = menu.readLine(r, w, file_writer, prompts[picked], &vbuf) catch continue;
+        if (val.len == 0) continue;
+        const dup = try alloc.dupe(u8, val);
+        switch (picked) {
+            0 => switcher.settings.api_keys.openai = dup,
+            1 => switcher.settings.api_keys.anthropic = dup,
+            2 => switcher.settings.api_keys.brave_api_key = dup,
+            else => {},
         }
-
-        // Anthropic
-        if (switcher.settings.api_keys.anthropic) |k| {
-            try std.Io.Writer.print(w, "  2. Anthropic API Key  : {s}\n", .{maskKey(k)});
-        } else {
-            try std.Io.Writer.writeAll(w, "  2. Anthropic API Key  : (not set)\n");
-        }
-
-        // Brave
-        if (switcher.settings.api_keys.brave_api_key) |k| {
-            try std.Io.Writer.print(w, "  3. Brave API Key      : {s}\n", .{maskKey(k)});
-        } else {
-            try std.Io.Writer.writeAll(w, "  3. Brave API Key      : (not set)\n");
-        }
-
-        try std.Io.Writer.print(w, "  4. Ollama Host        : {s}\n", .{switcher.settings.api_keys.ollama_host});
-        try std.Io.Writer.writeAll(w, "  5. Back\n");
-        try std.Io.Writer.writeAll(w, "\n  Select [1-5]: ");
-        try std.Io.File.Writer.flush(file_writer);
-
-        var buf: [4096]u8 = undefined;
-        var bw = std.Io.Writer.fixed(&buf);
-        const n = std.Io.Reader.streamDelimiter(r, &bw, '\n') catch break;
-        r.toss(1);
-        const sel = std.mem.trim(u8, buf[0..n], " \t\r\n");
-
-        if (std.mem.eql(u8, sel, "1")) {
-            try std.Io.Writer.writeAll(w, "  Enter OpenAI API Key (or Enter to keep): ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [256]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
-                switcher.settings.api_keys.openai = try alloc.dupe(u8, val);
-            }
-        } else if (std.mem.eql(u8, sel, "2")) {
-            try std.Io.Writer.writeAll(w, "  Enter Anthropic API Key (or Enter to keep): ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [256]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
-                switcher.settings.api_keys.anthropic = try alloc.dupe(u8, val);
-            }
-        } else if (std.mem.eql(u8, sel, "3")) {
-            try std.Io.Writer.writeAll(w, "  Enter Brave API Key (or Enter to keep): ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [256]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
-                switcher.settings.api_keys.brave_api_key = try alloc.dupe(u8, val);
-            }
-        } else if (std.mem.eql(u8, sel, "4")) {
-            try std.Io.Writer.writeAll(w, "  Enter Ollama Host URL: ");
-            try std.Io.File.Writer.flush(file_writer);
-            var vbuf: [256]u8 = undefined;
-            var vw = std.Io.Writer.fixed(&vbuf);
-            const vn = std.Io.Reader.streamDelimiter(r, &vw, '\n') catch continue;
-            r.toss(1);
-            const val = std.mem.trim(u8, vbuf[0..vn], " \t\r\n");
-            if (val.len > 0) {
-                switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
-            }
-        } else {
-            break; // Back or invalid
-        }
+        autoSaveSettings(w, file_writer, switcher, alloc, io);
     }
+    try std.Io.Writer.writeAll(w, "\n");
 }
+var mask_buf: [16]u8 = undefined;
 
-/// Mask a key for display: show "sk-...xyz" format.
-/// Returns a static buffer (overwritten on next call — fine for display).
-var mask_buf: [64]u8 = undefined;
 fn maskKey(key: []const u8) []const u8 {
     if (key.len <= 6) return "***";
     const prefix_len = @min(@as(usize, 3), key.len);
@@ -1981,6 +1890,39 @@ fn maskKey(key: []const u8) []const u8 {
         i += 1;
     }
     return mask_buf[0..i];
+}
+
+/// Interactive model picker: arrow keys + Enter to switch at runtime.
+fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, io: std.Io) !void {
+    var labels: [llm.KNOWN_MODELS.len + 1][]const u8 = undefined;
+    for (&llm.KNOWN_MODELS, 0..) |entry, i| {
+        const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.modelName())) " ●" else "";
+        labels[i] = try std.fmt.allocPrint(std.heap.smp_allocator, "{s:<20} {s}{s}", .{ entry.name, entry.description, marker });
+    }
+    labels[llm.KNOWN_MODELS.len] = "取消 (q)";
+    defer for (labels[0..llm.KNOWN_MODELS.len]) |l| std.heap.smp_allocator.free(l);
+
+    const picked = menu.select(w, r, file_writer, "选择模型 (Enter 切换):", &labels, 0) catch {
+        try printModelInfo(w, switcher);
+        return;
+    } orelse {
+        try printModelInfo(w, switcher); // cancelled — show the table
+        return;
+    };
+
+    if (picked == llm.KNOWN_MODELS.len) return; // 取消
+    const name = llm.KNOWN_MODELS[picked].name;
+    switcher.switchModel(name) catch |err| {
+        if (err == error.MissingApiKey) {
+            try std.Io.Writer.print(w, "  Error: API key not configured for {s}.\n  Use /config to set keys.\n\n", .{llm.KNOWN_MODELS[picked].backend.label()});
+        } else {
+            try std.Io.Writer.print(w, "  Error switching model: {}\n\n", .{err});
+        }
+        return;
+    };
+    switcher.settings.default_model = name;
+    config_mod.saveSettings(&switcher.settings, std.heap.smp_allocator, io) catch {};
+    try std.Io.Writer.print(w, "  ✓ 已切换: {s} ({s})\n\n", .{ switcher.modelName(), switcher.backendLabel() });
 }
 
 fn printModelInfo(w: *std.Io.Writer, switcher: *ModelSwitcher) !void {
