@@ -324,3 +324,5 @@
 - monitor/cron/event_bus 运行时接线（编译进二进制但 repl 不启动——属新功能接入非缺陷，另立任务）
 - config 五层加载覆盖时旧字符串泄漏（启动期 4 次小分配、会话级生命周期，接受不改；如要改需 owned 标记位）
 - reflection 所有权文档（runReflection 内部全 dupe，无泄漏，仅缺注释）
+
+补遗（bb3a926，复查后补掉的 3 个漏项）：max_snapshots 读写接通（jq 回环验证）；plan 模式 Bash 只读语义（白名单 bashIsReadOnly，链段逐一校验、重定向/git 写子命令拒绝，fail-closed）；RawGuard 信号兜底补 SIGTERM。197 测试 196 pass / 1 skip / 0 fail。SIGSEGV 崩溃兜底仍不含（异步信号安全原因，崩溃路径终端残留风险已大幅缩小）。
