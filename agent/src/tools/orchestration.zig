@@ -178,7 +178,7 @@ fn executeToolCall(
     const tool = findTool(tools_def, call.tool_name) orelse
         return .{ .output = "Tool not found", .is_error = true };
 
-    return tool.execute_fn(allocator, call.input, io) catch
+    return tool.execute(allocator, call.input, io) catch
         .{ .output = "Tool execution error", .is_error = true };
 }
 

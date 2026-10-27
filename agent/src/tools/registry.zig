@@ -75,6 +75,10 @@ pub const ToolDefinition = struct {
     description: []const u8,
     input_schema: []const u8,
     execute_fn: *const fn (std.mem.Allocator, std.json.Value, std.Io) anyerror!ToolResult,
+    /// Context-carrying executor (dynamic tools, e.g. MCP bridge): when
+    /// set, execute() dispatches here with `execute_ctx`.
+    execute_ctx_fn: ?*const fn (?*anyopaque, std.mem.Allocator, std.json.Value, std.Io) anyerror!ToolResult = null,
+    execute_ctx: ?*anyopaque = null,
     is_read_only: bool = true,
     is_destructive: bool = false,
 
@@ -92,6 +96,12 @@ pub const ToolDefinition = struct {
     search_hint: ?[]const u8 = null,
 
     // ──── Helper methods ────
+
+    /// Execute through whichever executor the definition carries.
+    pub fn execute(self: *const ToolDefinition, allocator: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!ToolResult {
+        if (self.execute_ctx_fn) |f| return f(self.execute_ctx, allocator, input, io);
+        return self.execute_fn(allocator, input, io);
+    }
 
     /// Check if this tool can run concurrently with others for the given input.
     pub fn isConcurrencySafe(self: *const ToolDefinition, input: std.json.Value) bool {

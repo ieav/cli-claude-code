@@ -10,6 +10,7 @@ const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
 const lineinput = @import("util/lineinput.zig");
 const slash_cmds = @import("util/slash_commands.zig");
+const runtime_registry = @import("tools/runtime_registry.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -293,6 +294,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var live_trace: ?decision_trace.DecisionTrace = null;
     defer if (live_trace) |*t| t.deinit();
 
+    // Runtime tool registry (M1): built-ins + (later) MCP dynamic tools.
+    // Everything downstream — /tools, /run, agent loop, orchestration —
+    // reads this one list.
+    var reg = runtime_registry.RuntimeRegistry.init(allocator);
+    defer reg.deinit();
+
     // Input history for the line editor (up/down navigation).
     var input_history: std.ArrayList([]u8) = .empty;
     defer {
@@ -357,7 +364,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 continue;
             } else if (std.mem.eql(u8, input, "/tools")) {
                 try std.Io.Writer.writeAll(w, "Registered tools:\n");
-                inline for (tools_mod.default_tools) |tool| {
+                for (reg.definitions()) |tool| {
                     const safety = if (tool.is_concurrency_safe_fn != null) "safe" else "serial";
                     try std.Io.Writer.print(w, "  {s} - {s} [{s}|{s}]\n", .{
                         tool.name,
@@ -366,7 +373,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         safety,
                     });
                 }
-                try std.Io.Writer.print(w, "\n  Total: {d} tools\n\n", .{tools_mod.default_tools.len});
+                try std.Io.Writer.print(w, "\n  Total: {d} tools\n\n", .{reg.count()});
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.startsWith(u8, input, "/run ")) {
@@ -396,9 +403,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // Permission gate — /run goes through the same pipeline as
                 // agent-loop tool calls (previously it bypassed the mode
                 // entirely, letting Plan mode perform writes).
-                if (tools_mod.DefaultRegistry.findByName(tool_name)) |tool_def| {
-                    if (!try permissionGate(tool_def, parsed, current_mode, &switcher, allocator, r, w, &file_writer)) continue;
-                }
+                const run_tool = reg.findByName(tool_name) orelse {
+                    try std.Io.Writer.print(w, "  Unknown tool: {s}\n\n", .{tool_name});
+                    try std.Io.File.Writer.flush(&file_writer);
+                    continue;
+                };
+                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, &file_writer)) continue;
 
                 // Backup file before modification (for /run commands)
                 var run_snap_id: ?[16]u8 = null;
@@ -414,7 +424,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     }
                 }
 
-                const result = tools_mod.DefaultRegistry.execute(tool_name, allocator, parsed, io) catch |err| {
+                const result = run_tool.execute(allocator, parsed, io) catch |err| {
                     logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
                     try std.Io.Writer.print(w, "  Tool error: {}\n\n", .{err});
                     _ = log.record(tool_name, "execution", "error", run_snap_id, false) catch {};
@@ -659,7 +669,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
                 // Declare the tools so the model can actually call them.
-                .tools = &tools_mod.default_tool_specs,
+                .tools = reg.toolSpecs(),
             }, w, &file_writer, allocator) catch |err| {
                 logger.err("LLM call failed: {}", .{err});
                 try std.Io.Writer.print(w, "  [LLM error: {}]\n\n", .{err});
@@ -747,7 +757,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const tc = block.tool_use;
 
                     // Find tool definition
-                    const tool_def = tools_mod.DefaultRegistry.findByName(tc.name) orelse {
+                    const tool_def = reg.findByName(tc.name) orelse {
                         try std.Io.Writer.print(w, "  [Unknown tool: {s}]\n", .{tc.name});
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = tc.id,
@@ -809,12 +819,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 defer allocator.free(call_view);
                 for (prepared.items, 0..) |p, i| call_view[i] = p.call;
 
-                const batches = try orchestration_mod.partitionToolCalls(call_view, tools_mod.default_tools, allocator);
+                const batches = try orchestration_mod.partitionToolCalls(call_view, reg.definitions(), allocator);
                 defer {
                     for (batches) |b| allocator.free(b.calls);
                     allocator.free(batches);
                 }
-                const results = try orchestration_mod.executeBatches(batches, allocator, io, tools_mod.default_tools);
+                const results = try orchestration_mod.executeBatches(batches, allocator, io, reg.definitions());
                 defer allocator.free(results);
 
                 var batch_errors: u32 = 0;
