@@ -274,3 +274,9 @@
 - **🟡 Ollama Host 配置链两处断裂（已修）**: ①改 host 后 ollama_provider 缓存（init 时固化 base_url）不清理——当前会话仍连旧地址；②Ollama Host 未接模型自动拉取（OpenAI/Anthropic 有）。修复：case 3 清 provider 缓存 + offerGatewayModels(.ollama)，本机已装模型也能菜单直选。
 - **🟢 登记不改**: fetchGatewayModels 的 JSON DOM 为 parseFromSliceLeaky 会话级泄漏（低频操作、量小）；promptCustomModel 返回堆串与 default_model 双重 dupe 小泄漏；menu.readLine（配置子输入）仍为 cooked 行读（无编辑器，主输入行已修）；lineinput draft 上限 1024 截断。
 - **链路复核结论**: A 接入配置链（菜单→落盘→缓存清理→拉取→选择→路由→HTTP）、B 自定义路由链（四层优先级→switchModel→getProvider）、C 行编辑器链（TTY raw/管道 fallback→命令分发→历史）全部闭环；嵌套 raw 进出（行编辑器→菜单→readLine）恢复顺序正确。
+
+### P26: 配置持久化复查（用户报告配置丢失）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **诊断**: 实测当前版本保存→落盘→重启读回**全链正常**（key/URL/掩码显示验证）。用户遇到的丢失为历史版本存量伤害：P23 之前 saveSettings 不序列化 base_url，且旧版本存在全量洗写窗口（某次启动读到无 key 的内存状态后 autoSave 覆盖文件），用户文件中 anthropic_base_url 被洗即为证据。当前代码已无此问题。
+- **🟡 /mode 持久化漏网（已修）**: 权限模式切换仅改运行时变量，重启回落配置值。现 /mode 切换即同步 settings.permission_mode + saveSettings（实测 accept_edits/plan 均落盘）。
+- **配置自动保存全覆盖盘点**: default_model ✓ max_tokens ✓ permission_mode(本次补) ✓ checkpointing ✓ system_prompt ✓ api_keys 全家(含 base_url) ✓ default_backend ✓ default_backend(P23) ✓ —— /config 所有项改动即存；TaskStore 为会话级设计内不持久化。

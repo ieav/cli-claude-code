@@ -424,7 +424,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             } else if (std.mem.eql(u8, input, "/mode")) {
                 // Cycle permission mode
                 current_mode = auth.nextMode(current_mode);
-                try std.Io.Writer.print(w, "  Permission mode: {s}\n\n", .{auth.modeLabel(current_mode)});
+                // Persist the mode choice — it was runtime-only before, so
+                // every restart silently fell back to the configured mode.
+                switcher.settings.permission_mode = current_mode;
+                config_mod.saveSettings(&switcher.settings, allocator, io) catch {};
+                try std.Io.Writer.print(w, "  Permission mode: {s} (已保存)\n\n", .{auth.modeLabel(current_mode)});
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/model") or std.mem.eql(u8, input, "/models")) {
