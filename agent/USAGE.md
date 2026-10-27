@@ -40,7 +40,7 @@ zig build install
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — Zig 自学习 Agent v0.4.0      ║
+║  Ziv — Zig 自学习 Agent v0.5.0      ║
 ║  pi 圆融 · e 增长 · phi 浓缩         ║
 ╚══════════════════════════════════════╝
 ```
@@ -51,7 +51,7 @@ zig build install
 |------|------|
 | `/help`, `/h` | 显示帮助信息 |
 | `/quit`, `/q`, `/exit` | 退出 Ziv |
-| `/version` | 显示版本号 (v0.4.0) |
+| `/version` | 显示版本号 (v0.5.0) |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
 | `/run <ToolName> <json>` | 直接执行工具 |
@@ -268,7 +268,7 @@ ziv> /model mistral             # → Ollama 后端（本地模型）
 ## 4. 架构总览
 
 ```
-Ziv Agent v0.4.0
+Ziv Agent v0.5.0
 ├── math/           数学常数核心 (pi, e, phi)
 ├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 消息压缩
 ├── tools/          comptime 工具系统 (12 tools) + 权限 + 编排
@@ -694,7 +694,7 @@ agent/
 │   └── migrations/        # SQL 迁移脚本
 └── src/
     ├── main.zig           # 入口 + 自检
-    ├── repl.zig           # 交互式 REPL（v0.4.0 — 完整 Agent Loop）
+    ├── repl.zig           # 交互式 REPL（v0.5.0 — 完整 Agent Loop）
     ├── config.zig         # 五层配置层级 + saveSettings + env 回退
     ├── system_prompt.zig  # 默认系统提示词
     │
