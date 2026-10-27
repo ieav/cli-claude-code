@@ -16,7 +16,7 @@ targets=(
   "aarch64-linux-musl"
 )
 
-for t in $targets; do
+for t in "${targets[@]}"; do
   echo "── building $t (ReleaseFast)…"
   zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$t"
   cp zig-out/bin/ziv "$OUT/ziv-$t"
