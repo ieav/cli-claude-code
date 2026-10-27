@@ -132,7 +132,9 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     // Parse API keys
     if (json_helpers.getObject(value, "api_keys")) |keys| {
         if (json_helpers.getString(keys, "openai")) |k| settings.api_keys.openai = try allocator.dupe(u8, k);
+        if (json_helpers.getString(keys, "openai_base_url")) |u| settings.api_keys.openai_base_url = try allocator.dupe(u8, u);
         if (json_helpers.getString(keys, "anthropic")) |k| settings.api_keys.anthropic = try allocator.dupe(u8, k);
+        if (json_helpers.getString(keys, "anthropic_base_url")) |u| settings.api_keys.anthropic_base_url = try allocator.dupe(u8, u);
         if (json_helpers.getString(keys, "brave")) |k| settings.api_keys.brave_api_key = try allocator.dupe(u8, k);
     }
 
@@ -143,6 +145,23 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
 }
 
 /// Save settings to user config file (~/.config/ziv/settings.json).
+fn writeJsonStringField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, value: []const u8) void {
+    buf.appendSlice(allocator, "    \"") catch return;
+    buf.appendSlice(allocator, name) catch return;
+    buf.appendSlice(allocator, "\": \"") catch return;
+    for (value) |ch| {
+        switch (ch) {
+            '"' => buf.appendSlice(allocator, "\\\"") catch return,
+            '\\' => buf.appendSlice(allocator, "\\\\") catch return,
+            '\n' => buf.appendSlice(allocator, "\\n") catch return,
+            '\r' => buf.appendSlice(allocator, "\\r") catch return,
+            '\t' => buf.appendSlice(allocator, "\\t") catch return,
+            else => buf.append(allocator, ch) catch return,
+        }
+    }
+    buf.appendSlice(allocator, "\",\n") catch return;
+}
+
 pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io: std.Io) !void {
     const dir = system_dirs.configDir(allocator) catch |err| return err;
     defer allocator.free(dir);
@@ -189,22 +208,23 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
         buf.appendSlice(allocator, "\",\n") catch {};
     }
 
-    // api_keys
+    // api_keys (escaped: a quote/backslash in a key would corrupt the file
+    // and the next load would silently drop EVERYTHING)
     buf.appendSlice(allocator, "  \"api_keys\": {\n") catch {};
     if (settings.api_keys.openai) |k| {
-        buf.print(allocator, "    \"openai\": \"{s}\",\n", .{k}) catch {};
+        writeJsonStringField(allocator, &buf, "openai", k);
     }
     if (settings.api_keys.openai_base_url) |u| {
-        buf.print(allocator, "    \"openai_base_url\": \"{s}\",\n", .{u}) catch {};
+        writeJsonStringField(allocator, &buf, "openai_base_url", u);
     }
     if (settings.api_keys.anthropic) |k| {
-        buf.print(allocator, "    \"anthropic\": \"{s}\",\n", .{k}) catch {};
+        writeJsonStringField(allocator, &buf, "anthropic", k);
     }
     if (settings.api_keys.anthropic_base_url) |u| {
-        buf.print(allocator, "    \"anthropic_base_url\": \"{s}\",\n", .{u}) catch {};
+        writeJsonStringField(allocator, &buf, "anthropic_base_url", u);
     }
     if (settings.api_keys.brave_api_key) |k| {
-        buf.print(allocator, "    \"brave\": \"{s}\",\n", .{k}) catch {};
+        writeJsonStringField(allocator, &buf, "brave", k);
     }
     buf.print(allocator, "    \"ollama_host\": \"{s}\"\n", .{settings.api_keys.ollama_host}) catch {};
     buf.appendSlice(allocator, "  }\n") catch {};

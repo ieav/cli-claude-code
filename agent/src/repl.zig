@@ -133,9 +133,14 @@ const ModelSwitcher = struct {
             },
         }
 
-        const len = @min(new_model.len, 64);
-        @memcpy(self.model_name_buf[0..len], new_model[0..len]);
-        self.model_name_len = len;
+        // Re-pin the backend without changing the name may pass the CURRENT
+        // name back in (switchModel(modelName()) from the gateway pin flow):
+        // skip the copy — @memcpy with aliasing src/dst is a panic in Zig.
+        if (!std.mem.eql(u8, new_model[0..@min(new_model.len, 64)], self.modelName())) {
+            const len = @min(new_model.len, 64);
+            @memcpy(self.model_name_buf[0..len], new_model[0..len]);
+            self.model_name_len = len;
+        }
         self.backend = new_backend;
 
         logger.info("Model switched: {s} (backend={s})", .{ new_model, @tagName(new_backend) });

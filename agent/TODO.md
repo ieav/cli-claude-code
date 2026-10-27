@@ -280,3 +280,10 @@
 - **诊断**: 实测当前版本保存→落盘→重启读回**全链正常**（key/URL/掩码显示验证）。用户遇到的丢失为历史版本存量伤害：P23 之前 saveSettings 不序列化 base_url，且旧版本存在全量洗写窗口（某次启动读到无 key 的内存状态后 autoSave 覆盖文件），用户文件中 anthropic_base_url 被洗即为证据。当前代码已无此问题。
 - **🟡 /mode 持久化漏网（已修）**: 权限模式切换仅改运行时变量，重启回落配置值。现 /mode 切换即同步 settings.permission_mode + saveSettings（实测 accept_edits/plan 均落盘）。
 - **配置自动保存全覆盖盘点**: default_model ✓ max_tokens ✓ permission_mode(本次补) ✓ checkpointing ✓ system_prompt ✓ api_keys 全家(含 base_url) ✓ default_backend ✓ default_backend(P23) ✓ —— /config 所有项改动即存；TaskStore 为会话级设计内不持久化。
+
+### P27: 🔴 配置丢失真根因修复 + pin 崩溃（用户真机报障）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **🔴 load 侧不解析 base_url（配置丢失真根因）**: P23 只修了 save 序列化，loadJsonIntoSettings 一直没读 openai_base_url/anthropic_base_url——保存成功但**重启读不回**，下次 autoSave 重写文件时该行消失。这就是用户"每次重新打开都要重新配置"的真正原因。已补 load 解析，重启实测 base_url 存活。用户被洗掉的 anthropic_base_url 已恢复。
+- **🔴 switchModel alias 崩溃**: 网关 pin 流程 `switchModel(modelName())` 自切自 → @memcpy(buf, buf) 同源 panic（真机实测崩溃栈）。修复：名字未变时跳过拷贝，只重设 backend。崩溃场景复现通过（pin 分支正常走完）。
+- **🟡 saveSettings key/URL 无 JSON 转义**: key 含引号会写坏文件，下次 load 静默丢全部配置。新增 writeJsonStringField 转义（5 种字符）。
+- **今日六笔提交（b709c74→f513945）链路复查**: A 接入配置链（含本次 load 修复后真正闭环）/ B 自定义路由链 / C 行编辑器链 / D Ollama host 链（P25 修）/ E /mode 持久化（P26 修）/ F pin 流程（本次修）——全部闭环。
