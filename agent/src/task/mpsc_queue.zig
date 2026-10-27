@@ -113,15 +113,24 @@ pub fn BoundedMPSC(comptime T: type, comptime capacity: usize) type {
             }
         }
 
-        /// Pop from consumer thread. Returns null if empty.
+        /// Pop (multi-consumer safe). Claims the head slot with cmpxchg so
+        /// concurrent workers can never take the same item or rewind head —
+        /// the old plain load/store version duplicated tasks and could wedge
+        /// every worker on a consumed slot once >1 worker ran.
         pub fn pop(self: *Self) ?T {
-            const head = self.head.load(.monotonic);
-            const entry = &self.buffer[head % capacity];
-            if (!entry.valid.load(.acquire)) return null;
-            const data = entry.data;
-            entry.valid.store(false, .monotonic);
-            self.head.store(head + 1, .release);
-            return data;
+            var head = self.head.load(.monotonic);
+            while (true) {
+                const entry = &self.buffer[head % capacity];
+                if (!entry.valid.load(.acquire)) return null;
+                // Claim the slot BEFORE reading data: winner reads, losers retry.
+                if (self.head.cmpxchgWeak(head, head + 1, .acq_rel, .monotonic)) |actual| {
+                    head = actual;
+                    continue;
+                }
+                const data = entry.data;
+                entry.valid.store(false, .release);
+                return data;
+            }
         }
 
         pub fn isEmpty(self: *const Self) bool {
