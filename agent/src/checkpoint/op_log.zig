@@ -46,11 +46,10 @@ pub const OperationLog = struct {
         snapshot_id: ?[16]u8,
         rollback_safe: bool,
     ) ![16]u8 {
+        // uuid, not timestamp-spice: two ops in the same millisecond used
+        // to collide on op_id (uuid was imported but never used).
         var id: [16]u8 = undefined;
-        const ts = time_mod.nowMillis();
-        for (&id, 0..) |*byte, i| {
-            byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
-        }
+        uuid.randomBytes(&id);
 
         try self.records.append(self.allocator, .{
             .op_id = id,

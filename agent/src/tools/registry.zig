@@ -155,13 +155,6 @@ pub fn ToolRegistry(comptime tools: []const ToolDefinition) type {
             return null;
         }
 
-        pub fn getByName(name: []const u8) ?*const ToolDefinition {
-            comptime for (tools) |*tool| {
-                if (std.mem.eql(u8, tool.name, name)) return tool;
-            };
-            return null;
-        }
-
         /// Find a tool by name, including aliases.
         pub fn findByName(name: []const u8) ?*const ToolDefinition {
             inline for (tools) |*tool| {

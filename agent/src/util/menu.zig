@@ -74,12 +74,55 @@ pub const RawGuard = struct {
         raw.cc[@backingInt(std.c.V.MIN)] = 1;
         raw.cc[@backingInt(std.c.V.TIME)] = 0;
         if (std.c.tcsetattr(0, .NOW, &raw) == 0) self.active = true;
+        // Crash/kill-safety: without a handler a SIGINT/SIGSEGV in raw mode
+        // left the terminal echo-less and unusable after the process died.
+        if (self.active) installSignalRestore(&self.orig);
     }
 
     pub fn restore(self: *RawGuard) void {
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
+        if (self.active) removeSignalRestore();
     }
 };
+
+/// Saved terminal settings for the signal handler (single guard at a time —
+/// menus never nest raw mode).
+var signal_saved: ?std.c.termios = null;
+
+fn restoreFromSignal(_: std.posix.SIG) callconv(.c) void {
+    if (signal_saved) |*t| {
+        _ = std.c.tcsetattr(0, .NOW, t);
+        // Restore the default disposition and re-raise so the exit status
+        // still reflects the signal instead of swallowing it.
+        const dfl_act: std.posix.Sigaction = .{
+            .handler = .{ .handler = @ptrFromInt(0) },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &dfl_act, null);
+        std.posix.raise(.INT) catch {};
+    }
+}
+
+fn installSignalRestore(orig: *const std.c.termios) void {
+    signal_saved = orig.*;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = restoreFromSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, null);
+}
+
+fn removeSignalRestore() void {
+    signal_saved = null;
+    const dfl_act: std.posix.Sigaction = .{
+        .handler = .{ .handler = @ptrFromInt(0) },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &dfl_act, null);
+}
 
 fn render(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: usize) !void {
     // Move back to the top of the previous frame (title + items + hint),

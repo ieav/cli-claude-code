@@ -61,6 +61,8 @@ pub const EventBus = struct {
         try result.value_ptr.append(self.allocator, handler);
     }
 
+    /// Ownership: `message` (and `data`) are stored by reference in the π
+    /// ring — callers must pass static or process-lifetime strings.
     pub fn emit(self: *Self, event_type: EventType, message: []const u8) void {
         const event = Event{
             .event_type = event_type,
@@ -98,6 +100,7 @@ pub const EventBus = struct {
     }
 
     /// Get recent events from π ring buffer (uniform coverage).
+    /// Caller owns the returned slice — free it with freeEvents().
     pub fn getRecentEvents(self: *Self, count: usize) []const Event {
         const n = @min(count, self.event_log.count);
         if (n == 0) return &.{};
@@ -111,6 +114,11 @@ pub const EventBus = struct {
             }
         }
         return result.toOwnedSlice() catch &.{};
+    }
+
+    /// Free a slice returned by getRecentEvents.
+    pub fn freeEvents(self: *Self, events: []const Event) void {
+        if (events.len > 0) self.allocator.free(@constCast(events));
     }
 
     pub fn eventCount(self: *const Self) usize {

@@ -46,13 +46,17 @@ pub fn retryDelay(base_ms: u64, attempt: u32, max_delay_ms: u64) u64 {
 /// Compute the effective max concurrent tasks given current queue pressure.
 /// Uses logistic growth bounded by hardware limit.
 pub fn effectiveConcurrency(current_load: usize, hw_threads: usize) usize {
-    if (hw_threads == 0) return 1;
-    const effective = logisticCap(
-        @floatFromInt(current_load),
-        @floatFromInt(hw_threads),
-        2.0,
-    );
-    return @max(1, @as(usize, @intFromFloat(@round(effective))));
+    if (hw_threads <= 1) return 1;
+    // Auto (load=0): half the cores, bounded [1, 8]. The old logisticCap
+    // formula returned sigmoid(-6)×hw ≈ 0.002×hw for every machine, so the
+    // pool always ran exactly one worker — parallelism in name only. (Safe
+    // to raise now that BoundedMPSC.pop is multi-consumer safe.)
+    if (current_load == 0) return @min(8, @max(1, hw_threads / 2));
+    // Under load: e-shaped hyperbolic decay reserves headroom as the queue
+    // fills: workers = hw / (1 + load/hw).
+    const load_ratio = @as(f64, @floatFromInt(current_load)) / @as(f64, @floatFromInt(hw_threads));
+    const scaled = @as(f64, @floatFromInt(hw_threads)) / (1.0 + load_ratio);
+    return @max(1, @as(usize, @intFromFloat(@round(scaled))));
 }
 
 test "sigmoid bounds" {

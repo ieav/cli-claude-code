@@ -23,14 +23,14 @@ pub const EpisodicStore = struct {
             \\VALUES (?1, ?2, 'private', ?3, ?4, ?5, ?6, ?7, ?8)
         );
         defer stmt.finalize();
-        stmt.bindBlob(1, &entry.id);
-        stmt.bindText(2, @tagName(entry.mem_type));
-        stmt.bindText(3, entry.name);
-        stmt.bindText(4, entry.description);
-        stmt.bindText(5, entry.content);
-        stmt.bindInt64(6, entry.access_count);
-        stmt.bindInt64(7, entry.created_at);
-        stmt.bindInt64(8, entry.updated_at);
+        try stmt.bindBlob(1, &entry.id);
+        try stmt.bindText(2, @tagName(entry.mem_type));
+        try stmt.bindText(3, entry.name);
+        try stmt.bindText(4, entry.description);
+        try stmt.bindText(5, entry.content);
+        try stmt.bindInt64(6, entry.access_count);
+        try stmt.bindInt64(7, entry.created_at);
+        try stmt.bindInt64(8, entry.updated_at);
         if (try stmt.step()) return error.UnexpectedRow;
     }
 
@@ -44,7 +44,7 @@ pub const EpisodicStore = struct {
                 "FROM memories ORDER BY updated_at DESC LIMIT ?1",
         );
         defer stmt.finalize();
-        stmt.bindInt64(1, @intCast(limit));
+        try stmt.bindInt64(1, @intCast(limit));
 
         var list: std.ArrayList(types.MemoryEntry) = .empty;
         errdefer {
@@ -79,8 +79,8 @@ pub const EpisodicStore = struct {
             "UPDATE memories SET access_count = access_count + 1, updated_at = ?1 WHERE id = ?2",
         ) catch return;
         defer stmt.finalize();
-        stmt.bindInt64(1, time_mod.nowMillis());
-        stmt.bindBlob(2, &memory_id);
+        stmt.bindInt64(1, time_mod.nowMillis()) catch return;
+        stmt.bindBlob(2, &memory_id) catch return;
         _ = stmt.step() catch {};
     }
 

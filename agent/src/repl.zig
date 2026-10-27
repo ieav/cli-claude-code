@@ -315,7 +315,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             .dont_ask => "ziv[dontask]",
             .auto => "ziv[auto]",
         };
-        const est_ctx = estimateHistoryTokens(history.items);
+        var est_ctx = estimateHistoryTokens(history.items);
         const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(MAX_CONTEXT_TOKENS)) * 100.0));
         var prompt_buf: [160]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
@@ -378,7 +378,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const tool_name = rest[0..space_idx];
                 const json_str = rest[space_idx + 1 ..];
 
-                const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_str, .{}) catch {
+                // Per-command arena: the DOM (and every string the tool
+                // pulled out of it) dies at the end of the /run arm.
+                var run_arena = std.heap.ArenaAllocator.init(allocator);
+                defer run_arena.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, run_arena.allocator(), json_str, .{}) catch {
                     try std.Io.Writer.writeAll(w, "Invalid JSON input\n\n");
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
@@ -423,7 +427,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.Writer.print(w, "  {s}\n\n", .{result.output});
                 }
                 _ = log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null) catch {};
-                if (!result.is_error) allocator.free(result.output);
+                allocator.free(result.output);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/mode")) {
@@ -614,6 +618,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
             // Compaction check
             maybeCompact(&history, allocator, w, &file_writer);
+            // est_ctx goes stale across tool rounds (history grows) — refresh
+            est_ctx = estimateHistoryTokens(history.items);
 
             // Get provider
             const prov = switcher.getProvider() catch |err| {
@@ -897,7 +903,7 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
     for (candidates.items[0..target]) |f| {
         const now = util_time.nowMillis();
         mem.store(.{
-            .id = injection_mod.memoryId(f.content),
+            .id = injection_mod.memoryId(f.content, @tagName(f.fact_type)),
             .mem_type = switch (f.fact_type) {
                 .user_preference => .user,
                 .project_context, .technical_fact, .error_solution, .pattern_observed => .project,
@@ -984,7 +990,7 @@ fn runReflection(
     const name = std.fmt.bufPrint(&name_buf, "reflection q={d} tools={d}", .{ window_queries.items.len, window_tools.* }) catch "reflection";
     const now = util_time.nowMillis();
     mem.store(.{
-        .id = injection_mod.memoryId(insights),
+        .id = injection_mod.memoryId(insights, "reflection"),
         .mem_type = .feedback,
         .name = name,
         .description = @tagName(reflection.trigger),
@@ -1344,7 +1350,15 @@ fn streamComplete(
     defer agg.deinit();
 
     try prov.stream(history, opts, @ptrCast(&agg), streamCb);
-    if (agg.saw_error) |e| return e;
+    if (agg.saw_error) |e| {
+        // These dupes never made it into history — free them here.
+        for (agg.tools.items) |*tu| {
+            alloc.free(tu.id);
+            alloc.free(tu.name);
+            freeJsonValue(alloc, tu.input);
+        }
+        return e;
+    }
 
     var blocks: std.ArrayList(llm.ContentBlock) = .empty;
     errdefer blocks.deinit(alloc);
@@ -1499,7 +1513,8 @@ fn finishToolCall(
         .is_error = result.is_error,
     } });
     _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null) catch {};
-    if (truncated and !result.is_error) {
+    if (truncated) {
+        // History owns the dupe; the original (error or not) is spent.
         alloc.free(result.output);
     }
     // If not truncated, content_for_history == result.output; ownership moved into history

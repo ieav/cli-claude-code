@@ -7,7 +7,7 @@ const time_mod = @import("time.zig");
 /// counter (the counter keeps same-millisecond calls distinct).
 var call_seq = std.atomic.Value(u64).init(0);
 
-fn randomBytes(buf: []u8) void {
+pub fn randomBytes(buf: []u8) void {
     const n = call_seq.fetchAdd(1, .monotonic);
     var seed: u64 = @bitCast(time_mod.nowMillis());
     seed ^= @intFromPtr(buf.ptr);

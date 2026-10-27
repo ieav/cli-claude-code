@@ -211,20 +211,24 @@ pub const Statement = struct {
         return .{ .allocator = allocator, .stmt = stmt.?, .db = db };
     }
 
-    pub fn bindText(self: Self, idx: c_int, text: []const u8) void {
-        _ = c.sqlite3_bind_text(self.stmt, idx, text.ptr, @intCast(text.len), c.SQLITE_STATIC);
+    pub fn bindText(self: Self, idx: c_int, text: []const u8) !void {
+        if (c.sqlite3_bind_text(self.stmt, idx, text.ptr, @intCast(text.len), c.SQLITE_STATIC) != c.SQLITE_OK)
+            return error.BindFailed;
     }
 
-    pub fn bindInt64(self: Self, idx: c_int, value: i64) void {
-        _ = c.sqlite3_bind_int64(self.stmt, idx, value);
+    pub fn bindInt64(self: Self, idx: c_int, value: i64) !void {
+        if (c.sqlite3_bind_int64(self.stmt, idx, value) != c.SQLITE_OK)
+            return error.BindFailed;
     }
 
-    pub fn bindFloat(self: Self, idx: c_int, value: f64) void {
-        _ = c.sqlite3_bind_double(self.stmt, idx, value);
+    pub fn bindFloat(self: Self, idx: c_int, value: f64) !void {
+        if (c.sqlite3_bind_double(self.stmt, idx, value) != c.SQLITE_OK)
+            return error.BindFailed;
     }
 
-    pub fn bindBlob(self: Self, idx: c_int, bytes: []const u8) void {
-        _ = c.sqlite3_bind_blob(self.stmt, idx, bytes.ptr, @intCast(bytes.len), c.SQLITE_STATIC);
+    pub fn bindBlob(self: Self, idx: c_int, bytes: []const u8) !void {
+        if (c.sqlite3_bind_blob(self.stmt, idx, bytes.ptr, @intCast(bytes.len), c.SQLITE_STATIC) != c.SQLITE_OK)
+            return error.BindFailed;
     }
 
     /// Returns true when a row is available, false when iteration is done.

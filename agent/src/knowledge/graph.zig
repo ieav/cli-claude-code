@@ -45,6 +45,18 @@ pub const KnowledgeGraph = struct {
     }
 
     pub fn addNode(self: *Self, entity: []const u8, entity_type: EntityType, source: ?[]const u8) !i64 {
+        // Entity dedup: the same entity text reused to return a fresh row
+        // every session, so re-extraction grew the graph without bound.
+        {
+            var find = try database.Statement.prepare(
+                self.allocator,
+                self.db,
+                "SELECT id FROM knowledge_nodes WHERE entity = ?1 LIMIT 1",
+            );
+            defer find.finalize();
+            try find.bindText(1, entity);
+            if (try find.step()) return find.columnInt64(0);
+        }
         const now = time_mod.nowMillis();
         var stmt = try database.Statement.prepare(
             self.allocator,
@@ -53,11 +65,11 @@ pub const KnowledgeGraph = struct {
                 "VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
         );
         defer stmt.finalize();
-        stmt.bindText(1, entity);
-        stmt.bindText(2, @tagName(entity_type));
-        if (source) |s| stmt.bindText(3, s);
-        stmt.bindInt64(4, now);
-        stmt.bindInt64(5, now);
+        try stmt.bindText(1, entity);
+        try stmt.bindText(2, @tagName(entity_type));
+        if (source) |s| try stmt.bindText(3, s);
+        try stmt.bindInt64(4, now);
+        try stmt.bindInt64(5, now);
         if (try stmt.step()) return error.UnexpectedRow;
         return self.db.lastInsertRowId();
     }
@@ -69,10 +81,10 @@ pub const KnowledgeGraph = struct {
             "INSERT INTO knowledge_edges (from_id, to_id, relation, weight) VALUES (?1, ?2, ?3, ?4)",
         );
         defer stmt.finalize();
-        stmt.bindInt64(1, from_id);
-        stmt.bindInt64(2, to_id);
-        stmt.bindText(3, relation);
-        stmt.bindFloat(4, weight);
+        try stmt.bindInt64(1, from_id);
+        try stmt.bindInt64(2, to_id);
+        try stmt.bindText(3, relation);
+        try stmt.bindFloat(4, weight);
         if (try stmt.step()) return error.UnexpectedRow;
     }
 
@@ -86,7 +98,7 @@ pub const KnowledgeGraph = struct {
             "DELETE FROM knowledge_edges WHERE weight < ?1",
         );
         defer stmt.finalize();
-        stmt.bindFloat(1, threshold);
+        try stmt.bindFloat(1, threshold);
         _ = try stmt.step();
         return @intCast(self.db.changes());
     }
@@ -122,7 +134,7 @@ pub const KnowledgeGraph = struct {
                 "FROM knowledge_nodes ORDER BY id DESC LIMIT ?1",
         );
         defer stmt.finalize();
-        stmt.bindInt64(1, @intCast(limit));
+        try stmt.bindInt64(1, @intCast(limit));
 
         var rows: std.ArrayList(NodeRow) = .empty;
         errdefer {

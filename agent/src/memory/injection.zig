@@ -71,8 +71,8 @@ pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.Mem
     try writer.writeAll("Relevant memories from previous sessions:\n");
     for (ranks) |r| {
         const e = entries[r.idx];
-        const name = e.name[0..@min(e.name.len, max_name)];
-        const content = e.content[0..@min(e.content.len, max_content)];
+        const name = e.name[0..utf8Boundary(e.name, max_name)];
+        const content = e.content[0..utf8Boundary(e.content, max_content)];
         const line = std.fmt.bufPrint(&line_buf, "- [{s}] {s}: {s}\n", .{
             @tagName(e.mem_type),
             name,
@@ -92,13 +92,24 @@ pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.Mem
     return try allocator.dupe(u8, list.items);
 }
 
+/// Cap a slice at `max` bytes but never mid-UTF-8-rune: back off to the
+/// nearest leading byte (ASCII and 4-byte scripts like CJK survive intact).
+fn utf8Boundary(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
+    var cut = max;
+    while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
+    return cut;
+}
+
 /// Derive a content-only id for an extracted memory. Identical content maps
 /// to the same id, so re-extracting a repeated statement upserts instead of
 /// duplicating the row.
-pub fn memoryId(content: []const u8) [16]u8 {
+pub fn memoryId(content: []const u8, mem_type: []const u8) [16]u8 {
     var id: [16]u8 = undefined;
-    const h1 = std.hash.Wyhash.hash(0, content);
-    const h2 = std.hash.Wyhash.hash(0x9e3779b9, content);
+    // mem_type is folded in: identical text extracted as two different fact
+    // types used to collide on one id and overwrite each other on upsert.
+    const h1 = std.hash.Wyhash.hash(0, content) ^ std.hash.Wyhash.hash(0x51ed270b, mem_type);
+    const h2 = std.hash.Wyhash.hash(0x9e3779b9, content) ^ std.hash.Wyhash.hash(0x85ebca6b, mem_type);
     @memcpy(id[0..8], std.mem.asBytes(&h1));
     @memcpy(id[8..16], std.mem.asBytes(&h2));
     return id;
@@ -175,7 +186,7 @@ test "end-to-end: store via EpisodicStore, reload, inject" {
     {
         var store = episodic.EpisodicStore.init(std.testing.allocator, &db);
         try store.store(.{
-            .id = memoryId("session1"),
+            .id = memoryId("session1", "episodic"),
             .mem_type = .user,
             .name = "E2E_MARKER memory",
             .description = "user_preference",

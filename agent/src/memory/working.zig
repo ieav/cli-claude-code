@@ -35,6 +35,7 @@ pub const WorkingMemory = struct {
         owned.description = try self.allocator.dupe(u8, entry.description);
         errdefer self.allocator.free(owned.description);
         owned.content = try self.allocator.dupe(u8, entry.content);
+        errdefer self.allocator.free(owned.content);
 
         // Evict oldest if at capacity
         if (self.entries.items.len >= self.max_entries) {
