@@ -19,7 +19,13 @@ pub const ServerConfig = struct {
     /// HTTP server (Streamable HTTP): exclusive with argv.
     url: ?[]const u8 = null,
     enabled: bool = true,
+    /// Handshake watchdog (stdio only). 0 keeps the default (20 s); a
+    /// hung server is SIGKILLed and connect() fails instead of freezing
+    /// the REPL forever.
+    handshake_timeout_ms: u32 = 0,
 };
+
+const default_handshake_timeout_ms: u32 = 20_000;
 
 pub const CallResult = struct {
     /// Concatenated text content items.
@@ -63,6 +69,15 @@ pub const McpSession = struct {
         if (self.connected) return;
         if (cfg.url != null) return self.connectHttp(io, cfg);
         const t = try stdio.StdioTransport.spawn(self.allocator, io, cfg.argv);
+
+        // Handshake watchdog: 100 ms polls; on timeout SIGKILL the child so
+        // the blocked pipe read below unblocks (EOF) and connect fails.
+        const timeout_ms = if (cfg.handshake_timeout_ms > 0) cfg.handshake_timeout_ms else default_handshake_timeout_ms;
+        var handshake_done = std.atomic.Value(bool).init(false);
+        const wd_thread = std.Thread.spawn(.{}, handshakeWatchdog, .{ t, &handshake_done, timeout_ms }) catch null;
+        defer if (wd_thread) |th| th.join(); // polls are short — join is fast
+        defer handshake_done.store(true, .release);
+        errdefer t.close(io);
 
         const init_params = try std.fmt.allocPrint(self.allocator,
             "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}",
@@ -232,6 +247,18 @@ pub const McpSession = struct {
         if (self.server_version.len > 0) self.allocator.free(self.server_version);
     }
 };
+
+fn handshakeWatchdog(t: *stdio.StdioTransport, done: *std.atomic.Value(bool), timeout_ms: u32) void {
+    var elapsed: u32 = 0;
+    while (elapsed < timeout_ms) : (elapsed += 100) {
+        var req: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&req, null);
+        if (done.load(.acquire)) return;
+    }
+    // Timeout: kill the server; the parked read gets EOF and connect()
+    // returns an error instead of freezing the caller forever.
+    t.killPid();
+}
 
 /// Bridge (M6): register every session tool into the runtime registry as
 /// `mcp__<server>__<tool>`. The trampoline gets the session as ctx.

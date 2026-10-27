@@ -71,6 +71,14 @@ pub const StdioTransport = struct {
         return self;
     }
 
+    /// Async-signal-safe kill used by the handshake watchdog: a SIGKILL
+    /// unblocks any read parked on the stdout pipe (EOF after reaping).
+    pub fn killPid(self: *Self) void {
+        if (self.child.id) |pid| {
+            _ = std.c.kill(pid, .KILL);
+        }
+    }
+
     /// Allocate a request id.
     pub fn nextId(self: *Self) i64 {
         const id = self.next_id;

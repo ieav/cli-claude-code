@@ -152,3 +152,38 @@ test "MCP HTTP transport: initialize, tools/list, tools/call" {
     const text = call_reply.result.?.object.get("content").?.array.items[0].object.get("text").?.string;
     try std.testing.expectEqualStrings("sunny in Beijing", text);
 }
+
+// Watchdog regression: a server that never answers must fail connect()
+// within the configured timeout instead of wedging the caller.
+// Env-gated: ZIV_MCP_DEAD_MOCK=<path to a silent server script>.
+test "MCP handshake watchdog kills a dead server" {
+    const env_mod = @import("../util/env.zig");
+    const mock = env_mod.get("ZIV_MCP_DEAD_MOCK") orelse return error.SkipZigTest;
+
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    var sess = session.McpSession{
+        .allocator = std.testing.allocator,
+        .name = "dead",
+        .allocator_io = io,
+    };
+    defer sess.deinit();
+
+    var ts0: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts0);
+    const t0 = ts0.sec * 1000 + @divTrunc(ts0.nsec, 1_000_000);
+    const result = sess.connect(io, .{
+        .name = "dead",
+        .argv = &.{ "python3", mock },
+        .handshake_timeout_ms = 1500,
+    });
+    var ts1: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts1);
+    const elapsed = ts1.sec * 1000 + @divTrunc(ts1.nsec, 1_000_000) - t0;
+    try std.testing.expectError(error.HandshakeFailed, result);
+    // Watchdog fired well before the default 20 s (allow scheduler slack).
+    try std.testing.expect(elapsed < 10_000);
+    try std.testing.expect(!sess.connected);
+}
