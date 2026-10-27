@@ -5,6 +5,7 @@ pub const jsonrpc = @import("jsonrpc.zig");
 pub const stdio = @import("stdio.zig");
 pub const session = @import("session.zig");
 pub const config = @import("config.zig");
+pub const http = @import("http.zig");
 
 pub const protocol_version = "2025-06-18";
 pub const client_info = "ziv/0.5.0";
@@ -14,6 +15,7 @@ test {
     _ = stdio;
     _ = session;
     _ = config;
+    _ = http;
 }
 
 // T2.2 spike: full handshake against a mock MCP server over stdio.
@@ -114,4 +116,39 @@ test "MCP real handshake: Playwright server lists browser tools" {
         if (n == .string and std.mem.eql(u8, n.string, "browser_navigate")) saw_navigate = true;
     }
     try std.testing.expect(saw_navigate);
+}
+
+// M5: HTTP transport against a mock Streamable-HTTP server. Env-gated
+// (ZIV_MCP_HTTP_MOCK=<port>) so normal runs need no python.
+test "MCP HTTP transport: initialize, tools/list, tools/call" {
+    const env_mod = @import("../util/env.zig");
+    const port_str = env_mod.get("ZIV_MCP_HTTP_MOCK") orelse return error.SkipZigTest;
+
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{s}/mcp", .{port_str});
+    defer std.testing.allocator.free(url);
+
+    const t = try http.HttpTransport.spawn(std.testing.allocator, io, url);
+    defer t.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const init_reply = (try t.roundTrip(arena.allocator(), "initialize",
+        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"0.5.0\"}}")) orelse return error.NoInitReply;
+    try std.testing.expect(init_reply.err == null);
+    try std.testing.expectEqualStrings("mock-http",
+        init_reply.result.?.object.get("serverInfo").?.object.get("name").?.string);
+    try std.testing.expect(t.session_id != null); // captured from header
+
+    const list_reply = (try t.roundTrip(arena.allocator(), "tools/list", null)) orelse return error.NoListReply;
+    const tools = list_reply.result.?.object.get("tools").?;
+    try std.testing.expectEqualStrings("fetch_weather", tools.array.items[0].object.get("name").?.string);
+
+    const call_reply = (try t.roundTrip(arena.allocator(), "tools/call",
+        "{\"name\":\"fetch_weather\",\"arguments\":{\"city\":\"Beijing\"}}")) orelse return error.NoCallReply;
+    const text = call_reply.result.?.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqualStrings("sunny in Beijing", text);
 }

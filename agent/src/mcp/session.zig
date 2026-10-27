@@ -7,15 +7,17 @@
 const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
 const stdio = @import("stdio.zig");
+const http_mod = @import("http.zig");
 const mod = @import("mod.zig");
 const registry = @import("../tools/registry.zig");
 const runtime_registry = @import("../tools/runtime_registry.zig");
 
 pub const ServerConfig = struct {
     name: []const u8,
-    /// Full command line (shell semantics not applied — argv[0] resolved
-    /// via PATH by the transport).
-    argv: []const []const u8,
+    /// stdio server: full command line (argv[0] resolved via PATH).
+    argv: []const []const u8 = &.{},
+    /// HTTP server (Streamable HTTP): exclusive with argv.
+    url: ?[]const u8 = null,
     enabled: bool = true,
 };
 
@@ -28,7 +30,8 @@ pub const CallResult = struct {
 pub const McpSession = struct {
     allocator: std.mem.Allocator,
     name: []const u8,
-    transport: ?*stdio.StdioTransport = null,
+    allocator_io: ?std.Io = null,
+    transport: ?Transport = null,
     server_name: []const u8 = "",
     server_version: []const u8 = "",
     tool_names: std.ArrayList([]const u8) = .empty,
@@ -38,6 +41,11 @@ pub const McpSession = struct {
     connected: bool = false,
 
     const Self = @This();
+
+    pub const Transport = union(enum) {
+        stdio: *stdio.StdioTransport,
+        http: *http_mod.HttpTransport,
+    };
 
     pub const ToolMeta = struct {
         description: []const u8,
@@ -53,6 +61,7 @@ pub const McpSession = struct {
     /// owned (freed in deinit).
     pub fn connect(self: *Self, io: std.Io, cfg: ServerConfig) !void {
         if (self.connected) return;
+        if (cfg.url != null) return self.connectHttp(io, cfg);
         const t = try stdio.StdioTransport.spawn(self.allocator, io, cfg.argv);
 
         const init_params = try std.fmt.allocPrint(self.allocator,
@@ -103,19 +112,77 @@ pub const McpSession = struct {
             try self.tool_defs.append(a, .{ .description = desc, .schema = schema });
         }
 
-        self.transport = t;
+        self.transport = .{ .stdio = t };
         self.connected = true;
+    }
+
+    /// Streamable HTTP connect: initialize + tools/list over POSTs.
+    fn connectHttp(self: *Self, io: std.Io, cfg: ServerConfig) !void {
+        _ = io;
+        const t = try http_mod.HttpTransport.spawn(self.allocator, self.allocator_io orelse return error.NoIo, cfg.url.?);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const init_params = try std.fmt.allocPrint(arena.allocator(),
+            "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}",
+            .{mod.protocol_version});
+        const init_reply = (try t.roundTrip(arena.allocator(), "initialize", init_params)) orelse return error.HandshakeFailed;
+        if (init_reply.err != null) return error.HandshakeFailed;
+        const a = self.allocator;
+        if (init_reply.result) |res| {
+            if (res.object.get("serverInfo")) |si| {
+                if (si.object.get("name")) |n| {
+                    if (n == .string) self.server_name = try a.dupe(u8, n.string);
+                }
+                if (si.object.get("version")) |v| {
+                    if (v == .string) self.server_version = try a.dupe(u8, v.string);
+                }
+            }
+        }
+        const list_reply = (try t.roundTrip(arena.allocator(), "tools/list", null)) orelse return error.ToolsListFailed;
+        if (list_reply.err != null) return error.ToolsListFailed;
+        const tools = list_reply.result.?.object.get("tools") orelse return error.ToolsListFailed;
+        try self.captureTools(a, arena.allocator(), tools);
+        self.transport = .{ .http = t };
+        self.connected = true;
+    }
+
+    /// Shared tools/list metadata capture (dupe out of the arena).
+    fn captureTools(self: *Self, a: std.mem.Allocator, arena: std.mem.Allocator, tools: std.json.Value) !void {
+        _ = arena;
+        for (tools.array.items) |tool| {
+            const name_v = tool.object.get("name") orelse continue;
+            if (name_v != .string) continue;
+            try self.tool_names.append(a, try a.dupe(u8, name_v.string));
+            const desc = if (tool.object.get("description")) |d|
+                (if (d == .string) try a.dupe(u8, d.string) else try a.dupe(u8, ""))
+            else
+                try a.dupe(u8, "");
+            const schema = blk: {
+                const sc = tool.object.get("inputSchema") orelse break :blk try a.dupe(u8, "{\"type\":\"object\"}");
+                var buf: std.ArrayList(u8) = .empty;
+                var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
+                try std.json.Stringify.value(sc, .{}, &aw.writer);
+                buf = aw.toArrayList();
+                break :blk try buf.toOwnedSlice(a);
+            };
+            try self.tool_defs.append(a, .{ .description = desc, .schema = schema });
+        }
     }
 
     /// Execute one tool call. Returned text is arena-owned.
     pub fn callTool(self: *Self, io: std.Io, arena: std.mem.Allocator, tool: []const u8, args_json: ?[]const u8) !CallResult {
-        const t = self.transport orelse return error.NotConnected;
         const params = if (args_json) |args|
             try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"arguments\":{s}}}", .{ tool, args })
         else
             try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\"}}", .{tool});
-        _ = try t.sendRequest(io, "tools/call", params);
-        const reply = (try t.readMessage(io, arena)) orelse return error.CallFailed;
+        const reply = switch (self.transport orelse return error.NotConnected) {
+            .http => |t| (try t.roundTrip(arena, "tools/call", params)) orelse return error.CallFailed,
+            .stdio => |t| blk: {
+                _ = try t.sendRequest(io, "tools/call", params);
+                break :blk (try t.readMessage(io, arena)) orelse return error.CallFailed;
+            },
+        };
         if (reply.err) |e| {
             return .{ .text = try std.fmt.allocPrint(arena, "MCP error {d}: {s}", .{ e.code, e.message }), .is_error = true };
         }
@@ -137,10 +204,14 @@ pub const McpSession = struct {
     }
 
     pub fn disconnect(self: *Self, io: std.Io) void {
-        if (self.transport) |t| {
-            t.close(io);
-            self.transport = null;
+        switch (self.transport orelse {
+            self.connected = false;
+            return;
+        }) {
+            .stdio => |t| t.close(io),
+            .http => |t| t.deinit(),
         }
+        self.transport = null;
         self.connected = false;
     }
 

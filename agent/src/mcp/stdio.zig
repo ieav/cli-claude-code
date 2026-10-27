@@ -20,6 +20,14 @@ pub const StdioTransport = struct {
     pub const SpawnError = std.process.SpawnError;
 
     /// Spawn `argv` (argv[0] resolved via PATH) with piped stdio.
+    ///
+    /// Pipes are created MANUALLY (posix.pipe2, no O_NONBLOCK): Zig's
+    /// `.pipe` StdIO uses nonblocking pipes, and the flag propagates into
+    /// the child's fds — node/libuv then loses readable events for any
+    /// data written AFTER the child attached its stdin stream (verified:
+    /// immediate-write handshakes work, delayed writes wedge forever,
+    /// python children are unaffected). Blocking pipes restore the POSIX
+    /// contract for every child.
     pub fn spawn(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) anyerror!*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -29,20 +37,37 @@ pub const StdioTransport = struct {
             .stdin_file = undefined,
             .stdout_file = undefined,
         };
-        // The child must inherit the real OS environment (PATH above all):
-        // Io.Threaded defaults to an empty environ, and node/npx launched via
-        // shebang `env node` die with "env: node: No such file or directory".
+        const in_pipe = std.Io.Threaded.pipe2(.{}) catch return error.PipeUnavailable;
+        const out_pipe = std.Io.Threaded.pipe2(.{}) catch {
+            blockingFile(in_pipe[0]).close(io);
+            blockingFile(in_pipe[1]).close(io);
+            return error.PipeUnavailable;
+        };
+
         self.env_map = buildEnvironMap(allocator) catch null;
-        self.child = try std.process.spawn(io, .{
+        self.child = std.process.spawn(io, .{
             .exe = .detect,
             .argv = argv,
-            .stdin = .pipe,
-            .stdout = .pipe,
+            .stdin = .{ .file = .{ .handle = in_pipe[0], .flags = .{ .nonblocking = false } } },
+            .stdout = .{ .file = .{ .handle = out_pipe[1], .flags = .{ .nonblocking = false } } },
             .stderr = .ignore,
             .environ_map = self.env_map,
-        });
-        self.stdin_file = self.child.stdin orelse return error.PipeUnavailable;
-        self.stdout_file = self.child.stdout orelse return error.PipeUnavailable;
+        }) catch |err| {
+            blockingFile(in_pipe[0]).close(io);
+            blockingFile(in_pipe[1]).close(io);
+            blockingFile(out_pipe[0]).close(io);
+            blockingFile(out_pipe[1]).close(io);
+            if (self.env_map) |m| {
+                m.deinit();
+                allocator.destroy(m);
+            }
+            return err;
+        };
+        // The child owns its ends now; the parent keeps the others.
+        blockingFile(in_pipe[0]).close(io);
+        blockingFile(out_pipe[1]).close(io);
+        self.stdin_file = .{ .handle = in_pipe[1], .flags = .{ .nonblocking = false } };
+        self.stdout_file = .{ .handle = out_pipe[0], .flags = .{ .nonblocking = false } };
         return self;
     }
 
@@ -108,17 +133,19 @@ pub const StdioTransport = struct {
             m.deinit();
             self.allocator.destroy(m);
         }
+        // Closing our write end signals EOF to a well-behaved server.
+        self.stdin_file.close(io);
         if (self.child.id != null) {
-            // Closing our write end signals EOF; a well-behaved server exits.
-            if (self.child.stdin) |*f| {
-                f.close(io);
-                self.child.stdin = null;
-            }
             self.child.kill(io);
         }
+        self.stdout_file.close(io);
         self.allocator.destroy(self);
     }
 };
+
+fn blockingFile(fd: std.posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
 
 /// Copy the real libc environ into a Map the spawn options accept.
 /// (Io.Threaded.init(.{}) defaults to an empty environ — children spawned

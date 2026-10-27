@@ -7,7 +7,9 @@ const session_mod = @import("session.zig");
 
 pub const ServerEntry = struct {
     name: []const u8,
-    command: []const u8,
+    command: []const u8 = "",
+    /// HTTP server URL (exclusive with command).
+    url: ?[]const u8 = null,
     enabled: bool = true,
 };
 
@@ -25,7 +27,8 @@ pub const McpConfig = struct {
     pub fn deinit(self: *Self) void {
         for (self.servers.items) |srv| {
             self.allocator.free(srv.name);
-            self.allocator.free(srv.command);
+            if (srv.command.len > 0) self.allocator.free(srv.command);
+            if (srv.url) |u| self.allocator.free(u);
         }
         self.servers.deinit(self.allocator);
     }
@@ -52,11 +55,14 @@ pub const McpConfig = struct {
             const name = e.key_ptr.*;
             const v = e.value_ptr.*;
             if (v != .object) continue;
-            const cmd = if (v.object.get("command")) |c| (if (c == .string) c.string else continue) else continue;
+            const cmd = if (v.object.get("command")) |c| (if (c == .string) c.string else "") else "";
+            const url = if (v.object.get("url")) |u| (if (u == .string) u.string else null) else null;
+            if (cmd.len == 0 and url == null) continue;
             const enabled = if (v.object.get("enabled")) |en| (en == .bool and en.bool) else true;
             self.servers.append(self.allocator, .{
                 .name = self.allocator.dupe(u8, name) catch continue,
                 .command = self.allocator.dupe(u8, cmd) catch continue,
+                .url = if (url) |u| (self.allocator.dupe(u8, u) catch null) else null,
                 .enabled = enabled,
             }) catch {};
         }
@@ -74,10 +80,26 @@ pub const McpConfig = struct {
             if (i > 0) w.writeAll(",") catch return;
             w.writeAll("\n    \"") catch return;
             jsonEscape(w, srv.name);
-            w.writeAll("\": {\"command\": \"") catch return;
-            jsonEscape(w, srv.command);
-            if (!srv.enabled) w.writeAll("\", \"enabled\": false") catch return;
-            w.writeAll("\"}") catch return;
+            w.writeAll("\": {") catch return;
+            var first_field = true;
+            if (srv.command.len > 0) {
+                w.writeAll("\"command\": \"") catch return;
+                jsonEscape(w, srv.command);
+                w.writeAll("\"") catch return;
+                first_field = false;
+            }
+            if (srv.url) |u| {
+                if (!first_field) w.writeAll(", ") catch return;
+                w.writeAll("\"url\": \"") catch return;
+                jsonEscape(w, u);
+                w.writeAll("\"") catch return;
+                first_field = false;
+            }
+            if (!srv.enabled) {
+                if (!first_field) w.writeAll(", ") catch return;
+                w.writeAll("\"enabled\": false") catch return;
+            }
+            w.writeAll("}") catch return;
         }
         w.writeAll("\n  }\n}\n") catch return;
 
@@ -95,7 +117,7 @@ pub const McpConfig = struct {
     pub fn upsert(self: *Self, name: []const u8, command: []const u8) !void {
         if (self.find(name)) |existing| {
             const new_cmd = try self.allocator.dupe(u8, command);
-            self.allocator.free(existing.command);
+            if (existing.command.len > 0) self.allocator.free(existing.command);
             existing.command = new_cmd;
         } else {
             try self.servers.append(self.allocator, .{
@@ -106,11 +128,27 @@ pub const McpConfig = struct {
         self.save();
     }
 
+    /// Add/replace an HTTP (url) server entry.
+    pub fn upsertUrl(self: *Self, name: []const u8, url: []const u8) !void {
+        if (self.find(name)) |existing| {
+            const new_url = try self.allocator.dupe(u8, url);
+            if (existing.url) |u| self.allocator.free(u);
+            existing.url = new_url;
+        } else {
+            try self.servers.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, name),
+                .url = try self.allocator.dupe(u8, url),
+            });
+        }
+        self.save();
+    }
+
     pub fn remove(self: *Self, name: []const u8) bool {
         for (self.servers.items, 0..) |srv, i| {
             if (std.mem.eql(u8, srv.name, name)) {
                 self.allocator.free(srv.name);
-                self.allocator.free(srv.command);
+                if (srv.command.len > 0) self.allocator.free(srv.command);
+                if (srv.url) |u| self.allocator.free(u);
                 _ = self.servers.orderedRemove(i);
                 self.save();
                 return true;

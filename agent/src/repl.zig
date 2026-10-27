@@ -407,7 +407,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         for (mcp_cfg.servers.items) |srv| {
                             const sess = findMcpSession(mcp_sessions.items, srv.name);
                             const state = if (sess) |ss| (if (ss.connected) "connected" else "down") else "off";
-                            try std.Io.Writer.print(w, "    {s} [{s}] — {s}\n", .{ srv.name, state, srv.command });
+                            try std.Io.Writer.print(w, "    {s} [{s}] — {s}\n", .{ srv.name, state, if (srv.url) |u| u else srv.command });
                         }
                         try std.Io.Writer.writeAll(w, "\n");
                     }
@@ -430,7 +430,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         try std.Io.File.Writer.flush(&file_writer);
                         continue;
                     };
-                    try mcp_cfg.upsert(args_str[0..sp], std.mem.trim(u8, args_str[sp + 1 ..], " \t"));
+                    const val = std.mem.trim(u8, args_str[sp + 1 ..], " \t");
+                    if (std.mem.startsWith(u8, val, "http://") or std.mem.startsWith(u8, val, "https://")) {
+                        try mcp_cfg.upsertUrl(args_str[0..sp], val);
+                    } else {
+                        try mcp_cfg.upsert(args_str[0..sp], val);
+                    }
                     try std.Io.Writer.print(w, "  Added. Connect with: /mcp connect {s}\n\n", .{args_str[0..sp]});
                 } else if (std.mem.startsWith(u8, rest_mcp, "remove ")) {
                     const want = std.mem.trim(u8, rest_mcp[7..], " \t");
@@ -703,9 +708,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const task = std.mem.trim(u8, rest[sp_end..], " \t");
                 const body = skill_loader.readBody(skill, allocator) catch "";
                 defer if (body.len > 0) allocator.free(body);
+                // $ARGUMENTS substitution: skills can template the whole
+                // argument string into their body (Claude-compatible).
+                var expanded: []const u8 = body;
+                var did_subst = false;
+                if (std.mem.indexOf(u8, body, "$ARGUMENTS") != null) {
+                    const arg_val = if (task.len > 0) task else "";
+                    expanded = std.mem.replaceOwned(u8, allocator, body, "$ARGUMENTS", arg_val) catch body;
+                    did_subst = true;
+                }
+                defer if (did_subst) allocator.free(expanded);
                 const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
                     skill.name,
-                    body,
+                    expanded,
                     if (task.len > 0) task else "follow the skill instructions",
                 }) catch continue;
                 var skill_blocks = try allocator.alloc(llm.ContentBlock, 1);
@@ -1549,26 +1564,51 @@ fn connectMcpServer(
             try std.Io.Writer.print(w, "  {s} already connected ({d} tools)\n\n", .{ entry.name, existing.tool_names.items.len });
             return;
         }
+        // Stale "down" session from a failed attempt: reap it so we never
+        // hold two entries for one server.
+        mcp_mod.session.unbridgeSessionTools(existing, reg);
+        existing.disconnect(io);
+        existing.deinit();
+        alloc.free(existing.name);
+        alloc.destroy(existing);
+        for (sessions.items, 0..) |sess, i| {
+            if (sess == existing) {
+                _ = sessions.orderedRemove(i);
+                break;
+            }
+        }
     }
-    const argv = mcp_mod.config.splitCommand(alloc, entry.command) catch {
-        try std.Io.Writer.writeAll(w, "  Failed to parse command\n\n");
-        return;
-    };
-    defer alloc.free(argv);
-
     const sess = try alloc.create(mcp_mod.session.McpSession);
     errdefer alloc.destroy(sess);
-    sess.* = .{ .allocator = alloc, .name = try alloc.dupe(u8, entry.name) };
+    sess.* = .{ .allocator = alloc, .name = try alloc.dupe(u8, entry.name), .allocator_io = io };
     errdefer alloc.free(sess.name);
-    sess.connect(io, .{ .name = entry.name, .argv = argv }) catch |err| {
-        try std.Io.Writer.print(w, "  Connect failed: {s}\n  (command: {s})\n\n", .{ @errorName(err), entry.command });
+    var cfg = mcp_mod.session.ServerConfig{ .name = entry.name };
+    if (entry.url) |u| {
+        cfg.url = u;
+    } else {
+        cfg.argv = mcp_mod.config.splitCommand(alloc, entry.command) catch {
+            try std.Io.Writer.writeAll(w, "  Failed to parse command\n\n");
+            sess.deinit();
+            alloc.free(sess.name);
+            alloc.destroy(sess);
+            return;
+        };
+    }
+    defer if (cfg.argv.len > 0) alloc.free(cfg.argv);
+    sess.connect(io, cfg) catch |err| {
+        try std.Io.Writer.print(w, "  Connect failed: {s}\n  ({s}: {s})\n\n", .{ @errorName(err), if (entry.url != null) "url" else "command", if (entry.url) |u| u else entry.command });
         sess.deinit();
         alloc.free(sess.name);
         alloc.destroy(sess);
         try std.Io.File.Writer.flush(file_writer);
         return;
     };
-    try sessions.append(allocator, sess);
+    sessions.append(allocator, sess) catch {
+        // Append failed: the child is already spawned — close it before
+        // the errdefers free the session.
+        sess.disconnect(io);
+        return error.OutOfMemory;
+    };
     mcp_mod.session.bridgeSessionTools(sess, reg) catch {};
     logger.info("mcp: {s} connected ({d} tools bridged)", .{ entry.name, sess.tool_names.items.len });
     try std.Io.Writer.print(w, "  {s} connected: {d} tools available as mcp__{s}__*\n\n", .{ entry.name, sess.tool_names.items.len, entry.name });
