@@ -393,9 +393,17 @@ test "accept_edits does not auto-allow shell commands (P28)" {
 
     var cmd: std.json.ObjectMap = .empty;
     defer cmd.deinit(std.testing.allocator);
-    try cmd.put(std.testing.allocator, "command", .{ .string = "echo harmless" });
+    // touch is not on the read-only whitelist — still asks in accept_edits.
+    try cmd.put(std.testing.allocator, "command", .{ .string = "touch /tmp/ziv_ae.txt" });
     const bash_decision = checkToolPermission(&registry.bash_tool, .{ .object = cmd }, &ctx);
     try std.testing.expect(bash_decision == .ask);
+
+    // Whitelisted read-only commands are fine without asking.
+    var ro: std.json.ObjectMap = .empty;
+    defer ro.deinit(std.testing.allocator);
+    try ro.put(std.testing.allocator, "command", .{ .string = "echo harmless" });
+    const ro_decision = checkToolPermission(&registry.bash_tool, .{ .object = ro }, &ctx);
+    try std.testing.expect(ro_decision == .allow);
 
     // Non-destructive file edits are still auto-allowed.
     var edit: std.json.ObjectMap = .empty;
@@ -405,4 +413,30 @@ test "accept_edits does not auto-allow shell commands (P28)" {
     try edit.put(std.testing.allocator, "new_string", .{ .string = "b" });
     const edit_decision = checkToolPermission(&registry.file_edit_tool, .{ .object = edit }, &ctx);
     try std.testing.expect(edit_decision == .allow);
+}
+
+test "plan mode allows read-only Bash, blocks writes (P28)" {
+    const ctx = PermissionContext{
+        .mode = .plan,
+        .allow_rules = &.{},
+        .deny_rules = &.{},
+    };
+
+    var ro: std.json.ObjectMap = .empty;
+    defer ro.deinit(std.testing.allocator);
+    try ro.put(std.testing.allocator, "command", .{ .string = "ls -la /tmp && git status" });
+    const ro_decision = checkToolPermission(&registry.bash_tool, .{ .object = ro }, &ctx);
+    try std.testing.expect(ro_decision == .allow);
+
+    var wr: std.json.ObjectMap = .empty;
+    defer wr.deinit(std.testing.allocator);
+    try wr.put(std.testing.allocator, "command", .{ .string = "ls > /tmp/x" });
+    const wr_decision = checkToolPermission(&registry.bash_tool, .{ .object = wr }, &ctx);
+    try std.testing.expect(wr_decision == .deny);
+
+    var gw: std.json.ObjectMap = .empty;
+    defer gw.deinit(std.testing.allocator);
+    try gw.put(std.testing.allocator, "command", .{ .string = "git push origin main" });
+    const gw_decision = checkToolPermission(&registry.bash_tool, .{ .object = gw }, &ctx);
+    try std.testing.expect(gw_decision == .deny);
 }

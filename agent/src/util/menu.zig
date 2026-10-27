@@ -89,7 +89,7 @@ pub const RawGuard = struct {
 /// menus never nest raw mode).
 var signal_saved: ?std.c.termios = null;
 
-fn restoreFromSignal(_: std.posix.SIG) callconv(.c) void {
+fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
     if (signal_saved) |*t| {
         _ = std.c.tcsetattr(0, .NOW, t);
         // Restore the default disposition and re-raise so the exit status
@@ -99,8 +99,8 @@ fn restoreFromSignal(_: std.posix.SIG) callconv(.c) void {
             .mask = std.posix.sigemptyset(),
             .flags = 0,
         };
-        std.posix.sigaction(.INT, &dfl_act, null);
-        std.posix.raise(.INT) catch {};
+        std.posix.sigaction(sig, &dfl_act, null);
+        std.posix.raise(sig) catch {};
     }
 }
 
@@ -112,6 +112,7 @@ fn installSignalRestore(orig: *const std.c.termios) void {
         .flags = 0,
     };
     std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
 }
 
 fn removeSignalRestore() void {
@@ -122,6 +123,7 @@ fn removeSignalRestore() void {
         .flags = 0,
     };
     std.posix.sigaction(.INT, &dfl_act, null);
+    std.posix.sigaction(.TERM, &dfl_act, null);
 }
 
 fn render(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: usize) !void {

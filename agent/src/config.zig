@@ -128,6 +128,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getString(value, "default_model")) |model| {
         settings.default_model = try allocator.dupe(u8, model);
     }
+    if (json_helpers.getInt(value, "max_snapshots")) |ms| {
+        if (ms > 0 and ms <= 10000) {
+            settings.max_snapshots = @intCast(ms);
+        }
+    }
     if (json_helpers.getInt(value, "max_tokens")) |mt| {
         if (mt > 0 and mt <= 128000) {
             settings.max_tokens = @intCast(mt);
@@ -308,8 +313,9 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
 
     // default_model (escaped — a quote/backslash here corrupts the file)
     writeJsonTopField(allocator, &buf, "default_model", settings.default_model);
-    // max_tokens
+    // max_tokens / max_snapshots
     buf.print(allocator, "  \"max_tokens\": {d},\n", .{settings.max_tokens}) catch {};
+    buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};
     // permission_mode

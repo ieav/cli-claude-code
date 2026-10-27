@@ -269,6 +269,51 @@ fn bashIsDestructive(input: std.json.Value) bool {
     return false;
 }
 
+/// Bash tool: read-only ONLY when every segment of the command starts with
+/// a known read-only verb and nothing redirects to a file. Fail-closed —
+/// plan mode used to deny even `ls`, yet allow nothing shell-shaped.
+fn bashIsReadOnly(input: std.json.Value) bool {
+    const cmd = getStringField(input, "command") orelse return false;
+    if (std.mem.indexOf(u8, cmd, ">") != null) return false; // redirect writes
+    var rest = cmd;
+    while (rest.len > 0) {
+        const cut = std.mem.indexOfAny(u8, rest, ";&|\n") orelse rest.len;
+        const seg = std.mem.trim(u8, rest[0..cut], " \t");
+        if (seg.len == 0) return false;
+        const verb_end = std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len;
+        const verb = seg[0..verb_end];
+        const ro_verbs = [_][]const u8{
+            "ls",     "cat",  "pwd",  "echo", "head", "tail", "wc",  "grep",
+            "rg",     "find", "fd",   "which", "file", "stat", "du",  "df",
+            "whoami", "date", "env",  "print", "type", "id",   "uname",
+            "git",    // only if subcommand is status/log/diff/show/branch — checked below
+        };
+        var ok = false;
+        for (ro_verbs) |v| {
+            if (std.mem.eql(u8, verb, v)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) return false;
+        if (std.mem.eql(u8, verb, "git")) {
+            // git write subcommands are not read-only
+            const git_write_subs = [_][]const u8{ "push", "pull", "commit", "reset", "checkout", "merge", "rebase", "clean", "add", "rm", "mv", "stash" };
+            const sub_end = std.mem.indexOfScalarPos(u8, seg, verb_end + 1, ' ') orelse seg.len;
+            const sub = seg[verb_end + 1 .. @min(sub_end, seg.len)];
+            for (git_write_subs) |gws| {
+                if (std.mem.eql(u8, sub, gws)) return false;
+            }
+        }
+        var i = cut;
+        while (i < rest.len) : (i += 1) {
+            if (rest[i] != '&' and rest[i] != ';' and rest[i] != '|' and rest[i] != '\n') break;
+        }
+        rest = rest[i..];
+    }
+    return true;
+}
+
 /// FileRead tool: always concurrency-safe.
 fn fileReadIsConcurrencySafe(_: std.json.Value) bool {
     return true;
@@ -301,6 +346,7 @@ pub const bash_tool: ToolDefinition = .{
     .is_read_only = false,
     .is_destructive = true,
     .is_concurrency_safe_fn = bashIsConcurrencySafe,
+    .is_read_only_fn = bashIsReadOnly,
     .is_destructive_fn = bashIsDestructive,
     .aliases = &.{ "Shell", "sh" },
     .search_hint = "shell command execute run",
