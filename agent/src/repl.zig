@@ -52,18 +52,30 @@ const ModelSwitcher = struct {
         return self.model_name_buf[0..self.model_name_len];
     }
 
+    /// Explicit backend (settings.default_backend) beats name detection —
+    /// custom names like glm-4.6 can be routed through a configured
+    /// OpenAI/Anthropic-compatible gateway instead of defaulting to Ollama.
+    fn effectiveBackend(self: *const Self, model: []const u8) llm.BackendType {
+        if (self.settings.default_backend) |b| {
+            if (std.meta.stringToEnum(llm.BackendType, b)) |be| return be;
+        }
+        return llm.detectBackend(model);
+    }
+
     pub fn init(settings: config_mod.Settings, io: std.Io) Self {
         const model = settings.default_model;
         const len = @min(model.len, 64);
         var buf: [64]u8 = undefined;
         @memcpy(buf[0..len], model[0..len]);
-        return .{
+        var switcher = Self{
             .model_name_buf = buf,
             .model_name_len = len,
             .backend = llm.detectBackend(model),
             .io = io,
             .settings = settings,
         };
+        switcher.backend = switcher.effectiveBackend(model);
+        return switcher;
     }
 
     pub fn deinit(self: *Self) void {
@@ -74,7 +86,7 @@ const ModelSwitcher = struct {
 
     /// Switch to a new model. Returns error if API key is missing.
     pub fn switchModel(self: *Self, new_model: []const u8) !void {
-        const new_backend = llm.detectBackend(new_model);
+        const new_backend = self.effectiveBackend(new_model);
 
         // Validate API key availability before switching
         switch (new_backend) {
@@ -1823,8 +1835,22 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
     if (picked == llm.KNOWN_MODELS.len + 1) return;
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
         var vbuf: [128]u8 = undefined;
-        const val = menu.readLine(r, w, file_writer, "  模型名: ", &vbuf) catch return;
+        const val = menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return;
         if (val.len == 0) return;
+        // Custom names default to Ollama by name-detection. If a compatible
+        // gateway is configured, ask which backend should serve this model —
+        // otherwise the gateway config would never be reached.
+        if (llm.detectBackend(val) == .ollama and (switcher.settings.api_keys.openai != null or switcher.settings.api_keys.anthropic != null)) {
+            const be_items = [_][]const u8{ "OpenAI 兼容接入（用已配的 OpenAI Key/网关）", "Anthropic 兼容接入（用已配的 Anthropic Key/网关）", "Ollama 本地" };
+            const be = (menu.select(w, r, file_writer, "该模型走哪个后端？", &be_items, 0) catch null);
+            if (be) |choice| {
+                switcher.settings.default_backend = switch (choice) {
+                    0 => "openai",
+                    1 => "claude",
+                    else => "ollama",
+                };
+            }
+        }
         break :blk try alloc.dupe(u8, val);
     } else llm.KNOWN_MODELS[picked].name;
 
@@ -1857,70 +1883,79 @@ fn runApiKeysMenu(
 ) !void {
     while (true) {
         var b1: [80]u8 = undefined;
-        var b2: [96]u8 = undefined;
-        var b3: [80]u8 = undefined;
-        var b4: [96]u8 = undefined;
-        var b5: [80]u8 = undefined;
-        var b6: [80]u8 = undefined;
+        var b2: [80]u8 = undefined;
         const items = [_][]const u8{
-            try_std_fmt(&b1, "OpenAI Key: {s}", .{if (switcher.settings.api_keys.openai) |k| maskKey(k) else "(未设置)"}),
-            try_std_fmt(&b2, "OpenAI Base URL: {s}", .{switcher.settings.api_keys.openai_base_url orelse "(默认官方)"}),
-            try_std_fmt(&b3, "Anthropic Key: {s}", .{if (switcher.settings.api_keys.anthropic) |k| maskKey(k) else "(未设置)"}),
-            try_std_fmt(&b4, "Anthropic Base URL: {s}", .{switcher.settings.api_keys.anthropic_base_url orelse "(默认官方)"}),
-            try_std_fmt(&b5, "Brave Key: {s}", .{if (switcher.settings.api_keys.brave_api_key) |k| maskKey(k) else "(未设置)"}),
-            try_std_fmt(&b6, "Ollama Host: {s}", .{switcher.settings.api_keys.ollama_host}),
+            try_std_fmt(&b1, "OpenAI 接入（Key + 网关地址）: {s}", .{if (switcher.settings.api_keys.openai) |k| maskKey(k) else "(未配置)"}),
+            try_std_fmt(&b2, "Anthropic 接入（Key + 网关地址）: {s}", .{if (switcher.settings.api_keys.anthropic) |k| maskKey(k) else "(未配置)"}),
+            "Brave Key（网络搜索）",
+            "Ollama Host（本地模型）",
             "返回",
         };
-        const picked = (menu.select(w, r, file_writer, "=== API Keys & 接入配置 ===", &items, 0) catch break) orelse break;
-        if (picked >= 6) break;
-
-        var vbuf: [256]u8 = undefined;
-        const prompts = [_][]const u8{
-            "  OpenAI API Key (回车保留): ",
-            "  OpenAI Base URL (如 https://你的网关/v1，回车保留，输 - 恢复默认): ",
-            "  Anthropic API Key (回车保留): ",
-            "  Anthropic Base URL (回车保留，输 - 恢复默认): ",
-            "  Brave API Key (回车保留): ",
-            "  Ollama Host (回车保留): ",
-        };
-        const val = menu.readLine(r, w, file_writer, prompts[picked], &vbuf) catch continue;
-        if (val.len == 0) continue;
-
+        const picked = (menu.select(w, r, file_writer, "=== 模型接入配置 ===", &items, 0) catch break) orelse break;
         switch (picked) {
-            0 => switcher.settings.api_keys.openai = try alloc.dupe(u8, val),
-            1 => {
-                if (std.mem.eql(u8, val, "-")) {
-                    switcher.settings.api_keys.openai_base_url = null;
-                } else {
-                    switcher.settings.api_keys.openai_base_url = try alloc.dupe(u8, val);
+            0, 1 => {
+                const is_openai = picked == 0;
+                const key_prompt: []const u8 = if (is_openai) "  API Key: " else "  API Key: ";
+                var kbuf: [256]u8 = undefined;
+                const key = menu.readLine(r, w, file_writer, key_prompt, &kbuf) catch continue;
+                var ubuf: [256]u8 = undefined;
+                const url_prompt: []const u8 = if (is_openai)
+                    "  Base URL（兼容网关填这里，回车=官方，-=清除）: "
+                else
+                    "  Base URL（兼容网关填这里，回车=官方，-=清除）: ";
+                const url = menu.readLine(r, w, file_writer, url_prompt, &ubuf) catch continue;
+
+                if (key.len > 0) {
+                    const kd = try alloc.dupe(u8, key);
+                    if (is_openai) switcher.settings.api_keys.openai = kd else switcher.settings.api_keys.anthropic = kd;
+                }
+                if (url.len > 0) {
+                    const ud: ?[]const u8 = if (std.mem.eql(u8, url, "-")) null else try alloc.dupe(u8, url);
+                    if (is_openai) switcher.settings.api_keys.openai_base_url = ud else switcher.settings.api_keys.anthropic_base_url = ud;
+                }
+                // Drop cached providers so the new key/URL takes effect now.
+                if (switcher.openai_provider) |*p| {
+                    p.deinit();
+                    switcher.openai_provider = null;
+                }
+                if (switcher.claude_provider) |*p| {
+                    p.deinit();
+                    switcher.claude_provider = null;
+                }
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+
+                // Routing hint: if the current model would NOT use this
+                // gateway (name detection sends it to Ollama), offer to pin
+                // the backend so the configuration actually takes effect.
+                const want: llm.BackendType = if (is_openai) .openai else .claude;
+                if (switcher.backend != want and switcher.backend == .ollama) {
+                    const pin_items = [_][]const u8{ "是，走此接入", "否" };
+                    try std.Io.Writer.print(w, "\n  当前模型 {s} 被按名字路由到了 Ollama。\n", .{switcher.modelName()});
+                    const pin = (menu.select(w, r, file_writer, "让它走刚配置的接入吗？", &pin_items, 0) catch continue) orelse continue;
+                    if (pin == 0) {
+                        switcher.settings.default_backend = if (is_openai) "openai" else "claude";
+                        autoSaveSettings(w, file_writer, switcher, alloc, io);
+                        switcher.switchModel(switcher.modelName()) catch {};
+                    }
                 }
             },
-            2 => switcher.settings.api_keys.anthropic = try alloc.dupe(u8, val),
+            2 => {
+                var vbuf: [256]u8 = undefined;
+                const val = menu.readLine(r, w, file_writer, "  Brave API Key: ", &vbuf) catch continue;
+                if (val.len > 0) switcher.settings.api_keys.brave_api_key = try alloc.dupe(u8, val);
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+            },
             3 => {
-                if (std.mem.eql(u8, val, "-")) {
-                    switcher.settings.api_keys.anthropic_base_url = null;
-                } else {
-                    switcher.settings.api_keys.anthropic_base_url = try alloc.dupe(u8, val);
-                }
+                var vbuf: [256]u8 = undefined;
+                const val = menu.readLine(r, w, file_writer, "  Ollama Host: ", &vbuf) catch continue;
+                if (val.len > 0) switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
             },
-            4 => switcher.settings.api_keys.brave_api_key = try alloc.dupe(u8, val),
-            5 => switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val),
-            else => {},
+            else => break,
         }
-        // Provider 缓存要重建才能吃到新 key/base_url。
-        if (switcher.openai_provider) |*p| {
-            p.deinit();
-            switcher.openai_provider = null;
-        }
-        if (switcher.claude_provider) |*p| {
-            p.deinit();
-            switcher.claude_provider = null;
-        }
-        autoSaveSettings(w, file_writer, switcher, alloc, io);
     }
     try std.Io.Writer.writeAll(w, "\n");
 }
-
 var mask_buf: [16]u8 = undefined;
 
 fn maskKey(key: []const u8) []const u8 {

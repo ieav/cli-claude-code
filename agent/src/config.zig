@@ -20,6 +20,10 @@ pub const Settings = struct {
     deny_rules: []const auth_mode.PermissionRule = &.{},
     api_keys: ApiKeys = .{},
     default_model: []const u8 = "gpt-4o",
+    /// Explicit backend override ("openai"/"claude"/"ollama"). When set it
+    /// beats name-based detection, so custom model names (glm-4.6, deepseek-…)
+    /// can be routed through a configured compatible gateway.
+    default_backend: ?[]const u8 = null,
     max_tokens: u32 = 4096,
     max_snapshots: u32 = 100,
     checkpointing_enabled: bool = true,
@@ -119,6 +123,12 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
         if (std.mem.eql(u8, mode_str, "default")) settings.permission_mode = .default else if (std.mem.eql(u8, mode_str, "accept_edits")) settings.permission_mode = .accept_edits else if (std.mem.eql(u8, mode_str, "plan")) settings.permission_mode = .plan else if (std.mem.eql(u8, mode_str, "bypass")) settings.permission_mode = .bypass else if (std.mem.eql(u8, mode_str, "auto")) settings.permission_mode = .auto;
     }
 
+    if (json_helpers.getString(value, "default_backend")) |b| {
+        if (std.mem.eql(u8, b, "openai") or std.mem.eql(u8, b, "claude") or std.mem.eql(u8, b, "ollama")) {
+            settings.default_backend = try allocator.dupe(u8, b);
+        }
+    }
+
     // Parse API keys
     if (json_helpers.getObject(value, "api_keys")) |keys| {
         if (json_helpers.getString(keys, "openai")) |k| settings.api_keys.openai = try allocator.dupe(u8, k);
@@ -158,6 +168,9 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     // permission_mode
     const mode_str = @tagName(settings.permission_mode);
     buf.print(allocator, "  \"permission_mode\": \"{s}\",\n", .{mode_str}) catch {};
+    if (settings.default_backend) |b| {
+        buf.print(allocator, "  \"default_backend\": \"{s}\",\n", .{b}) catch {};
+    }
 
     // system_prompt
     if (settings.system_prompt) |sp| {
