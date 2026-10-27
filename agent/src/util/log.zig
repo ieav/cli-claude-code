@@ -19,7 +19,15 @@ pub const Level = enum {
     }
 };
 
-var current_level: Level = .info;
+var current_level: Level = .warning;
+
+/// Raise verbosity via ZIV_LOG=debug|info|warning (call once at startup).
+pub fn initFromEnv() void {
+    const v = @import("env.zig").get("ZIV_LOG") orelse return;
+    if (std.mem.eql(u8, v, "debug")) current_level = .debug;
+    if (std.mem.eql(u8, v, "info")) current_level = .info;
+    if (std.mem.eql(u8, v, "warning")) current_level = .warning;
+}
 
 pub fn setLevel(level: Level) void {
     current_level = level;

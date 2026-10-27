@@ -114,6 +114,7 @@ pub fn main() !void {
     try std.Io.File.Writer.flush(&file_writer);
 
     // Self-test
+    @import("util/log.zig").initFromEnv();
     try std.Io.Writer.writeAll(w, "Running self-tests...\n");
     const result = runTests();
     switch (result) {

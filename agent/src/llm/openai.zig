@@ -372,6 +372,21 @@ pub const OpenAIProvider = struct {
     fn parseOpenAIStreamChunk(data: []const u8) ?provider.StreamEvent {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.smp_allocator, data, .{}) catch return null;
 
+        // The final chunk carries top-level usage — emit it as .done so the
+        // session counters see real token numbers (they were stuck at 0).
+        if (parsed.object.get("usage")) |u| {
+            if (u == .object) {
+                const pt = u.object.get("prompt_tokens");
+                const ct = u.object.get("completion_tokens");
+                if (pt != null and pt.? == .integer and ct != null and ct.? == .integer) {
+                    return .{ .done = .{
+                        .input_tokens = @intCast(pt.?.integer),
+                        .output_tokens = @intCast(ct.?.integer),
+                    } };
+                }
+            }
+        }
+
         const choices = parsed.object.get("choices") orelse return null;
         if (choices.array.items.len == 0) return null;
 
