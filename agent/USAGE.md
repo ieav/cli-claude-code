@@ -955,7 +955,8 @@ agent/
 ```
 - 配置持久化于 `~/.config/ziv/mcp.json`；env 全量继承（node/npx 可用）
 - 连接后工具进入 LLM tools 声明，调用→权限确认→执行→结果回传全自动
-- **已知限制**：npx 形态的 playwright 在 ziv 原生 spawn 下无法握手（环境/管道/npm 三因素已排除，剩余为 node 重启动的深层交互）；**推荐 HTTP 方式**：终端 `npx -y @playwright/mcp@latest --port 8931` 后 `/mcp add playwright http://127.0.0.1:8931/mcp`
+- **Playwright 接入方式（真机已验收）**：终端起服务 `npx -y @playwright/mcp@latest --port 18931`，然后 `/mcp add playwright http://localhost:18931/mcp` + `/mcp connect playwright`（25 个 browser 工具自动桥接；注意用 `localhost`——服务默认监听 IPv6）
+- 已知限制：npx 由 ziv 原生拉起的 stdio 形态握手不兼容（深层 spawn 交互），用上述 HTTP 方式即可
 
 ### Skill（Claude SKILL.md 兼容）
 - 目录：`~/.config/ziv/skills/<名>/SKILL.md`（全局）+ `.ziv/skills/<名>/`（项目级，同名覆盖）

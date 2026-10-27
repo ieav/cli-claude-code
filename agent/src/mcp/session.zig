@@ -154,6 +154,10 @@ pub const McpSession = struct {
                 }
             }
         }
+        // The spec requires the initialized notification before any
+        // request; playwright rejects tools/list without it.
+        _ = try t.roundTrip(arena.allocator(), "notifications/initialized", null);
+
         const list_reply = (try t.roundTrip(arena.allocator(), "tools/list", null)) orelse return error.ToolsListFailed;
         if (list_reply.err != null) return error.ToolsListFailed;
         const tools = list_reply.result.?.object.get("tools") orelse return error.ToolsListFailed;

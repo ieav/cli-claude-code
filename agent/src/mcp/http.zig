@@ -79,15 +79,30 @@ pub const HttpTransport = struct {
             }
         }
 
-        // Capture content_type before the body reader takes over the
-        // response internals (head bytes are invalidated once streaming).
-        const content_type = blk: {
+        // Capture content_type BEFORE reading the body, and COPY it: the
+        // head bytes are reused as the body streams (a borrowed slice turns
+        // into body garbage — found via ct=eference… in a debug run).
+        var ct_buf: [96]u8 = undefined;
+        const ct_len = blk: {
             var hit = response.head.iterateHeaders();
             while (hit.next()) |h| {
-                if (std.ascii.eqlIgnoreCase(h.name, "content-type")) break :blk h.value;
+                if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+                    break :blk @min(h.value.len, ct_buf.len);
+                }
             }
-            break :blk "";
+            break :blk 0;
         };
+        // second pass to copy (iterator borrows head; re-iterate then dupe)
+        if (ct_len > 0) {
+            var hit = response.head.iterateHeaders();
+            while (hit.next()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+                    @memcpy(ct_buf[0..ct_len], h.value[0..ct_len]);
+                    break;
+                }
+            }
+        }
+        const content_type = ct_buf[0..ct_len];
 
         // Read the body (either JSON or SSE).
         var transfer_buf: [8192]u8 = undefined;
