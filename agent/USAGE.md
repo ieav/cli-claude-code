@@ -917,3 +917,27 @@ agent/
 |------|------|--------|----------|
 | ~~/clear 后 system prompt 残留旧记忆注入块~~ 已修复（2026-10-26：clear 时重建 system message，实测 token 252→182）|
 | `/rewind` 序号/y-N 在管道模式消费后续行 | 管道脚本中的交互式确认不适配 | 无（设计内） | 交互模式使用 |
+
+
+## v0.5.0 — 工具自动调用（无需 /run）
+
+模型现在会**自主决定并调用工具**：请求携带全部 12 个工具声明，流式解析 tool_calls
+（OpenAI 分片累积 / Claude content_block_start+input_json_delta / Ollama tool_calls），
+经权限门确认后真实执行，结果以 tool result 回传模型继续推理——多轮直到回答完成。
+`/run <Tool> <json>` 仍保留，用于手动直执行。
+
+## 权限规则（settings.json）
+
+```json
+"allow_rules": ["Bash(git status*)", "FileRead"],
+"deny_rules":  ["Bash(rm *)"],
+"ask_rules":   ["Bash(curl *)"]
+```
+
+- 规则形如 `工具名(glob)` 或裸 `工具名`（放行/拒绝整个工具）
+- `ask_rules` 强制确认，**bypass 模式也不豁免**
+- **链式命令分段匹配**：`cd x && git push --force` 会被 deny `git push*` 命中（任一段命中即拒绝）；
+  allow 则要求**每一段**都被覆盖——`git status*` 不会放行 `git status && rm -rf /x`
+- 模式语义：default 全问；accept_edits 自动放行只读与文件编辑（Bash 仍需规则或确认，
+  白名单只读命令如 `ls`/`git status` 例外）；plan 只读（含只读 Bash 白名单）；bypass 全放
+  （ask 规则除外）

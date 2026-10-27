@@ -564,7 +564,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/version")) {
-                try std.Io.Writer.writeAll(w, "  Ziv v0.4.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
+                try std.Io.Writer.writeAll(w, "  Ziv v0.5.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else {
@@ -934,6 +934,9 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
 
 /// M4: run a reflection pass over the query window and persist the insight
 /// as a feedback memory. Resets the window.
+/// Ownership: dupes every string it keeps onto the session allocator before the
+/// window slices (cleared right after) are reused; the reflection insight is
+/// owned by the memory system after store. No borrows outlive this call.
 fn runReflection(
     reflector: *reflection_mod.ReflectionEngine,
     mem: *memory_mod.MemorySystem,
