@@ -2096,7 +2096,14 @@ fn runApiKeysMenu(
                 var vbuf: [256]u8 = undefined;
                 const val = menu.readLine(r, w, file_writer, "  Ollama Host: ", &vbuf) catch continue;
                 if (val.len > 0) switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
+                // The provider caches base_url at init — drop it so the new
+                // host takes effect this session, then list local models.
+                if (switcher.ollama_provider) |*p| {
+                    p.deinit();
+                    switcher.ollama_provider = null;
+                }
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
+                try offerGatewayModels(w, r, file_writer, switcher, alloc, io, .ollama);
             },
             else => break,
         }

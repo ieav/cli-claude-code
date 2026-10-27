@@ -268,3 +268,9 @@
 - **✨ 主输入行编辑器**（util/lineinput.zig）: raw 模式下方向键 ←→ 移动光标（UTF-8 按字符步进、CJK 双宽光标定位）、↑↓ 翻输入历史（相邻去重、上限滚动）、Backspace/Delete/Home/End、Ctrl-C 清行、Ctrl-D 空行退出；管道自动降级旧读法（全部既有脚本行为不变）。原主循环 streamDelimiter 替换。
 - **/model 新增"自定义…"入口**: 与 /config 共享 promptCustomModel（含后端询问），网关模型免进 /config。
 - **验证**: 187 测试全绿（新增路由优先级 + 编辑器缓冲操作 + 宽度计算）；管道回归（多命令/菜单/工具/记忆提取）全通过。
+
+### P25: 接入链闭环复查（code-review）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **🟡 Ollama Host 配置链两处断裂（已修）**: ①改 host 后 ollama_provider 缓存（init 时固化 base_url）不清理——当前会话仍连旧地址；②Ollama Host 未接模型自动拉取（OpenAI/Anthropic 有）。修复：case 3 清 provider 缓存 + offerGatewayModels(.ollama)，本机已装模型也能菜单直选。
+- **🟢 登记不改**: fetchGatewayModels 的 JSON DOM 为 parseFromSliceLeaky 会话级泄漏（低频操作、量小）；promptCustomModel 返回堆串与 default_model 双重 dupe 小泄漏；menu.readLine（配置子输入）仍为 cooked 行读（无编辑器，主输入行已修）；lineinput draft 上限 1024 截断。
+- **链路复核结论**: A 接入配置链（菜单→落盘→缓存清理→拉取→选择→路由→HTTP）、B 自定义路由链（四层优先级→switchModel→getProvider）、C 行编辑器链（TTY raw/管道 fallback→命令分发→历史）全部闭环；嵌套 raw 进出（行编辑器→菜单→readLine）恢复顺序正确。
