@@ -11,6 +11,7 @@ const menu = @import("util/menu.zig");
 const lineinput = @import("util/lineinput.zig");
 const slash_cmds = @import("util/slash_commands.zig");
 const runtime_registry = @import("tools/runtime_registry.zig");
+const skills_mod = @import("skills/mod.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -249,6 +250,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     else
         null;
 
+    // Skills (T7/T8): SKILL.md packs from ~/.config/ziv/skills + ./.ziv/skills.
+    var skill_loader = skills_mod.loader.SkillLoader.init(allocator, io);
+    defer skill_loader.deinit();
+    skill_loader.load();
+    if (skill_loader.skills.items.len > 0) {
+        logger.info("skills: {d} loaded", .{skill_loader.skills.items.len});
+    }
+
     // Add system prompt as first message, appending cross-session memories
     // recovered from .ziv/memory.db (most recent first, token-budgeted).
     const sys_prompt = switcher.settings.system_prompt orelse system_prompt_mod.default_system_prompt;
@@ -264,10 +273,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
         }
     }
-    const sys_block_count: usize = if (memory_block != null) 2 else 1;
+    // Skill manifest: one line per skill, budgeted (bodies load on invoke).
+    var skill_manifest: ?[]u8 = null;
+    defer if (skill_manifest) |m| allocator.free(m);
+    skill_manifest = skill_loader.buildManifest(allocator, 300) catch null;
+    const sys_block_count: usize = 1 + @as(usize, @intFromBool(memory_block != null)) + @as(usize, @intFromBool(skill_manifest != null));
     var sys_blocks = try allocator.alloc(llm.ContentBlock, sys_block_count);
     sys_blocks[0] = .{ .text = sys_prompt };
-    if (memory_block) |mb| sys_blocks[1] = .{ .text = mb };
+    var sys_i: usize = 1;
+    if (memory_block) |mb| {
+        sys_blocks[sys_i] = .{ .text = mb };
+        sys_i += 1;
+    }
+    if (skill_manifest) |sm| sys_blocks[sys_i] = .{ .text = sm };
     try history.append(allocator, .{
         .role = .system,
         .content = sys_blocks,
@@ -347,6 +365,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         const input = std.mem.trim(u8, line_buf[0..n], " \t\r\n");
         if (input.len == 0) continue;
 
+        var skill_injected = false;
         // ──── Meta commands ────
         if (std.mem.startsWith(u8, input, "/")) {
             if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q") or std.mem.eql(u8, input, "/exit")) {
@@ -360,6 +379,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 break;
             } else if (std.mem.eql(u8, input, "/help") or std.mem.eql(u8, input, "/h")) {
                 try printHelp(w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/skills")) {
+                if (skill_loader.skills.items.len == 0) {
+                    try std.Io.Writer.writeAll(w, "  No skills found. Add SKILL.md packs under ~/.config/ziv/skills/<name>/ or .ziv/skills/<name>/\n\n");
+                } else {
+                    try std.Io.Writer.writeAll(w, "  Skills (invoke with /<name>):\n");
+                    for (skill_loader.skills.items) |skill| {
+                        try std.Io.Writer.print(w, "    /{s} — {s} [{s}]\n", .{ skill.name, skill.description, @tagName(skill.source) });
+                    }
+                    try std.Io.Writer.writeAll(w, "\n");
+                }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/tools")) {
@@ -578,6 +609,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.Writer.writeAll(w, "  Ziv v0.5.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
+            } else if (input.len > 1 and skill_loader.findByName(if (std.mem.indexOfScalar(u8, input[1..], ' ')) |sp| input[1 .. 1 + sp] else input[1..]) != null) {
+                // /<skill-name> [task...]: known skill -> inject its body as
+                // the user message (v1: prompt-only skills) and fall through
+                // to the normal agent path.
+                const rest = input[1..];
+                const sp_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+                const skill = skill_loader.findByName(rest[0..sp_end]).?;
+                const task = std.mem.trim(u8, rest[sp_end..], " \t");
+                const body = skill_loader.readBody(skill, allocator) catch "";
+                defer if (body.len > 0) allocator.free(body);
+                const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
+                    skill.name,
+                    body,
+                    if (task.len > 0) task else "follow the skill instructions",
+                }) catch continue;
+                var skill_blocks = try allocator.alloc(llm.ContentBlock, 1);
+                skill_blocks[0] = .{ .text = msg };
+                try history.append(allocator, .{
+                    .role = .user,
+                    .content = skill_blocks,
+                    .timestamp = util_time.nowMillis(),
+                });
+                skill_injected = true;
             } else {
                 try std.Io.Writer.print(w, "Unknown command: {s}", .{input});
                 // Typo hints from the canonical command table.
@@ -596,41 +650,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
         }
 
-        // ──── Process message — Agent Loop ────
-        message_count += 1;
-
-        _ = log.record("UserMessage", input, "(awaiting LLM response)", null, false) catch {};
-
-        try std.Io.Writer.print(w, "\n  [Processing: \"{s}\"]\n", .{input});
-        try std.Io.File.Writer.flush(&file_writer);
-
-        // Track query for the reflection window (cap at 20; drop oldest)
-        {
-            const q = try allocator.dupe(u8, input);
-            errdefer allocator.free(q);
-            try window_queries.append(allocator, q);
-            if (window_queries.items.len > 20) {
-                const old = window_queries.orderedRemove(0);
-                allocator.free(old);
-            }
+        // Append user message to history (skill invocations already did)
+        if (!skill_injected) {
+            var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
+            user_blocks[0] = .{ .text = try allocator.dupe(u8, input) };
+            try history.append(allocator, .{
+                .role = .user,
+                .content = user_blocks,
+                .timestamp = util_time.nowMillis(),
+            });
         }
-
-        // Fresh decision trace for this query.
-        if (live_trace) |*t| t.deinit();
-        live_trace = decision_trace.DecisionTrace.init(allocator, try allocator.dupe(u8, input));
-        if (live_trace) |*t| {
-            // Step 1: memory retrieval (system-prompt injection status).
-            traceAddStep(t, .memory_retrieval, if (injected_count > 0) 0.8 else 0.3, input, "recency-ranked e-decay injection", "injected count from startup", allocator) catch {};
-        }
-
-        // Append user message to history
-        var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
-        user_blocks[0] = .{ .text = try allocator.dupe(u8, input) };
-        try history.append(allocator, .{
-            .role = .user,
-            .content = user_blocks,
-            .timestamp = util_time.nowMillis(),
-        });
 
         // Agent loop
         var agent_iterations: usize = 0;

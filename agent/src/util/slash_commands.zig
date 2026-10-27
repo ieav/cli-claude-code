@@ -11,6 +11,7 @@ pub const commands = [_][]const u8{
     "/run",   "/mode",  "/model", "/models", "/config", "/compact",
     "/clear", "/reset", "/new",   "/context", "/memory", "/research",
     "/knowledge", "/diagnose", "/undo", "/history", "/rewind", "/stats",
+    "/skills",
     "/version",
 };
 

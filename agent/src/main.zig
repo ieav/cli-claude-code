@@ -63,6 +63,7 @@ test {
     _ = @import("util/lineinput.zig");
     _ = @import("util/slash_commands.zig");
     _ = @import("mcp/mod.zig");
+    _ = @import("skills/loader.zig");
     _ = @import("tools/runtime_registry.zig");
     _ = @import("util/binary_check.zig");
     _ = @import("util/cancel.zig");
