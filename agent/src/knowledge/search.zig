@@ -129,10 +129,13 @@ pub const WebSearch = struct {
 
     /// Parse Brave Search API JSON response.
     fn parseBraveResults(self: *Self, body: []const u8, max_results: usize) ![]SearchResult {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
+        // parseFromSlice (not Leaky): the DOM lives in its own arena and is
+        // freed below — Leaky on the long-lived allocator leaked the whole
+        // tree on every search (up to the 4 MB body cap).
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch
             return &.{};
-
-        const web_results = parsed.object.get("web") orelse return &.{};
+        defer parsed.deinit();
+        const web_results = parsed.value.object.get("web") orelse return &.{};
         const results_array = web_results.object.get("results") orelse return &.{};
 
         var output = std.ArrayList(SearchResult).empty;
@@ -202,10 +205,10 @@ pub const WebSearch = struct {
 
     /// Parse SearXNG JSON response.
     fn parseSearXNGResults(self: *Self, body: []const u8, max_results: usize) ![]SearchResult {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.allocator, body, .{}) catch
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch
             return &.{};
-
-        const results_array = parsed.object.get("results") orelse return &.{};
+        defer parsed.deinit();
+        const results_array = parsed.value.object.get("results") orelse return &.{};
 
         var output = std.ArrayList(SearchResult).empty;
         const count = @min(results_array.array.items.len, max_results);

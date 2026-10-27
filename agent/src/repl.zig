@@ -465,12 +465,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 settings = switcher.settings;
                 continue;
             } else if (std.mem.eql(u8, input, "/compact")) {
-                try compactHistory(&history, w);
+                try compactHistory(&history, allocator, w);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
                 if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
-                clearHistory(&history, sys_prompt);
+                clearHistory(&history, allocator);
                 // Drop the stale memory-injection block from the surviving
                 // system message so the fresh conversation isn't primed
                 // with the cleared one's memories.
@@ -522,7 +522,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/undo")) {
-                try undoLastExchange(&history, w);
+                try undoLastExchange(&history, allocator, w);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/history")) {
@@ -613,7 +613,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
             // Compaction check
-            maybeCompact(&history, w, &file_writer);
+            maybeCompact(&history, allocator, w, &file_writer);
 
             // Get provider
             const prov = switcher.getProvider() catch |err| {
@@ -1400,7 +1400,9 @@ fn permissionGate(
     if (mode == .auto and decision == .ask) {
         if (switcher.getProvider() catch null) |p| {
             var lc = classifier_mod.LLMClassifier.init(alloc, p);
-            const cr = lc.classify(tool_def, input) catch classifier_mod.ClassifierResult{ .allow = {} };
+            // Fail CLOSED: on classifier error fall back to asking the user
+            // (fail-open silently allowed writes when the LLM was down).
+            const cr = lc.classify(tool_def, input) catch classifier_mod.ClassifierResult{ .block = .{ .reason = "classifier unavailable — confirm manually" } };
             decision = switch (cr) {
                 .allow => .{ .allow = {} },
                 .block => |b| .{ .deny = .{ .message = b.reason } },
@@ -1518,29 +1520,29 @@ fn estimateHistoryTokens(history: []const llm.Message) u32 {
 }
 
 /// Auto-compact if history exceeds phi threshold.
-fn maybeCompact(history: *std.ArrayList(llm.Message), w: *std.Io.Writer, file_writer: *std.Io.File.Writer) void {
+fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer) void {
     const current_tokens = estimateHistoryTokens(history.items);
     if (!compaction.needsCompaction(current_tokens, MAX_CONTEXT_TOKENS)) return;
 
-    compactHistoryImpl(history);
+    compactHistoryImpl(history, alloc);
     std.Io.Writer.print(w, "  [Context auto-compacted: {d} messages remaining]\n", .{history.items.len}) catch {};
     std.Io.File.Writer.flush(file_writer) catch {};
 }
 
 /// Force compact history (used by /compact command).
-fn compactHistory(history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
+fn compactHistory(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     if (history.items.len <= 2) {
         try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
         return;
     }
     const before = history.items.len;
-    compactHistoryImpl(history);
+    compactHistoryImpl(history, alloc);
     const est = estimateHistoryTokens(history.items);
     try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} tokens)\n\n", .{ before, history.items.len, est });
 }
 
 /// Core compaction: keep system prompt + recent 61.8% of messages.
-fn compactHistoryImpl(history: *std.ArrayList(llm.Message)) void {
+fn compactHistoryImpl(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
     if (history.items.len <= 2) return;
 
     // Keep system prompt (index 0) and recent messages up to phi target
@@ -1548,22 +1550,25 @@ fn compactHistoryImpl(history: *std.ArrayList(llm.Message)) void {
     const target = compaction.condensationTarget(total);
     if (target >= total) return;
 
-    const remove_count = total - target;
-    // Remove messages [1..remove_count+1] (keep system at 0, keep recent)
+    // Remove the oldest non-system messages down to the phi target,
+    // freeing their content — previously every removal leaked.
     const new_len = 1 + target; // system + remaining
-    for (history.items[1 .. remove_count + 1]) |_| {
-        _ = history.orderedRemove(1);
-    }
-    // Ensure we have the right count
     while (history.items.len > new_len) {
-        _ = history.orderedRemove(1);
+        const msg = history.orderedRemove(1);
+        freeMessage(msg, alloc);
     }
 }
 
 /// Clear history, keep only system prompt.
-fn clearHistory(history: *std.ArrayList(llm.Message), _: []const u8) void {
+/// Free one history message's content blocks (strings + JSON trees).
+fn freeMessage(msg: llm.Message, alloc: std.mem.Allocator) void {
+    freeContentBlocks(alloc, msg.content);
+}
+
+fn clearHistory(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
     while (history.items.len > 1) {
-        _ = history.orderedRemove(1);
+        const msg = history.orderedRemove(1);
+        freeMessage(msg, alloc);
     }
 }
 
@@ -1593,7 +1598,7 @@ fn showContext(history: *std.ArrayList(llm.Message), total_in: u64, total_out: u
 }
 
 /// Undo last exchange (remove last assistant + any tool results).
-fn undoLastExchange(history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
+fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     // Need at least system prompt + one user message + one assistant message
     if (history.items.len < 3) {
         try std.Io.Writer.writeAll(w, "  Nothing to undo.\n\n");
@@ -1606,7 +1611,8 @@ fn undoLastExchange(history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !vo
     if (history.items.len > 0) {
         const last = history.items[history.items.len - 1];
         if (last.role == .assistant) {
-            _ = history.pop();
+            const msg = history.pop().?;
+            freeMessage(msg, alloc);
             removed += 1;
         }
     }
@@ -1624,7 +1630,8 @@ fn undoLastExchange(history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !vo
                 }
             }
             if (has_tool_result) {
-                _ = history.pop();
+                const msg = history.pop().?;
+                freeMessage(msg, alloc);
                 removed += 1;
             }
         }
@@ -1634,7 +1641,8 @@ fn undoLastExchange(history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !vo
     if (history.items.len > 1) {
         const last = history.items[history.items.len - 1];
         if (last.role == .user) {
-            _ = history.pop();
+            const msg = history.pop().?;
+            freeMessage(msg, alloc);
             removed += 1;
         }
     }
@@ -2178,7 +2186,8 @@ fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fil
     } else llm.KNOWN_MODELS[picked].name;
     switcher.switchModel(name) catch |err| {
         if (err == error.MissingApiKey) {
-            try std.Io.Writer.print(w, "  Error: API key not configured for {s}.\n  Use /config to set keys.\n\n", .{llm.KNOWN_MODELS[picked].backend.label()});
+            const be: llm.BackendType = if (picked < llm.KNOWN_MODELS.len) llm.KNOWN_MODELS[picked].backend else switcher.effectiveBackend(name);
+            try std.Io.Writer.print(w, "  Error: API key not configured for {s}.\n  Use /config to set keys.\n\n", .{be.label()});
         } else {
             try std.Io.Writer.print(w, "  Error switching model: {}\n\n", .{err});
         }

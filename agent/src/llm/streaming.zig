@@ -142,7 +142,11 @@ pub fn parseClaudeStreamEvent(allocator: std.mem.Allocator, data: []const u8) ?p
             return .{
                 .done = .{
                     .input_tokens = 0,
-                    .output_tokens = @intFromFloat(usage.object.get("output_tokens").?.float),
+                    .output_tokens = switch (usage.object.get("output_tokens").?) {
+                        .integer => |i| @intCast(i),
+                        .float => |f| @intFromFloat(f),
+                        else => 0,
+                    },
                 },
             };
         }

@@ -40,16 +40,22 @@ pub const FileHistoryState = struct {
         };
     }
 
+    fn freeSnapshotBackups(self: *Self, snap_in: Snapshot) void {
+        var snap = snap_in;
+        var iter = snap.backups.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.backup_path) |bp| {
+                self.allocator.free(bp);
+            }
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snap.backups.deinit();
+    }
+
     pub fn deinit(self: *Self) void {
         // Clean up snapshots
-        for (self.snapshots.items) |*snap| {
-            var iter = snap.backups.iterator();
-            while (iter.next()) |entry| {
-                if (entry.value_ptr.backup_path) |bp| {
-                    self.allocator.free(bp);
-                }
-            }
-            snap.backups.deinit();
+        for (self.snapshots.items) |snap| {
+            self.freeSnapshotBackups(snap);
         }
         self.snapshots.deinit(self.allocator);
 
@@ -107,14 +113,12 @@ pub const FileHistoryState = struct {
             // Skip if unchanged since last backup
             if (snap.backups.get(file_path)) |existing| {
                 if (std.mem.eql(u8, &existing.content_hash, &content_hash)) return;
-                // Hash changed — remove old backup entry
-                if (snap.backups.fetchRemove(file_path)) |old| {
-                    if (old.value.backup_path) |bp| self.allocator.free(bp);
-                    self.allocator.free(old.key);
-                }
             }
 
-            // Write backup file
+            // Write the new backup file FIRST — only after it exists on disk
+            // do we replace the old entry, so a failed write leaves the
+            // snapshot with its previous valid backup instead of silently
+            // dropping the file from rollback coverage.
             self.sequence += 1;
             const basename_start = std.mem.lastIndexOfScalar(u8, file_path, '/') orelse 0;
             const basename = if (basename_start > 0) file_path[basename_start + 1 ..] else file_path;
@@ -129,6 +133,11 @@ pub const FileHistoryState = struct {
                 self.allocator.free(backup_path);
                 return;
             };
+
+            if (snap.backups.fetchRemove(file_path)) |old| {
+                if (old.value.backup_path) |bp| self.allocator.free(bp);
+                self.allocator.free(old.key);
+            }
 
             const path_key = try self.allocator.dupe(u8, file_path);
             try snap.backups.put(path_key, .{
@@ -164,14 +173,8 @@ pub const FileHistoryState = struct {
 
         // Evict oldest if over limit
         if (self.snapshots.items.len > self.max_snapshots) {
-            var old = self.snapshots.orderedRemove(0);
-            var iter = old.backups.iterator();
-            while (iter.next()) |entry| {
-                if (entry.value_ptr.backup_path) |bp| {
-                    self.allocator.free(bp);
-                }
-            }
-            old.backups.deinit();
+            const old = self.snapshots.orderedRemove(0);
+            self.freeSnapshotBackups(old);
         }
     }
 

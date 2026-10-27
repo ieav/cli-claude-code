@@ -145,6 +145,37 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
 }
 
 /// Save settings to user config file (~/.config/ziv/settings.json).
+fn writeJsonTopField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, value: []const u8) void {
+    writeJsonField(allocator, buf, "  ", name, value);
+}
+
+fn writeJsonNestedField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, value: []const u8) void {
+    writeJsonField(allocator, buf, "    ", name, value);
+    // Last field of the object: writeJsonField ends with ",\n" — swap the
+    // comma for a space so the closing brace has no trailing comma.
+    if (buf.items.len >= 2 and buf.items[buf.items.len - 2] == ',') {
+        buf.items[buf.items.len - 2] = ' ';
+    }
+}
+
+fn writeJsonField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), indent: []const u8, name: []const u8, value: []const u8) void {
+    buf.appendSlice(allocator, indent) catch return;
+    buf.appendSlice(allocator, "\"") catch return;
+    buf.appendSlice(allocator, name) catch return;
+    buf.appendSlice(allocator, "\": \"") catch return;
+    for (value) |ch| {
+        switch (ch) {
+            '"' => buf.appendSlice(allocator, "\\\"") catch return,
+            '\\' => buf.appendSlice(allocator, "\\\\") catch return,
+            '\n' => buf.appendSlice(allocator, "\\n") catch return,
+            '\r' => buf.appendSlice(allocator, "\\r") catch return,
+            '\t' => buf.appendSlice(allocator, "\\t") catch return,
+            else => buf.append(allocator, ch) catch return,
+        }
+    }
+    buf.appendSlice(allocator, "\",\n") catch return;
+}
+
 fn writeJsonStringField(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, value: []const u8) void {
     buf.appendSlice(allocator, "    \"") catch return;
     buf.appendSlice(allocator, name) catch return;
@@ -178,8 +209,8 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
 
     buf.appendSlice(allocator, "{\n") catch return;
 
-    // default_model
-    buf.print(allocator, "  \"default_model\": \"{s}\",\n", .{settings.default_model}) catch {};
+    // default_model (escaped — a quote/backslash here corrupts the file)
+    writeJsonTopField(allocator, &buf, "default_model", settings.default_model);
     // max_tokens
     buf.print(allocator, "  \"max_tokens\": {d},\n", .{settings.max_tokens}) catch {};
     // checkpointing_enabled
@@ -188,7 +219,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     const mode_str = @tagName(settings.permission_mode);
     buf.print(allocator, "  \"permission_mode\": \"{s}\",\n", .{mode_str}) catch {};
     if (settings.default_backend) |b| {
-        buf.print(allocator, "  \"default_backend\": \"{s}\",\n", .{b}) catch {};
+        writeJsonTopField(allocator, &buf, "default_backend", b);
     }
 
     // system_prompt
@@ -226,7 +257,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     if (settings.api_keys.brave_api_key) |k| {
         writeJsonStringField(allocator, &buf, "brave", k);
     }
-    buf.print(allocator, "    \"ollama_host\": \"{s}\"\n", .{settings.api_keys.ollama_host}) catch {};
+    writeJsonNestedField(allocator, &buf, "ollama_host", settings.api_keys.ollama_host);
     buf.appendSlice(allocator, "  }\n") catch {};
 
     buf.appendSlice(allocator, "}\n") catch {};

@@ -287,3 +287,20 @@
 - **🔴 switchModel alias 崩溃**: 网关 pin 流程 `switchModel(modelName())` 自切自 → @memcpy(buf, buf) 同源 panic（真机实测崩溃栈）。修复：名字未变时跳过拷贝，只重设 backend。崩溃场景复现通过（pin 分支正常走完）。
 - **🟡 saveSettings key/URL 无 JSON 转义**: key 含引号会写坏文件，下次 load 静默丢全部配置。新增 writeJsonStringField 转义（5 种字符）。
 - **今日六笔提交（b709c74→f513945）链路复查**: A 接入配置链（含本次 load 修复后真正闭环）/ B 自定义路由链 / C 行编辑器链 / D Ollama host 链（P25 修）/ E /mode 持久化（P26 修）/ F pin 流程（本次修）——全部闭环。
+
+### P28: 全量多 agent 代码审查（4 agent 并行，46 项发现）
+- **状态**: 🔴 大部分已修 (2026-10-27)，1 项大工程转功能开发
+- **审查规模**: 4 个并行 agent 覆盖 llm/tools/memory+storage+checkpoint/repl+runtime+task+config，共 🔴16 / 🟡21 / 🟢9
+- **已修复（🔴×11 + 🟡×2）**:
+  - memory 3 红（P28 前段）：快照 key 泄漏 / 备份失败静默丢文件 / 搜索 JSON 树泄漏（Brave+SearXNG 两处改 parseFromSlice+defer deinit）
+  - streaming.zig Claude 流式 usage `.float` 对 `.integer` union panic → switch 兼容
+  - orchestration defer 顺序 UAF：pool.deinit 移至最先注册（LIFO 最后执行），确保 join 先于 free(tasks/ctxs)
+  - lineinput draft 缓冲 1024→4096（与编辑缓冲一致，防长行按↑越界）
+  - /model 自定义模型 + MissingApiKey 时 KNOWN_MODELS[picked] 越界 → effectiveBackend 兜底
+  - classifier fail-open → fail-closed（分类器故障回退 block 而非静默放行）
+  - openai 流式请求补 stream_options.include_usage（官方 API 才发 usage；智谱本来就发）
+  - /clear /compact /undo maybeCompact 五处消息移除全部改为 freeMessage 释放 content（此前每次压缩/清空/撤销整块泄漏）
+  - saveSettings default_model/default_backend/ollama_host 补 JSON 转义（与其他字段对称）
+- **🔴 转功能开发（最大发现）**: **工具声明从未发送**——全 llm 层无一处写 "tools" 字段，buildRequestBody 只发 messages；agent loop 依赖的 stop_reason==.tool_use 从未发生（用户一直用 /run 手动执行掩盖了此缺口）。配套缺口：流式 tool_calls 解析（openai items[0]/空参数/分片丢弃、Claude content_block_start+input_json_delta 未处理、ollama 工具回路断裂）。这是「让 LLM 自动调用工具」的完整功能，涉及三后端请求构造+流式解析，工作量 1.5~2 天，列为下一任务
+- **已登记未修（🟡×7 + 🟢×9）**: ollama parseChatResponse 无 arena / 流错误吞成 EOF / 每事件 leaky 三种所有权制度 / 1MiB 栈缓冲线程溢出风险 / compaction.zig 桩 / ask 规则无实现 / accept_edits 放行任意 Bash / pattern "cd x && git push" 绕过 / bash+grep 工具输出泄漏 / env 密钥静默落盘 / 管道超长行 EOF / effectiveConcurrency(0,·)恒=1（并行名存实亡，同时掩盖 MPSC 单消费缺陷）/ MPSC 多消费者不安全 / task_store global() 竞态（被串行批掩盖）/ findWeakSteps+event_bus+monitor+cron 死代码 / max_snapshots+allow_rules 配置对称缺口
+- **验证**: 187 测试全绿；配置 JSON 落盘合法性实测 ✓；/run+权限门+/model 自定义切换冒烟 ✓

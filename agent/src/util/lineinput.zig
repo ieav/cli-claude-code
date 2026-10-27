@@ -119,7 +119,7 @@ pub fn readLine(
 
     var ed = Editor{ .w = w, .file_writer = file_writer, .r = r, .prompt = prompt, .buf = buf };
     var nav: ?usize = null; // history index while navigating
-    var draft: [1024]u8 = undefined;
+    var draft: [4096]u8 = undefined; // match the edit buffer — smaller sizes overflow on long lines
     var draft_len: usize = 0;
 
     try ed.render();

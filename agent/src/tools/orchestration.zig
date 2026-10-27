@@ -89,6 +89,9 @@ pub fn executeBatches(
                 continue;
             };
             try pool.start();
+            // Defer order is LIFO: register the pool join FIRST so it runs
+            // LAST — workers may still write task.status after done is set,
+            // so tasks/ctxs must outlive the join.
             defer pool.deinit();
 
             const ctxs = try allocator.alloc(ParallelCall, batch.calls.len);
