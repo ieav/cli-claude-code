@@ -10,6 +10,7 @@ pub const Message = provider.Message;
 pub const MessageRole = provider.MessageRole;
 pub const ContentBlock = provider.ContentBlock;
 pub const CompleteOptions = provider.CompleteOptions;
+pub const ToolSpec = provider.ToolSpec;
 pub const StreamEvent = provider.StreamEvent;
 pub const Usage = provider.Usage;
 

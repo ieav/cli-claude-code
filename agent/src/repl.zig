@@ -640,6 +640,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             const response = streamComplete(prov, history.items, .{
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
+                // Declare the tools so the model can actually call them.
+                .tools = &tools_mod.default_tool_specs,
             }, w, &file_writer, allocator) catch |err| {
                 logger.err("LLM call failed: {}", .{err});
                 try std.Io.Writer.print(w, "  [LLM error: {}]\n\n", .{err});

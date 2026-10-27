@@ -104,7 +104,8 @@ pub const ClaudeProvider = struct {
         var resp_read_buf: [8192]u8 = undefined;
         const resp_reader = response.reader(&resp_read_buf);
         var chunk_buf: [4096]u8 = undefined;
-        var total_usage: ?provider.Usage = null;
+        var agg = streaming_mod.ClaudeStreamState.init(self.allocator);
+        defer agg.deinit();
 
         while (true) {
             // Incremental read: take whatever is buffered right now (at least
@@ -130,20 +131,15 @@ pub const ClaudeProvider = struct {
 
             for (events) |evt| {
                 if (evt.data) |data| {
-                    if (streaming_mod.parseClaudeStreamEvent(self.allocator, data)) |stream_event| {
-                        switch (stream_event) {
-                            .done => |u| {
-                                if (u) |new_usage| total_usage = new_usage;
-                                try cb(ctx, .{ .done = total_usage });
-                                return;
-                            },
-                            else => try cb(ctx, stream_event),
-                        }
+                    const finished = try agg.feed(data, ctx, cb);
+                    if (finished) {
+                        try cb(ctx, .{ .done = agg.usageValue() });
+                        return;
                     }
                 }
             }
         }
-        try cb(ctx, .{ .done = total_usage });
+        try cb(ctx, .{ .done = agg.usageValue() });
     }
 
     fn countTokens(ptr: *anyopaque, text: []const u8) anyerror!u32 {
@@ -274,6 +270,22 @@ pub const ClaudeProvider = struct {
             msg_idx += 1;
         }
         try writer.writeAll("]");
+
+        // Tool declarations (Claude format: bare objects with input_schema).
+        if (opts.tools) |tools| {
+            try writer.writeAll(",\"tools\":[");
+            for (tools, 0..) |tool, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"name\":");
+                try message.writeJsonString(writer, tool.name);
+                try writer.writeAll(",\"description\":");
+                try message.writeJsonString(writer, tool.description);
+                try writer.writeAll(",\"input_schema\":");
+                try writer.writeAll(tool.input_schema);
+                try writer.writeAll("}");
+            }
+            try writer.writeAll("]");
+        }
 
         if (do_stream) {
             try writer.writeAll(",\"stream\":true");
@@ -549,4 +561,23 @@ test "Claude buildRequestBody streaming flag" {
     const body_nostream = try p.buildRequestBody(&msgs, .{ .max_tokens = 50, .temperature = 0.7 }, false);
     defer std.testing.allocator.free(body_nostream);
     try std.testing.expect(std.mem.indexOf(u8, body_nostream, "\"stream\"") == null);
+}
+
+test "Claude buildRequestBody sends tool declarations" {
+    const config = ClaudeConfig{ .api_key = "test-key" };
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    var p = ClaudeProvider.init(std.testing.allocator, io_state.io(), config);
+    defer p.deinit();
+
+    const msgs = [_]provider.Message{
+        .{ .role = .user, .content = &.{.{ .text = "Hi" }}, .timestamp = 0 },
+    };
+    const tools = [_]provider.ToolSpec{
+        .{ .name = "FileRead", .description = "Read a file", .input_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}" },
+    };
+    const body = try p.buildRequestBody(&msgs, .{ .tools = &tools }, false);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"FileRead\",\"description\":\"Read a file\",\"input_schema\":{\"type\":\"object\"") != null);
 }

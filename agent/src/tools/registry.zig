@@ -475,6 +475,20 @@ pub const default_tools = &[_]ToolDefinition{
 /// Convenience type for the default registry.
 pub const DefaultRegistry = ToolRegistry(default_tools);
 
+/// Provider-agnostic specs for every default tool — pass as
+/// CompleteOptions.tools so the model sees the tool declarations.
+pub const default_tool_specs = blk: {
+    var specs: [default_tools.len]llm.ToolSpec = undefined;
+    for (default_tools, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name,
+            .description = tool.description,
+            .input_schema = tool.input_schema,
+        };
+    }
+    break :blk specs;
+};
+
 // ──── Tests ────
 
 test "ToolRegistry has and getByName" {

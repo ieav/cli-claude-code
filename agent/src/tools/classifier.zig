@@ -13,13 +13,13 @@ pub const ClassifierResult = union(enum) {
 };
 
 /// Safe tools that are always allowed in auto mode (no classifier needed).
+/// (TaskGet was removed: no such tool exists in the registry.)
 pub const auto_safe_tools = [_][]const u8{
     "FileRead",
     "Glob",
     "Grep",
     "ToolSearch",
     "TaskList",
-    "TaskGet",
 };
 
 /// Check if a tool is in the auto-allow safe list.
@@ -96,6 +96,9 @@ pub const LLMClassifier = struct {
             .max_tokens = 50,
             .temperature = 0.0,
         });
+        // Release the response DOM arena (the reason string is already duped
+        // onto the classifier allocator below).
+        defer response.free(self.allocator);
 
         // Find text content in response
         var response_text: ?[]const u8 = null;

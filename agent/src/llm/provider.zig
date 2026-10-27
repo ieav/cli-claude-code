@@ -34,10 +34,21 @@ pub const Message = struct {
     timestamp: i64,
 };
 
+/// Provider-agnostic tool declaration sent in request bodies. `input_schema`
+/// is raw JSON Schema text (not a JSON string) — backends embed it verbatim
+/// in their wire format.
+pub const ToolSpec = struct {
+    name: []const u8,
+    description: []const u8,
+    input_schema: []const u8,
+};
+
 pub const CompleteOptions = struct {
     max_tokens: u32 = 4096,
     temperature: f64 = 0.7,
     stop_sequences: ?[]const []const u8 = null,
+    /// Tool declarations the model may call. null = plain chat (no tools).
+    tools: ?[]const ToolSpec = null,
 };
 
 pub const CompleteResponse = struct {

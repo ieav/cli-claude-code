@@ -12,6 +12,7 @@ pub const ToolResult = registry.ToolResult;
 pub const ToolRegistry = registry.ToolRegistry;
 pub const DefaultRegistry = registry.DefaultRegistry;
 pub const default_tools = registry.default_tools;
+pub const default_tool_specs = registry.default_tool_specs;
 pub const PermissionMode = registry.PermissionMode;
 pub const PermissionContext = registry.PermissionContext;
 pub const PermissionDecision = registry.PermissionDecision;
