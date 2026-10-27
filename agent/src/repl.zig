@@ -9,6 +9,7 @@ const auth = @import("tools/auth_mode.zig");
 const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
 const lineinput = @import("util/lineinput.zig");
+const slash_cmds = @import("util/slash_commands.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -568,7 +569,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else {
-                try std.Io.Writer.print(w, "Unknown command: {s}\nType /help for available commands.\n\n", .{input});
+                try std.Io.Writer.print(w, "Unknown command: {s}", .{input});
+                // Typo hints from the canonical command table.
+                if (slash_cmds.suggestMatching(allocator, input) catch null) |hits| {
+                    defer allocator.free(hits);
+                    if (hits.len > 0) {
+                        try std.Io.Writer.writeAll(w, "\nDid you mean:");
+                        for (hits[0..@min(hits.len, 5)]) |h| {
+                            try std.Io.Writer.print(w, " {s}", .{h});
+                        }
+                    }
+                }
+                try std.Io.Writer.writeAll(w, "\nType /help for available commands.\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             }

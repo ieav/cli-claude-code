@@ -3,6 +3,7 @@
 /// advances per character. Falls back to plain line reading on non-TTY
 /// stdin (pipes/scripts keep the old behavior byte-for-byte).
 const std = @import("std");
+const lineinput_cmds = @import("slash_commands.zig");
 const menu = @import("menu.zig");
 
 /// Rough display width: CJK/emoji count 2 columns, ASCII 1, UTF-8
@@ -49,9 +50,24 @@ const Editor = struct {
     pos: usize = 0,
 
     fn render(self: *Editor) !void {
-        try self.w.print("\r\x1b[2K{s}{s}", .{ self.prompt, self.buf[0..self.len] });
+        try self.w.print("\r\x1b[2K{s}", .{self.prompt});
+        // Highlight a leading slash command: the first token renders cyan
+        // (dim if unknown), the rest of the line stays plain.
+        const line = self.buf[0..self.len];
+        if (line.len > 0 and line[0] == '/') {
+            const tok_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+            const tok = line[0..tok_end];
+            const known = lineinput_cmds.isKnownCommand(tok);
+            if (known) {
+                try self.w.print("\x1b[36m{s}\x1b[0m{s}", .{ tok, line[tok_end..] });
+            } else {
+                try self.w.print("\x1b[90m{s}\x1b[0m{s}", .{ tok, line[tok_end..] });
+            }
+        } else {
+            try self.w.writeAll(line);
+        }
         // Park the cursor at the editing position.
-        const tail_w = strWidth(self.buf[self.pos..self.len]);
+        const tail_w = strWidth(line[self.pos..self.len]);
         if (tail_w > 0) {
             var b: [16]u8 = undefined;
             const back = std.fmt.bufPrint(&b, "\x1b[{d}D", .{tail_w}) catch "";
