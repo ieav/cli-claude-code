@@ -1,7 +1,9 @@
 /// Interactive arrow-key menu for the REPL (raw terminal mode).
-/// Keys: arrow up/down or vim k/j to move, Enter to select, q/Esc to cancel,
-/// digits 1-9 to jump. Falls back to plain byte reading when stdin is not
-/// a TTY (pipes/tests) so the same escape sequences still work.
+/// Keys: arrow up/down or vim k/j to move, Enter to select, Esc (or q) to
+/// cancel, digits 1-9 to jump. On a TTY a lone ESC is distinguished from
+/// arrow sequences (ESC [ A/B) by polling for follow-up bytes with a short
+/// timeout; on non-TTY stdin (pipes/tests) all bytes are already buffered,
+/// so the reader never blocks and sequences are read directly.
 const std = @import("std");
 
 pub const Key = union(enum) {
@@ -25,15 +27,27 @@ pub fn parseKey(b: u8) Key {
     };
 }
 
-/// Read one logical key; ESC [ A/B are arrow up/down, a lone ESC is quit.
+var is_tty = false;
+
+/// Read one logical key. ESC handling: in raw TTY mode a lone ESC is
+/// followed by nothing (poll times out) -> quit; ESC [ A/B -> up/down.
 pub fn readKey(r: *std.Io.Reader) !Key {
     const c = r.takeByte() catch |err| {
         if (err == error.EndOfStream) return .quit;
         return err;
     };
     if (c != 0x1b) return parseKey(c);
+
+    if (is_tty) {
+        // Distinguish a lone ESC from an escape sequence: poll stdin for
+        // 25ms — arrow keys deliver the remaining bytes within that window.
+        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&pfd, 1, 25);
+        if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return .quit;
+    }
+
     const next = r.takeByte() catch return .quit;
-    if (next != '[') return .quit;
+    if (next != '[') return parseKey(next); // ESC followed by a normal key
     const final = r.takeByte() catch return .quit;
     return switch (final) {
         'A' => .up,
@@ -76,7 +90,7 @@ fn render(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: 
             try w.print("    {s}\n", .{item});
         }
     }
-    try w.writeAll("  ↑↓/jk 移动 · Enter 确认 · q 取消\n");
+    try w.writeAll("  ↑↓/jk 移动 · Enter 确认 · Esc 取消\n");
 }
 
 /// Show an interactive menu. Returns the selected index, or null on cancel.
@@ -91,6 +105,7 @@ pub fn select(
     var guard = RawGuard{};
     guard.enter();
     defer guard.restore();
+    is_tty = guard.active;
 
     var idx = @min(start, items.len - 1);
     try render(w, title, items, idx);
@@ -136,11 +151,24 @@ test "parseKey mappings" {
     try std.testing.expect(parseKey('\r') == .enter);
     try std.testing.expect(parseKey('\n') == .enter);
     try std.testing.expect(parseKey('q') == .quit);
+    try std.testing.expect(parseKey(0x1b) == .quit);
     try std.testing.expect(parseKey('k') == .up);
     try std.testing.expect(parseKey('j') == .down);
     const k = parseKey('2');
     try std.testing.expect(k == .digit);
     try std.testing.expect(k.digit == 1);
     try std.testing.expect(parseKey('x') == .ignore);
-    try std.testing.expect(parseKey(0x1b) == .quit);
+}
+
+test "readKey parses arrow sequences from buffered input (non-tty path)" {
+    is_tty = false; // bytes are pre-buffered; no poll needed
+    var seq = std.Io.Reader.fixed("\x1b[A\x1b[B\rq");
+    try std.testing.expect((try readKey(&seq)) == .up);
+    try std.testing.expect((try readKey(&seq)) == .down);
+    try std.testing.expect((try readKey(&seq)) == .enter);
+    try std.testing.expect((try readKey(&seq)) == .quit);
+
+    // Lone ESC at end of stream: takeByte hits EOF -> quit.
+    var esc_only = std.Io.Reader.fixed("\x1b");
+    try std.testing.expect((try readKey(&esc_only)) == .quit);
 }
