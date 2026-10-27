@@ -181,8 +181,14 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     if (settings.api_keys.openai) |k| {
         buf.print(allocator, "    \"openai\": \"{s}\",\n", .{k}) catch {};
     }
+    if (settings.api_keys.openai_base_url) |u| {
+        buf.print(allocator, "    \"openai_base_url\": \"{s}\",\n", .{u}) catch {};
+    }
     if (settings.api_keys.anthropic) |k| {
         buf.print(allocator, "    \"anthropic\": \"{s}\",\n", .{k}) catch {};
+    }
+    if (settings.api_keys.anthropic_base_url) |u| {
+        buf.print(allocator, "    \"anthropic_base_url\": \"{s}\",\n", .{u}) catch {};
     }
     if (settings.api_keys.brave_api_key) |k| {
         buf.print(allocator, "    \"brave\": \"{s}\",\n", .{k}) catch {};

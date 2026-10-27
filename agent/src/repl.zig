@@ -1821,16 +1821,30 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
 
     const picked = (menu.select(w, r, file_writer, "选择默认模型:", &labels, 0) catch return) orelse return;
     if (picked == llm.KNOWN_MODELS.len + 1) return;
-    if (picked == llm.KNOWN_MODELS.len) {
+    const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
         var vbuf: [128]u8 = undefined;
         const val = menu.readLine(r, w, file_writer, "  模型名: ", &vbuf) catch return;
         if (val.len == 0) return;
-        switcher.settings.default_model = try alloc.dupe(u8, val);
+        break :blk try alloc.dupe(u8, val);
+    } else llm.KNOWN_MODELS[picked].name;
+
+    // Persist AND switch the live session — previously this only wrote the
+    // settings file, so nothing changed until a restart (and it looked like
+    // "configuring the model did nothing").
+    switcher.settings.default_model = try alloc.dupe(u8, name);
+    switcher.switchModel(name) catch |err| {
         autoSaveSettings(w, file_writer, switcher, alloc, io);
+        if (err == error.MissingApiKey) {
+            try std.Io.Writer.print(w, "  已保存默认模型 {s}，但该后端未配 API key（当前会话暂未切换）。\n  请先在「API Keys」里配置，或 /quit 重启后使用。\n", .{name});
+        } else {
+            try std.Io.Writer.print(w, "  已保存，但切换失败: {any}\n", .{err});
+        }
+        try std.Io.File.Writer.flush(file_writer);
         return;
-    }
-    switcher.settings.default_model = try alloc.dupe(u8, llm.KNOWN_MODELS[picked].name);
+    };
     autoSaveSettings(w, file_writer, switcher, alloc, io);
+    try std.Io.Writer.print(w, "  ✓ 已切换并保存: {s} ({s})\n", .{ switcher.modelName(), switcher.backendLabel() });
+    try std.Io.File.Writer.flush(file_writer);
 }
 
 fn runApiKeysMenu(
@@ -1843,31 +1857,70 @@ fn runApiKeysMenu(
 ) !void {
     while (true) {
         var b1: [80]u8 = undefined;
-        var b2: [80]u8 = undefined;
+        var b2: [96]u8 = undefined;
         var b3: [80]u8 = undefined;
+        var b4: [96]u8 = undefined;
+        var b5: [80]u8 = undefined;
+        var b6: [80]u8 = undefined;
         const items = [_][]const u8{
             try_std_fmt(&b1, "OpenAI Key: {s}", .{if (switcher.settings.api_keys.openai) |k| maskKey(k) else "(未设置)"}),
-            try_std_fmt(&b2, "Anthropic Key: {s}", .{if (switcher.settings.api_keys.anthropic) |k| maskKey(k) else "(未设置)"}),
-            try_std_fmt(&b3, "Brave Key: {s}", .{if (switcher.settings.api_keys.brave_api_key) |k| maskKey(k) else "(未设置)"}),
+            try_std_fmt(&b2, "OpenAI Base URL: {s}", .{switcher.settings.api_keys.openai_base_url orelse "(默认官方)"}),
+            try_std_fmt(&b3, "Anthropic Key: {s}", .{if (switcher.settings.api_keys.anthropic) |k| maskKey(k) else "(未设置)"}),
+            try_std_fmt(&b4, "Anthropic Base URL: {s}", .{switcher.settings.api_keys.anthropic_base_url orelse "(默认官方)"}),
+            try_std_fmt(&b5, "Brave Key: {s}", .{if (switcher.settings.api_keys.brave_api_key) |k| maskKey(k) else "(未设置)"}),
+            try_std_fmt(&b6, "Ollama Host: {s}", .{switcher.settings.api_keys.ollama_host}),
             "返回",
         };
-        const picked = (menu.select(w, r, file_writer, "=== API Keys ===", &items, 0) catch break) orelse break;
-        const prompts = [_][]const u8{ "  OpenAI API Key (回车保留): ", "  Anthropic API Key (回车保留): ", "  Brave API Key (回车保留): " };
-        if (picked >= 3) break;
+        const picked = (menu.select(w, r, file_writer, "=== API Keys & 接入配置 ===", &items, 0) catch break) orelse break;
+        if (picked >= 6) break;
+
         var vbuf: [256]u8 = undefined;
+        const prompts = [_][]const u8{
+            "  OpenAI API Key (回车保留): ",
+            "  OpenAI Base URL (如 https://你的网关/v1，回车保留，输 - 恢复默认): ",
+            "  Anthropic API Key (回车保留): ",
+            "  Anthropic Base URL (回车保留，输 - 恢复默认): ",
+            "  Brave API Key (回车保留): ",
+            "  Ollama Host (回车保留): ",
+        };
         const val = menu.readLine(r, w, file_writer, prompts[picked], &vbuf) catch continue;
         if (val.len == 0) continue;
-        const dup = try alloc.dupe(u8, val);
+
         switch (picked) {
-            0 => switcher.settings.api_keys.openai = dup,
-            1 => switcher.settings.api_keys.anthropic = dup,
-            2 => switcher.settings.api_keys.brave_api_key = dup,
+            0 => switcher.settings.api_keys.openai = try alloc.dupe(u8, val),
+            1 => {
+                if (std.mem.eql(u8, val, "-")) {
+                    switcher.settings.api_keys.openai_base_url = null;
+                } else {
+                    switcher.settings.api_keys.openai_base_url = try alloc.dupe(u8, val);
+                }
+            },
+            2 => switcher.settings.api_keys.anthropic = try alloc.dupe(u8, val),
+            3 => {
+                if (std.mem.eql(u8, val, "-")) {
+                    switcher.settings.api_keys.anthropic_base_url = null;
+                } else {
+                    switcher.settings.api_keys.anthropic_base_url = try alloc.dupe(u8, val);
+                }
+            },
+            4 => switcher.settings.api_keys.brave_api_key = try alloc.dupe(u8, val),
+            5 => switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val),
             else => {},
+        }
+        // Provider 缓存要重建才能吃到新 key/base_url。
+        if (switcher.openai_provider) |*p| {
+            p.deinit();
+            switcher.openai_provider = null;
+        }
+        if (switcher.claude_provider) |*p| {
+            p.deinit();
+            switcher.claude_provider = null;
         }
         autoSaveSettings(w, file_writer, switcher, alloc, io);
     }
     try std.Io.Writer.writeAll(w, "\n");
 }
+
 var mask_buf: [16]u8 = undefined;
 
 fn maskKey(key: []const u8) []const u8 {
