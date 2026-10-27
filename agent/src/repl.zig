@@ -636,6 +636,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 switcher.modelName(), history.items.len, switcher.settings.max_tokens,
             });
             // Stream the response: text deltas print live as they arrive.
+            const llm_t0 = util_time.nowMillis();
             const response = streamComplete(prov, history.items, .{
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
@@ -678,10 +679,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     else => {},
                 }
             }
-            try std.Io.Writer.print(w, "  [tokens: in={d} out={d} | stop: {s}]\n", .{
+            const llm_elapsed_s = @as(f64, @floatFromInt(util_time.nowMillis() - llm_t0)) / 1000.0;
+            try std.Io.Writer.print(w, "  [tokens: in={d} out={d} | stop: {s} | {d:.1}s]\n", .{
                 response.usage.input_tokens,
                 response.usage.output_tokens,
                 @tagName(response.stop_reason),
+                llm_elapsed_s,
             });
             try std.Io.File.Writer.flush(&file_writer);
 
