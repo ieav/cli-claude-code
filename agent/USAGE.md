@@ -941,3 +941,26 @@ agent/
 - 模式语义：default 全问；accept_edits 自动放行只读与文件编辑（Bash 仍需规则或确认，
   白名单只读命令如 `ls`/`git status` 例外）；plan 只读（含只读 Bash 白名单）；bypass 全放
   （ask 规则除外）
+
+
+## v0.5.1 — MCP 接入 + Skill 系统
+
+### MCP（stdio + Streamable HTTP 双传输）
+```
+/mcp install playwright          # 内置 registry：playwright/filesystem/memory/fetch/sequential-thinking
+/mcp add <名> <command...>       # 自定义 stdio 服务器
+/mcp add <名> http(s)://…        # HTTP 服务器（自动识别）
+/mcp connect <名> / disconnect   # 握手 + 工具桥接为 mcp__<名>__<工具>（走同一权限门，默认 ask）
+/mcp list / remove
+```
+- 配置持久化于 `~/.config/ziv/mcp.json`；env 全量继承（node/npx 可用）
+- 连接后工具进入 LLM tools 声明，调用→权限确认→执行→结果回传全自动
+- **已知限制**：npx 形态的 playwright 在 ziv 原生 spawn 下无法握手（环境/管道/npm 三因素已排除，剩余为 node 重启动的深层交互）；**推荐 HTTP 方式**：终端 `npx -y @playwright/mcp@latest --port 8931` 后 `/mcp add playwright http://127.0.0.1:8931/mcp`
+
+### Skill（Claude SKILL.md 兼容）
+- 目录：`~/.config/ziv/skills/<名>/SKILL.md`（全局）+ `.ziv/skills/<名>/`（项目级，同名覆盖）
+- frontmatter：name / description / when_to_use（未识别键忽略）
+- 调用：`/<技能名> [任务参数]`——正文注入对话，`$ARGUMENTS` 占位替换；`/skills` 列出
+
+### 指令高亮
+输入框中斜杠命令实时着色：已知命令青色、未完成/未知暗灰；打错命令给出 Did-you-mean 提示。

@@ -338,3 +338,9 @@
 **遗留（T9 验收阶段）**：
 - Playwright 真机握手在 zig spawn 下卡（shell 手动同命令秒通；python/node 轻量 mock 均通）——已二分收敛至 zig spawn 管道/进程组属性 × playwright cli.js 重启动的交互，候选解法：pty 包装或直调 npx 缓存 node 入口；known-issue 注记在 mcp/mod.zig
 - M5 Streamable HTTP 传输（迭代二）；skill $ARGUMENTS 参数替换、when_to_use 语义触发（迭代三）
+
+## P31（2026-10-28）遗留清偿 + 全批 review
+
+- **1e26a04**：本批 review 修复（mcp.json enabled=false 无效 JSON；connect append 失败子进程泄漏；重连残留双条目）+ **StdioTransport 阻塞管道**（zig .pipe 的 O_NONBLOCK 传染子进程，node 对 attach 后写入失去可读事件——延迟写复现、阻塞管道修复）+ **M5 Streamable HTTP 传输**（POST/SSE/Mcp-Session-Id；mock 单测 + REPL 全链 e2e PASS）+ Skill $ARGUMENTS（e2e PASS）
+- T9 结论：playwright 原生 spawn 三因素（env/管道/npm）全部排除后仍卡（node 重启动×zig spawn 深层交互）；**支持路径=HTTP remote**（--port + /mcp add url），文档已注明
+- 216 测试：212 pass / 4 skip / 0 fail；stdio/http/skill 三 e2e 全绿
