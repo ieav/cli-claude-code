@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     // Root module with SQLite C source
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
+        .strip = b.option(bool, "strip", "Strip debug symbols from the binary") orelse false,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
