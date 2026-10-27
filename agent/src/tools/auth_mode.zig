@@ -9,6 +9,7 @@ const glob_match = @import("../util/glob_match.zig");
 // Re-export from registry
 pub const PermissionMode = registry.PermissionMode;
 pub const PermissionRule = registry.PermissionRule;
+pub const RuleBehavior = registry.RuleBehavior;
 pub const PermissionContext = registry.PermissionContext;
 pub const PermissionDecision = registry.PermissionDecision;
 
@@ -49,7 +50,7 @@ pub fn checkToolPermission(
     for (ctx.deny_rules) |rule| {
         if (tool.matchesName(rule.tool_name)) {
             if (rule.content_pattern) |pattern| {
-                if (inputMatchesPattern(input, pattern)) {
+                if (inputMatchesPatternAny(input, pattern)) {
                     return .{ .deny = .{ .message = "denied by rule (pattern match)" } };
                 }
             } else {
@@ -58,8 +59,19 @@ pub fn checkToolPermission(
         }
     }
 
-    // Step 1b: Check ask rules — bypass-immune
-    // (These always prompt regardless of mode)
+    // Step 1b: ask rules — bypass-immune, always prompt when matched
+    // (deny still wins; ask beats allow and every permissive mode).
+    for (ctx.ask_rules) |rule| {
+        if (tool.matchesName(rule.tool_name)) {
+            if (rule.content_pattern) |pattern| {
+                if (inputMatchesPatternAny(input, pattern)) {
+                    return .{ .ask = .{ .message = "asked by rule (pattern match)" } };
+                }
+            } else {
+                return .{ .ask = .{ .message = "asked by rule" } };
+            }
+        }
+    }
 
     // Step 1c: Tool-specific permission check
     const tool_decision = tool.checkPermissions(input, ctx);
@@ -84,10 +96,12 @@ pub fn checkToolPermission(
             return .allow;
         },
         .accept_edits => {
-            // Auto-allow non-destructive file operations
+            // Auto-allow reads and non-destructive file edits — but shell
+            // commands always fall through: "non-destructive" Bash cannot
+            // be audited by substring heuristics (P28).
             if (tool.isReadOnly(input)) return .allow;
-            if (!tool.isDestructive(input)) return .allow;
-            // Destructive ops still need approval
+            if (!tool.isDestructive(input) and !tool.matchesName("Bash")) return .allow;
+            // Everything else still needs approval (or an explicit allow rule)
         },
         .dont_ask => {
             // Auto-deny everything that would ask
@@ -113,12 +127,15 @@ pub fn checkToolPermission(
         },
     }
 
-    // Step 2b: Check allow rules. Pattern rules only allow on match; a
-    // non-matching pattern falls through to the default ask below.
+    // Step 2b: Check allow rules. Pattern rules only allow when the whole
+    // input matches — and for chained shell commands every segment must be
+    // covered by the pattern, so "git status && rm -rf /" cannot ride in on
+    // an allow rule for git status. A non-matching pattern falls through to
+    // the default ask below.
     for (ctx.allow_rules) |rule| {
         if (tool.matchesName(rule.tool_name)) {
             if (rule.content_pattern) |pattern| {
-                if (inputMatchesPattern(input, pattern)) return .allow;
+                if (inputMatchesPatternAll(input, pattern)) return .allow;
             } else {
                 return .allow;
             }
@@ -129,13 +146,61 @@ pub fn checkToolPermission(
     return .{ .ask = .{ .message = "permission required" } };
 }
 
-/// Match a rule's content pattern against the operative input field
-/// (command for Bash, path for file tools). Glob syntax via glob_match.
-fn inputMatchesPattern(input: std.json.Value, pattern: []const u8) bool {
-    const target = registry.getStringField(input, "command") orelse
-        registry.getStringField(input, "path") orelse
-        return false;
-    return glob_match.match(pattern, target);
+/// Pattern match for deny/ask rules: the whole operative field, or — for
+/// shell commands — ANY single segment of a chained command. Chaining used
+/// to smuggle "cd x && git push --force" past a deny on "git push*".
+fn inputMatchesPatternAny(input: std.json.Value, pattern: []const u8) bool {
+    if (registry.getStringField(input, "command")) |cmd| {
+        if (glob_match.match(pattern, cmd)) return true;
+        return anySegmentMatches(pattern, cmd);
+    }
+    if (registry.getStringField(input, "path")) |p| return glob_match.match(pattern, p);
+    return false;
+}
+
+/// Pattern match for allow rules: the whole field, or ALL segments of a
+/// chained command must individually match (fail-closed to ask otherwise).
+/// A trailing * in the pattern would otherwise swallow the whole chain
+/// ("git status*" must not allow "git status && rm -rf /x").
+fn inputMatchesPatternAll(input: std.json.Value, pattern: []const u8) bool {
+    if (registry.getStringField(input, "command")) |cmd| {
+        if (std.mem.indexOfAny(u8, cmd, ";&|\n") == null) return glob_match.match(pattern, cmd);
+        return allSegmentsMatch(pattern, cmd);
+    }
+    if (registry.getStringField(input, "path")) |p| return glob_match.match(pattern, p);
+    return false;
+}
+
+/// Iterate segments of a shell command chain (split on && || ; | and
+/// newlines), invoking `matcher` per trimmed segment until it returns true.
+fn anySegmentMatches(pattern: []const u8, cmd: []const u8) bool {
+    var rest = cmd;
+    while (rest.len > 0) {
+        const cut = std.mem.indexOfAny(u8, rest, ";&|\n") orelse rest.len;
+        const seg = std.mem.trim(u8, rest[0..cut], " \t");
+        if (seg.len > 0 and glob_match.match(pattern, seg)) return true;
+        var i = cut;
+        while (i < rest.len) : (i += 1) {
+            if (rest[i] != '&' and rest[i] != ';' and rest[i] != '|' and rest[i] != '\n') break;
+        }
+        rest = rest[i..];
+    }
+    return false;
+}
+
+fn allSegmentsMatch(pattern: []const u8, cmd: []const u8) bool {
+    var rest = cmd;
+    while (rest.len > 0) {
+        const cut = std.mem.indexOfAny(u8, rest, ";&|\n") orelse rest.len;
+        const seg = std.mem.trim(u8, rest[0..cut], " \t");
+        if (seg.len > 0 and !glob_match.match(pattern, seg)) return false;
+        var i = cut;
+        while (i < rest.len) : (i += 1) {
+            if (rest[i] != '&' and rest[i] != ';' and rest[i] != '|' and rest[i] != '\n') break;
+        }
+        rest = rest[i..];
+    }
+    return true;
 }
 
 /// Check if the input contains references to protected paths.
@@ -237,4 +302,107 @@ test "content patterns: table-driven deny/allow matching" {
             return err;
         };
     }
+}
+
+test "chained commands cannot smuggle past pattern rules (P28)" {
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "command", .{ .string = "cd /tmp && git push --force" });
+    const input = std.json.Value{ .object = obj };
+
+    // Deny "git push*" must catch the chained segment.
+    {
+        const deny_rules = [_]registry.PermissionRule{.{
+            .source = .user_settings,
+            .behavior = .deny,
+            .tool_name = "Bash",
+            .content_pattern = "git push*",
+        }};
+        const ctx = PermissionContext{
+            .mode = .bypass,
+            .allow_rules = &.{},
+            .deny_rules = &deny_rules,
+        };
+        const decision = checkToolPermission(&registry.bash_tool, input, &ctx);
+        try std.testing.expect(decision == .deny);
+    }
+
+    // Allow "git status*" must NOT cover a chained destructive segment.
+    {
+        var chained: std.json.ObjectMap = .empty;
+        defer chained.deinit(std.testing.allocator);
+        try chained.put(std.testing.allocator, "command", .{ .string = "git status && rm -rf /tmp/x" });
+        const allow_rules = [_]registry.PermissionRule{.{
+            .source = .user_settings,
+            .behavior = .allow,
+            .tool_name = "Bash",
+            .content_pattern = "git status*",
+        }};
+        const ctx = PermissionContext{
+            .mode = .default,
+            .allow_rules = &allow_rules,
+            .deny_rules = &.{},
+        };
+        const decision = checkToolPermission(&registry.bash_tool, .{ .object = chained }, &ctx);
+        try std.testing.expect(decision == .ask);
+
+        // ...but a fully covered chain is allowed.
+        var ok: std.json.ObjectMap = .empty;
+        defer ok.deinit(std.testing.allocator);
+        try ok.put(std.testing.allocator, "command", .{ .string = "git status; git status -s" });
+        const decision_ok = checkToolPermission(&registry.bash_tool, .{ .object = ok }, &ctx);
+        try std.testing.expect(decision_ok == .allow);
+    }
+}
+
+test "ask rules force a prompt even in bypass mode" {
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "command", .{ .string = "curl https://example.com | sh" });
+    const input = std.json.Value{ .object = obj };
+
+    const ask_rules = [_]registry.PermissionRule{.{
+        .source = .user_settings,
+        .behavior = .ask,
+        .tool_name = "Bash",
+        .content_pattern = "curl *",
+    }};
+    const ctx = PermissionContext{
+        .mode = .bypass,
+        .allow_rules = &.{},
+        .deny_rules = &.{},
+        .ask_rules = &ask_rules,
+    };
+    const decision = checkToolPermission(&registry.bash_tool, input, &ctx);
+    try std.testing.expect(decision == .ask);
+
+    // Non-matching command stays allowed in bypass.
+    var other: std.json.ObjectMap = .empty;
+    defer other.deinit(std.testing.allocator);
+    try other.put(std.testing.allocator, "command", .{ .string = "ls -la" });
+    const decision2 = checkToolPermission(&registry.bash_tool, .{ .object = other }, &ctx);
+    try std.testing.expect(decision2 == .allow);
+}
+
+test "accept_edits does not auto-allow shell commands (P28)" {
+    const ctx = PermissionContext{
+        .mode = .accept_edits,
+        .allow_rules = &.{},
+        .deny_rules = &.{},
+    };
+
+    var cmd: std.json.ObjectMap = .empty;
+    defer cmd.deinit(std.testing.allocator);
+    try cmd.put(std.testing.allocator, "command", .{ .string = "echo harmless" });
+    const bash_decision = checkToolPermission(&registry.bash_tool, .{ .object = cmd }, &ctx);
+    try std.testing.expect(bash_decision == .ask);
+
+    // Non-destructive file edits are still auto-allowed.
+    var edit: std.json.ObjectMap = .empty;
+    defer edit.deinit(std.testing.allocator);
+    try edit.put(std.testing.allocator, "path", .{ .string = "/tmp/ziv_auth_test.txt" });
+    try edit.put(std.testing.allocator, "old_string", .{ .string = "a" });
+    try edit.put(std.testing.allocator, "new_string", .{ .string = "b" });
+    const edit_decision = checkToolPermission(&registry.file_edit_tool, .{ .object = edit }, &ctx);
+    try std.testing.expect(edit_decision == .allow);
 }

@@ -5,6 +5,7 @@ const system_dirs = @import("util/system_dirs.zig");
 const json_helpers = @import("util/json_helpers.zig");
 const auth_mode = @import("tools/auth_mode.zig");
 const env_mod = @import("util/env.zig");
+const rule_parser = @import("tools/rule_parser.zig");
 
 pub const SettingSource = enum {
     user_settings,
@@ -18,7 +19,9 @@ pub const Settings = struct {
     permission_mode: auth_mode.PermissionMode = .default,
     allow_rules: []const auth_mode.PermissionRule = &.{},
     deny_rules: []const auth_mode.PermissionRule = &.{},
+    ask_rules: []const auth_mode.PermissionRule = &.{},
     api_keys: ApiKeys = .{},
+    env_sourced: ApiKeysEnvSourced = .{},
     default_model: []const u8 = "gpt-4o",
     /// Explicit backend override ("openai"/"claude"/"ollama"). When set it
     /// beats name-based detection, so custom model names (glm-4.6, deepseek-…)
@@ -37,6 +40,17 @@ pub const Settings = struct {
         ollama_host: []const u8 = "http://localhost:11434",
         brave_api_key: ?[]const u8 = null,
     };
+
+    /// Which api_keys fields were filled from the environment. Env values
+    /// are transient (they point into environ and may be secrets) —
+    /// saveSettings must not silently persist them to disk.
+    pub const ApiKeysEnvSourced = struct {
+        openai: bool = false,
+        openai_base_url: bool = false,
+        anthropic: bool = false,
+        anthropic_base_url: bool = false,
+        brave: bool = false,
+    };
 };
 
 /// Load settings from all sources, merged in priority order.
@@ -52,26 +66,31 @@ pub fn loadSettings(allocator: std.mem.Allocator, io: std.Io) !Settings {
     if (settings.api_keys.openai == null) {
         if (env_mod.get("OPENAI_API_KEY")) |k| {
             settings.api_keys.openai = k;
+            settings.env_sourced.openai = true;
         }
     }
     if (settings.api_keys.openai_base_url == null) {
         if (env_mod.get("OPENAI_BASE_URL")) |u| {
             settings.api_keys.openai_base_url = u;
+            settings.env_sourced.openai_base_url = true;
         }
     }
     if (settings.api_keys.anthropic == null) {
         if (env_mod.get("ANTHROPIC_API_KEY")) |k| {
             settings.api_keys.anthropic = k;
+            settings.env_sourced.anthropic = true;
         }
     }
     if (settings.api_keys.anthropic_base_url == null) {
         if (env_mod.get("ANTHROPIC_BASE_URL")) |u| {
             settings.api_keys.anthropic_base_url = u;
+            settings.env_sourced.anthropic_base_url = true;
         }
     }
     if (settings.api_keys.brave_api_key == null) {
         if (env_mod.get("BRAVE_API_KEY")) |k| {
             settings.api_keys.brave_api_key = k;
+            settings.env_sourced.brave = true;
         }
     }
 
@@ -141,6 +160,84 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     // Parse system prompt
     if (json_helpers.getString(value, "system_prompt")) |sp| {
         settings.system_prompt = try allocator.dupe(u8, sp);
+    }
+
+    // Parse permission rule lists ("Bash(git status)" or "FileRead" form)
+    if (json_helpers.getArray(value, "allow_rules")) |arr| {
+        settings.allow_rules = parseRuleArray(allocator, arr, .allow) catch settings.allow_rules;
+    }
+    if (json_helpers.getArray(value, "deny_rules")) |arr| {
+        settings.deny_rules = parseRuleArray(allocator, arr, .deny) catch settings.deny_rules;
+    }
+    if (json_helpers.getArray(value, "ask_rules")) |arr| {
+        settings.ask_rules = parseRuleArray(allocator, arr, .ask) catch settings.ask_rules;
+    }
+}
+
+/// Parse a JSON array of rule strings into PermissionRules (dupe'd onto
+/// the settings allocator — session-lifetime, like every other field).
+fn parseRuleArray(
+    allocator: std.mem.Allocator,
+    arr: []std.json.Value,
+    behavior: auth_mode.RuleBehavior,
+) ![]auth_mode.PermissionRule {
+    var rules = std.ArrayList(auth_mode.PermissionRule).empty;
+    errdefer rules.deinit(allocator);
+    for (arr) |item| {
+        if (item != .string) continue;
+        const parsed = rule_parser.parse(item.string) orelse continue;
+        try rules.append(allocator, .{
+            .source = .user_settings,
+            .behavior = behavior,
+            .tool_name = try allocator.dupe(u8, parsed.tool_name),
+            .content_pattern = if (parsed.pattern) |p| try allocator.dupe(u8, p) else null,
+        });
+    }
+    return rules.toOwnedSlice(allocator);
+}
+
+/// Serialize a permission rule list back to "Tool(pattern)" JSON strings.
+fn writeRuleArray(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, rules: []const auth_mode.PermissionRule) void {
+    if (rules.len == 0) return;
+    // Previous fields end with ",\n" already; the api_keys object closes
+    // with a bare "}" and a previous rule array with a bare "]" — append
+    // the missing comma so the file stays parseable.
+    const tail = std.mem.trim(u8, buf.items, " \t\n");
+    if (std.mem.endsWith(u8, tail, "}") or std.mem.endsWith(u8, tail, "]")) {
+        // Splice the separator onto the previous line instead of emitting
+        // an ugly standalone comma line.
+        if (buf.items.len > 0) buf.items[buf.items.len - 1] = ',';
+    }
+    buf.appendSlice(allocator, "\n  \"") catch return;
+    buf.appendSlice(allocator, name) catch return;
+    buf.appendSlice(allocator, "\": [") catch return;
+    for (rules, 0..) |rule, i| {
+        if (i > 0) buf.appendSlice(allocator, ", ") catch return;
+        buf.append(allocator, '"') catch return;
+        appendEscaped(allocator, buf, rule.tool_name);
+        if (rule.content_pattern) |ptn| {
+            buf.append(allocator, '(') catch return;
+            appendEscaped(allocator, buf, ptn);
+            buf.append(allocator, ')') catch return;
+        }
+        buf.append(allocator, '"') catch return;
+    }
+    // No trailing comma: rule arrays are the last fields before the
+    // closing brace.
+    buf.appendSlice(allocator, "]\n") catch return;
+}
+
+/// Append `value` to `buf` with JSON string escaping.
+fn appendEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: []const u8) void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => buf.appendSlice(allocator, "\\\"") catch return,
+            '\\' => buf.appendSlice(allocator, "\\\\") catch return,
+            '\n' => buf.appendSlice(allocator, "\\n") catch return,
+            '\r' => buf.appendSlice(allocator, "\\r") catch return,
+            '\t' => buf.appendSlice(allocator, "\\t") catch return,
+            else => buf.append(allocator, ch) catch return,
+        }
     }
 }
 
@@ -242,23 +339,30 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     // api_keys (escaped: a quote/backslash in a key would corrupt the file
     // and the next load would silently drop EVERYTHING)
     buf.appendSlice(allocator, "  \"api_keys\": {\n") catch {};
-    if (settings.api_keys.openai) |k| {
-        writeJsonStringField(allocator, &buf, "openai", k);
+    // Env-sourced keys/URLs are transient and may be secrets — never
+    // persist them to disk on autoSave.
+    if (settings.api_keys.openai != null and !settings.env_sourced.openai) {
+        writeJsonStringField(allocator, &buf, "openai", settings.api_keys.openai.?);
     }
-    if (settings.api_keys.openai_base_url) |u| {
-        writeJsonStringField(allocator, &buf, "openai_base_url", u);
+    if (settings.api_keys.openai_base_url != null and !settings.env_sourced.openai_base_url) {
+        writeJsonStringField(allocator, &buf, "openai_base_url", settings.api_keys.openai_base_url.?);
     }
-    if (settings.api_keys.anthropic) |k| {
-        writeJsonStringField(allocator, &buf, "anthropic", k);
+    if (settings.api_keys.anthropic != null and !settings.env_sourced.anthropic) {
+        writeJsonStringField(allocator, &buf, "anthropic", settings.api_keys.anthropic.?);
     }
-    if (settings.api_keys.anthropic_base_url) |u| {
-        writeJsonStringField(allocator, &buf, "anthropic_base_url", u);
+    if (settings.api_keys.anthropic_base_url != null and !settings.env_sourced.anthropic_base_url) {
+        writeJsonStringField(allocator, &buf, "anthropic_base_url", settings.api_keys.anthropic_base_url.?);
     }
-    if (settings.api_keys.brave_api_key) |k| {
-        writeJsonStringField(allocator, &buf, "brave", k);
+    if (settings.api_keys.brave_api_key != null and !settings.env_sourced.brave) {
+        writeJsonStringField(allocator, &buf, "brave", settings.api_keys.brave_api_key.?);
     }
     writeJsonNestedField(allocator, &buf, "ollama_host", settings.api_keys.ollama_host);
     buf.appendSlice(allocator, "  }\n") catch {};
+
+    // Permission rule lists (symmetric with the load side)
+    writeRuleArray(allocator, &buf, "allow_rules", settings.allow_rules);
+    writeRuleArray(allocator, &buf, "deny_rules", settings.deny_rules);
+    writeRuleArray(allocator, &buf, "ask_rules", settings.ask_rules);
 
     buf.appendSlice(allocator, "}\n") catch {};
 
@@ -267,4 +371,26 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
         .sub_path = path,
         .data = buf.items,
     }) catch |err| return err;
+}
+
+test "parseRuleArray parses Tool(pattern) rule strings" {
+    const alloc = std.testing.allocator;
+    var input_items = [_]std.json.Value{
+        .{ .string = "Bash(git status*)" },
+        .{ .string = "FileRead" },
+        .{ .string = "bad rule (unclosed" },
+    };
+    const rules = try parseRuleArray(alloc, &input_items, .deny);
+    defer {
+        for (rules) |r| {
+            alloc.free(r.tool_name);
+            if (r.content_pattern) |p| alloc.free(p);
+        }
+        alloc.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("Bash", rules[0].tool_name);
+    try std.testing.expectEqualStrings("git status*", rules[0].content_pattern.?);
+    try std.testing.expect(rules[1].content_pattern == null);
 }

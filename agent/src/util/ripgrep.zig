@@ -14,6 +14,15 @@ pub const GrepResult = struct {
     files_with_matches: usize,
 };
 
+/// Free a GrepResult and every string it owns.
+pub fn freeResult(allocator: std.mem.Allocator, result: GrepResult) void {
+    for (result.matches) |m| {
+        allocator.free(m.file_path);
+        allocator.free(m.line_content);
+    }
+    allocator.free(result.matches);
+}
+
 /// Search for a pattern in files using ripgrep (rg).
 /// Falls back to grep if rg is not available.
 /// Caller owns all returned data.

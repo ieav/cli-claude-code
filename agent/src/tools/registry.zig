@@ -48,9 +48,11 @@ pub const PermissionMode = enum {
     auto,
 };
 
+pub const RuleBehavior = enum { allow, deny, ask };
+
 pub const PermissionRule = struct {
     source: enum { user_settings, project_settings, local_settings, session },
-    behavior: enum { allow, deny, ask },
+    behavior: RuleBehavior,
     tool_name: []const u8,
     content_pattern: ?[]const u8 = null,
 };
@@ -59,6 +61,9 @@ pub const PermissionContext = struct {
     mode: PermissionMode,
     allow_rules: []const PermissionRule,
     deny_rules: []const PermissionRule,
+    /// Rules that force a confirmation prompt even in permissive modes
+    /// (bypass-immune, like deny rules).
+    ask_rules: []const PermissionRule = &.{},
     provider: ?llm.Provider = null,
     allocator: ?std.mem.Allocator = null,
 };
@@ -253,9 +258,18 @@ fn bashIsConcurrencySafe(_: std.json.Value) bool {
 }
 
 /// Bash tool: destructive if command contains rm, dd, mkfs, etc.
+/// The list intentionally over-matches (curl/wget are code-execution
+/// vectors when piped to a shell) — destructive only tightens permissions.
 fn bashIsDestructive(input: std.json.Value) bool {
     const cmd = getStringField(input, "command") orelse return false; // malformed input is rejected by validateInput, not here
-    const dangerous_cmds = [_][]const u8{ "rm ", "rmdir", "dd ", "mkfs.", "format", "> /dev/", "chmod 000", "chown root" };
+    const dangerous_cmds = [_][]const u8{
+        "rm ",        "rm\t",    "rmdir",             "dd ",            "mkfs.",    "format",
+        "> /dev/",    "chmod 000", "chown root",     "chmod -R",       "chown -R",
+        // P28: chained/piped destructive forms the old 8-substring list missed
+        "git reset --hard", "git push --force", "git clean", "shred",
+        "truncate -s", "curl ", "wget ", "sudo ", "shutdown", "reboot",
+        "kill -9", "pkill ", "find -delete", "xargs rm", "srm ",
+    };
     for (dangerous_cmds) |dc| {
         if (std.mem.indexOf(u8, cmd, dc) != null) return true;
     }

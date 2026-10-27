@@ -93,6 +93,19 @@ const Editor = struct {
     }
 };
 
+/// Consume the rest of a line that overflowed the caller's buffer, so the
+/// next read starts at a fresh line instead of mid-content.
+fn drainRestOfLine(r: *std.Io.Reader) void {
+    var sink: [1024]u8 = undefined;
+    while (true) {
+        var sw = std.Io.Writer.fixed(&sink);
+        _ = std.Io.Reader.streamDelimiter(r, &sw, '\n') catch return; // EOF / read error
+        r.toss(1); // consume the delimiter streamDelimiter left buffered
+        if (sw.end < sink.len) return; // end of line reached with room to spare
+        // Sink filled exactly — the line may continue; check again.
+    }
+}
+
 /// Read a line with full cursor editing. Returns the byte length, or null
 /// on EOF / Ctrl-D on an empty line. `history` receives committed non-empty
 /// lines and is used for up/down navigation.
@@ -110,9 +123,18 @@ pub fn readLine(
     defer guard.restore();
 
     if (!guard.active and !force_editor) {
-        // Non-TTY: behave exactly like the old reader.
+        // Non-TTY: behave exactly like the old reader, except an overlong
+        // line is truncated instead of being mistaken for EOF — the old
+        // path returned null (Goodbye!) and left the tail of the long line
+        // polluting the next read.
         var bw = std.Io.Writer.fixed(buf);
-        const n = std.Io.Reader.streamDelimiter(r, &bw, '\n') catch return null;
+        const n = std.Io.Reader.streamDelimiter(r, &bw, '\n') catch |err| switch (err) {
+            error.WriteFailed => {
+                drainRestOfLine(r);
+                return buf.len;
+            },
+            else => return null,
+        };
         r.toss(1);
         return n;
     }

@@ -28,6 +28,10 @@ pub const TaskStore = struct {
     allocator: std.mem.Allocator,
     tasks: std.ArrayList(Task) = .empty,
     next_id: usize = 1,
+    /// TaskList/TaskCreate run on the parallel executor — the shared store
+    /// must survive concurrent calls. Spin lock (short critical sections,
+    /// same style as thread_pool.workerLoop).
+    mu: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     const Self = @This();
 
@@ -35,7 +39,19 @@ pub const TaskStore = struct {
         return .{ .allocator = allocator };
     }
 
+    fn lockMu(self: *Self) void {
+        while (self.mu.cmpxchgWeak(0, 1, .acquire, .acquire)) |_| {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlockMu(self: *Self) void {
+        self.mu.store(0, .release);
+    }
+
     pub fn deinit(self: *Self) void {
+        self.lockMu();
+        defer self.unlockMu();
         for (self.tasks.items) |t| {
             self.allocator.free(t.subject);
             self.allocator.free(t.description);
@@ -44,6 +60,8 @@ pub const TaskStore = struct {
     }
 
     pub fn create(self: *Self, subject: []const u8, description: []const u8) !usize {
+        self.lockMu();
+        defer self.unlockMu();
         const task = Task{
             .id = self.next_id,
             .subject = try self.allocator.dupe(u8, subject),
@@ -58,6 +76,8 @@ pub const TaskStore = struct {
     /// Returns false when the id is unknown or the status string invalid.
     pub fn update(self: *Self, id: usize, status_str: []const u8) bool {
         const status = std.meta.stringToEnum(TaskStatus, status_str) orelse return false;
+        self.lockMu();
+        defer self.unlockMu();
         for (self.tasks.items) |*t| {
             if (t.id == id) {
                 t.status = status;
@@ -109,18 +129,37 @@ pub const TaskStore = struct {
 };
 
 var g_store: ?TaskStore = null;
+var g_store_init = std.atomic.Value(bool).init(false);
 
 /// The process-wide session store (lazily initialized, never deinit'd —
-/// task data is session-scoped and freed at process exit).
+/// task data is session-scoped and freed at process exit). Init is
+/// locked: parallel workers used to race the null-check and could get
+/// two stores (one leaked, one divergent).
 pub fn global() *TaskStore {
-    if (g_store == null) g_store = TaskStore.init(std.heap.smp_allocator);
+    if (!g_store_init.load(.acquire)) {
+        while (g_init_mu.cmpxchgWeak(0, 1, .acquire, .acquire)) |_| {
+            std.Thread.yield() catch {};
+        }
+        defer g_init_mu.store(0, .release);
+        if (!g_store_init.load(.acquire)) {
+            g_store = TaskStore.init(std.heap.smp_allocator);
+            g_store_init.store(true, .release);
+        }
+    }
     return &g_store.?;
 }
 
+var g_init_mu = std.atomic.Value(u8).init(0);
+
 /// Reset and free the global store (used by tests).
 pub fn resetGlobal() void {
+    while (g_init_mu.cmpxchgWeak(0, 1, .acquire, .acquire)) |_| {
+        std.Thread.yield() catch {};
+    }
+    defer g_init_mu.store(0, .release);
     if (g_store) |*s| s.deinit();
     g_store = null;
+    g_store_init.store(false, .release);
 }
 
 test "TaskStore create/update/render lifecycle" {

@@ -249,7 +249,9 @@ test "DecisionTrace findWeakSteps filters by threshold" {
     const weak = trace.findWeakSteps(0.618);
     defer std.testing.allocator.free(weak);
     try std.testing.expectEqual(@as(usize, 1), weak.len);
-    try std.testing.expectEqual(@as(u32, 2), weak[0].step_id);
+    // Indices into the step list; the weak step is step #2.
+    try std.testing.expectEqual(@as(usize, 1), weak[0]);
+    try std.testing.expectEqual(@as(u32, 2), trace.getSteps()[weak[0]].step_id);
 }
 
 test "DecisionTrace totalDurationMs" {

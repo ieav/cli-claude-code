@@ -13,9 +13,20 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 
-    const output = alloc.dupe(u8, result.stdout) catch "dup failed";
+    // Own one combined buffer, then release the run() buffers (they were
+    // leaking per call, and stderr was dropped entirely).
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    out.appendSlice(alloc, result.stdout) catch {};
+    if (result.stderr.len > 0) {
+        if (out.items.len > 0) out.append(alloc, '\n') catch {};
+        out.appendSlice(alloc, result.stderr) catch {};
+    }
+    alloc.free(result.stdout);
+    alloc.free(result.stderr);
+
     const is_error = result.term != .exited or result.term.exited != 0;
-    return registry.ToolResult{ .output = output, .is_error = is_error };
+    return registry.ToolResult{ .output = try out.toOwnedSlice(alloc), .is_error = is_error };
 }
 
 fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {

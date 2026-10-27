@@ -13,6 +13,8 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return simpleSearch(alloc, pattern, path, max_results);
     };
 
+    defer ripgrep.freeResult(alloc, search_result);
+
     var output = std.ArrayList(u8).empty;
     defer output.deinit(alloc);
 

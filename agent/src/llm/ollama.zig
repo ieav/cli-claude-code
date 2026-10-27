@@ -100,13 +100,20 @@ pub const OllamaProvider = struct {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.allocator);
         var total_usage: ?provider.Usage = null;
+        var read_err: ?anyerror = null;
 
         while (true) {
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
             // killing real-time streaming.
-            const avail = resp_reader.peekGreedy(1) catch break;
+            const avail = resp_reader.peekGreedy(1) catch |err| {
+                // A mid-stream read failure is NOT EOF: surface it so the
+                // caller sees a truncated response instead of a silent
+                // "completed" one.
+                read_err = err;
+                break;
+            };
             if (avail.len == 0) break;
             const n = @min(avail.len, chunk_buf.len);
             @memcpy(chunk_buf[0..n], avail[0..n]);
@@ -135,6 +142,13 @@ pub const OllamaProvider = struct {
             if (res.usage) |u| total_usage = u;
         }
 
+        if (read_err) |e| {
+            try cb(ctx, .{ .error_occurred = switch (e) {
+                error.ConnectionResetByPeer, error.BrokenPipe => provider.ProviderError.NetworkTimeout,
+                else => provider.ProviderError.ServerError,
+            } });
+            return;
+        }
         try cb(ctx, .{ .done = total_usage });
     }
 
@@ -303,7 +317,8 @@ pub const OllamaProvider = struct {
             }
         }
 
-        var body_buf: [1024 * 1024]u8 = undefined;
+        // 64 KiB I/O buffer instead of a 1 MiB stack array — see openai.zig.
+        var body_buf: [64 * 1024]u8 = undefined;
         const reader = response.reader(&body_buf);
         return reader.allocRemaining(self.allocator, .limited(1024 * 1024));
     }

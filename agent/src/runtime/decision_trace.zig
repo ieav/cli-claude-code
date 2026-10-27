@@ -87,7 +87,9 @@ pub const DecisionTrace = struct {
     }
 
     /// Find all steps with confidence below the golden ratio threshold.
-    pub fn findWeakSteps(self: *const Self, threshold: f64) []const DecisionStep {
+    /// Returns indices into `getSteps()` — the old version returned copies
+    /// of steps (each owning duped strings) that no caller ever freed.
+    pub fn findWeakSteps(self: *const Self, threshold: f64) []const usize {
         var result = std.ArrayList(usize).empty;
         defer result.deinit(self.allocator);
         for (self.steps.items, 0..) |step, i| {
@@ -96,12 +98,7 @@ pub const DecisionTrace = struct {
             }
         }
         if (result.items.len == 0) return &.{};
-        // Allocate a slice of weak steps
-        var weak = self.allocator.alloc(DecisionStep, result.items.len) catch return &.{};
-        for (result.items, 0..) |idx, i| {
-            weak[i] = self.steps.items[idx];
-        }
-        return weak;
+        return self.allocator.dupe(usize, result.items) catch &.{};
     }
 
     /// Total duration of the decision chain.

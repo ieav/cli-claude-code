@@ -1,5 +1,6 @@
 /// Message compaction — compress conversation history when context exceeds phi threshold.
-/// Combines LLM summarization with phi-based condensation target calculation.
+/// Real history truncation lives in repl.zig compactHistoryImpl (maybeCompact,
+/// /compact); this module provides the φ threshold math it relies on.
 const std = @import("std");
 const math_mod = @import("../math/mod.zig");
 
@@ -28,40 +29,6 @@ pub fn condensationTarget(message_count: usize) usize {
     return math_mod.condensationTarget(message_count);
 }
 
-/// Compact message history.
-/// Strategy:
-///   - summarize: Send old messages to LLM for summary, replace with summary message
-///   - phi_condense: Keep phi (61.8%) of most recent messages, drop oldest
-///   - hybrid: phi-condense first, then summarize the dropped messages
-pub fn compactMessages(
-    allocator: std.mem.Allocator,
-    message_count: usize,
-    current_tokens: u32,
-    max_tokens: u32,
-    strategy: CompactionStrategy,
-) CompactionResult {
-    if (!needsCompaction(current_tokens, max_tokens)) return .no_change;
-    if (message_count < 4) return .no_change;
-
-    const target = switch (strategy) {
-        .phi_condense, .hybrid => condensationTarget(message_count),
-        .summarize => message_count / 2,
-    };
-
-    const removed = message_count - target;
-    const tokens_saved = if (current_tokens > max_tokens / 2)
-        current_tokens / 2
-    else
-        current_tokens / 4;
-
-    _ = allocator;
-    return .{
-        .compacted = .{
-            .messages_removed = removed,
-            .tokens_saved = tokens_saved,
-        },
-    };
-}
 
 test "needsCompaction" {
     // Below phi threshold (61.8%)
@@ -75,13 +42,3 @@ test "condensationTarget" {
     try std.testing.expectEqual(@as(usize, 618), condensationTarget(1000));
 }
 
-test "compactMessages" {
-    const result = compactMessages(std.testing.allocator, 100, 800, 1000, .phi_condense);
-    switch (result) {
-        .compacted => |c| {
-            try std.testing.expect(c.messages_removed > 0);
-            try std.testing.expect(c.tokens_saved > 0);
-        },
-        .no_change => return error.UnexpectedNoChange,
-    }
-}

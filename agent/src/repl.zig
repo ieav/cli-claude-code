@@ -1393,6 +1393,7 @@ fn permissionGate(
         .mode = mode,
         .allow_rules = switcher.settings.allow_rules,
         .deny_rules = switcher.settings.deny_rules,
+        .ask_rules = switcher.settings.ask_rules,
         .provider = switcher.getProvider() catch null,
         .allocator = alloc,
     };
@@ -1427,15 +1428,18 @@ fn permissionGate(
             try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
             try std.Io.File.Writer.flush(file_writer);
 
-            var ans_buf: [64]u8 = undefined;
-            var ans_writer = std.Io.Writer.fixed(&ans_buf);
-            _ = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
+            // Allocating answer buffer: the old fixed 64-byte reader turned
+            // a long pasted answer into "Cancelled" and left the tail of the
+            // line polluting the next read.
+            var ans_aw: std.Io.Writer.Allocating = .init(alloc);
+            defer ans_aw.deinit();
+            _ = std.Io.Reader.streamDelimiter(r, &ans_aw.writer, '\n') catch {
                 try std.Io.Writer.writeAll(w, "\n  [Cancelled]\n");
                 try std.Io.File.Writer.flush(file_writer);
                 return false;
             };
             r.toss(1);
-            const ans = std.mem.trim(u8, ans_buf[0..@min(ans_writer.end, ans_buf.len)], " \t\r\n");
+            const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
             if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
                 try std.Io.Writer.writeAll(w, "  [Denied by user]\n");
                 try std.Io.File.Writer.flush(file_writer);
