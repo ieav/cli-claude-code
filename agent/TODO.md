@@ -259,3 +259,12 @@
 - **/config 重写**: 主菜单（API Keys/默认模型/最大 tokens/权限模式/检查点/系统提示词/退出）全部方向键导航；权限模式与模型子菜单也是 select；**每项修改立即自动保存** settings.json（autoSaveSettings）；API Keys 子菜单菜单化+掩码显示。
 - **/model 交互式**: 无参 `/model` 弹模型选择菜单（9 个已知模型+当前●标记+取消），Enter 运行时切换并保存 default_model；`/model <name>` 命令式保留。
 - **实测（管道注入 ESC 序列）**: `/config ↓ Enter ↓ Enter` → 默认模型切 claude-sonnet-4-6 → settings.json 自动落盘 ✓；`/model ↓ Enter` → 已选+key 缺失正确提示 ✓。测试配置已净零清理。
+
+### P24: 模型接入三连修 + 行编辑器（用户实测反馈驱动）
+- **状态**: ✅ 已完成 (2026-10-27)
+- **🔴 自定义模型名首字符丢失**: promptCustomModel 返回**栈缓冲切片**（悬垂），/model 路径 allocPrint 前栈被覆写（glm-5.3 → " lm-5.3"）。修复：函数内 dupe 后返回堆串（日志实测 model=glm-5.3 完整）。
+- **🔴 default_backend 劫持已知模型**（自查发现）: pin 后选 claude-*/表内模型也被发往网关。路由改四层优先级：表内 > 可识别前缀 > 显式 override（仅未识别名）> Ollama 兜底；四情形单测覆盖。
+- **✨ 配置接入时自动拉取模型列表**: 新增 fetchGatewayModels（OpenAI 兼容 GET /models Bearer；Anthropic GET /v1/models x-api-key；Ollama GET /api/tags）+ offerGatewayModels（列出→选择→自动设 default_model/backend→切换→保存）。mock 实测：配 key+URL →"发现 3 个模型"→选 glm-4.5-air→对话真发网关（FETCHED_MODEL_OK）→落盘 ✓。
+- **✨ 主输入行编辑器**（util/lineinput.zig）: raw 模式下方向键 ←→ 移动光标（UTF-8 按字符步进、CJK 双宽光标定位）、↑↓ 翻输入历史（相邻去重、上限滚动）、Backspace/Delete/Home/End、Ctrl-C 清行、Ctrl-D 空行退出；管道自动降级旧读法（全部既有脚本行为不变）。原主循环 streamDelimiter 替换。
+- **/model 新增"自定义…"入口**: 与 /config 共享 promptCustomModel（含后端询问），网关模型免进 /config。
+- **验证**: 187 测试全绿（新增路由优先级 + 编辑器缓冲操作 + 宽度计算）；管道回归（多命令/菜单/工具/记忆提取）全通过。

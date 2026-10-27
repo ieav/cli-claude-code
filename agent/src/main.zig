@@ -60,6 +60,7 @@ test {
     _ = @import("tools/task_store.zig");
     _ = @import("util/embedding.zig");
     _ = @import("util/menu.zig");
+    _ = @import("util/lineinput.zig");
     _ = @import("util/binary_check.zig");
     _ = @import("util/cancel.zig");
     _ = @import("util/diff.zig");

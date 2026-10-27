@@ -8,6 +8,7 @@ const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
 const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
+const lineinput = @import("util/lineinput.zig");
 const registry = @import("tools/registry.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
@@ -286,6 +287,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var live_trace: ?decision_trace.DecisionTrace = null;
     defer if (live_trace) |*t| t.deinit();
 
+    // Input history for the line editor (up/down navigation).
+    var input_history: std.ArrayList([]u8) = .empty;
+    defer {
+        for (input_history.items) |h| allocator.free(h);
+        input_history.deinit(allocator);
+    }
+
     try std.Io.Writer.writeAll(w,
         \\Type your message (or /help for commands):
         \\
@@ -304,24 +312,22 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         };
         const est_ctx = estimateHistoryTokens(history.items);
         const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(MAX_CONTEXT_TOKENS)) * 100.0));
-        try std.Io.Writer.print(w, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct });
-        try std.Io.File.Writer.flush(&file_writer);
+        var prompt_buf: [160]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
 
-        // Read line
+        // Read line via the raw-mode editor: arrows move the cursor,
+        // up/down walk history, Backspace/Delete/Home/End work. Pipes
+        // (non-TTY) transparently fall back to plain line reading.
         var line_buf: [4096]u8 = undefined;
-        var line_writer = std.Io.Writer.fixed(&line_buf);
-        const lw = &line_writer;
-
-        const n = std.Io.Reader.streamDelimiter(r, lw, '\n') catch |err| {
-            if (err == error.EndOfStream or err == error.ReadFailed) {
-                try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                return;
-            }
+        const maybe_n = lineinput.readLine(w, r, &file_writer, prompt, &line_buf, &input_history, allocator) catch |err| {
             std.debug.print("Error reading input: {}\n", .{err});
             return;
         };
-        r.toss(1); // consume the delimiter byte
+        const n = maybe_n orelse {
+            try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
+            try std.Io.File.Writer.flush(&file_writer);
+            return;
+        };
 
         if (n == 0) continue;
 
@@ -1834,10 +1840,14 @@ fn promptCustomModel(
     r: *std.Io.Reader,
     file_writer: *std.Io.File.Writer,
     switcher: *ModelSwitcher,
+    alloc: std.mem.Allocator,
 ) !?[]const u8 {
     var vbuf: [128]u8 = undefined;
     const val = menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return null;
     if (val.len == 0) return null;
+    // vbuf is a stack buffer — dupe BEFORE any further calls, otherwise the
+    // returned slice dangles (first bytes got clobbered: "glm-5.3" -> " lm-5.3").
+    const owned = try alloc.dupe(u8, val);
 
     if (llm.detectBackend(val) == .ollama and (switcher.settings.api_keys.openai != null or switcher.settings.api_keys.anthropic != null)) {
         const be_items = [_][]const u8{ "OpenAI 兼容接入（用已配的 OpenAI Key/网关）", "Anthropic 兼容接入（用已配的 Anthropic Key/网关）", "Ollama 本地" };
@@ -1850,7 +1860,7 @@ fn promptCustomModel(
             };
         }
     }
-    return val;
+    return owned;
 }
 
 /// Default-model picker shared by /config: known models + custom entry.
@@ -1867,8 +1877,7 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
     const picked = (menu.select(w, r, file_writer, "选择默认模型:", &labels, 0) catch return) orelse return;
     if (picked == llm.KNOWN_MODELS.len + 1) return;
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
-        const typed = (try promptCustomModel(w, r, file_writer, switcher)) orelse return;
-        break :blk try alloc.dupe(u8, typed);
+        break :blk (try promptCustomModel(w, r, file_writer, switcher, alloc)) orelse return;
     } else llm.KNOWN_MODELS[picked].name;
 
     // Persist AND switch the live session — previously this only wrote the
@@ -1888,6 +1897,126 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
     autoSaveSettings(w, file_writer, switcher, alloc, io);
     try std.Io.Writer.print(w, "  ✓ 已切换并保存: {s} ({s})\n", .{ switcher.modelName(), switcher.backendLabel() });
     try std.Io.File.Writer.flush(file_writer);
+}
+
+/// Fetch the model list a configured endpoint exposes.
+/// OpenAI-compatible: GET {base}/models (Bearer); Anthropic: GET {base}/v1/models
+/// (x-api-key); Ollama: GET {host}/api/tags. Caller frees each name + slice.
+fn fetchGatewayModels(alloc: std.mem.Allocator, io: std.Io, switcher: *ModelSwitcher, backend: llm.BackendType) ![][]const u8 {
+    var client = std.http.Client{ .allocator = alloc, .io = io };
+    defer client.deinit();
+
+    var url_buf: [512]u8 = undefined;
+    var auth_buf: [512]u8 = undefined;
+    const url: []const u8, const key: ?[]const u8 = switch (backend) {
+        .openai => .{
+            std.fmt.bufPrint(&url_buf, "{s}/models", .{switcher.settings.api_keys.openai_base_url orelse "https://api.openai.com/v1"}) catch return error.BadURL,
+            switcher.settings.api_keys.openai,
+        },
+        .claude => .{
+            std.fmt.bufPrint(&url_buf, "{s}/v1/models", .{switcher.settings.api_keys.anthropic_base_url orelse "https://api.anthropic.com"}) catch return error.BadURL,
+            switcher.settings.api_keys.anthropic,
+        },
+        .ollama => .{
+            std.fmt.bufPrint(&url_buf, "{s}/api/tags", .{switcher.settings.api_keys.ollama_host}) catch return error.BadURL,
+            null,
+        },
+    };
+
+    const uri = try std.Uri.parse(url);
+    var auth_header: []const u8 = "";
+    var auth_val: std.http.Client.Request.Headers.Value = .default;
+    if (backend == .openai and key != null) {
+        auth_header = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{key.?});
+        auth_val = .{ .override = auth_header };
+    }
+    var extra: [1]std.http.Header = undefined;
+    var n_extra: usize = 0;
+    if (backend == .claude and key != null) {
+        extra[0] = .{ .name = "x-api-key", .value = key.? };
+        n_extra = 1;
+    }
+
+    var req = try client.request(.GET, uri, .{
+        .headers = .{ .authorization = auth_val },
+        .extra_headers = extra[0..n_extra],
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var redirect_buf: [4096]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status.class() != .success) return error.FetchFailed;
+
+    var transfer_buf: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    const body = try readHttpBodyCapped(reader, alloc);
+    defer alloc.free(body);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{}) catch return error.BadJSON;
+
+    // openai/claude: {data:[{id:...}]}; ollama: {models:[{name:...}]}
+    const arr = if (parsed.object.get("data")) |d| d.array.items else if (parsed.object.get("models")) |m| m.array.items else return error.BadJSON;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    for (arr) |item| {
+        const id = item.object.get("id") orelse item.object.get("name") orelse continue;
+        if (id != .string) continue;
+        try names.append(alloc, try alloc.dupe(u8, id.string));
+    }
+    return names.toOwnedSlice(alloc);
+}
+
+fn readHttpBodyCapped(reader: *std.Io.Reader, alloc: std.mem.Allocator) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(alloc);
+    var chunk: [8192]u8 = undefined;
+    while (list.items.len < 4 * 1024 * 1024) {
+        const n = reader.readSliceShort(&chunk) catch break;
+        if (n == 0) break;
+        try list.appendSlice(alloc, chunk[0..n]);
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+/// After configuring an endpoint, offer the models it actually serves.
+fn offerGatewayModels(
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    file_writer: *std.Io.File.Writer,
+    switcher: *ModelSwitcher,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backend: llm.BackendType,
+) !void {
+    const names = fetchGatewayModels(alloc, io, switcher, backend) catch return;
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    if (names.len == 0) return;
+
+    try std.Io.Writer.print(w, "\n  网关上发现 {d} 个模型。\n", .{names.len});
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer labels.deinit(alloc);
+    for (names) |n| try labels.append(alloc, n);
+    try labels.append(alloc, "跳过");
+    const picked = (menu.select(w, r, file_writer, "选一个作为当前模型？", labels.items, 0) catch return) orelse return;
+    if (picked >= names.len) return;
+
+    const model = names[picked];
+    switcher.settings.default_model = try alloc.dupe(u8, model);
+    if (llm.detectBackend(model) == .ollama and backend != .ollama) {
+        switcher.settings.default_backend = switch (backend) {
+            .openai => "openai",
+            .claude => "claude",
+            .ollama => null,
+        };
+    }
+    switcher.switchModel(model) catch {};
+    autoSaveSettings(w, file_writer, switcher, alloc, io);
+    try std.Io.Writer.print(w, "  ✓ 已切换: {s}\n", .{switcher.modelName()});
 }
 
 fn runApiKeysMenu(
@@ -1940,6 +2069,7 @@ fn runApiKeysMenu(
                     switcher.claude_provider = null;
                 }
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
+                try offerGatewayModels(w, r, file_writer, switcher, alloc, io, if (is_openai) .openai else .claude);
 
                 // Routing hint: if the current model would NOT use this
                 // gateway (name detection sends it to Ollama), offer to pin
@@ -2018,8 +2148,7 @@ fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fil
 
     if (picked == llm.KNOWN_MODELS.len + 1) return; // 取消
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
-        const typed = (try promptCustomModel(w, r, file_writer, switcher)) orelse return;
-        break :blk try std.fmt.allocPrint(std.heap.smp_allocator, "{s}", .{typed});
+        break :blk (try promptCustomModel(w, r, file_writer, switcher, std.heap.smp_allocator)) orelse return;
     } else llm.KNOWN_MODELS[picked].name;
     switcher.switchModel(name) catch |err| {
         if (err == error.MissingApiKey) {

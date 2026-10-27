@@ -62,11 +62,11 @@ pub fn readKey(r: *std.Io.Reader) !Key {
     };
 }
 
-const RawGuard = struct {
+pub const RawGuard = struct {
     orig: std.c.termios = undefined,
     active: bool = false,
 
-    fn enter(self: *RawGuard) void {
+    pub fn enter(self: *RawGuard) void {
         if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
         var raw = self.orig;
         raw.lflag.ICANON = false;
@@ -76,7 +76,7 @@ const RawGuard = struct {
         if (std.c.tcsetattr(0, .NOW, &raw) == 0) self.active = true;
     }
 
-    fn restore(self: *RawGuard) void {
+    pub fn restore(self: *RawGuard) void {
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
     }
 };
