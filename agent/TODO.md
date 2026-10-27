@@ -304,3 +304,23 @@
 - **🔴 转功能开发（最大发现）**: **工具声明从未发送**——全 llm 层无一处写 "tools" 字段，buildRequestBody 只发 messages；agent loop 依赖的 stop_reason==.tool_use 从未发生（用户一直用 /run 手动执行掩盖了此缺口）。配套缺口：流式 tool_calls 解析（openai items[0]/空参数/分片丢弃、Claude content_block_start+input_json_delta 未处理、ollama 工具回路断裂）。这是「让 LLM 自动调用工具」的完整功能，涉及三后端请求构造+流式解析，工作量 1.5~2 天，列为下一任务
 - **已登记未修（🟡×7 + 🟢×9）**: ollama parseChatResponse 无 arena / 流错误吞成 EOF / 每事件 leaky 三种所有权制度 / 1MiB 栈缓冲线程溢出风险 / compaction.zig 桩 / ask 规则无实现 / accept_edits 放行任意 Bash / pattern "cd x && git push" 绕过 / bash+grep 工具输出泄漏 / env 密钥静默落盘 / 管道超长行 EOF / effectiveConcurrency(0,·)恒=1（并行名存实亡，同时掩盖 MPSC 单消费缺陷）/ MPSC 多消费者不安全 / task_store global() 竞态（被串行批掩盖）/ findWeakSteps+event_bus+monitor+cron 死代码 / max_snapshots+allow_rules 配置对称缺口
 - **验证**: 187 测试全绿；配置 JSON 落盘合法性实测 ✓；/run+权限门+/model 自定义切换冒烟 ✓
+
+## P29（2026-10-27）4-agent 审查遗留项清零 + 工具调用闭环落地
+
+三笔提交：
+- **65fe4d7 工具调用闭环（P28 最大遗留，功能开发）**：
+  - `provider.ToolSpec` + `CompleteOptions.tools`；registry 导出 `default_tool_specs`（12 工具）
+  - openai：请求体铺平（assistant tool_use→`tool_calls`、tool_result→独立 `role:"tool"` 消息）+ tools 声明 + `stream_options.include_usage`；`OpenAIStreamState` 按 index 累积分片 arguments、finish_reason/[DONE] 时逐个发射 `.tool_call`（旧解析只取 items[0]、id 缺失 panic、arguments 全丢）；parseResponse 加固 + id 合成
+  - Claude：tools 以 `{name,description,input_schema}` 发送；`ClaudeStreamState`（content_block_start tool_use + input_json_delta + thinking_delta + message_start/delta usage 合并 + message_stop）
+  - ollama：tools（OpenAI 式）；tool_use→message.tool_calls（对象 arguments）、tool_result→`role:"tool"`+tool_name（id→name 映射表）；parseChatResponse 响应 arena 化 + 唯一 `ot_N` id + stop_reason=tool_use；流式行发射完整 tool_calls
+  - repl agent loop 带 `.tools`；classifier 释放 complete() arena；删幻影 TaskGet
+  - **e2e 已验证**：mock 网关 → 分片流式 tool_call 解析 → 权限门 y 确认 → 真实 FileRead → `role:"tool"` 回传 → 二轮最终回答
+- **bd2d41d 权限加固+流错误+泄漏+竞态（13 项）**：链式命令分段匹配（deny 任一段命中；allow 全段覆盖且禁用整体短路，`git status*` 不再放行 `git status && rm -rf /x`）；ask 规则全链路实现（config 读写/checkToolPermission Step 1b/bypass 免疫）；accept_edits 不再放行 Bash；危险命令表扩充；门应答缓冲 Allocating 化；管道超长行截断+排水；规则列表读写对称（jq 校验）；**env 密钥不再被 autoSave 落盘**（复现 ANTHROPIC_BASE_URL 泄漏后修复：EnvSourced 标记）；三后端流中断→`.error_occurred`；sendRequest 1MiB 栈→64KiB；bash 释放+stderr；grep 释放；TaskStore 锁+竞态修复 global；findWeakSteps 返回索引；删 compactMessages 桩
+- **67162e8 并行真化+泄漏+UTF-8+信号安全**：effectiveConcurrency 0→hw/2（此前恒 1，并行名存实亡）；finishToolCall//run 错误 output 泄漏；StreamAgg 错误路径工具串释放；/run arena；est_ctx 每轮刷新；RawGuard SIGINT 恢复 termios；op_id uuid 化；memoryId 掺 mem_type；注入截断退到 UTF-8 边界；bind 返回码上抛；graph addNode 实体去重；EventBus 所有权契约；删 registry.getByName
+
+测试：187→196（195 pass / 1 skip / 0 fail），e2e 双跑 PASS。
+
+**仍未做（显式遗留）**：
+- monitor/cron/event_bus 运行时接线（编译进二进制但 repl 不启动——属新功能接入非缺陷，另立任务）
+- config 五层加载覆盖时旧字符串泄漏（启动期 4 次小分配、会话级生命周期，接受不改；如要改需 owned 标记位）
+- reflection 所有权文档（runReflection 内部全 dupe，无泄漏，仅缺注释）
