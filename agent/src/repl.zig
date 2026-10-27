@@ -2053,6 +2053,13 @@ fn runApiKeysMenu(
                 const key_prompt: []const u8 = if (is_openai) "  API Key: " else "  API Key: ";
                 var kbuf: [256]u8 = undefined;
                 const key = menu.readLine(r, w, file_writer, key_prompt, &kbuf) catch continue;
+                // Guard: typing menu-ish escape hatches ("q", "/quit") at the
+                // value prompt used to store them AS the key — producing
+                // confusing 401s on the next LLM call.
+                if (std.mem.eql(u8, key, "q") or std.mem.eql(u8, key, "/quit") or std.mem.indexOfScalar(u8, key, ' ') != null) {
+                    try std.Io.Writer.writeAll(w, "  (忽略：疑似误输入的命令/含空格，配置未更改)\n");
+                    continue;
+                }
                 var ubuf: [256]u8 = undefined;
                 const url_prompt: []const u8 = if (is_openai)
                     "  Base URL（兼容网关填这里，回车=官方，-=清除）: "
