@@ -52,14 +52,21 @@ const ModelSwitcher = struct {
         return self.model_name_buf[0..self.model_name_len];
     }
 
-    /// Explicit backend (settings.default_backend) beats name detection —
-    /// custom names like glm-4.6 can be routed through a configured
-    /// OpenAI/Anthropic-compatible gateway instead of defaulting to Ollama.
+    /// Backend routing, in priority order:
+    ///   1. known-model table entry (authoritative — an override must not
+    ///      hijack claude-*/gpt-*/table models after pinning a custom name)
+    ///   2. recognizable name prefixes (claude-*, gpt-*, …)
+    ///   3. explicit settings.default_backend — rescues UNRECOGNIZED names
+    ///      (glm-4.6, deepseek-v3, …) into a configured compatible gateway
+    ///   4. Ollama fallback (the old behavior)
     fn effectiveBackend(self: *const Self, model: []const u8) llm.BackendType {
+        if (llm.findKnownModel(model)) |entry| return entry.backend;
+        const detected = llm.detectBackend(model);
+        if (detected != .ollama) return detected;
         if (self.settings.default_backend) |b| {
             if (std.meta.stringToEnum(llm.BackendType, b)) |be| return be;
         }
-        return llm.detectBackend(model);
+        return .ollama;
     }
 
     pub fn init(settings: config_mod.Settings, io: std.Io) Self {
@@ -1820,6 +1827,32 @@ fn try_std_fmt(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch fmt;
 }
 
+/// Shared custom-model entry: read the name, and when it is unrecognized
+/// while a compatible gateway is configured, ask which backend serves it.
+fn promptCustomModel(
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    file_writer: *std.Io.File.Writer,
+    switcher: *ModelSwitcher,
+) !?[]const u8 {
+    var vbuf: [128]u8 = undefined;
+    const val = menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return null;
+    if (val.len == 0) return null;
+
+    if (llm.detectBackend(val) == .ollama and (switcher.settings.api_keys.openai != null or switcher.settings.api_keys.anthropic != null)) {
+        const be_items = [_][]const u8{ "OpenAI 兼容接入（用已配的 OpenAI Key/网关）", "Anthropic 兼容接入（用已配的 Anthropic Key/网关）", "Ollama 本地" };
+        const be = menu.select(w, r, file_writer, "该模型走哪个后端？", &be_items, 0) catch null;
+        if (be) |choice| {
+            switcher.settings.default_backend = switch (choice) {
+                0 => "openai",
+                1 => "claude",
+                else => "ollama",
+            };
+        }
+    }
+    return val;
+}
+
 /// Default-model picker shared by /config: known models + custom entry.
 fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, alloc: std.mem.Allocator, io: std.Io) !void {
     var labels: [llm.KNOWN_MODELS.len + 2][]const u8 = undefined;
@@ -1834,24 +1867,8 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
     const picked = (menu.select(w, r, file_writer, "选择默认模型:", &labels, 0) catch return) orelse return;
     if (picked == llm.KNOWN_MODELS.len + 1) return;
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
-        var vbuf: [128]u8 = undefined;
-        const val = menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return;
-        if (val.len == 0) return;
-        // Custom names default to Ollama by name-detection. If a compatible
-        // gateway is configured, ask which backend should serve this model —
-        // otherwise the gateway config would never be reached.
-        if (llm.detectBackend(val) == .ollama and (switcher.settings.api_keys.openai != null or switcher.settings.api_keys.anthropic != null)) {
-            const be_items = [_][]const u8{ "OpenAI 兼容接入（用已配的 OpenAI Key/网关）", "Anthropic 兼容接入（用已配的 Anthropic Key/网关）", "Ollama 本地" };
-            const be = (menu.select(w, r, file_writer, "该模型走哪个后端？", &be_items, 0) catch null);
-            if (be) |choice| {
-                switcher.settings.default_backend = switch (choice) {
-                    0 => "openai",
-                    1 => "claude",
-                    else => "ollama",
-                };
-            }
-        }
-        break :blk try alloc.dupe(u8, val);
+        const typed = (try promptCustomModel(w, r, file_writer, switcher)) orelse return;
+        break :blk try alloc.dupe(u8, typed);
     } else llm.KNOWN_MODELS[picked].name;
 
     // Persist AND switch the live session — previously this only wrote the
@@ -1982,12 +1999,13 @@ fn maskKey(key: []const u8) []const u8 {
 
 /// Interactive model picker: arrow keys + Enter to switch at runtime.
 fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, io: std.Io) !void {
-    var labels: [llm.KNOWN_MODELS.len + 1][]const u8 = undefined;
+    var labels: [llm.KNOWN_MODELS.len + 2][]const u8 = undefined;
     for (&llm.KNOWN_MODELS, 0..) |entry, i| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.modelName())) " ●" else "";
         labels[i] = try std.fmt.allocPrint(std.heap.smp_allocator, "{s:<20} {s}{s}", .{ entry.name, entry.description, marker });
     }
-    labels[llm.KNOWN_MODELS.len] = "取消 (q)";
+    labels[llm.KNOWN_MODELS.len] = "自定义…（输入模型名，兼容网关可用）";
+    labels[llm.KNOWN_MODELS.len + 1] = "取消 (q)";
     defer for (labels[0..llm.KNOWN_MODELS.len]) |l| std.heap.smp_allocator.free(l);
 
     const picked = menu.select(w, r, file_writer, "选择模型 (Enter 切换):", &labels, 0) catch {
@@ -1998,8 +2016,11 @@ fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fil
         return;
     };
 
-    if (picked == llm.KNOWN_MODELS.len) return; // 取消
-    const name = llm.KNOWN_MODELS[picked].name;
+    if (picked == llm.KNOWN_MODELS.len + 1) return; // 取消
+    const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
+        const typed = (try promptCustomModel(w, r, file_writer, switcher)) orelse return;
+        break :blk try std.fmt.allocPrint(std.heap.smp_allocator, "{s}", .{typed});
+    } else llm.KNOWN_MODELS[picked].name;
     switcher.switchModel(name) catch |err| {
         if (err == error.MissingApiKey) {
             try std.Io.Writer.print(w, "  Error: API key not configured for {s}.\n  Use /config to set keys.\n\n", .{llm.KNOWN_MODELS[picked].backend.label()});
@@ -2112,4 +2133,21 @@ test "cloneContentBlocks deep-copies text and tool_use JSON trees" {
     const nested = owned[1].tool_use.input.object.get("nested").?;
     try std.testing.expectEqual(@as(i64, 1), nested.array.items[0].integer);
     try std.testing.expectEqualStrings("two", nested.array.items[1].string);
+}
+
+test "effectiveBackend priority: table > prefixes > explicit override > fallback" {
+    const s1 = config_mod.Settings{};
+    var sw1 = ModelSwitcher.init(s1, undefined);
+    // 1) Table entries are authoritative even with an override set.
+    sw1.settings.default_backend = "openai";
+    try std.testing.expect(sw1.effectiveBackend("claude-sonnet-4-6") == .claude);
+    try std.testing.expect(sw1.effectiveBackend("llama3.2") == .ollama);
+    // 2) Recognizable prefix beats the override.
+    try std.testing.expect(sw1.effectiveBackend("gpt-5-turbo") == .openai);
+    try std.testing.expect(sw1.effectiveBackend("claude-future-model") == .claude);
+    // 3) Unrecognized name + override -> the gateway backend.
+    try std.testing.expect(sw1.effectiveBackend("glm-4.6") == .openai);
+    // 4) Unrecognized name, no override -> Ollama fallback.
+    sw1.settings.default_backend = null;
+    try std.testing.expect(sw1.effectiveBackend("glm-4.6") == .ollama);
 }
