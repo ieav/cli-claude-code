@@ -326,3 +326,15 @@
 - reflection 所有权文档（runReflection 内部全 dupe，无泄漏，仅缺注释）
 
 补遗（bb3a926，复查后补掉的 3 个漏项）：max_snapshots 读写接通（jq 回环验证）；plan 模式 Bash 只读语义（白名单 bashIsReadOnly，链段逐一校验、重定向/git 写子命令拒绝，fail-closed）；RawGuard 信号兜底补 SIGTERM。197 测试 196 pass / 1 skip / 0 fail。SIGSEGV 崩溃兜底仍不含（异步信号安全原因，崩溃路径终端残留风险已大幅缩小）。
+
+## P30（2026-10-28）MCP + Skill 落地（dev-senior-blueprint 计划的阶段 0-3）
+
+- **9e688ff 阶段0**：jsonrpc.zig（编解码+7测试）；stdio.zig（0.17 process.spawn 管道传输，**修复子进程环境丢 PATH**）；runtime_registry.zig（运行时工具注册表，ctx trampoline 执行器）；repl 迁移（/tools 输出逐字节一致验证）
+- **ae92f4a Skill（T7/T8）**：SKILL.md 发现/解析（Claude frontmatter 子集，project 覆盖 user）；system prompt 技能清单（300 token 预算）；`/技能名 [任务]` 注入调用；/skills 列表。mock 网关 e2e PASS
+- **c6481bd MCP（T3/T4/M6）**：McpSession（握手/tools_list/tools_call）；mcp.json 配置 + `/mcp list|install|add|remove|connect|disconnect`；桥接 `mcp__<server>__<tool>` 进权限管道。**全链 e2e PASS**（mock LLM + mock MCP：声明→流式调用→stdio 执行→role:tool 回传→二轮回答）
+
+测试 213 项：212 pass / 3 skip / 0 fail。
+
+**遗留（T9 验收阶段）**：
+- Playwright 真机握手在 zig spawn 下卡（shell 手动同命令秒通；python/node 轻量 mock 均通）——已二分收敛至 zig spawn 管道/进程组属性 × playwright cli.js 重启动的交互，候选解法：pty 包装或直调 npx 缓存 node 入口；known-issue 注记在 mcp/mod.zig
+- M5 Streamable HTTP 传输（迭代二）；skill $ARGUMENTS 参数替换、when_to_use 语义触发（迭代三）
