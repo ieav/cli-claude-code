@@ -632,7 +632,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const out_desc = std.fmt.bufPrint(&ctx_buf, "history={d} ctx~{d}t", .{ history.items.len, est_ctx }) catch "history";
                 traceAddStep(t, .context_assembly, if (est_ctx < MAX_CONTEXT_TOKENS) 0.9 else 0.5, "messages + memory block", out_desc, "compaction-checked assembly", allocator) catch {};
             }
-            logger.info("LLM call: model={s} history_len={d} max_tokens={d}", .{
+            logger.notice("LLM call: model={s} history_len={d} max_tokens={d}", .{
                 switcher.modelName(), history.items.len, switcher.settings.max_tokens,
             });
             // Stream the response: text deltas print live as they arrive.

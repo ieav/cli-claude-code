@@ -6,6 +6,7 @@ const time_mod = @import("time.zig");
 pub const Level = enum {
     debug,
     info,
+    notice,
     warning,
     error_level,
 
@@ -13,13 +14,14 @@ pub const Level = enum {
         return switch (self) {
             .debug => "DBG",
             .info => "INF",
+            .notice => "INF",
             .warning => "WRN",
             .error_level => "ERR",
         };
     }
 };
 
-var current_level: Level = .warning;
+var current_level: Level = .notice;
 
 /// Raise verbosity via ZIV_LOG=debug|info|warning (call once at startup).
 pub fn initFromEnv() void {
@@ -40,10 +42,15 @@ pub fn log(comptime level: Level, comptime format: []const u8, args: anytype) vo
     const prefix: []const u8 = switch (level) {
         .debug => "[DBG]",
         .info => "[INF]",
+        .notice => "[INF]",
         .warning => "[WRN]",
         .error_level => "[ERR]",
     };
     std.debug.print("{s} {d} " ++ format ++ "\n", .{ prefix, ts } ++ args);
+}
+
+pub fn notice(comptime format: []const u8, args: anytype) void {
+    log(.notice, format, args);
 }
 
 pub fn debug(comptime format: []const u8, args: anytype) void {
