@@ -309,7 +309,7 @@ test "OperationLog record and canRollbackTo" {
     var snap_id: [16]u8 = undefined;
     for (&snap_id, 0..) |*byte, i| byte.* = @intCast(i);
 
-    const op_id = try log.record("FileEdit", "path:/tmp/test.txt", "ok", snap_id, true);
+    const op_id = try log.record("FileEdit", "path:/tmp/test.txt", "ok", snap_id, true, 0);
     try std.testing.expect(log.canRollbackTo(op_id));
     try std.testing.expect(!log.canRollbackTo(snap_id)); // not an op_id
 }
@@ -318,7 +318,7 @@ test "OperationLog non-rollback-safe operation" {
     var log = op_log.OperationLog.init(std.testing.allocator);
     defer log.deinit();
 
-    const op_id = try log.record("Bash", "rm -rf /", "error", null, false);
+    const op_id = try log.record("Bash", "rm -rf /", "error", null, false, 0);
     try std.testing.expect(!log.canRollbackTo(op_id));
 }
 
@@ -331,9 +331,9 @@ test "OperationLog getOperationsSince" {
     var snap2: [16]u8 = undefined;
     for (&snap2, 0..) |*byte, i| byte.* = @intCast(i + 100);
 
-    _ = try log.record("FileRead", "path:a.txt", "ok", snap1, true);
-    _ = try log.record("FileEdit", "path:b.txt", "ok", snap2, true);
-    _ = try log.record("Grep", "pattern:test", "ok", null, false);
+    _ = try log.record("FileRead", "path:a.txt", "ok", snap1, true, 0);
+    _ = try log.record("FileEdit", "path:b.txt", "ok", snap2, true, 0);
+    _ = try log.record("Grep", "pattern:test", "ok", null, false, 0);
 
     const ops = log.getOperationsSince(snap1);
     try std.testing.expectEqual(@as(usize, 3), ops.len);
@@ -349,9 +349,9 @@ test "OperationLog rollbackPoints" {
     var snap: [16]u8 = undefined;
     for (&snap, 0..) |*byte, i| byte.* = @intCast(i);
 
-    _ = try log.record("FileEdit", "path:a", "ok", snap, true);
-    _ = try log.record("Bash", "cmd:ls", "ok", null, false);
-    _ = try log.record("FileWrite", "path:b", "ok", snap, true);
+    _ = try log.record("FileEdit", "path:a", "ok", snap, true, 0);
+    _ = try log.record("Bash", "cmd:ls", "ok", null, false, 0);
+    _ = try log.record("FileWrite", "path:b", "ok", snap, true, 0);
 
     var points = log.rollbackPoints();
     defer points.deinit(std.testing.allocator);

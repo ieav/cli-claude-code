@@ -69,6 +69,11 @@ pub const ReflectionEngine = struct {
 
     /// Run reflection on recent interactions and produce insights.
     /// In full implementation, this calls LLM. Here we use heuristic analysis.
+    ///
+    /// Ownership contract: the returned `Reflection` (and every string it
+    /// holds) is owned by the engine — it is kept in `self.reflections` and
+    /// freed at deinit. Callers must dupe any field they keep past the next
+    /// reflect()/deinit; the query slices passed in are only borrowed.
     pub fn reflect(
         self: *Self,
         recent_queries: []const []const u8,

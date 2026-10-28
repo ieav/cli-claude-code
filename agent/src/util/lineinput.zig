@@ -48,13 +48,21 @@ const Editor = struct {
     buf: []u8,
     len: usize = 0,
     pos: usize = 0,
+    /// True while the line shows a HISTORY entry (up/down navigation): the
+    /// line renders bold magenta so it is instantly tellable apart from a
+    /// fresh draft. Editing drops back to the draft style.
+    browsing: bool = false,
 
     fn render(self: *Editor) !void {
         try self.w.print("\r\x1b[2K{s}", .{self.prompt});
-        // Highlight a leading slash command: the first token renders cyan
-        // (dim if unknown), the rest of the line stays plain.
         const line = self.buf[0..self.len];
-        if (line.len > 0 and line[0] == '/') {
+        // History browsing renders the whole line bold magenta: vivid on light
+        // AND dark themes, ANSI-16 only (gray bg tints were invisible/ugly).
+        if (self.browsing) try self.w.writeAll("\x1b[1;35m");
+        // Highlight a leading slash command: the first token renders cyan
+        // (dim if unknown), the rest of the line stays plain. Skipped while
+        // browsing history — the inner reset would drop the magenta.
+        if (!self.browsing and line.len > 0 and line[0] == '/') {
             const tok_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
             const tok = line[0..tok_end];
             const known = lineinput_cmds.isKnownCommand(tok);
@@ -66,6 +74,7 @@ const Editor = struct {
         } else {
             try self.w.writeAll(line);
         }
+        if (self.browsing) try self.w.writeAll("\x1b[0m");
         // Park the cursor at the editing position.
         const tail_w = strWidth(line[self.pos..self.len]);
         if (tail_w > 0) {
@@ -187,6 +196,7 @@ pub fn readLine(
                     if (nav.? > 0) {
                         nav.? -= 1;
                         ed.loadHistory(history.items[nav.?]);
+                        ed.browsing = true;
                     }
                 },
                 'B' => { // down: next history entry
@@ -197,6 +207,7 @@ pub fn readLine(
                     } else {
                         nav = null;
                         ed.loadHistory(draft[0..draft_len]);
+                        ed.browsing = false;
                     }
                 },
                 'H', '1' => ed.pos = 0, // Home (some terms: ESC[1~)
@@ -204,6 +215,7 @@ pub fn readLine(
                 '3' => { // Delete (ESC[3~)
                     _ = ed.r.takeByte() catch {}; // consume '~'
                     ed.deleteAt();
+                    ed.browsing = false;
                 },
                 else => {},
             }
@@ -223,11 +235,15 @@ pub fn readLine(
                 }
                 return ed.len;
             },
-            0x7f, 0x08 => ed.backspace(),
+            0x7f, 0x08 => {
+                ed.backspace();
+                ed.browsing = false;
+            },
             0x03 => { // Ctrl-C: clear the line, start over
                 ed.len = 0;
                 ed.pos = 0;
                 nav = null;
+                ed.browsing = false;
                 try ed.w.writeAll("^C\n");
             },
             0x04 => { // Ctrl-D on empty line: EOF
@@ -237,7 +253,10 @@ pub fn readLine(
                 }
             },
             else => {
-                if (c >= 0x20) try ed.insert(c);
+                if (c >= 0x20) {
+                    try ed.insert(c);
+                    ed.browsing = false;
+                }
             },
         }
         try ed.render();

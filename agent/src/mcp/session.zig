@@ -45,6 +45,11 @@ pub const McpSession = struct {
     /// Per-tool trampoline contexts (bridge allocates; freed in deinit).
     trampolines: std.ArrayList(*TrampolineCtx) = .empty,
     connected: bool = false,
+    /// Serializes callTool invocations: readOnly MCP tools may execute in
+    /// parallel batches, but one session's pipe/HTTP conversation is a
+    /// strictly sequential protocol — the lock keeps JSON-RPC frames from
+    /// interleaving while different servers still run truly in parallel.
+    call_mutex: std.Io.Mutex = .init,
 
     const Self = @This();
 
@@ -56,6 +61,10 @@ pub const McpSession = struct {
     pub const ToolMeta = struct {
         description: []const u8,
         schema: []const u8,
+        /// Server-declared `annotations.readOnlyHint`. Unverified claim —
+        /// the permission gate still asks — but it makes the tool eligible
+        /// for parallel execution (serialized per-session by call_mutex).
+        read_only: bool = false,
     };
 
     pub const TrampolineCtx = struct {
@@ -79,9 +88,7 @@ pub const McpSession = struct {
         defer handshake_done.store(true, .release);
         errdefer t.close(io);
 
-        const init_params = try std.fmt.allocPrint(self.allocator,
-            "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}",
-            .{mod.protocol_version});
+        const init_params = try std.fmt.allocPrint(self.allocator, "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}", .{mod.protocol_version});
         defer self.allocator.free(init_params);
         _ = try t.sendRequest(io, "initialize", init_params);
 
@@ -124,7 +131,11 @@ pub const McpSession = struct {
                 buf = aw.toArrayList();
                 break :blk try buf.toOwnedSlice(a);
             };
-            try self.tool_defs.append(a, .{ .description = desc, .schema = schema });
+            try self.tool_defs.append(a, .{
+                .description = desc,
+                .schema = schema,
+                .read_only = toolIsReadOnly(tool),
+            });
         }
 
         self.transport = .{ .stdio = t };
@@ -138,9 +149,7 @@ pub const McpSession = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const init_params = try std.fmt.allocPrint(arena.allocator(),
-            "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}",
-            .{mod.protocol_version});
+        const init_params = try std.fmt.allocPrint(arena.allocator(), "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}", .{mod.protocol_version});
         const init_reply = (try t.roundTrip(arena.allocator(), "initialize", init_params)) orelse return error.HandshakeFailed;
         if (init_reply.err != null) return error.HandshakeFailed;
         const a = self.allocator;
@@ -185,12 +194,28 @@ pub const McpSession = struct {
                 buf = aw.toArrayList();
                 break :blk try buf.toOwnedSlice(a);
             };
-            try self.tool_defs.append(a, .{ .description = desc, .schema = schema });
+            try self.tool_defs.append(a, .{
+                .description = desc,
+                .schema = schema,
+                .read_only = toolIsReadOnly(tool),
+            });
         }
     }
 
-    /// Execute one tool call. Returned text is arena-owned.
+    /// MCP annotations: `annotations.readOnlyHint == true` marks a tool as
+    /// side-effect-free per the server's claim.
+    fn toolIsReadOnly(tool: std.json.Value) bool {
+        const ann = tool.object.get("annotations") orelse return false;
+        if (ann != .object) return false;
+        const hint = ann.object.get("readOnlyHint") orelse return false;
+        return hint == .bool and hint.bool;
+    }
+
+    /// Execute one tool call. Returned text is arena-owned. Serialized per
+    /// session (call_mutex): safe to invoke from parallel tool batches.
     pub fn callTool(self: *Self, io: std.Io, arena: std.mem.Allocator, tool: []const u8, args_json: ?[]const u8) !CallResult {
+        self.call_mutex.lockUncancelable(io);
+        defer self.call_mutex.unlock(io);
         const params = if (args_json) |args|
             try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"arguments\":{s}}}", .{ tool, args })
         else
@@ -281,7 +306,7 @@ pub fn bridgeSessionTools(
         tc.* = .{ .session = session, .tool_name = try session.allocator.dupe(u8, tool_name) };
         try session.trampolines.append(session.allocator, tc);
 
-        try reg.registerDynamic(full, meta.description, meta.schema, trampoline, tc);
+        try reg.registerDynamic(full, meta.description, meta.schema, trampoline, tc, meta.read_only);
     }
 }
 
@@ -321,4 +346,29 @@ fn trampoline(
         .output = try allocator.dupe(u8, res.text),
         .is_error = res.is_error,
     };
+}
+
+test "captureTools parses annotations.readOnlyHint" {
+    const alloc = std.testing.allocator;
+    var sess = McpSession{
+        .allocator = alloc,
+        .name = "t",
+    };
+    defer sess.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const tools = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\[{"name":"ro_tool","description":"d","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},
+        \\ {"name":"rw_tool","description":"d","annotations":{"readOnlyHint":false}},
+        \\ {"name":"plain_tool","description":"d"}]
+    , .{});
+
+    try sess.captureTools(alloc, arena.allocator(), tools);
+
+    try std.testing.expectEqual(@as(usize, 3), sess.tool_defs.items.len);
+    try std.testing.expect(sess.tool_defs.items[0].read_only);
+    try std.testing.expect(!sess.tool_defs.items[1].read_only);
+    try std.testing.expect(!sess.tool_defs.items[2].read_only);
+    try std.testing.expectEqualStrings("ro_tool", sess.tool_names.items[0]);
 }

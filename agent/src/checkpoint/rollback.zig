@@ -8,6 +8,14 @@ pub const RollbackPoint = struct {
     tool_name: []const u8,
     timestamp: i64,
     files_affected: usize,
+    /// Conversation length when the op was recorded: /rewind truncates the
+    /// history back to this many messages (index-precise, unlike ms
+    /// timestamps). The session-start sentinel rewinds to 1 (system only).
+    history_len: usize,
+    /// Conversation epoch at record time; a mismatch with the log's current
+    /// epoch means the history was rewritten since (compact/clear/undo) and
+    /// the dialogue part of the rewind must be skipped.
+    epoch: u64,
 };
 
 pub const RollbackResult = struct {
@@ -65,6 +73,8 @@ pub const RollbackEngine = struct {
                     .tool_name = rec.tool_name,
                     .timestamp = rec.timestamp,
                     .files_affected = files_affected,
+                    .history_len = if (rec.history_len > 0) rec.history_len else 1,
+                    .epoch = rec.epoch,
                 });
             }
         }

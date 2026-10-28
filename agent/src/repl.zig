@@ -21,6 +21,7 @@ const llm = @import("llm/mod.zig");
 const compaction = @import("llm/compaction.zig");
 const config_mod = @import("config.zig");
 const util_time = @import("util/time.zig");
+const file_cache_mod = @import("util/file_cache.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const logger = @import("util/log.zig");
 const memory_mod = @import("memory/mod.zig");
@@ -218,6 +219,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var current_mode: auth.PermissionMode = switcher.settings.permission_mode;
     var log = op_log.OperationLog.init(allocator);
     defer log.deinit();
+    // Process-wide FileRead cache (repeat reads of unchanged files skip IO
+    // and re-formatting); freshness is validated per read via stat.
+    file_cache_mod.globalInit(allocator);
+    defer file_cache_mod.deinitGlobal();
     var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, ".ziv/checkpoints"));
     defer fhist.deinit();
     var rollback_engine = rollback_mod.RollbackEngine.init(allocator, &fhist, &log);
@@ -547,7 +552,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const result = run_tool.execute(allocator, parsed, io) catch |err| {
                     logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
                     try std.Io.Writer.print(w, "  Tool error: {}\n\n", .{err});
-                    _ = log.record(tool_name, "execution", "error", run_snap_id, false) catch {};
+                    _ = log.record(tool_name, "execution", "error", run_snap_id, false, history.items.len) catch {};
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 };
@@ -557,7 +562,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 } else {
                     try std.Io.Writer.print(w, "  {s}\n\n", .{result.output});
                 }
-                _ = log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null) catch {};
+                _ = log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, history.items.len) catch {};
                 allocator.free(result.output);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -600,12 +605,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 settings = switcher.settings;
                 continue;
             } else if (std.mem.eql(u8, input, "/compact")) {
-                try compactHistory(&history, allocator, w);
+                // Claude-style: LLM summarizes the conversation, the summary
+                // replaces the history (context condensed, not dropped).
+                try compactHistory(&history, &switcher, &log, allocator, w, &file_writer, &total_input_tokens, &total_output_tokens);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/compact phi")) {
+                // Original φ truncation strategy, kept as an explicit option
+                // (also what auto-compaction runs).
+                try compactHistoryPhi(&history, allocator, w, &log);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
                 if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 clearHistory(&history, allocator);
+                log.bumpEpoch();
                 // Drop the stale memory-injection block from the surviving
                 // system message so the fresh conversation isn't primed
                 // with the cleared one's memories.
@@ -621,7 +635,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 message_count = 0;
                 total_input_tokens = 0;
                 total_output_tokens = 0;
-                _ = log.record("ClearHistory", "/", "/", null, false) catch {};
+                _ = log.record("ClearHistory", "/", "/", null, false, 0) catch {};
                 try std.Io.Writer.writeAll(w, "  Conversation cleared. Starting fresh.\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -658,6 +672,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 continue;
             } else if (std.mem.eql(u8, input, "/undo")) {
                 try undoLastExchange(&history, allocator, w);
+                log.bumpEpoch();
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/history")) {
@@ -673,7 +688,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/rewind")) {
-                try rewindOperation(&rollback_engine, w, r, &file_writer, allocator, io);
+                try rewindOperation(&rollback_engine, &history, w, r, &file_writer, allocator, io);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/stats")) {
@@ -766,10 +781,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         defer result_blocks.deinit(allocator);
 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
-            // Compaction check
-            maybeCompact(&history, allocator, w, &file_writer);
-            // est_ctx goes stale across tool rounds (history grows) — refresh
-            est_ctx = estimateHistoryTokens(history.items);
+            // Compaction check + context estimate in one pass.
+            est_ctx = maybeCompact(&history, allocator, w, &file_writer, &log);
 
             // Get provider
             const prov = switcher.getProvider() catch |err| {
@@ -858,7 +871,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             });
 
             // Record in operation log
-            _ = log.record("LLMResponse", input, "response", null, false) catch {};
+            _ = log.record("LLMResponse", input, "response", null, false, 0) catch {};
             if (live_trace) |*t| {
                 traceAddStep(t, .response_postprocess, 0.95, "stream aggregation", "blocks appended to history", "REPL-owned copy", allocator) catch {};
             }
@@ -887,9 +900,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // Find tool definition
                     const tool_def = reg.findByName(tc.name) orelse {
                         try std.Io.Writer.print(w, "  [Unknown tool: {s}]\n", .{tc.name});
+                        // History blocks own every string: the id must be
+                        // duped (it borrows the assistant message's copy —
+                        // freeing both was a double free) and literals too.
                         try result_blocks.append(allocator, .{ .tool_result = .{
-                            .tool_use_id = tc.id,
-                            .content = "Tool not found",
+                            .tool_use_id = try allocator.dupe(u8, tc.id),
+                            .content = try allocator.dupe(u8, "Tool not found"),
                             .is_error = true,
                         } });
                         continue;
@@ -914,8 +930,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, &file_writer);
                     if (!approved) {
                         try result_blocks.append(allocator, .{ .tool_result = .{
-                            .tool_use_id = tc.id,
-                            .content = "denied by permission gate",
+                            .tool_use_id = try allocator.dupe(u8, tc.id),
+                            .content = try allocator.dupe(u8, "denied by permission gate"),
                             .is_error = true,
                         } });
                         continue;
@@ -958,7 +974,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 var batch_errors: u32 = 0;
                 for (prepared.items, 0..) |p, i| {
                     window_tools += 1;
-                    const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, &file_writer);
+                    const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, &file_writer, history.items.len);
                     if (errored) {
                         window_errors += 1;
                         batch_errors += 1;
@@ -1636,13 +1652,14 @@ fn permissionGate(
         .ask_rules = switcher.settings.ask_rules,
         .provider = switcher.getProvider() catch null,
         .allocator = alloc,
+        .model_name = switcher.modelName(),
     };
     var decision = auth.checkToolPermission(tool_def, input, &perm_ctx);
 
     // Auto mode: delegate ambiguous (ask) calls to the LLM classifier.
     if (mode == .auto and decision == .ask) {
         if (switcher.getProvider() catch null) |p| {
-            var lc = classifier_mod.LLMClassifier.init(alloc, p);
+            var lc = classifier_mod.LLMClassifier.init(alloc, p, switcher.modelName());
             // Fail CLOSED: on classifier error fall back to asking the user
             // (fail-open silently allowed writes when the LLM was down).
             const cr = lc.classify(tool_def, input) catch classifier_mod.ClassifierResult{ .block = .{ .reason = "classifier unavailable — confirm manually" } };
@@ -1715,6 +1732,7 @@ fn finishToolCall(
     result_blocks: *std.ArrayList(llm.ContentBlock),
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
+    history_len: usize,
 ) !bool {
     logger.info("Tool execute: {s}", .{p.call.tool_name});
 
@@ -1733,12 +1751,16 @@ fn finishToolCall(
     else
         raw; // ownership transfers, no dupe needed
 
-    try result_blocks.append(alloc, .{ .tool_result = .{
-        .tool_use_id = p.call.tool_use_id,
-        .content = content_for_history,
-        .is_error = result.is_error,
-    } });
-    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null) catch {};
+    try result_blocks.append(alloc, .{
+        .tool_result = .{
+            // Duped: p.call.tool_use_id borrows the assistant message's id —
+            // history must own its own copy or clearHistory double-frees.
+            .tool_use_id = try alloc.dupe(u8, p.call.tool_use_id),
+            .content = content_for_history,
+            .is_error = result.is_error,
+        },
+    });
+    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null, history_len) catch {};
     if (truncated) {
         // History owns the dupe; the original (error or not) is spent.
         alloc.free(result.output);
@@ -1766,26 +1788,131 @@ fn estimateHistoryTokens(history: []const llm.Message) u32 {
     return total;
 }
 
-/// Auto-compact if history exceeds phi threshold.
-fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer) void {
+/// Auto-compact if history exceeds phi threshold. Returns the history's
+/// token estimate AFTER any compaction — callers reuse it instead of
+/// re-scanning the whole history (the loop used to run the same O(n)
+/// estimate twice per iteration).
+fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog) u32 {
     const current_tokens = estimateHistoryTokens(history.items);
-    if (!compaction.needsCompaction(current_tokens, MAX_CONTEXT_TOKENS)) return;
+    if (!compaction.needsCompaction(current_tokens, MAX_CONTEXT_TOKENS)) return current_tokens;
 
     compactHistoryImpl(history, alloc);
+    log.bumpEpoch();
     std.Io.Writer.print(w, "  [Context auto-compacted: {d} messages remaining]\n", .{history.items.len}) catch {};
     std.Io.File.Writer.flush(file_writer) catch {};
+    return estimateHistoryTokens(history.items);
 }
 
-/// Force compact history (used by /compact command).
-fn compactHistory(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+/// Force compact history via LLM summary (used by /compact) — Claude-style:
+/// the current provider summarizes the conversation and the summary replaces
+/// the history, so earlier context is condensed instead of dropped. On any
+/// failure the history is left untouched and the user is pointed at
+/// /compact phi (truncation) rather than silently losing context.
+fn compactHistory(
+    history: *std.ArrayList(llm.Message),
+    switcher: *ModelSwitcher,
+    log: *op_log.OperationLog,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+    total_in: *u64,
+    total_out: *u64,
+) !void {
+    if (history.items.len <= 2) {
+        try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
+        return;
+    }
+
+    const prov = switcher.getProvider() catch |err| {
+        try std.Io.Writer.print(w, "  Summary model unavailable ({}).\n  History untouched — try /compact phi for plain truncation.\n\n", .{err});
+        return;
+    };
+
+    const before_msgs = history.items.len;
+    const before_tokens = estimateHistoryTokens(history.items);
+    try std.Io.Writer.print(w, "  Compacting: summarizing {d} messages (~{d} tokens)…\n", .{ before_msgs - 1, before_tokens });
+    std.Io.File.Writer.flush(file_writer) catch {};
+
+    const transcript = compaction.renderTranscript(alloc, history.items[1..]) catch |err| {
+        try std.Io.Writer.print(w, "  Compaction failed: {}\n  History untouched — try /compact phi.\n\n", .{err});
+        return;
+    };
+    defer alloc.free(transcript);
+
+    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    defer alloc.free(sys_blocks);
+    sys_blocks[0] = .{ .text = compaction.SUMMARY_INSTRUCTION };
+    const user_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    defer alloc.free(user_blocks);
+    user_blocks[0] = .{ .text = transcript };
+    const msgs = [_]llm.Message{
+        .{ .role = .system, .content = sys_blocks, .timestamp = util_time.nowMillis() },
+        .{ .role = .user, .content = user_blocks, .timestamp = util_time.nowMillis() },
+    };
+    var resp = prov.complete(&msgs, .{
+        .max_tokens = @min(switcher.settings.max_tokens, 2048),
+        .temperature = 0.3,
+    }) catch |err| {
+        try std.Io.Writer.print(w, "  Summary call failed: {}.\n  History untouched — try /compact phi.\n\n", .{err});
+        return;
+    };
+    // Extract the summary text before the response DOM arena is freed.
+    var summary = std.ArrayList(u8).empty;
+    defer summary.deinit(alloc);
+    for (resp.content) |block| {
+        if (block == .text) summary.appendSlice(alloc, block.text) catch break;
+    }
+    const usage = resp.usage;
+    resp.free(alloc);
+    total_in.* += usage.input_tokens;
+    total_out.* += usage.output_tokens;
+
+    if (summary.items.len == 0) {
+        try std.Io.Writer.writeAll(w, "  Summary came back empty — history untouched.\n  Try /compact phi for plain truncation.\n\n");
+        return;
+    }
+
+    try replaceHistoryWithSummary(history, alloc, summary.items);
+    log.bumpEpoch();
+
+    const after_tokens = estimateHistoryTokens(history.items);
+    try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} → ~{d} tokens | summary call {d} in / {d} out)\n\n", .{
+        before_msgs, history.items.len, before_tokens, after_tokens, usage.input_tokens, usage.output_tokens,
+    });
+}
+
+/// Replace everything after the system prompt with a single user message
+/// carrying the LLM summary (Claude-style compact outcome).
+fn replaceHistoryWithSummary(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, summary: []const u8) !void {
+    clearHistory(history, alloc);
+    const text = try alloc.print(
+        "Here is a summary of the conversation so far:\n\n{s}\n\nThis summary replaces the earlier conversation history. Continue from here.",
+        .{summary},
+    );
+    errdefer alloc.free(text);
+    const blocks = try alloc.alloc(llm.ContentBlock, 1);
+    errdefer alloc.free(blocks);
+    blocks[0] = .{ .text = text };
+    try history.append(alloc, .{
+        .role = .user,
+        .content = blocks,
+        .timestamp = util_time.nowMillis(),
+    });
+}
+
+/// Force compact via phi truncation (used by /compact phi). This is the
+/// original strategy: keep the system prompt + most recent 61.8% of
+/// messages, drop the rest.
+fn compactHistoryPhi(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, log: *op_log.OperationLog) !void {
     if (history.items.len <= 2) {
         try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
         return;
     }
     const before = history.items.len;
     compactHistoryImpl(history, alloc);
+    log.bumpEpoch();
     const est = estimateHistoryTokens(history.items);
-    try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} tokens)\n\n", .{ before, history.items.len, est });
+    try std.Io.Writer.print(w, "  Compacted (phi): {d} → {d} messages (~{d} tokens)\n\n", .{ before, history.items.len, est });
 }
 
 /// Core compaction: keep system prompt + recent 61.8% of messages.
@@ -1902,8 +2029,12 @@ fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocat
 }
 
 /// Rewind: show rollback points and restore files to a previous checkpoint.
+/// Claude-style: the conversation is rewound too — every message newer than
+/// the checkpoint's timestamp is dropped, so files AND dialogue return to
+/// that moment (the system prompt always survives).
 fn rewindOperation(
     engine: *rollback_mod.RollbackEngine,
+    history: *std.ArrayList(llm.Message),
     w: *std.Io.Writer,
     r: *std.Io.Reader,
     file_writer: *std.Io.File.Writer,
@@ -1957,6 +2088,15 @@ fn rewindOperation(
         rollback_mod.session_start_op_id
     else
         rollback_points[idx - 1].op_id;
+    // Rewind boundary for the conversation: the message count at the moment
+    // the op was recorded (index-precise — ms timestamps cannot split
+    // messages inside one fast tool turn). Session start keeps only the
+    // system prompt. A stale epoch (history rewritten by compact/clear/undo
+    // since the point) invalidates the index — files rewind, dialogue does
+    // not, instead of deleting innocent post-rewrite messages.
+    const point_epoch: u64 = if (idx == 0) engine.op_log.epoch else rollback_points[idx - 1].epoch;
+    const epoch_valid = point_epoch == engine.op_log.epoch;
+    const truncate_to: usize = if (idx == 0) 1 else rollback_points[idx - 1].history_len;
 
     // Preview first
     const preview = engine.previewRollback(target_op_id) catch {
@@ -1964,10 +2104,17 @@ fn rewindOperation(
         return;
     };
 
+    const messages_to_drop: usize = if (epoch_valid and history.items.len > truncate_to) history.items.len - truncate_to else 0;
+
     try std.Io.Writer.print(w, "\n  Rollback preview:\n", .{});
     try std.Io.Writer.print(w, "    Files to restore: {d}\n", .{preview.files_to_restore});
     try std.Io.Writer.print(w, "    Files to delete:  {d}\n", .{preview.files_to_delete});
     try std.Io.Writer.print(w, "    Operations to undo: {d}\n", .{preview.operations_to_undo});
+    if (epoch_valid) {
+        try std.Io.Writer.print(w, "    Messages to drop: {d} (conversation rewinds with the files)\n", .{messages_to_drop});
+    } else {
+        try std.Io.Writer.writeAll(w, "    Messages to drop: 0 (history was compacted/cleared since this point — files rewind only)\n");
+    }
     try std.Io.Writer.writeAll(w, "  Proceed? [y/N]: ");
     try std.Io.File.Writer.flush(file_writer);
 
@@ -2000,10 +2147,20 @@ fn rewindOperation(
     for (result.errors) |e| {
         try std.Io.Writer.print(w, "    Error: {s}: {s}\n", .{ e.file_path, e.message });
     }
-    try std.Io.Writer.print(w, "  ({d} restored, {d} deleted, {d} errors)\n\n", .{
+    // Conversation rewind: pop messages down to the checkpoint length
+    // (system prompt at index 0 always survives). Skipped on stale epoch.
+    var dropped: usize = 0;
+    while (epoch_valid and history.items.len > @max(truncate_to, 1)) {
+        const msg = history.orderedRemove(history.items.len - 1);
+        freeMessage(msg, alloc);
+        dropped += 1;
+    }
+
+    try std.Io.Writer.print(w, "  ({d} restored, {d} deleted, {d} errors, {d} messages rewound)\n\n", .{
         result.restored_files.len,
         result.deleted_files.len,
         result.errors.len,
+        dropped,
     });
 
     engine.freeResult(result);
@@ -2143,8 +2300,15 @@ fn configPickModel(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fi
 
     const picked = (menu.select(w, r, file_writer, "选择默认模型:", &labels, 0) catch return) orelse return;
     if (picked == llm.KNOWN_MODELS.len + 1) return;
+    // promptCustomModel returns a heap string; static table names are not.
+    // Track which one we hold so it is freed exactly once (default_model
+    // gets its own dupe below — the old code leaked the prompt's copy).
+    var owned_name: ?[]const u8 = null;
+    defer if (owned_name) |n| alloc.free(n);
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
-        break :blk (try promptCustomModel(w, r, file_writer, switcher, alloc)) orelse return;
+        const n = (try promptCustomModel(w, r, file_writer, switcher, alloc)) orelse return;
+        owned_name = n;
+        break :blk n;
     } else llm.KNOWN_MODELS[picked].name;
 
     // Persist AND switch the live session — previously this only wrote the
@@ -2218,7 +2382,11 @@ fn fetchGatewayModels(alloc: std.mem.Allocator, io: std.Io, switcher: *ModelSwit
     const reader = response.reader(&transfer_buf);
     const body = try readHttpBodyCapped(reader, alloc);
     defer alloc.free(body);
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{}) catch return error.BadJSON;
+    // DOM lives in an arena that dies here; model names are duped out below
+    // (the old leaky parse left the whole DOM behind on the session heap).
+    var dom_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dom_arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, dom_arena.allocator(), body, .{}) catch return error.BadJSON;
 
     // openai/claude: {data:[{id:...}]}; ollama: {models:[{name:...}]}
     const arr = if (parsed.object.get("data")) |d| d.array.items else if (parsed.object.get("models")) |m| m.array.items else return error.BadJSON;
@@ -2485,12 +2653,13 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /config           Interactive configuration menu
         \\
         \\Conversation:
-        \\  /compact          Compress conversation history to free tokens
+        \\  /compact          Summarize the conversation (LLM) to free tokens
+        \\  /compact phi      Truncate history to the recent 61.8% (no LLM call)
         \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
         \\  /context          Show current context/token usage
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
-        \\  /rewind           Rollback to a checkpoint
+        \\  /rewind           Rewind files AND conversation to a checkpoint
         \\  /memory           Show injected and stored memories
         \\  /research <topic> Web research with phi-curated solutions
         \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
@@ -2510,7 +2679,7 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\Example:
         \\  /config                       Open configuration menu
         \\  /model claude-sonnet-4-6      Switch to Claude Sonnet
-        \\  /compact                      Free up context tokens
+        \\  /compact                      Summarize the conversation (LLM)
         \\  /run Bash {"command":"ls"}
         \\
     );
@@ -2561,4 +2730,64 @@ test "effectiveBackend priority: table > prefixes > explicit override > fallback
     // 4) Unrecognized name, no override -> Ollama fallback.
     sw1.settings.default_backend = null;
     try std.testing.expect(sw1.effectiveBackend("glm-4.6") == .ollama);
+}
+
+test "replaceHistoryWithSummary swaps history for one summary message" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer history.deinit(alloc);
+
+    // System prompt + two exchanges, all heap-owned strings.
+    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    sys_blocks[0] = .{ .text = try alloc.dupe(u8, "system prompt") };
+    try history.append(alloc, .{ .role = .system, .content = sys_blocks, .timestamp = 0 });
+    for ([_][]const u8{ "q1", "a1", "q2" }) |txt| {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, txt) };
+        try history.append(alloc, .{ .role = .user, .content = b, .timestamp = 0 });
+    }
+    try std.testing.expectEqual(@as(usize, 4), history.items.len);
+
+    try replaceHistoryWithSummary(&history, alloc, "1. Primary Request: test the compact swap");
+
+    try std.testing.expectEqual(@as(usize, 2), history.items.len);
+    try std.testing.expect(history.items[0].role == .system);
+    try std.testing.expect(history.items[1].role == .user);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[1].content[0].text, "Primary Request: test the compact swap") != null);
+
+    // Full teardown with the production free path (zero leaks).
+    clearHistory(&history, alloc);
+    alloc.free(history.items[0].content[0].text);
+    alloc.free(@constCast(history.items[0].content));
+}
+
+test "clearHistory survives assistant tool_use + tool_result pair (no double free)" {
+    // Regression for the /clear crash: the tool_result's tool_use_id used to
+    // BORROW the assistant message's id (same allocation), so freeing the
+    // pair double-freed it; literal result contents were freed as well.
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer history.deinit(alloc);
+
+    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    sys_blocks[0] = .{ .text = try alloc.dupe(u8, "sys") };
+    try history.append(alloc, .{ .role = .system, .content = sys_blocks, .timestamp = 0 });
+
+    const owned_id = try alloc.dupe(u8, "call_x");
+    const tu_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    tu_blocks[0] = .{ .tool_use = .{ .id = owned_id, .name = try alloc.dupe(u8, "FileWrite"), .input = .null } };
+    try history.append(alloc, .{ .role = .assistant, .content = tu_blocks, .timestamp = 0 });
+
+    // Simulate what the fixed construction produces: duped id + owned content.
+    const tr_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    tr_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try alloc.dupe(u8, owned_id),
+        .content = try alloc.dupe(u8, "wrote 2 bytes"),
+    } };
+    try history.append(alloc, .{ .role = .user, .content = tr_blocks, .timestamp = 0 });
+
+    // The production free path must not double-free the shared-looking id.
+    clearHistory(&history, alloc);
+    alloc.free(history.items[0].content[0].text);
+    alloc.free(@constCast(history.items[0].content));
 }

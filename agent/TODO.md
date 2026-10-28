@@ -344,3 +344,67 @@
 - **1e26a04**：本批 review 修复（mcp.json enabled=false 无效 JSON；connect append 失败子进程泄漏；重连残留双条目）+ **StdioTransport 阻塞管道**（zig .pipe 的 O_NONBLOCK 传染子进程，node 对 attach 后写入失去可读事件——延迟写复现、阻塞管道修复）+ **M5 Streamable HTTP 传输**（POST/SSE/Mcp-Session-Id；mock 单测 + REPL 全链 e2e PASS）+ Skill $ARGUMENTS（e2e PASS）
 - T9 结论：playwright 原生 spawn 三因素（env/管道/npm）全部排除后仍卡（node 重启动×zig spawn 深层交互）；**支持路径=HTTP remote**（--port + /mcp add url），文档已注明
 - 216 测试：212 pass / 4 skip / 0 fail；stdio/http/skill 三 e2e 全绿
+
+## P32（2026-10-28）Claude 式 /compact 摘要压缩 + 遗留缺陷清偿
+
+- **/compact 双策略落地**（用户需求：保留原算法 + 增加 Claude 式压缩）：
+  - `/compact` = **LLM 摘要压缩**：compaction.zig 从"纯数学桩"变真实现——`SUMMARY_INSTRUCTION`（8 节结构化摘要指令）+ `renderTranscript`（角色标注转写：text 逐块、tool_use 连 input JSON、tool_result 内联、thinking 剔除）；repl 侧 `compactHistory` 用当前 provider `complete()` 生成摘要，`replaceHistoryWithSummary` 把 system 之后的历史**整体替换为单条摘要 user 消息**（上下文浓缩而非丢弃）。摘要调用的 usage 计入 session 统计。**失败不破坏历史**：无 key/网络错/空摘要 → 原样保留 + 提示 `/compact phi` 回退
+  - `/compact phi` = **原 φ 截断算法**（原 `/compact` 行为改名保留）；自动压缩（maybeCompact，超 61.8% 阈值）继续走截断
+  - e2e 三路径全验证（mock 网关）：摘要式 3→2 messages（150/72 token 计入）；phi 5→3；无 key 降级提示
+  - e2e 副发现：**摘要内容会被会话结束记忆提取存库**（summary 消息也是 history 文本）→ 下会话注入。属既有提取行为非缺陷，暂不改
+- **流式事件三套所有权制度统一**（P28 登记项）：provider.zig `StreamEvent` 上成文**统一契约**——"所有 payload 切片（delta 文本、tool_call 的 id/name/input DOM）仅在回调期间有效，消费方必须同步 dupe"；三后端注释对齐契约（ollama tool_call 随行 arena 释放、openai/claude 活到 state deinit——但都不许依赖后者）。代码本已满足契约（REPL StreamSink/StreamAgg 均同步 dupe），修的是**契约无处成文 × 三家实现各自表述**的隐患
+- **廉价泄漏两处**（P25 登记不改项，顺手清偿）：`promptCustomModel` 返回堆串在 configPickModel 里被二次 dupe 后泄漏（owned_name 追踪 + 精确释放）；`fetchGatewayModels` 的 `parseFromSliceLeaky` DOM 会话级泄漏（改 arena + 名称 dupe 出域）
+- **reflection 所有权文档**（P29 显式遗留）：repl.runReflection 已有契约注释；补 engine 侧 `reflect()` 契约——返回的 Reflection 及其字符串为 engine 所有（存 self.reflections、deinit 释放），调用方留存需 dupe
+- **验证**：219 测试（214 pass / 5 skip / 0 fail，新增 renderTranscript 转写、replaceHistoryWithSummary 换血两测）；e2e mock 网关三路径 + 全新目录复测（规避摘要文本入记忆导致的 mock 误判）；REPL 冒烟正常
+- **文档**：USAGE.md 命令表/对话管理示例/§5.6 压缩章节重写；/help 收录 /compact phi
+
+## P33（2026-10-28）harness 工具效率优化（第一批）+ Bash 完整改造
+
+- **并行模型重写（orchestration.zig）**：executeBatches 并行批从"每批 ThreadPool.init + spawn hw/2 空闲轮询 worker + join 销毁"改为**每调用一线程、按 e 函数分波**（波宽 = max(effectiveConcurrency(0,hw),1)，spawn 失败该调用降级当前线程串行）。一次性消除四个开销源：每批建/销毁池、小批起过量线程、worker nanosleep 1ms 轮询、提交方 1ms 自旋等 done（join 即等待）。ThreadPool 模块保留（未来 monitor/cron 用），工具热路径不再依赖它
+- **Bash 工具改造（bash.zig + registry.zig）**：`std.process.run` 本就支持 timeout/cwd（RunOptions.timeout + MultiReader + 超时自动 kill），旧实现全部没用上——
+  - **超时**：`timeout` 参数真实生效（schema 早就声明了却是摆设）：默认 30s、上限 300s、0=不限；挂死命令 2s 被杀实测 ✓，REPL 不再可能被卡死
+  - **working_directory**：新参数，spawn 原生 chdir
+  - **输出上限**：stdout/stderr 各 256 KiB（Io.Limit），`yes` 类失控命令不再能吃光内存（超限报错而非截断语义）
+  - 字段读取补 union 守卫（`.null` 输入 panic 隐患，P13 同类）
+- **验证**：223 测试（218 pass / 5 skip / 0 fail，新增 bash×3 + orchestration 波次保序×1）；REPL 冒烟三连（timeout 精确杀 / cwd 生效 / 常规执行）；4 路 FileRead 并行既有测试仍绿
+- **剩余优化项（未做）**：FileRead 接 file_cache（重复读省 token）/ Glob 构建目录排除 + maxdepth / Grep rg 可用性缓存 + 结果上限 / MCP 工具按 readOnly 放行并行 / ThreadPool worker 轮询改造（仅剩历史用途）
+
+## P34（2026-10-28）harness 工具效率优化（第二+三批全量）
+
+- **③ FileRead 接 file_cache**（此前模块存在但零接线）：缓存行号格式化输出，键=path、新鲜度=mtime+size（statFile 校验，任何写入自动失效，无需显式 invalidate）；全局实例 REPL 启动接/停；互斥锁护并行批；格式化从"每行一次 alloc/free"改为单 Writer 一次成型。顺带修复 **PiRingBuffer π 迭代器漏访条目**导致的缓存泄漏隐患——缓存存储换朴素槽位环形数组 + 同路径原位替换（π 环降级为纯数学模块用途）
+- **④ Glob 剪枝重写**：弃 Dir.walk 改自研递归——14 种构建/依赖目录名（.git/.hg/.svn/target/build/node_modules/.zig-cache/zig-out/dist/out/__pycache__/.venv/.cache/.next）**整树不进入**（不是遍历后过滤）；`maxDepth` 参数（默认 10）；结果上限 2000 + 截断标注；目录符号链接不跟随（防环）；相对路径零分配缓冲（回溯式）
+- **⑤ Grep/ripgrep 双修**：后端判定一次化（PATH 扫描 rg→grep，绝对路径存静态缓冲，进程内互斥一次解析——旧实现每次搜索先 spawn rg 失败再 spawn grep）；30s 硬超时 + 1 MiB 捕获上限（std.process.run RunOptions）+ `-m 1000` 每文件上限 + 解析 500 条截断标注；exit 1（无匹配）不再当错误；工具层删除 simpleSearch 空转桩
+- **⑥ MCP 并行放行**：`annotations.readOnlyHint` 解析入 ToolMeta（stdio/http 两路）→ registerDynamic 新增 concurrency_safe 参数 → readOnly MCP 工具进并行批；**McpSession.call_mutex 互斥**保证同 server 的 JSON-RPC 帧不交错（声明错误最坏只是过度串行化，不会损坏协议；跨 server 真并行）；权限门行为不变（readOnly 声明未验证，照常询问）
+- **验证**：229 测试（224 pass / 5 skip / 0 fail；新增 file_cache×2、FileRead 缓存失效×1、Glob 剪枝×1、ripgrep 截断×2、MCP annotations×1，registry 动态并发断言并入既有测试）；REPL 冒烟（Glob/Grep/FileRead 真实输出 ✓）
+- **harness 效率优化全部完成**：P33（并行模型/Bash 改造）+ P34（③④⑤⑥）+ P32 前置（compact/泄漏/契约）收口
+
+### P34 补记：code-review 三批全链审查（2026-10-28）
+
+- **🔴 复审发现并修复：Bash 超时杀不掉进程树**——`std.process.run` 的 kill 只杀直接子进程（childKillPosix 单 pid SIGTERM），复合命令（`printf X; sleep 60`）的孙进程超时后变孤儿残留（实测复现）。修复：bash.zig 弃 run() 手写 spawn——`.pgid=0` 子进程自成进程组（fork 内 setpgid）、双读线程排空管道防死锁、看门狗线程到点 `kill(-pgid, KILL)` 杀整组、主线程 waitpid 收尸。e2e 复验孤儿数 0；新增杀树单测（pgrep 锚定探针）
+- **🟡 复审发现并修复：Glob 遍历错误静默截断**——`it.next() catch null` 把单个目录的读取错误放大成"整个遍历终止且无提示"。改为 read_errors 计数 + 输出尾部标注 "(N directories could not be read)"
+- **闭环验证通过的链**：compact 链（命令→provider→转写→替换历史→连续 user 消息三后端兼容→/context→usage 计入）；并行链（判定→wave spawn→join 保序→截断入史，threads 波内无未初始化读）；缓存链（stat 新鲜度校验 × FileWrite/FileEdit/rewind 全部写路径自动失效，并发双 put 安全）；MCP 链（readOnlyHint 两路捕获→registerDynamic→call_mutex 同 server 串行跨 server 并行，connect 先于 bridge 无锁窗口）；/run 与 agent loop 双路径收敛 def.execute 同口径
+- **登记不改**：StreamTooLong 丢弃部分输出（错误已说明）；file_cache stat-read TOCTOU 纳秒窗口；compact 后连续 user 依赖 API 合并（三家一致允许）
+- **结果**：230 测试 225 pass / 5 skip / 0 fail
+
+## P35（2026-10-28）输入行背景色 + 对话级 /rewind + harness 第三轮优化（含上游堆损根因修复）
+
+- **输入历史行背景色**（lineinput.zig）：↑↓ 浏览历史时整行渲染 `\x1b[48;5;236m` 暗底（slash 前景色在该态下让位避免 reset 清背景）；编辑/Delete/Ctrl-C/回到底部即恢复草稿样式。pty 实测序列 ✓
+- **/rewind 升级为 Claude 式双重回滚**：文件恢复链不变，新增**对话按精确消息索引截断**——op_log 记录每操作时的 history_len（毫秒时间戳无法区分同轮内的消息，索引可以），/rewind 选择点后 free 并弹尾消息；触发该操作的 user 提问保留（可让 LLM 重做）。preview 显示 "Messages to drop: N"；`[0]` 回卷到只剩 system。e2e：工具闭环 → /rewind → messages rewound + 文件 restored ✓
+- **classifier 判定缓存**（classifier.zig）：auto 模式 LLM 安全判定按 (tool + input JSON) 进程内缓存（权限门在 agent-loop Phase 1 串行 → 无锁）；reason 生命周期收敛——命中返回缓存自有串、miss 存缓存后回读，零悬垂零泄漏；分配器 c_allocator；key 超 512B 跳过缓存。**实测第二次相同判定零 LLM 请求**
+- **🔴 上游既有堆损坏根因修复（本轮最大收获）**：e2e "双轮工具对话 + /clear" 组合首次暴露 panic——DebugAllocator 五连压测捕获 **double free**：tool_result.tool_use_id 借用 assistant 消息的 tool_use.id 同一块内存（+ 字面量 content 被 free），clearHistory/compact/rewind 清史时双重释放（smp 表现为 free list 对齐断言、glibc 表现为 SIGABRT）。P29 引入工具闭环时即存在，此前未炸纯因"工具对话+清史"组合从未同测。修复三处构造点全部 dupe（unknown-tool / permission-denied / finishToolCall），回归单测锁死。修复后 smp 5/5 压测稳定 + compact/rewind 工具场景全绿
+- **est_ctx 合并**：maybeCompact 返回估算值复用，agent loop 每轮省一次 O(history) 全量扫描
+- **验证**：232 测试（227 pass / 5 skip / 0 fail，新增 verdict 缓存 + clearHistory 回归两测）；e2e 全景（双轮工具 /clear ×5、工具+compact、工具+rewind、classifier 缓存命中日志）全过；pty 背景色实测
+- **登记**：DebugAllocator 单轮未复现属堆损坏非确定时序，以五连压测为准；SmpAllocator 对齐断言即 double free 的显影，根因修复后未再现
+
+### P35 补记：code-review 发现并修复 rewind×compact 索引错位（2026-10-28）
+
+- **🔴 epoch 纪元修复**：审查实证"compact 后选旧 rollback 点"会按过期的 history_len 截断——**误删 compact 后的合法新对话**（5 messages rewound，数据丢失级）。根因：compact/clear/undo 重写历史后，旧点的消息索引指向无关内容。修复：op_log 增加 epoch 计数（compact×2/clear/undo 五处 bump），rewind 校验点 epoch——失配时**文件回滚保留、对话回卷跳过**并明示 "history was compacted/cleared since this point"；rewind 自身不 bump（截断单调性保证更早点仍正确，连续回滚可用）。对照 e2e：失配点 0 rewound + 新对话全保 ✓；正常点 4 rewound ✓
+- **审查确认闭环**：double free 修复构造点完整（生产 3 处 dupe + cloneContentBlocks 深拷贝，余为测试）；classifier 缓存不会绕过 deny 规则（Step 1a 先于 Step 2a auto 分支）；est_ctx 合并语义正确；背景色不占行宽、编辑退出浏览态正确
+- **登记**：auto 模式下 allow 规则被 classifier 终决覆盖（Step 2a 先于 2b）为 P22 既有行为，缓存未改变其语义（🟢 另立任务再议）
+- 结果：232 测试 227 pass / 5 skip / 0 fail
+
+### P36（2026-10-28）auto 模式 allow 规则优先 + classifier 缓存按模型隔离
+
+- **🟡→✅ allow 规则优先于 classifier**（auth_mode.zig Step 2a auto 分支）：用户显式配的 `allow_rules` 是确定性授权，不是给 LLM 的提示——原先 auto 下 classifier 终决在前，allow 规则完全无效且每次白付 LLM 调用。修复：auto 分支先查 allow（提取 `allowRulesMatch` 与 Step 2b 共用，链段 fail-closed 语义一致），命中直接放行零 LLM。deny(1a)/ask(1b)/safety(1d) 优先级与 plan/accept_edits 等模式行为不变。e2e 决定性验证：mock 一律答 BLOCK，allow 命中的 FileWrite 仍执行 + classifier 请求 0 次
+- **🟢→✅ 缓存 key 加模型标识**（classifier.zig）：key = tool + model + input——换模型（glm→claude）后重新判定而非沿用旧模型决议；PermissionContext 增加 model_name 字段（repl 构造处传 switcher.modelName()），LLMClassifier.init 三层穿透。单测覆盖换模型 miss
+- **验证**：233 测试（228 pass / 5 skip / 0 fail，新增 auto-allow 优先级单测：无 provider 时 allow 命中返回 .allow = classifier 未跑的构造性证明；未命中回落 .ask）

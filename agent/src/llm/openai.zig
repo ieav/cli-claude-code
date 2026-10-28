@@ -454,7 +454,9 @@ pub const OpenAIProvider = struct {
     const OpenAIStreamState = struct {
         allocator: std.mem.Allocator,
         /// Owns id/name strings and input DOMs referenced by emitted
-        /// tool_call events (the REPL callback dupes synchronously).
+        /// tool_call events. Delta strings point into the per-chunk DOM
+        /// (freed when feed returns). Callback-scoped validity either way —
+        /// see the provider.StreamEvent ownership contract.
         arena: std.heap.ArenaAllocator,
         calls: std.ArrayList(?*ToolCallAcc) = .empty,
         usage: ?provider.Usage = null,

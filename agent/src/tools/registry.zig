@@ -66,6 +66,10 @@ pub const PermissionContext = struct {
     ask_rules: []const PermissionRule = &.{},
     provider: ?llm.Provider = null,
     allocator: ?std.mem.Allocator = null,
+    /// Current model name — scopes the auto-mode classifier's verdict cache
+    /// so switching models re-judges instead of replaying the old model's
+    /// decisions.
+    model_name: []const u8 = "",
 };
 
 // ──── Enhanced ToolDefinition ────
@@ -266,12 +270,13 @@ fn bashIsConcurrencySafe(_: std.json.Value) bool {
 fn bashIsDestructive(input: std.json.Value) bool {
     const cmd = getStringField(input, "command") orelse return false; // malformed input is rejected by validateInput, not here
     const dangerous_cmds = [_][]const u8{
-        "rm ",        "rm\t",    "rmdir",             "dd ",            "mkfs.",    "format",
-        "> /dev/",    "chmod 000", "chown root",     "chmod -R",       "chown -R",
+        "rm ",              "rm\t",      "rmdir",      "dd ",         "mkfs.",    "format",
+        "> /dev/",          "chmod 000", "chown root", "chmod -R",    "chown -R",
         // P28: chained/piped destructive forms the old 8-substring list missed
-        "git reset --hard", "git push --force", "git clean", "shred",
-        "truncate -s", "curl ", "wget ", "sudo ", "shutdown", "reboot",
-        "kill -9", "pkill ", "find -delete", "xargs rm", "srm ",
+        "git reset --hard",
+        "git push --force", "git clean", "shred",      "truncate -s", "curl ",    "wget ",
+        "sudo ",            "shutdown",  "reboot",     "kill -9",     "pkill ",   "find -delete",
+        "xargs rm",         "srm ",
     };
     for (dangerous_cmds) |dc| {
         if (std.mem.indexOf(u8, cmd, dc) != null) return true;
@@ -293,10 +298,10 @@ fn bashIsReadOnly(input: std.json.Value) bool {
         const verb_end = std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len;
         const verb = seg[0..verb_end];
         const ro_verbs = [_][]const u8{
-            "ls",     "cat",  "pwd",  "echo", "head", "tail", "wc",  "grep",
-            "rg",     "find", "fd",   "which", "file", "stat", "du",  "df",
-            "whoami", "date", "env",  "print", "type", "id",   "uname",
-            "git",    // only if subcommand is status/log/diff/show/branch — checked below
+            "ls",     "cat",  "pwd", "echo",  "head", "tail", "wc",    "grep",
+            "rg",     "find", "fd",  "which", "file", "stat", "du",    "df",
+            "whoami", "date", "env", "print", "type", "id",   "uname",
+            "git", // only if subcommand is status/log/diff/show/branch — checked below
         };
         var ok = false;
         for (ro_verbs) |v| {
@@ -350,7 +355,7 @@ pub const bash_tool: ToolDefinition = .{
     .name = "Bash",
     .description = "Execute a shell command and return its output",
     .input_schema =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds"}},"required":["command"]}
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 300; 0 = unlimited)"},"working_directory":{"type":"string","description":"Working directory for the command (default: current)"}},"required":["command"]}
     ,
     .execute_fn = @import("bash.zig").execute,
     .is_read_only = false,
@@ -393,9 +398,9 @@ pub const file_write_tool: ToolDefinition = .{
 
 pub const glob_tool: ToolDefinition = .{
     .name = "Glob",
-    .description = "Find files matching a pattern in a directory tree",
+    .description = "Find files matching a pattern in a directory tree (build/vendor dirs pruned)",
     .input_schema =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. *.zig, src/**/*.ts)"},"path":{"type":"string","description":"Directory to search in"}},"required":["pattern"]}
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. *.zig, src/**/*.ts)"},"path":{"type":"string","description":"Directory to search in"},"maxDepth":{"type":"integer","description":"Maximum directory depth (default 10)"}},"required":["pattern"]}
     ,
     .execute_fn = @import("glob.zig").execute,
     .is_read_only = true,

@@ -391,6 +391,12 @@ pub const OllamaProvider = struct {
     /// Process one line-delimited stream JSON object. Emits events through
     /// cb (the REPL callback consumes them synchronously); all referenced
     /// strings live in a per-line arena that dies on return.
+    /// Parse one newline-delimited stream line and emit its events.
+    /// Every emitted string — deltas AND tool_call id/name/input — points
+    /// into the line arena below, so all payloads are callback-scoped only
+    /// (unlike OpenAI/Claude, whose tool_call strings outlive the callback
+    /// in a state arena; consumers must dupe synchronously either way — see
+    /// the provider.StreamEvent ownership contract).
     fn handleStreamLine(self: *Self, line: []const u8, ctx: ?*anyopaque, cb: *const provider.StreamCallback) anyerror!OllamaLineResult {
         var line_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer line_arena.deinit();

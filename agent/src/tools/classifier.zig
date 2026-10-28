@@ -4,6 +4,7 @@ const std = @import("std");
 const registry = @import("registry.zig");
 const llm = @import("../llm/mod.zig");
 const time_mod = @import("../util/time.zig");
+const logger = @import("../util/log.zig");
 
 pub const ClassifierResult = union(enum) {
     allow,
@@ -48,11 +49,14 @@ pub fn classify(
 pub const LLMClassifier = struct {
     allocator: std.mem.Allocator,
     provider: llm.Provider,
+    /// Scopes the verdict cache: switching models starts a fresh verdict
+    /// history instead of replaying the previous model's decisions.
+    model_name: []const u8 = "",
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, provider: llm.Provider) Self {
-        return .{ .allocator = allocator, .provider = provider };
+    pub fn init(allocator: std.mem.Allocator, provider: llm.Provider, model_name: []const u8) Self {
+        return .{ .allocator = allocator, .provider = provider, .model_name = model_name };
     }
 
     pub fn classify(self: *Self, tool: *const registry.ToolDefinition, input: std.json.Value) !ClassifierResult {
@@ -68,9 +72,23 @@ pub const LLMClassifier = struct {
     }
 
     fn classifyViaLLM(self: *Self, tool: *const registry.ToolDefinition, input: std.json.Value) !ClassifierResult {
-        // Serialize input to JSON for the prompt
+        // Serialize input to JSON for the prompt (and the cache key)
         const input_str = std.json.Stringify.valueAlloc(self.allocator, input, .{}) catch "{}";
         defer self.allocator.free(input_str);
+
+        // Verdict cache. The permission gate runs serially in agent-loop
+        // phase 1 (parallel batches only execute already-approved calls),
+        // so no lock is needed; entries are process-lifetime. This is the
+        // classifier's latency fix: auto mode used to block on a full LLM
+        // round trip for EVERY ask-level call, including exact repeats of
+        // one the user just saw.
+        {
+            const cached = verdictCacheGet(tool.name, self.model_name, input_str);
+            if (cached) |v| {
+                logger.notice("classifier(auto): cache hit for {s} -> {s}", .{ tool.name, if (v.allow) "allow" else "block" });
+                return if (v.allow) .allow else .{ .block = .{ .reason = v.reason } };
+            }
+        }
 
         const prompt = try self.allocator.print(
             \\You are a tool safety classifier. Respond with exactly "ALLOW" or "BLOCK: reason".
@@ -111,20 +129,85 @@ pub const LLMClassifier = struct {
 
         const text = response_text orelse return .allow;
 
-        // Parse BLOCK response
+        // Parse BLOCK response. `reason` points into the response DOM — it
+        // dies with the deferred response.free(), so the cache stores its
+        // own copy and a miss returns a dupe on self.allocator.
+        var allow = true;
+        var reason: []const u8 = "";
         if (std.mem.indexOf(u8, text, "BLOCK") != null) {
+            allow = false;
             const colon_pos = std.mem.indexOf(u8, text, ": ") orelse
-                return .{ .block = .{ .reason = "LLM classified as unsafe" } };
-            if (colon_pos + 2 < text.len) {
-                const reason = try self.allocator.dupe(u8, std.mem.trim(u8, text[colon_pos + 2 ..], " \n\r"));
-                return .{ .block = .{ .reason = reason } };
-            }
-            return .{ .block = .{ .reason = "LLM classified as unsafe" } };
+                std.mem.indexOf(u8, text, ":");
+            reason = blk: {
+                if (colon_pos) |cp| {
+                    if (cp + 2 <= text.len) {
+                        break :blk std.mem.trim(u8, text[cp + 2 ..], " \n\r");
+                    }
+                }
+                break :blk "LLM classified as unsafe";
+            };
         }
 
-        return .allow;
+        verdictCachePut(tool.name, self.model_name, input_str, .{ .allow = allow, .reason = reason });
+
+        if (allow) return .allow;
+        // The cache now owns the reason copy — read it back so the returned
+        // block reason never needs its own allocation (and never dangles).
+        // If caching was skipped (oversized input), fall back to a literal.
+        if (verdictCacheGet(tool.name, self.model_name, input_str)) |v| {
+            return .{ .block = .{ .reason = v.reason } };
+        }
+        return .{ .block = .{ .reason = "LLM classified as unsafe" } };
     }
 };
+
+/// Process-lifetime verdict cache (see classifyViaLLM). The reason string is
+/// cache-owned and outlives the ClassifierResult — callers only print it.
+const Verdict = struct {
+    allow: bool,
+    reason: []const u8,
+};
+
+var verdict_cache: std.StringHashMapUnmanaged(Verdict) = .empty;
+/// Fixed allocator so cached entries never entangle with a caller's
+/// testing.allocator (leak detector ignores smp).
+const cache_alloc = std.heap.c_allocator;
+
+fn verdictCacheGet(tool: []const u8, model: []const u8, input_json: []const u8) ?Verdict {
+    var key_buf: [640]u8 = undefined;
+    const key = cacheKey(&key_buf, tool, model, input_json) orelse return null;
+    return verdict_cache.get(key);
+}
+
+fn verdictCachePut(tool: []const u8, model: []const u8, input_json: []const u8, v: Verdict) void {
+    var key_buf: [640]u8 = undefined;
+    const key = cacheKey(&key_buf, tool, model, input_json) orelse return; // oversized input: skip caching
+    const owned_key = cache_alloc.dupe(u8, key) catch return;
+    const owned_reason = cache_alloc.dupe(u8, if (v.reason.len > 128) v.reason[0..128] else v.reason) catch {
+        cache_alloc.free(owned_key);
+        return;
+    };
+    verdict_cache.put(cache_alloc, owned_key, .{ .allow = v.allow, .reason = owned_reason }) catch {
+        cache_alloc.free(owned_key);
+        cache_alloc.free(owned_reason);
+    };
+}
+
+fn cacheKey(buf: []u8, tool: []const u8, model: []const u8, input_json: []const u8) ?[]const u8 {
+    if (tool.len + 1 + model.len + 1 + input_json.len > buf.len) return null;
+    var n: usize = 0;
+    @memcpy(buf[n..][0..tool.len], tool);
+    n += tool.len;
+    buf[n] = 0;
+    n += 1;
+    @memcpy(buf[n..][0..model.len], model);
+    n += model.len;
+    buf[n] = 0;
+    n += 1;
+    @memcpy(buf[n..][0..input_json.len], input_json);
+    n += input_json.len;
+    return buf[0..n];
+}
 
 test "classifier safe tools" {
     try std.testing.expect(isAutoSafe("FileRead"));
@@ -141,4 +224,16 @@ test "classifier blocks destructive" {
         .block => {},
         else => return error.ExpectedBlock,
     }
+}
+
+test "verdict cache roundtrip and key separation" {
+    verdictCachePut("FileWrite", "glm-4.6", "{\"path\":\"a\"}", .{ .allow = false, .reason = "nope" });
+    const hit = verdictCacheGet("FileWrite", "glm-4.6", "{\"path\":\"a\"}").?;
+    try std.testing.expect(!hit.allow);
+    try std.testing.expectEqualStrings("nope", hit.reason);
+    // Same tool, different input → miss; different tool → miss; different
+    // model → miss (model switch re-judges).
+    try std.testing.expect(verdictCacheGet("FileWrite", "glm-4.6", "{\"path\":\"b\"}") == null);
+    try std.testing.expect(verdictCacheGet("FileEdit", "glm-4.6", "{\"path\":\"a\"}") == null);
+    try std.testing.expect(verdictCacheGet("FileWrite", "claude-x", "{\"path\":\"a\"}") == null);
 }

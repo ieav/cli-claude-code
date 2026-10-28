@@ -11,14 +11,36 @@ pub const OperationRecord = struct {
     output: []const u8,
     snapshot_id: ?[16]u8,
     rollback_safe: bool,
+    /// Conversation length (history.items.len) at the moment this op was
+    /// recorded — the EXACT rewind boundary for /rewind's dialogue part.
+    /// Millisecond timestamps cannot split messages inside one fast turn;
+    /// an index can. 0 = "not a conversation checkpoint" (records that are
+    /// never rollback points, or tests).
+    history_len: usize = 0,
+    /// Conversation epoch when recorded. /compact, /clear and /undo REWRITE
+    /// the history, so an old point's history_len then indexes unrelated
+    /// messages — rewinding to it would delete innocent new dialogue. Those
+    /// operations bump the epoch; points from a stale epoch rewind FILES
+    /// ONLY.
+    epoch: u64 = 0,
 };
 
 pub const OperationLog = struct {
     allocator: std.mem.Allocator,
     records: std.ArrayList(OperationRecord),
     current_position: u32,
+    /// Bumped whenever the conversation is rewritten (compact/clear/undo);
+    /// see OperationRecord.epoch.
+    epoch: u64 = 0,
 
     const Self = @This();
+
+    /// Invalidate every recorded conversation checkpoint: the history they
+    /// indexed has been rewritten. File rollback for old points stays
+    /// available — only the dialogue truncation is disabled.
+    pub fn bumpEpoch(self: *Self) void {
+        self.epoch += 1;
+    }
 
     pub fn init(alloc: std.mem.Allocator) Self {
         return .{
@@ -45,6 +67,7 @@ pub const OperationLog = struct {
         output: []const u8,
         snapshot_id: ?[16]u8,
         rollback_safe: bool,
+        history_len: usize,
     ) ![16]u8 {
         // uuid, not timestamp-spice: two ops in the same millisecond used
         // to collide on op_id (uuid was imported but never used).
@@ -59,6 +82,8 @@ pub const OperationLog = struct {
             .output = try self.allocator.dupe(u8, output),
             .snapshot_id = snapshot_id,
             .rollback_safe = rollback_safe,
+            .history_len = history_len,
+            .epoch = self.epoch,
         });
         self.current_position = @intCast(self.records.items.len);
         return id;

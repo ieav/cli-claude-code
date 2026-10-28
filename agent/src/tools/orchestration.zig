@@ -2,7 +2,7 @@
 /// Safe tools execute in parallel, unsafe tools execute serially.
 const std = @import("std");
 const registry = @import("registry.zig");
-const thread_pool = @import("../task/thread_pool.zig");
+const math = @import("../math/mod.zig");
 
 pub const ToolCall = struct {
     tool_name: []const u8,
@@ -66,7 +66,16 @@ pub fn partitionToolCalls(
     return batches.toOwnedSlice(allocator);
 }
 
-/// Execute batches — safe batches via thread pool, unsafe batches serially.
+/// Execute batches — safe batches run in parallel, unsafe batches serially.
+///
+/// Parallelism model: one thread per call, spawned in waves bounded by the
+/// e-based concurrency function (effectiveConcurrency(0, hw)). This replaces
+/// the old per-batch ThreadPool, which — for every batch — initialized a
+/// pool, spawned hw/2 idle-polling workers, and joined/destroyed them, even
+/// for two-call batches. Threads now exist only while there is work, in the
+/// amount there is work for; join() replaces both the worker nanosleep
+/// polling and the submitter's 1ms spin-wait. A spawn failure degrades that
+/// single call to serial — semantics never depend on the pool existing.
 pub fn executeBatches(
     batches: []const ToolCallBatch,
     allocator: std.mem.Allocator,
@@ -76,59 +85,34 @@ pub fn executeBatches(
     var results = std.ArrayList(BatchResult).empty;
     defer results.deinit(allocator);
 
+    const hw = std.Thread.getCpuCount() catch 4;
+    const cap = @max(math.effectiveConcurrency(0, hw), 1);
+
     for (batches) |batch| {
         if (batch.is_concurrency_safe and batch.calls.len > 1) {
-            // True parallelism: submit to the e-bounded thread pool, wait for
-            // all workers, then collect results in the original call order.
-            var pool = thread_pool.ThreadPool.init(allocator) catch {
-                // Pool unavailable — degrade to serial, semantics unchanged.
-                for (batch.calls) |call| {
-                    const result = executeToolCall(call, allocator, io, tools_def);
-                    try results.append(allocator, .{ .tool_use_id = call.tool_use_id, .result = result });
-                }
-                continue;
-            };
-            try pool.start();
-            // Defer order is LIFO: register the pool join FIRST so it runs
-            // LAST — workers may still write task.status after done is set,
-            // so tasks/ctxs must outlive the join.
-            defer pool.deinit();
-
             const ctxs = try allocator.alloc(ParallelCall, batch.calls.len);
             defer allocator.free(ctxs);
-            const tasks = try allocator.alloc(thread_pool.Task, batch.calls.len);
-            defer allocator.free(tasks);
+            const threads = try allocator.alloc(?std.Thread, batch.calls.len);
+            defer allocator.free(threads);
 
-            for (batch.calls, 0..) |call, i| {
-                ctxs[i] = .{ .call = call, .allocator = allocator, .io = io, .tools_def = tools_def };
-                tasks[i] = .{
-                    .id = i,
-                    .name = "tool_call",
-                    .priority = .normal,
-                    .status = std.atomic.Value(thread_pool.TaskStatus).init(.pending),
-                    .progress = std.atomic.Value(f64).init(0),
-                    .execute_fn = parallelCallTask,
-                    .ctx = &ctxs[i],
-                    .cancel_token = std.atomic.Value(bool).init(false),
-                    .error_message = null,
-                    .retry_count = 0,
-                    .max_retries = 0,
-                };
-                try pool.submit(&tasks[i]);
-            }
-
-            // Wait for all workers to report done.
-            while (true) {
-                var all_done = true;
-                for (ctxs) |*c| {
-                    if (!c.done.load(.acquire)) {
-                        all_done = false;
-                        break;
+            // Wave execution: at most `cap` calls in flight at once.
+            var start: usize = 0;
+            while (start < batch.calls.len) {
+                const wave_end = @min(start + cap, batch.calls.len);
+                for (batch.calls[start..wave_end], start..) |call, i| {
+                    ctxs[i] = .{ .call = call, .allocator = allocator, .io = io, .tools_def = tools_def };
+                    threads[i] = std.Thread.spawn(.{}, parallelCallThread, .{&ctxs[i]}) catch null;
+                    if (threads[i] == null) {
+                        // Spawn failed — run this call on the current thread.
+                        parallelCallThread(&ctxs[i]);
                     }
                 }
-                if (all_done) break;
-                var req: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = std.c.nanosleep(&req, null);
+                // Blocking join replaces the old spin-wait; result writes
+                // happen-before join returns.
+                for (batch.calls[start..wave_end], start..) |_, i| {
+                    if (threads[i]) |t| t.join();
+                }
+                start = wave_end;
             }
 
             for (ctxs) |*c| {
@@ -153,20 +137,17 @@ fn findTool(tools_def: []const registry.ToolDefinition, name: []const u8) ?*cons
     return null;
 }
 
-/// Per-call context handed to pool workers.
+/// Per-call context handed to worker threads.
 const ParallelCall = struct {
     call: ToolCall,
     allocator: std.mem.Allocator,
     io: std.Io,
     tools_def: []const registry.ToolDefinition,
     result: registry.ToolResult = .{ .output = "not run", .is_error = true },
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-fn parallelCallTask(_: *std.mem.Allocator, ctx_opaque: ?*anyopaque) anyerror!void {
-    const ctx: *ParallelCall = @ptrCast(@alignCast(ctx_opaque.?));
+fn parallelCallThread(ctx: *ParallelCall) void {
     ctx.result = executeToolCall(ctx.call, ctx.allocator, ctx.io, ctx.tools_def);
-    ctx.done.store(true, .release);
 }
 
 fn executeToolCall(
@@ -254,5 +235,56 @@ test "executeBatches runs safe batch in parallel with ordered results" {
         try std.testing.expect(!r.result.is_error);
         try std.testing.expect(std.mem.indexOf(u8, r.result.output, "PARALLEL_OK") != null);
         alloc.free(r.result.output);
+    }
+}
+
+test "executeBatches preserves order across many calls (wave looping)" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    // 16 calls — more than typical e-based caps, forcing multi-wave execution.
+    const tmp_path = "/tmp/ziv_orch_waves_test.txt";
+    {
+        var io2_state = std.Io.Threaded.init(alloc, .{});
+        defer io2_state.deinit();
+        try std.Io.Dir.cwd().writeFile(io2_state.io(), .{ .sub_path = tmp_path, .data = "WAVE_OK" });
+    }
+    defer {
+        var io3_state = std.Io.Threaded.init(alloc, .{});
+        defer io3_state.deinit();
+        std.Io.Dir.cwd().deleteFile(io3_state.io(), tmp_path) catch {};
+    }
+
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(alloc);
+    try obj.put(alloc, "path", .{ .string = tmp_path });
+
+    var calls: [16]ToolCall = undefined;
+    for (&calls, 0..) |*c, i| {
+        c.* = .{ .tool_name = "FileRead", .input = .{ .object = obj }, .tool_use_id = "w1" };
+        c.tool_use_id = switch (i % 3) {
+            0 => "a",
+            1 => "b",
+            else => "c",
+        };
+    }
+
+    const batches = try partitionToolCalls(&calls, registry.default_tools, alloc);
+    defer {
+        for (batches) |b| alloc.free(b.calls);
+        alloc.free(batches);
+    }
+    const results = try executeBatches(batches, alloc, io, registry.default_tools);
+    defer {
+        for (results) |r| alloc.free(r.result.output);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 16), results.len);
+    for (results) |r| {
+        try std.testing.expect(!r.result.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, r.result.output, "WAVE_OK") != null);
     }
 }

@@ -9,8 +9,19 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const path = registry.getStringField(input, "path") orelse ".";
     const max_results: u32 = @intCast(registry.getIntField(input, "maxResults") orelse 100);
 
-    const search_result = ripgrep.search(alloc, pattern, path, io) catch {
-        return simpleSearch(alloc, pattern, path, max_results);
+    const search_result = ripgrep.search(alloc, pattern, path, io) catch |err| switch (err) {
+        error.NoSearchBackend => return registry.ToolResult{
+            .output = "Error: neither rg nor grep is available on PATH",
+            .is_error = true,
+        },
+        error.SearchTimedOut => return registry.ToolResult{
+            .output = try alloc.print("Error: search timed out after 30s: {s}", .{pattern}),
+            .is_error = true,
+        },
+        else => return registry.ToolResult{
+            .output = try alloc.print("Error: search failed: {}", .{err}),
+            .is_error = true,
+        },
     };
 
     defer ripgrep.freeResult(alloc, search_result);
@@ -29,17 +40,11 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     if (count == 0) {
         try output.appendSlice(alloc, "No matches found.\n");
+    } else if (search_result.truncated) {
+        try output.appendSlice(alloc, "… (search output truncated — narrow the pattern or path)\n");
     }
 
     return registry.ToolResult{ .output = try output.toOwnedSlice(alloc) };
-}
-
-fn simpleSearch(allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, max_results: u32) anyerror!registry.ToolResult {
-    _ = path;
-    _ = max_results;
-    return registry.ToolResult{
-        .output = try allocator.print("Pattern: {s} (simple search not yet implemented)", .{pattern}),
-    };
 }
 
 fn grepIsConcurrencySafe(_: std.json.Value) bool {

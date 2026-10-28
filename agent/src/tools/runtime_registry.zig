@@ -69,7 +69,11 @@ pub const RuntimeRegistry = struct {
 
     /// Register a dynamic tool. All strings are copied; `execute_ctx_fn` +
     /// `execute_ctx` are the trampoline the MCP bridge uses (ctx = server
-    /// session). Rejects name collisions with anything already registered.
+    /// session). `concurrency_safe` opts the tool into parallel batches —
+    /// the MCP bridge passes it for server-declared readOnlyHint tools,
+    /// which are serialized per-session by McpSession's call mutex (so the
+    /// claim being wrong cannot corrupt the wire, only overserialize).
+    /// Rejects name collisions with anything already registered.
     pub fn registerDynamic(
         self: *Self,
         name: []const u8,
@@ -77,6 +81,7 @@ pub const RuntimeRegistry = struct {
         input_schema: []const u8,
         execute_ctx_fn: *const fn (?*anyopaque, std.mem.Allocator, std.json.Value, std.Io) anyerror!registry.ToolResult,
         execute_ctx: ?*anyopaque,
+        concurrency_safe: bool,
     ) !void {
         if (self.findByName(name) != null) return error.ToolNameTaken;
         if (self.defs_cache) |c| self.allocator.free(c);
@@ -90,13 +95,19 @@ pub const RuntimeRegistry = struct {
                 .execute_ctx_fn = execute_ctx_fn,
                 .execute_ctx = execute_ctx,
                 .is_read_only = false,
-                // MCP tools are unauditable → concurrency-unsafe and
-                // "destructive unknown": the permission gate asks.
+                // MCP tools are unauditable → "destructive unknown": the
+                // permission gate asks regardless of the concurrency flag.
                 .is_destructive = false,
+                .is_concurrency_safe_fn = if (concurrency_safe) dynamicConcurrencySafe else null,
             },
             .owned = true,
         });
         try self.appendSpec(.{ .name = name, .description = description, .input_schema = input_schema });
+    }
+
+    /// Concurrency predicate for opt-in dynamic tools (MCP readOnlyHint).
+    fn dynamicConcurrencySafe(_: std.json.Value) bool {
+        return true;
     }
 
     /// Remove every dynamic tool whose name starts with `prefix`
@@ -198,12 +209,14 @@ test "RuntimeRegistry: built-ins present, specs in sync" {
 test "RuntimeRegistry: dynamic register, lookup, prefix removal" {
     var reg = RuntimeRegistry.init(std.testing.allocator);
     defer reg.deinit();
-    try reg.registerDynamic("mcp__srv__echo", "Echo", "{\"type\":\"object\"}", testExec, null);
+    try reg.registerDynamic("mcp__srv__echo", "Echo", "{\"type\":\"object\"}", testExec, null, false);
+    try reg.registerDynamic("mcp__srv__ro", "ReadOnly", "{}", testExec, null, true);
     try std.testing.expect(reg.findByName("mcp__srv__echo") != null);
-    try std.testing.expectEqual(registry.default_tools.len + 1, reg.toolSpecs().len);
+    try std.testing.expect(reg.findByName("mcp__srv__ro").?.isConcurrencySafe(.null));
+    try std.testing.expectEqual(registry.default_tools.len + 2, reg.toolSpecs().len);
 
     // Duplicate names are rejected.
-    try std.testing.expectError(error.ToolNameTaken, reg.registerDynamic("mcp__srv__echo", "x", "{}", testExec, null));
+    try std.testing.expectError(error.ToolNameTaken, reg.registerDynamic("mcp__srv__echo", "x", "{}", testExec, null, false));
 
     // execute() dispatches through the ctx trampoline.
     const def = reg.findByName("mcp__srv__echo").?;
@@ -212,9 +225,12 @@ test "RuntimeRegistry: dynamic register, lookup, prefix removal" {
     const res = try def.execute(std.testing.allocator, .null, io_state.io());
     try std.testing.expectEqualStrings("dyn-ok", res.output);
 
+    // Concurrency opt-in is reflected in the definition.
+    try std.testing.expect(!reg.findByName("mcp__srv__echo").?.isConcurrencySafe(.null));
+
     // Prefix removal drops only the dynamic tools.
     const removed = reg.removeByPrefix("mcp__srv__");
-    try std.testing.expectEqual(@as(usize, 1), removed);
+    try std.testing.expectEqual(@as(usize, 2), removed);
     try std.testing.expect(reg.findByName("mcp__srv__echo") == null);
     try std.testing.expectEqual(registry.default_tools.len, reg.count());
     try std.testing.expectEqual(registry.default_tools.len, reg.toolSpecs().len);

@@ -3,8 +3,11 @@
 > 一个用 Zig 构建的支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库）的 CLI Agent。
 > 核心算法由三大数学常数驱动：**pi** 圆融信息、**e** 控制增长、**phi** 浓缩知识。
 > v0.4.0 — 自学习闭环：记忆/反思飞轮 + 知识图谱 + /research /diagnose + 工具并行编排（π/e/φ 全落地）。
+> v0.5.0 — 工具自动调用（模型自主决定，无需 /run）· v0.5.1 — MCP 接入（stdio + Streamable HTTP）+ Skill 系统。
 
 ---
+
+**目录**：[1 环境要求](#1-环境要求) · [2 构建与运行](#2-构建与运行) · [3 CLI 使用](#3-cli-使用) · [4 架构总览](#4-架构总览) · [5 核心能力](#5-核心能力) · [6 配置说明](#6-配置说明) · [7 项目结构](#7-项目结构) · [8 当前状态](#8-当前状态与待完成项) · [9 使用前须知](#9-使用前须知)
 
 ## 1. 环境要求
 
@@ -34,6 +37,91 @@ zig build test
 zig build install
 ```
 
+### 2.1 打包发布（release.sh）
+
+**日常发布 SOP（三步）**：
+
+```bash
+# ① 改版本号 —— 两处必须同步改（漏改会被 release.sh 防呆拦截，见下）
+vim src/main.zig        # :110  启动 banner  "Agent v0.5.2"
+vim src/repl.zig        # :713  /version 输出 "Ziv v0.5.2"（release.sh 以此为准）
+
+# ② 构建 + 安装包打包（唯一入口，产物见下方表格）
+./release.sh
+
+# ③ 安装升级（本机）或分发（别的机器）
+./dist/ziv-vX.Y.Z/install.sh                    # 本机升级，原子覆盖
+scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./install.sh
+```
+
+也可以显式传版本号 `./release.sh 0.5.2`，但**必须先完成 ① 的两处修改**——传参只用于覆盖，不做 bump。
+
+**版本防呆**：脚本启动即校验 `main.zig` 与 `repl.zig` 两处版本串一致、且与传参相符，不一致直接拒绝构建并打印修改位置：
+
+```
+✗ version mismatch: repl.zig='0.5.0' main.zig='0.5.0' arg='0.5.1'
+  bump BOTH version strings, then rerun:
+    src/main.zig:110  startup banner   (Agent vX.Y.Z)
+    src/repl.zig:713  /version output  (Ziv vX.Y.Z — release.sh reads this)
+```
+
+脚本流程：
+1. `rm -rf dist` —— 先清空整个 dist/（旧版本目录会被删除，git 状态里旧产物显示为 deleted）
+2. 依次交叉编译 4 个 target（`zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget=...`）→ 裸二进制
+3. 每个 target 打 `tar.gz`（CLI 工具标准发布形态）
+4. `lipo` 合并 arm64+x86_64 → `pkgbuild` 出 macOS 安装包；构建机有 `dpkg-deb` 则再出 2 个 `.deb`
+5. 生成离线安装器 `install.sh` + 覆盖全部产物的 `SHA256SUMS.txt`
+
+| 产物 | 形态 | 说明 |
+|------|------|------|
+| `ziv-<target>` ×4 | 裸二进制 | aarch64/x86_64 × macOS/linux-musl（Linux 版为静态 ELF，无运行时依赖），scp + chmod 直接执行 |
+| `ziv-$V-<target>.tar.gz` ×4 | tar.gz | 解压即用，等同裸二进制 |
+| `ziv-$V-macos.pkg` | **macOS 安装包** | universal（arm64+x86_64 合一），安装到 `/usr/local/bin/ziv`，收据入 `/var/db/receipts`，可用 `pkgutil` 卸载 |
+| `ziv_$V-1_amd64.deb` / `ziv_$V-1_arm64.deb` | **Linux 安装包** | 静态无依赖；需构建机装有 `dpkg-deb`（`brew install dpkg`），缺失时自动跳过 |
+| `install.sh` | 离线安装器 | 自动识别平台，从本目录选对应二进制装到 `<prefix>/bin`（默认 /usr/local，无写权限自动回退 ~/.local）；`uninstall` 子命令可卸载；tmp+mv 原子替换，旧版运行中也可安全覆盖升级 |
+| `SHA256SUMS.txt` | 校验和 | 覆盖目录内全部产物（`shasum -c SHA256SUMS.txt` 验证） |
+
+注意：
+- 脚本每次运行先 `rm -rf dist`，只保留**最新一个版本**的产物目录；要保留历史版本需自行归档（如 `mv dist/ziv-vX.Y.Z ~/releases/`）
+- 脚本跑完后 `zig-out/bin/ziv` 是循环中**最后一个 target**（aarch64-linux-musl）的产物，在 macOS 上直接运行会报格式错误，属正常现象——分发请用 dist/ 内对应平台的文件
+- 脚本依赖 `rg`（提取版本号）、`shasum`；`lipo`/`pkgbuild` 为 macOS 原生自带；`dpkg-deb` 可选
+- `.pkg` 未签名公证（需 Apple 开发者账号）：首次安装如被 Gatekeeper 拦，右键→打开，或 `xattr -d com.apple.quarantine ziv-*.pkg`
+
+### 2.2 运行打包产物
+
+产物为单文件可执行，免安装；配置读取与开发版完全一致（`~/.config/ziv/settings.json` + 启动目录 `.ziv/`）。四种安装方式按需选：
+
+```bash
+cd agent/dist/ziv-v0.5.1
+
+# 方式一：离线安装脚本（自动识别平台；默认 /usr/local，无写权限自动回退 ~/.local）
+./install.sh
+./install.sh uninstall     # 卸载二进制（配置与 .ziv/ 数据保留，按需手动删）
+
+# 方式二：macOS 安装包（universal，装到 /usr/local/bin/ziv）
+sudo installer -pkg ziv-0.5.1-macos.pkg -target /        # 或双击安装
+sudo pkgutil --forget com.ziv.ziv                        # 卸载登记（另需 sudo rm /usr/local/bin/ziv）
+
+# 方式三：Linux .deb（卸载：sudo dpkg -r ziv）
+sudo dpkg -i ziv_0.5.1-1_amd64.deb
+
+# 方式四：tar.gz / 裸二进制，解压即用
+tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
+```
+
+- 传输后确认执行位（`chmod +x`）；Linux musl 版为静态链接，目标机无需安装任何运行时
+- macOS：经浏览器/聊天工具下载的文件带 quarantine 属性会被 Gatekeeper 拦截，执行 `xattr -d com.apple.quarantine ziv-aarch64-macos` 解除；scp/rsync 传输一般不触发
+
+**运行时数据落点**（在启动目录生成）：
+
+| 路径 | 内容 |
+|------|------|
+| `.ziv/memory.db` | SQLite 情景记忆库（含 -shm/-wal，跨会话） |
+| `.ziv/checkpoints/` | 文件快照（/rewind 回滚用，首次文件编辑时创建） |
+| `.ziv/settings.json` / `settings.local.json` | 项目级配置（优先级高于用户级） |
+| `.ziv/skills/<名>/SKILL.md` | 项目级 Skill（v0.5.1，覆盖同名全局 Skill） |
+| stderr | 结构化运行日志（`./ziv 2>ziv.log` 落盘） |
+
 ## 3. CLI 使用
 
 启动后进入交互式 REPL：
@@ -56,21 +144,27 @@ zig build install
 | `/tools` | 列出所有已注册工具（含安全属性） |
 | `/run <ToolName> <json>` | 直接执行工具 |
 | **模型 & 配置** | |
-| `/model` | 显示当前模型和可用模型列表 |
+| `/model`、`/models` | 显示当前模型和可用模型列表 |
 | `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`） |
 | `/mode` | 切换权限模式 |
 | `/config` | 打开交互式配置菜单（API Key、模型、权限等） |
 | **对话管理** | |
-| `/compact` | 压缩对话历史，释放 token |
+| `/compact` | LLM 摘要压缩（Claude 式）：摘要替换历史，上下文被浓缩而非丢弃 |
+| **输入行编辑** | ↑↓ 翻输入历史时整行**粗体品红**（`\x1b[1;35m`），一眼区分历史回显与草稿；编辑/Ctrl-C 退出浏览即恢复。注意：需先提交过至少一行输入，历史非空时 ↑ 才有内容可翻；**改动生效需退出并重启 ziv 会话**（运行中的旧会话仍执行旧二进制） |
+| `/compact phi` | φ 截断压缩：保留 system + 最近 61.8% 消息，最旧的直接丢弃（无 LLM 调用，自动压缩同此策略） |
 | `/clear` | 清空对话，重新开始（别名: `/reset`, `/new`） |
 | `/context` | 显示当前上下文/token 用量 |
 | `/undo` | 撤销上一轮对话 |
 | `/history` | 显示操作历史记录 |
-| `/rewind` | 回滚到检查点（`[0]` = 撤销本会话全部文件改动；其余编号 = 回到该操作之后） |
+| `/rewind` | **Claude 式双重回滚**：恢复文件 + 对话按精确索引截断回该时刻（触发操作的 user 提问保留可重做；`[0]` 回卷全部） |
 | **记忆 & 自学习** | |
 | `/memory` | 查看本会话注入的记忆条数与最近存储的记忆 |
 | `/research <topic>` | 网络自主研究：φ 生成多组查询并发搜索、精选方案并给出 ★ 推荐 |
 | `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链，定位低于 φ 置信度的环节并给建议 |
+| `/knowledge` | 查看知识图谱统计（节点/边） |
+| **MCP & Skill (v0.5.1)** | |
+| `/skills` | 列出已安装 Skill（详见下文 v0.5.1 节） |
+| `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见下文 v0.5.1 节） |
 
 ### 权限模式 (Permission Modes)
 
@@ -217,9 +311,17 @@ ziv (gpt-4o) [12%] > /context
   Compaction threshold: 79104 tokens (61.8%)
   Session total: 1234 in / 567 out tokens
 
-# 手动压缩历史
+# LLM 摘要压缩（Claude 式，默认）
 ziv (gpt-4o) [45%] > /compact
-  Compacted: 15 → 10 messages (~3200 tokens)
+  Compacting: summarizing 14 messages (~52000 tokens)…
+  Compacted: 15 → 2 messages (~52000 → ~2400 tokens | summary call 51000 in / 380 out)
+# 失败时历史保持原样并提示改用截断：
+#   Summary model unavailable (error.MissingApiKey).
+#   History untouched — try /compact phi for plain truncation.
+
+# φ 截断压缩（原始算法，无 LLM 调用）
+ziv (gpt-4o) [45%] > /compact phi
+  Compacted (phi): 15 → 10 messages (~3200 tokens)
 
 # 清空对话
 ziv (gpt-4o) [45%] > /clear
@@ -350,13 +452,13 @@ comptime 泛型注册，零运行时开销。每个工具支持：
 
 | 工具 | 别名 | 类型 | 并发安全 | 说明 |
 |------|------|------|----------|------|
-| **Bash** | Shell, sh | 读写/破坏性 | 不安全 | 执行 shell 命令，自动检测破坏性命令 |
-| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页） |
+| **Bash** | Shell, sh | 读写/破坏性 | 不安全 | 执行 shell 命令，自动检测破坏性命令。参数：`timeout`（秒，默认 30、上限 300、0=不限）、`working_directory`（工作目录）；stdout/stderr 各限 256 KiB |
+| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页）；重复读取未变更文件走 FileStateCache（mtime+size 校验命中，跳过磁盘 IO 与格式化） |
+| **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配（`*.zig`, `src/**/*.ts`）；构建/依赖目录（.git/target/node_modules/.zig-cache/zig-out/dist 等 14 种）整树剪枝不进入，`maxDepth` 默认 10，结果上限 2000；目录符号链接不跟随 |
+| **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置）；后端一次判定（rg→grep 降级结果进程内缓存，不再每次 spawn 试错），30s 超时、1 MiB 捕获上限、解析 500 条截断 |
 | **FileWrite** | Write | 读写 | 不安全 | 写入文件 |
-| **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配 (`*.zig`, `src/**/*.ts`) |
-| **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置） |
 | **FileEdit** | Edit, sed | 读写 | 不安全 | 字符串查找替换编辑 |
-| **WebSearch** | — | 只读 | 安全 | 网络搜索（API 待接入） |
+| **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave） |
 | **TaskCreate** | — | 读写 | 不安全 | 创建任务 |
 | **TaskList** | — | 只读 | 安全 | 列出所有任务 |
 | **TaskUpdate** | — | 读写 | 不安全 | 更新任务状态 |
@@ -370,6 +472,8 @@ comptime 泛型注册，零运行时开销。每个工具支持：
 `orchestration.zig` 实现智能工具调用分组：
 - `partitionToolCalls()` — 将并发安全的调用分组在一起
 - **安全工具真并行执行**（e 上限线程池：FileRead、Glob、Grep 等；结果按原始调用顺序回收；池故障自动降级串行）
+- **auto 模式分类器缓存**：LLM 安全判定按 (工具+入参) 进程内缓存——重复 ask 级操作不再每次等待 LLM 分类（实测第二次判定零 LLM 请求）
+- **安全工具并行执行**：每调用一线程、按 e 函数分波限流（波宽 = effectiveConcurrency(0, hw)），spawn 失败单调用降级串行——替代旧"每批新建 hw/2 线程池 + nanosleep 轮询"模式
 - **不安全工具串行执行**（Bash、FileWrite、FileEdit 等）
 
 ```
@@ -426,13 +530,13 @@ auto 模式下的工具分类：
 
 ### 5.6 消息压缩 (Compaction)
 
-`llm/compaction.zig` 使用 phi 阈值触发上下文压缩：
+`llm/compaction.zig` 提供两种已实现的压缩策略（φ 阈值数学为两者共用）：
 
-| 策略 | 说明 |
-|------|------|
-| **summarize** | 将旧消息发给 LLM 生成摘要 |
-| **phi_condense** | 保留最近 61.8% 的消息，丢弃最旧的 |
-| **hybrid** | phi-condense + 摘要被丢弃的消息 |
+| 策略 | 触发 | 说明 |
+|------|------|------|
+| **summarize** | `/compact` 手动 | LLM 将对话总结为 8 节结构化摘要（`SUMMARY_INSTRUCTION`），摘要以单条 user 消息**替换** system 之后的历史——上下文被浓缩而非丢弃；任何失败（无 key/网络/空摘要）历史保持原样并提示回退 |
+| **phi_condense** | 自动（超 61.8% 阈值）+ `/compact phi` 手动 | 保留 system prompt + 最近 61.8% 消息，最旧的直接丢弃；无 LLM 调用，agent loop 每轮检查 |
+| **hybrid** | 预留 | 未实现（枚举占位） |
 
 触发条件：当前 token 使用量 > max_tokens x phi (61.8%)
 
@@ -463,7 +567,7 @@ auto 模式下的工具分类：
 **情景记忆完整闭环（v0.3.x 已实现）**：
 - **提取**：`/quit`、`/clear` 时启发式扫描 user/assistant 消息（中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…），φ 浓缩只保重要性前 61.8% 后入库
 - **幂等**：id = 内容双 Wyhash，`INSERT OR REPLACE` —— 同一句话重复提及自动去重并刷新时间戳
-- **注入**：下次启动取最近 20 条，按 **0.5×e 衰减 + 0.5×与最新记忆的向量余弦**（64 维 hash 词袋嵌入）混合排序，token 预算 800 截断后拼入 system prompt（ziv.log 可见 `[INF] memory: injected N entries`）
+- **注入**：下次启动取最近 20 条，按 **0.5×e 衰减 + 0.5×与最新记忆的向量余弦**（64 维 hash 词袋嵌入）混合排序，token 预算 800 截断后拼入 system prompt（stderr 日志可见 `[INF] memory: injected N entries`，`./ziv 2>ziv.log` 落盘）
 - **查看**：`/memory` 命令
 
 **反思引擎（已接线）**：会话内维护查询窗口（≤20 条 + 工具/错误计数），每 10 轮或 π×10min 触发反思；`/quit` 时强制收尾。insights 以 `.feedback` 记忆入库，下会话自动注入——改进经验跨会话生效。
@@ -579,11 +683,12 @@ Ziv 支持 5 层配置源，后者覆盖前者：
 | `api_keys.anthropic` | string | null | Anthropic API Key（也支持 ANTHROPIC_API_KEY 环境变量） |
 | `api_keys.anthropic_base_url` | string | null | Anthropic API 自定义地址（也支持 ANTHROPIC_BASE_URL 环境变量） |
 | `api_keys.brave` | string | null | Brave Search API Key（也支持 BRAVE_API_KEY 环境变量） |
-
-搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
 | `api_keys.ollama_host` | string | `"http://localhost:11434"` | Ollama 服务地址 |
 | `allow_rules` | string[] | [] | 允许规则列表 |
 | `deny_rules` | string[] | [] | 拒绝规则列表 |
+| `ask_rules` | string[] | [] | 强制确认规则（bypass 模式也不豁免，语法同 allow/deny） |
+
+搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
 
 ### 6.3 代码中配置
 

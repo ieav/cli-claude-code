@@ -127,7 +127,9 @@ pub const SSEParser = struct {
 pub const ClaudeStreamState = struct {
     allocator: std.mem.Allocator,
     /// Owns id/name strings and input DOMs referenced by emitted tool_call
-    /// events (the REPL callback dupes synchronously).
+    /// events. Delta strings point into the per-payload DOM (freed when
+    /// feed returns). Callback-scoped validity either way — see the
+    /// provider.StreamEvent ownership contract.
     arena: std.heap.ArenaAllocator,
     tools: std.ArrayList(ToolAcc) = .empty,
     input_tokens: u32 = 0,

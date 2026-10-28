@@ -111,10 +111,16 @@ pub fn checkToolPermission(
             // Will fall through to allow rules check
         },
         .auto => {
+            // Explicit user allow rules outrank the classifier: a configured
+            // "Bash(git status*)" is an affirmative grant, not a hint — and
+            // honoring it first also skips the LLM round trip entirely.
+            // (Same matching semantics as Step 2b, chain-segment fail-closed.)
+            if (allowRulesMatch(ctx.allow_rules, tool, input)) return .allow;
+
             // LLM-augmented classifier for auto mode
             if (ctx.provider) |prov| {
                 if (ctx.allocator) |alloc| {
-                    var llm_classifier = classifier.LLMClassifier.init(alloc, prov);
+                    var llm_classifier = classifier.LLMClassifier.init(alloc, prov, ctx.model_name);
                     const result = llm_classifier.classify(tool, input) catch
                         return .{ .ask = .{ .message = "classification failed" } };
                     switch (result) {
@@ -127,23 +133,31 @@ pub fn checkToolPermission(
         },
     }
 
-    // Step 2b: Check allow rules. Pattern rules only allow when the whole
-    // input matches — and for chained shell commands every segment must be
-    // covered by the pattern, so "git status && rm -rf /" cannot ride in on
-    // an allow rule for git status. A non-matching pattern falls through to
-    // the default ask below.
-    for (ctx.allow_rules) |rule| {
-        if (tool.matchesName(rule.tool_name)) {
-            if (rule.content_pattern) |pattern| {
-                if (inputMatchesPatternAll(input, pattern)) return .allow;
-            } else {
-                return .allow;
-            }
-        }
-    }
+    // Step 2b: Check allow rules (auto mode already honored them in 2a;
+    // this is the default-mode path). Pattern rules only allow when the
+    // whole input matches — and for chained shell commands every segment
+    // must be covered by the pattern, so "git status && rm -rf /" cannot
+    // ride in on an allow rule for git status. A non-matching pattern falls
+    // through to the default ask below.
+    if (allowRulesMatch(ctx.allow_rules, tool, input)) return .allow;
 
     // Step 3: Default to ask
     return .{ .ask = .{ .message = "permission required" } };
+}
+
+/// Allow-rule matching shared by Step 2a (auto, explicit grants outrank the
+/// classifier) and Step 2b (default mode).
+fn allowRulesMatch(rules: []const PermissionRule, tool: anytype, input: std.json.Value) bool {
+    for (rules) |rule| {
+        if (tool.matchesName(rule.tool_name)) {
+            if (rule.content_pattern) |pattern| {
+                if (inputMatchesPatternAll(input, pattern)) return true;
+            } else {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Pattern match for deny/ask rules: the whole operative field, or — for
@@ -439,4 +453,28 @@ test "plan mode allows read-only Bash, blocks writes (P28)" {
     try gw.put(std.testing.allocator, "command", .{ .string = "git push origin main" });
     const gw_decision = checkToolPermission(&registry.bash_tool, .{ .object = gw }, &ctx);
     try std.testing.expect(gw_decision == .deny);
+}
+
+test "auto mode: explicit allow rule outranks the classifier" {
+    // No provider: if the classifier path ran, auto would fall through to
+    // rules/ask — only the allow-rule fast path can produce .allow here.
+    const ctx = PermissionContext{
+        .mode = .auto,
+        .allow_rules = &.{.{ .source = .user_settings, .behavior = .allow, .tool_name = "FileWrite", .content_pattern = "/tmp/allow/*" }},
+        .deny_rules = &.{},
+        .provider = null,
+        .allocator = null,
+    };
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "path", .{ .string = "/tmp/allow/x.txt" });
+    const r = checkToolPermission(&registry.file_write_tool, .{ .object = obj }, &ctx);
+    try std.testing.expect(r == .allow);
+
+    // Non-matching input still falls through (no classifier → default ask).
+    var obj2: std.json.ObjectMap = .empty;
+    defer obj2.deinit(std.testing.allocator);
+    try obj2.put(std.testing.allocator, "path", .{ .string = "/etc/passwd" });
+    const r2 = checkToolPermission(&registry.file_write_tool, .{ .object = obj2 }, &ctx);
+    try std.testing.expect(r2 == .ask);
 }

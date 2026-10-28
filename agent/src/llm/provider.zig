@@ -83,6 +83,16 @@ pub const Usage = struct {
     output_tokens: u32,
 };
 
+/// A streaming event delivered through StreamCallback.
+///
+/// Ownership contract (binding for ALL backends): every payload slice —
+/// delta text, and a tool_call's id/name/input DOM — is only guaranteed
+/// valid for the duration of the callback invocation. Backends back them
+/// with per-chunk or stream-scoped arenas that may be released as soon as
+/// the callback returns (Ollama frees tool_call strings with the line;
+/// OpenAI/Claude keep them until the stream state deinits — never rely on
+/// that longer lifetime). Consumers must dupe synchronously anything they
+/// keep.
 pub const StreamEvent = union(enum) {
     content_delta: []const u8,
     thinking_delta: []const u8,
