@@ -20,6 +20,10 @@ pub const Reflection = struct {
     insights: []const u8,
     action_items: []const u8,
     quality_score: f64, // 0-1, quality of the interaction
+    /// True when the window shows something worth acting on (high error
+    /// rate / tool pressure / weak quality). Clean windows are routine —
+    /// callers skip the LLM, the printout and the stored insight for them.
+    actionable: bool = false,
     created_at: i64,
 };
 
@@ -100,19 +104,25 @@ pub const ReflectionEngine = struct {
         // Quality score: e-based decay of error rate
         const quality_score = math.sigmoid(-3.0 * (error_rate - 0.3));
 
-        // Generate insights based on patterns
+        // Generate insights based on patterns. `actionable` marks windows
+        // worth an LLM round trip / a stored insight — a clean window is
+        // routine and must not bill the exit 1-3 s plus a junk memory row.
+        var actionable = false;
         var insights_buf = std.ArrayList(u8).empty;
         defer insights_buf.deinit(self.allocator);
 
         if (error_rate > (1.0 - math.constants.PHI)) {
             // Error rate > 38.2%
             try insights_buf.appendSlice(self.allocator, "错误率过高。建议减少并发任务或切换到更稳定的模型。");
+            actionable = true;
         } else if (recent_tools_used > recent_queries.len * 3) {
             try insights_buf.appendSlice(self.allocator, "工具调用频繁。可能需要优化提示词以减少不必要的工具调用。");
+            actionable = true;
         } else if (quality_score > math.constants.PHI) {
             try insights_buf.appendSlice(self.allocator, "交互质量良好。当前策略有效，继续保持。");
         } else {
             try insights_buf.appendSlice(self.allocator, "交互质量一般。建议关注上下文管理和信息检索策略。");
+            actionable = true;
         }
 
         // Generate action items
@@ -133,6 +143,7 @@ pub const ReflectionEngine = struct {
             .insights = try self.allocator.dupe(u8, insights_buf.items),
             .action_items = try self.allocator.dupe(u8, actions_buf.items),
             .quality_score = quality_score,
+            .actionable = actionable,
             .created_at = time_mod.nowMillis(),
         };
 
@@ -199,4 +210,32 @@ test "ReflectionEngine reflect produces insights" {
     const result = try engine.reflect(queries, 5, 0, .on_timer);
     try std.testing.expect(result != null);
     try std.testing.expect(engine.reflectionCount() == 1);
+}
+
+test "reflect classifies actionable vs routine windows" {
+    const alloc = std.testing.allocator;
+    var engine = ReflectionEngine.init(alloc);
+    defer engine.deinit();
+
+    // Clean window: no errors, no tool pressure → routine (no LLM/print/store).
+    const clean = [_][]const u8{ "a", "b", "c" };
+    const r1 = (try engine.reflect(&clean, 2, 0, .on_query_complete)).?;
+    try std.testing.expect(!r1.actionable);
+
+    // Error-heavy window (>38.2%) → actionable.
+    const messy = [_][]const u8{ "a", "b" };
+    const r2 = (try engine.reflect(&messy, 1, 1, .on_query_complete)).?;
+    try std.testing.expect(r2.actionable);
+
+    // Tool pressure (>3× queries) → actionable.
+    const busy = [_][]const u8{ "a" };
+    const r3 = (try engine.reflect(&busy, 4, 0, .on_query_complete)).?;
+    try std.testing.expect(r3.actionable);
+
+    // Mediocre quality (error rate under 38.2%, tools under 3×, quality
+    // ≤ φ) → actionable — the branch whose polarity this batch flipped.
+    const mediocre = [_][]const u8{ "a", "b", "c", "d" }; // er = 1/4 = 0.25
+    const r4 = (try engine.reflect(&mediocre, 5, 1, .on_query_complete)).?;
+    try std.testing.expect(r4.actionable);
+    try std.testing.expect(r4.quality_score < 0.62);
 }

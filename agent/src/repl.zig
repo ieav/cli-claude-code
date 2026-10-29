@@ -60,12 +60,57 @@ const ModelSwitcher = struct {
     openai_provider: ?llm.OpenAIProvider = null,
     claude_provider: ?llm.ClaudeProvider = null,
     ollama_provider: ?llm.OllamaProvider = null,
+    /// A provider retired by a model switch but NOT deinit'd yet: a
+    /// detached reflection worker (3 s deadline abandon) may still be
+    /// running a request on it — deinit-ing in place was a use-after-free
+    /// on /model switches. Parked here and freed at switcher deinit
+    /// (process exit). At most one detached worker exists at a time, so
+    /// one slot suffices.
+    retired: ?RetiredProvider = null,
     settings: config_mod.Settings,
+
+    const RetiredProvider = union(enum) {
+        openai: llm.OpenAIProvider,
+        claude: llm.ClaudeProvider,
+        ollama: llm.OllamaProvider,
+    };
 
     const Self = @This();
 
     pub fn modelName(self: *const Self) []const u8 {
         return self.model_name_buf[0..self.model_name_len];
+    }
+
+    /// Park the current provider of `backend` into the retired slot instead
+    /// of deinit-ing it (the slot is nulled either way, so getProvider
+    /// rebuilds with the new model name — semantics unchanged).
+    fn retireProvider(self: *Self, backend: llm.BackendType) void {
+        if (self.retired != null) self.freeRetired(); // previous retiree must die now
+        switch (backend) {
+            .openai => if (self.openai_provider) |p| {
+                self.retired = .{ .openai = p };
+                self.openai_provider = null;
+            },
+            .claude => if (self.claude_provider) |p| {
+                self.retired = .{ .claude = p };
+                self.claude_provider = null;
+            },
+            .ollama => if (self.ollama_provider) |p| {
+                self.retired = .{ .ollama = p };
+                self.ollama_provider = null;
+            },
+        }
+    }
+
+    fn freeRetired(self: *Self) void {
+        if (self.retired) |*r| {
+            switch (r.*) {
+                .openai => |*p| p.deinit(),
+                .claude => |*p| p.deinit(),
+                .ollama => |*p| p.deinit(),
+            }
+            self.retired = null;
+        }
     }
 
     /// Backend routing, in priority order:
@@ -105,6 +150,7 @@ const ModelSwitcher = struct {
         if (self.openai_provider) |*p| p.deinit();
         if (self.claude_provider) |*p| p.deinit();
         if (self.ollama_provider) |*p| p.deinit();
+        self.freeRetired();
     }
 
     /// Switch to a new model. Returns error if API key is missing.
@@ -126,27 +172,10 @@ const ModelSwitcher = struct {
             .ollama => {},
         }
 
-        // Deinit old provider of the same backend type
-        switch (new_backend) {
-            .openai => {
-                if (self.openai_provider) |*p| {
-                    p.deinit();
-                    self.openai_provider = null;
-                }
-            },
-            .claude => {
-                if (self.claude_provider) |*p| {
-                    p.deinit();
-                    self.claude_provider = null;
-                }
-            },
-            .ollama => {
-                if (self.ollama_provider) |*p| {
-                    p.deinit();
-                    self.ollama_provider = null;
-                }
-            },
-        }
+        // Park the old provider of the same backend type in `retired`
+        // (deinit-in-place was a UAF for a detached reflection worker
+        // still mid-request on it; see retireProvider).
+        self.retireProvider(new_backend);
 
         // Re-pin the backend without changing the name may pass the CURRENT
         // name back in (switchModel(modelName()) from the gateway pin flow):
@@ -461,10 +490,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Ctrl-D on an empty line (EOF): same session-end cleanup as
             // /quit — this path used to skip reflection + memory extraction,
             // silently losing the session's learnings on a common exit habit.
+            // Extract first, reflect last — see the /quit path note.
+            if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
             if (mem_sys != null and window_queries.items.len > 0) {
                 runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
             }
-            if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
             return;
@@ -486,10 +516,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         if (std.mem.startsWith(u8, input, "/") and std.mem.indexOfScalar(u8, input, '\n') == null) {
             if (std.ascii.eqlIgnoreCase(input, "/quit") or std.ascii.eqlIgnoreCase(input, "/q") or std.ascii.eqlIgnoreCase(input, "/exit")) {
                 // M4: session-end reflection on whatever the window still holds.
+                // Extract memories FIRST (valuable, durable, ms) — reflection
+                // is best-effort behind it; killing the window mid-exit
+                // used to lose the whole session's learnings.
+                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
                 }
-                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
@@ -727,10 +760,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // both reflect first; /clear used to skip it, leaking the
                 // cleared conversation's queries into the next one's
                 // reflection window.
+                // Extract memories FIRST (valuable, durable, ms) — reflection
+                // is best-effort behind it; killing the window mid-exit
+                // used to lose the whole session's learnings.
+                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
                 }
-                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
                 // Drop the stale memory-injection block from the surviving
@@ -1118,7 +1154,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .tool_use => {},
                     .tool_result => |tr| {
                         const label = if (tr.is_error) "error" else "result";
-                        try std.Io.Writer.print(w, "  [tool {s}: {s}]\n", .{ label, tr.content });
+                        try std.Io.Writer.print(w, "  [tool {s}: ", .{label});
+                        var at_ls = false;
+                        try writeMarginLines(w, tr.content, "  ", &at_ls);
+                        try std.Io.Writer.writeAll(w, "]\n");
                     },
                     else => {},
                 }
@@ -1392,6 +1431,142 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
 /// Ownership: dupes every string it keeps onto the session allocator before the
 /// window slices (cleared right after) are reused; the reflection insight is
 /// owned by the memory system after store. No borrows outlive this call.
+/// Write text with a left margin: `indent` before every line. `at_line_start`
+/// carries the line position ACROSS calls (streaming deltas split lines
+/// mid-chunk) — display only, the stored text stays raw.
+fn writeMarginLines(w: *std.Io.Writer, s: []const u8, indent: []const u8, at_line_start: *bool) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (at_line_start.*) {
+            try w.writeAll(indent);
+            at_line_start.* = false;
+        }
+        const nl = std.mem.indexOfScalar(u8, s[i..], '\n') orelse {
+            try w.writeAll(s[i..]);
+            return;
+        };
+        try w.writeAll(s[i .. i + nl + 1]);
+        at_line_start.* = true;
+        i += nl + 1;
+    }
+}
+
+/// Drop the reflection window (shared by the actionable and clean paths).
+fn resetReflectionWindow(
+    window_queries: *std.ArrayList([]u8),
+    window_tools: *u32,
+    window_errors: *u32,
+    alloc: std.mem.Allocator,
+) void {
+    for (window_queries.items) |q| alloc.free(q);
+    window_queries.clearRetainingCapacity();
+    window_tools.* = 0;
+    window_errors.* = 0;
+}
+
+/// Reflection LLM call under a hard deadline: a hung gateway must not
+/// stall the exit (or the prompt). Safety contract for the abandon path:
+///   · Shared lives on the HEAP — a detached worker keeps writing to it
+///     after this frame returns (a stack Shared was a dangling-frame write).
+///   · queries are duped up front — the caller's window list can be freed
+///     while a slow worker is still copying them.
+///   · on timeout the worker, the Shared block and the dupes are all
+///     abandoned (leak with the process) — never freed under a live worker.
+fn reflectLlmWithTimeout(
+    provider: llm.Provider,
+    queries: []const []const u8,
+    alloc: std.mem.Allocator,
+    deadline_ms: i64,
+) ?[]u8 {
+    const Shared = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        result: ?[]u8 = null,
+    };
+    const shared = alloc.create(Shared) catch return null;
+    shared.* = .{};
+
+    // Own copies of the query strings (see contract above).
+    const qs = alloc.alloc([]const u8, queries.len) catch {
+        alloc.destroy(shared);
+        return null;
+    };
+    var filled: usize = 0;
+    for (queries) |q| {
+        qs[filled] = alloc.dupe(u8, q) catch {
+            for (qs[0..filled]) |d| alloc.free(d);
+            alloc.free(qs);
+            alloc.destroy(shared);
+            return null;
+        };
+        filled += 1;
+    }
+
+    const Worker = struct {
+        fn run(p: llm.Provider, q_list: []const []const u8, a: std.mem.Allocator, sh: *Shared) void {
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            const pw = &aw.writer;
+            pw.writeAll("Recent queries in this session:\n") catch {
+                sh.done.store(true, .release);
+                return;
+            };
+            for (q_list) |q| {
+                pw.print("- {s}\n", .{q}) catch break;
+            }
+            var prompt_list = aw.toArrayList();
+            defer prompt_list.deinit(a);
+
+            const sys_blocks = a.alloc(llm.ContentBlock, 1) catch null;
+            if (sys_blocks) |sb| {
+                sb[0] = .{ .text = "你是反思引擎。用一句中文总结这些交互的改进点，不超过40字，只输出总结本身。" };
+                const user_blocks = a.alloc(llm.ContentBlock, 1) catch null;
+                if (user_blocks) |ub| {
+                    ub[0] = .{ .text = prompt_list.items };
+                    const msgs = [_]llm.Message{
+                        .{ .role = .system, .content = sb, .timestamp = util_time.nowMillis() },
+                        .{ .role = .user, .content = ub, .timestamp = util_time.nowMillis() },
+                    };
+                    if (p.complete(&msgs, .{ .max_tokens = 100, .temperature = 0.3 })) |resp| {
+                        var r = resp;
+                        defer r.free(a);
+                        if (r.content.len > 0 and r.content[0] == .text) {
+                            sh.result = a.dupe(u8, r.content[0].text) catch null;
+                        }
+                    } else |_| {}
+                    a.free(ub);
+                }
+                a.free(sb);
+            }
+            sh.done.store(true, .release);
+        }
+    }.run;
+
+    const t = std.Thread.spawn(.{}, Worker, .{ provider, qs, alloc, shared }) catch {
+        Worker(provider, qs, alloc, shared); // spawn failed: inline fallback
+        const res = shared.result;
+        for (qs) |d| alloc.free(d);
+        alloc.free(qs);
+        alloc.destroy(shared);
+        return res;
+    };
+    const t0 = util_time.nowMillis();
+    while (util_time.nowMillis() - t0 < deadline_ms) {
+        if (shared.done.load(.acquire)) {
+            t.join();
+            const res = shared.result;
+            for (qs) |d| alloc.free(d);
+            alloc.free(qs);
+            alloc.destroy(shared);
+            return res;
+        }
+        var poll_req: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&poll_req, null);
+    }
+    t.detach();
+    logger.warning("reflection LLM exceeded {d}ms — heuristic fallback", .{deadline_ms});
+    return null; // worker + shared + dupes leak with the process (by design)
+}
+
 fn runReflection(
     reflector: *reflection_mod.ReflectionEngine,
     mem: *memory_mod.MemorySystem,
@@ -1405,45 +1580,20 @@ fn runReflection(
     const reflect_t0 = util_time.nowMillis();
     const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
 
-    // LLM augmentation: when a provider is reachable, ask it to summarize
-    // the query window into one improvement insight; heuristics stay as
-    // the fallback (and quality score source). Only for windows with real
-    // signal (>= 3 queries) — trivial windows used to pay a full blocking
-    // LLM round trip for nothing, stalling the prompt for seconds.
+    // Gate: only ACTIONABLE windows pay the LLM round trip (and the print
+    // and the stored row). A clean session is routine — it used to be
+    // billed 1-3 s at exit plus a junk "良好" memory entry every session.
+    if (!reflection.actionable) {
+        resetReflectionWindow(window_queries, window_tools, window_errors, alloc);
+        return;
+    }
+
+    // LLM augmentation for windows with real signal: sharper insight than
+    // the heuristic template, capped at 3 s so a hung gateway cannot
+    // stall the exit or the prompt.
     var llm_insights: ?[]u8 = null;
     if (provider != null and window_queries.items.len >= 3) {
-        const p = provider.?;
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        defer aw.deinit();
-        const pw = &aw.writer;
-        pw.writeAll("Recent queries in this session:\n") catch {};
-        for (window_queries.items) |q| {
-            pw.print("- {s}\n", .{q}) catch {};
-        }
-        var prompt_list = aw.toArrayList();
-        defer prompt_list.deinit(alloc);
-
-        const sys_blocks = alloc.alloc(llm.ContentBlock, 1) catch null;
-        if (sys_blocks) |sb| {
-            sb[0] = .{ .text = "你是反思引擎。用一句中文总结这些交互的改进点，不超过40字，只输出总结本身。" };
-            const user_blocks = alloc.alloc(llm.ContentBlock, 1) catch null;
-            if (user_blocks) |ub| {
-                ub[0] = .{ .text = prompt_list.items };
-                const msgs = [_]llm.Message{
-                    .{ .role = .system, .content = sb, .timestamp = util_time.nowMillis() },
-                    .{ .role = .user, .content = ub, .timestamp = util_time.nowMillis() },
-                };
-                if (p.complete(&msgs, .{ .max_tokens = 100, .temperature = 0.3 })) |resp| {
-                    var r = resp;
-                    defer r.free(alloc);
-                    if (r.content.len > 0 and r.content[0] == .text) {
-                        llm_insights = alloc.dupe(u8, r.content[0].text) catch null;
-                    }
-                } else |_| {}
-                alloc.free(ub);
-            }
-            alloc.free(sb);
-        }
+        llm_insights = reflectLlmWithTimeout(provider.?, window_queries.items, alloc, 3000);
     }
     const insights: []const u8 = llm_insights orelse reflection.insights;
     defer if (llm_insights) |li| alloc.free(li);
@@ -1464,11 +1614,7 @@ fn runReflection(
     logger.info("reflection: quality={d:.2} insights stored (llm={})", .{ reflection.quality_score, llm_insights != null });
     w.print("  [Reflection {d}ms] {s}\n", .{ util_time.nowMillis() - reflect_t0, insights }) catch {};
 
-    // Reset the window.
-    for (window_queries.items) |q| alloc.free(q);
-    window_queries.clearRetainingCapacity();
-    window_tools.* = 0;
-    window_errors.* = 0;
+    resetReflectionWindow(window_queries, window_tools, window_errors, alloc);
 }
 
 /// M4: /memory — show what was injected this session and what is stored.
@@ -1832,6 +1978,10 @@ const StreamAgg = struct {
     /// for seconds, reading like a hang.
     thinking_shown: bool = false,
     thinking_newline_needed: bool = false,
+    /// Response left margin: every displayed response line opens with one
+    /// space (user preference); the flag survives across delta chunks so a
+    /// line broken between chunks still gets its margin.
+    at_line_start: bool = true,
     /// Esc-interrupt: when set, streamCb polls stdin (throttled) so Esc
     /// cancels generation and recalls the input for editing.
     esc_probe_r: ?*std.Io.Reader = null,
@@ -1922,8 +2072,9 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
                 self.thinking_newline_needed = false;
                 try std.Io.Writer.writeAll(self.w, "\n");
             }
-            // Live print: this is the whole point of streaming.
-            try std.Io.Writer.writeAll(self.w, d);
+            // Live print with the one-space response margin (display only —
+            // self.text keeps the raw text for history).
+            try writeMarginLines(self.w, d, " ", &self.at_line_start);
             std.Io.File.Writer.flush(self.file_writer) catch {};
             try self.text.appendSlice(self.alloc, d);
         },
@@ -2258,10 +2409,12 @@ fn finishToolCall(
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    try std.Io.Writer.print(w, "  [{s}: {s}]\n", .{
-        p.call.tool_name,
-        if (raw.len > 200) raw[0..200] else raw,
-    });
+    // Preview with a 2-space left margin on continuation lines (raw output
+    // often embeds newlines; those lines used to slam into column 0).
+    try std.Io.Writer.print(w, "  [{s}: ", .{p.call.tool_name});
+    var at_ls = false;
+    try writeMarginLines(w, if (raw.len > 200) raw[0..200] else raw, "  ", &at_ls);
+    try std.Io.Writer.writeAll(w, "]\n");
 
     const content_for_history: []const u8 = if (truncated)
         try alloc.dupe(u8, raw[0..max_result])
@@ -3658,4 +3811,63 @@ test "toolArgSummary picks the informative field and caps length" {
         "{\"command\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", .{});
     const out = toolArgSummary(a, "Bash", longv);
     try std.testing.expect(std.mem.endsWith(u8, out, "…)"));
+}
+
+test "reflectLlmWithTimeout abandons a hung gateway" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn complete(_: *anyopaque, _: []const llm.provider.Message, _: llm.provider.CompleteOptions) anyerror!llm.provider.CompleteResponse {
+            var req: std.c.timespec = .{ .sec = 10, .nsec = 0 }; // "hang"
+            _ = std.c.nanosleep(&req, null);
+            return error.Hung;
+        }
+        fn stream(_: *anyopaque, _: []const llm.provider.Message, _: llm.provider.CompleteOptions, _: ?*anyopaque, _: *const llm.provider.StreamCallback) anyerror!void {}
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn noop(_: *anyopaque) void {}
+    };
+    const vt = llm.provider.ProviderVTable{
+        .complete_fn = Fake.complete,
+        .stream_fn = Fake.stream,
+        .count_tokens_fn = null,
+        .supports_tool_use_fn = Fake.yes,
+        .supports_streaming_fn = Fake.yes,
+        .deinit_fn = Fake.noop,
+    };
+    const fake = llm.Provider{ .ptr = @ptrFromInt(16), .vtable = &vt };
+    const queries = [_][]const u8{"hung-gateway-probe"};
+    const t0 = util_time.nowMillis();
+    // page_allocator: the detached hung worker's prompt allocations are
+    // intentionally abandoned — the leak-checking allocator would flag them.
+    _ = alloc;
+    const res = reflectLlmWithTimeout(fake, &queries, std.heap.page_allocator, 300);
+    const elapsed = util_time.nowMillis() - t0;
+    try std.testing.expect(res == null);
+    // Returned at the 300 ms deadline (± scheduling slack), not after 60 s.
+    try std.testing.expect(elapsed < 2500);
+}
+
+test "writeMarginLines keeps the margin across chunk splits" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    // Response-style: first line indented too (at_line_start starts true).
+    var ls = true;
+    try writeMarginLines(w, "hello\nwor", " ", &ls);
+    try writeMarginLines(w, "ld\nlast", " ", &ls);
+    try std.testing.expectEqualStrings(" hello\n world\n last", aw.written());
+
+    // Preview-style: first line already positioned, only continuations.
+    aw.writer.end = 0;
+    var ls2 = false;
+    try writeMarginLines(w, "file_a\nfile_b\n", "  ", &ls2);
+    try std.testing.expectEqualStrings("file_a\n  file_b\n", aw.written());
+
+    // Trailing newline does not leave a dangling indent.
+    aw.writer.end = 0;
+    var ls3 = false;
+    try writeMarginLines(w, "x\n", "  ", &ls3);
+    try std.testing.expectEqualStrings("x\n", aw.written());
 }
