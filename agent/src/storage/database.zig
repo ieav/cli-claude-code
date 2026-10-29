@@ -174,21 +174,38 @@ pub const Database = struct {
 
         // Concurrent windows, part 2: enforce graph uniqueness at the SCHEMA
         // level. SELECT-then-INSERT dedup cannot close a cross-process race
-        // (both windows miss, both insert). Order is FK-safe: edges touching
-        // duplicate nodes go first, then the duplicate nodes themselves,
-        // then duplicate edges, then the unique indexes.
+        // (both windows miss, both insert). The block runs in ONE immediate
+        // transaction — a mixed-version window (old binary still open) could
+        // write a dup-referencing edge between the remap and the delete,
+        // FK-failing the whole migration and silently disabling memory for
+        // the session. busy_timeout makes concurrent writers queue instead
+        // of interleaving.
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        // Re-point edges hanging on duplicate nodes at the kept node FIRST —
+        // deleting them outright lost relations a losing race-window had
+        // learned. Remap both endpoints; triple dedup below absorbs the
+        // duplicates this creates (and self-loops from dup↔dup edges are
+        // legit knowledge).
         try self.exec(
-            \\DELETE FROM knowledge_edges
-            \\ WHERE from_id IN (SELECT id FROM knowledge_nodes
-            \\                    WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity))
-            \\    OR to_id   IN (SELECT id FROM knowledge_nodes
-            \\                    WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity));
+            \\UPDATE knowledge_edges
+            \\   SET from_id = (SELECT m.keep_id FROM (SELECT entity, MIN(id) AS keep_id FROM knowledge_nodes GROUP BY entity) m
+            \\                   WHERE m.entity = (SELECT entity FROM knowledge_nodes n WHERE n.id = knowledge_edges.from_id))
+            \\ WHERE from_id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity);
         );
+        try self.exec(
+            \\UPDATE knowledge_edges
+            \\   SET to_id = (SELECT m.keep_id FROM (SELECT entity, MIN(id) AS keep_id FROM knowledge_nodes GROUP BY entity) m
+            \\                 WHERE m.entity = (SELECT entity FROM knowledge_nodes n WHERE n.id = knowledge_edges.to_id))
+            \\ WHERE to_id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity);
+        );
+        // No edge references a duplicate anymore — drop them FK-safely.
         try self.exec("DELETE FROM knowledge_nodes WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity);");
         try self.exec("DELETE FROM knowledge_edges WHERE from_id NOT IN (SELECT id FROM knowledge_nodes) OR to_id NOT IN (SELECT id FROM knowledge_nodes);");
         try self.exec("DELETE FROM knowledge_edges WHERE id NOT IN (SELECT MIN(id) FROM knowledge_edges GROUP BY from_id, to_id, relation);");
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_knodes_entity ON knowledge_nodes(entity);");
         try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kedges_triple ON knowledge_edges(from_id, to_id, relation);");
+        try self.exec("COMMIT;");
     }
 
     /// Get the underlying sqlite3 pointer for advanced operations.
@@ -302,4 +319,42 @@ test "Database init and migration" {
 
     try db.runMigrations();
     try std.testing.expect(try db.checkIntegrity());
+}
+
+test "runMigrations dedupes graph: remaps edges, keeps relations, enforces unique" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/ziv_mig_{d}.db", .{std.c.getpid()});
+    defer _ = @import("../util/fs_ops.zig").deleteFile(path);
+
+    var db = try Database.init(alloc, path);
+    defer db.deinit();
+    // Create the schema once, then rebuild a messy state by hand: duplicate
+    // entities and every edge shape, FK-tolerant in that endpoints exist.
+    try db.runMigrations();
+    // DROP indexes BEFORE clearing rows — sqlite refuses nothing here, but
+    // re-inserting dup entities requires the unique index gone first.
+    try db.exec("DROP INDEX IF EXISTS idx_knodes_entity;");
+    try db.exec("DROP INDEX IF EXISTS idx_kedges_triple;");
+    try db.exec("DELETE FROM knowledge_edges;");
+    try db.exec("DELETE FROM knowledge_nodes;");
+    try db.exec("INSERT INTO knowledge_nodes (id, entity, entity_type, created_at, updated_at) VALUES (1,'X','concept',0,0),(2,'X','concept',0,0),(3,'Y','concept',0,0),(4,'X','concept',0,0);");
+    // dup→kept, kept→dup, dup→dup, dup self-loop, and a duplicate triple.
+    try db.exec("INSERT INTO knowledge_edges (from_id,to_id,relation,weight) VALUES (2,3,'co',1),(3,2,'co',1),(2,4,'co',1),(2,2,'self',1),(1,3,'co',1),(1,3,'co',1);");
+
+    try db.runMigrations();
+
+    var stmt = try Statement.prepare(alloc, &db, "SELECT COUNT(*), COUNT(DISTINCT entity) FROM knowledge_nodes;");
+    defer stmt.finalize();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 2), stmt.columnInt64(0));
+    try std.testing.expectEqual(@as(i64, 2), stmt.columnInt64(1));
+
+    // X–Y relations survive the merge (remapped, not dropped), triples unique.
+    var e = try Statement.prepare(alloc, &db, "SELECT COUNT(*) FROM knowledge_edges;");
+    defer e.finalize();
+    _ = try e.step();
+    const edges = e.columnInt64(0);
+    try std.testing.expect(edges >= 2); // X↔Y co + X self kept
+    try std.testing.expect(edges <= 4); // dedup absorbed the rest
 }
