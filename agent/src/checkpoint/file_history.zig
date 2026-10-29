@@ -130,11 +130,15 @@ pub const FileHistoryState = struct {
             // do we replace the old entry, so a failed write leaves the
             // snapshot with its previous valid backup instead of silently
             // dropping the file from rollback coverage.
+            // The pid in the name keeps concurrent ziv windows (which each
+            // start their sequence at 1) from overwriting each other's
+            // backups — a /rewind then restored the OTHER window's snapshot.
             self.sequence += 1;
             const basename_start = std.mem.lastIndexOfScalar(u8, file_path, '/') orelse 0;
             const basename = if (basename_start > 0) file_path[basename_start + 1 ..] else file_path;
-            const backup_path = self.allocator.print("{s}/{d}_{s}", .{
+            const backup_path = self.allocator.print("{s}/{d}_{d}_{s}", .{
                 self.checkpoint_dir,
+                std.c.getpid(),
                 self.sequence,
                 basename,
             }) catch return;

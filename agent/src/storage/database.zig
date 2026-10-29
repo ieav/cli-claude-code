@@ -31,6 +31,12 @@ pub const Database = struct {
         // Enable WAL mode for better concurrent reads
         _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL;", null, null, null);
         _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON;", null, null, null);
+        // Concurrent windows: two ziv processes in one working directory
+        // write this same DB. WAL serializes writers safely, but with the
+        // default busy_timeout=0 the loser got an immediate "database is
+        // locked" — measured: a concurrent writer dropped 100% of its rows.
+        // 2 s of patient retry makes simultaneous exits/clears coexist.
+        _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=2000;", null, null, null);
 
         return .{
             .allocator = allocator,
@@ -165,6 +171,24 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS idx_nodes_entity ON knowledge_nodes(entity);");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_edges_from ON knowledge_edges(from_id);");
         try self.exec("CREATE INDEX IF NOT EXISTS idx_edges_to ON knowledge_edges(to_id);");
+
+        // Concurrent windows, part 2: enforce graph uniqueness at the SCHEMA
+        // level. SELECT-then-INSERT dedup cannot close a cross-process race
+        // (both windows miss, both insert). Order is FK-safe: edges touching
+        // duplicate nodes go first, then the duplicate nodes themselves,
+        // then duplicate edges, then the unique indexes.
+        try self.exec(
+            \\DELETE FROM knowledge_edges
+            \\ WHERE from_id IN (SELECT id FROM knowledge_nodes
+            \\                    WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity))
+            \\    OR to_id   IN (SELECT id FROM knowledge_nodes
+            \\                    WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity));
+        );
+        try self.exec("DELETE FROM knowledge_nodes WHERE id NOT IN (SELECT MIN(id) FROM knowledge_nodes GROUP BY entity);");
+        try self.exec("DELETE FROM knowledge_edges WHERE from_id NOT IN (SELECT id FROM knowledge_nodes) OR to_id NOT IN (SELECT id FROM knowledge_nodes);");
+        try self.exec("DELETE FROM knowledge_edges WHERE id NOT IN (SELECT MIN(id) FROM knowledge_edges GROUP BY from_id, to_id, relation);");
+        try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_knodes_entity ON knowledge_nodes(entity);");
+        try self.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kedges_triple ON knowledge_edges(from_id, to_id, relation);");
     }
 
     /// Get the underlying sqlite3 pointer for advanced operations.

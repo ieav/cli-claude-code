@@ -61,7 +61,10 @@ pub const KnowledgeGraph = struct {
         var stmt = try database.Statement.prepare(
             self.allocator,
             self.db,
-            "INSERT INTO knowledge_nodes (entity, entity_type, properties, source, created_at, updated_at) " ++
+            // OR IGNORE closes the cross-process race the SELECT above
+            // cannot (two windows both miss, both insert): the unique
+            // idx_knodes_entity swallows the loser's row.
+            "INSERT OR IGNORE INTO knowledge_nodes (entity, entity_type, properties, source, created_at, updated_at) " ++
                 "VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
         );
         defer stmt.finalize();
@@ -71,7 +74,17 @@ pub const KnowledgeGraph = struct {
         try stmt.bindInt64(4, now);
         try stmt.bindInt64(5, now);
         if (try stmt.step()) return error.UnexpectedRow;
-        return self.db.lastInsertRowId();
+        // Resolve the id by entity — on a race-lost INSERT OR IGNORE,
+        // lastInsertRowId is stale and would hand out the WRONG node.
+        var find = try database.Statement.prepare(
+            self.allocator,
+            self.db,
+            "SELECT id FROM knowledge_nodes WHERE entity = ?1 LIMIT 1",
+        );
+        defer find.finalize();
+        try find.bindText(1, entity);
+        if (try find.step()) return find.columnInt64(0);
+        return error.NodeInsertFailed;
     }
 
     pub fn addEdge(self: *Self, from_id: i64, to_id: i64, relation: []const u8, weight: f32) !void {
@@ -93,7 +106,9 @@ pub const KnowledgeGraph = struct {
         var stmt = try database.Statement.prepare(
             self.allocator,
             self.db,
-            "INSERT INTO knowledge_edges (from_id, to_id, relation, weight) VALUES (?1, ?2, ?3, ?4)",
+            // OR IGNORE: the unique idx_kedges_triple arbitrates the
+            // cross-process race the SELECT cannot.
+            "INSERT OR IGNORE INTO knowledge_edges (from_id, to_id, relation, weight) VALUES (?1, ?2, ?3, ?4)",
         );
         defer stmt.finalize();
         try stmt.bindInt64(1, from_id);
