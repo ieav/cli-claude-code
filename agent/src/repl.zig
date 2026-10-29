@@ -880,7 +880,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // sequences; this tells the TERMINAL to actually send one.
                 const term = env.get("TERM_PROGRAM") orelse "";
                 try std.Io.Writer.writeAll(w,
-                    \\  Shift+Enter 换行配置指引（ziv 已支持以下全部信号；另有通用回退）
+                    \\  Shift+Enter 换行配置指引
+                    \\
+                    \\  ─ kitty 键盘协议终端（开箱即用）────────────────
+                    \\    kitty / WezTerm / foot / ghostty / Alacritty ≥0.13 /
+                    \\    iTerm2 ≥3.5 / VS Code（较新 xterm.js）：
+                    \\    ziv 启动时已自动启用协议，Shift+Enter 直接换行。
                     \\
                     \\  ─ 通用（所有终端立即可用）────────────────────────
                     \\    · 行尾反斜杠 `\` + Enter   续行
@@ -918,9 +923,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.Writer.writeAll(w,
                         \\
                         \\  ─ 其他终端（含 Apple Terminal）─────────────────
-                        \\    Apple Terminal 不支持单键改映射，推荐用 `\`+Enter 或 Ctrl+J。
-                        \\    kitty/foot 等支持 kitty keyboard 协议的终端：
-                        \\      ziv 已直接识别其 Shift+Enter（CSI 13;2u），无需配置。
+                        \\    Apple Terminal 不支持 kitty 协议，也不支持单键改映射，
+                        \\    推荐用 `\`+Enter 或 Ctrl+J。
                         \\
                     );
                 }
