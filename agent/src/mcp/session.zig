@@ -9,6 +9,8 @@ const jsonrpc = @import("jsonrpc.zig");
 const stdio = @import("stdio.zig");
 const http_mod = @import("http.zig");
 const mod = @import("mod.zig");
+const message_mod = @import("../llm/message.zig");
+const version_mod = @import("../util/version.zig");
 const registry = @import("../tools/registry.zig");
 const runtime_registry = @import("../tools/runtime_registry.zig");
 
@@ -85,58 +87,39 @@ pub const McpSession = struct {
         var handshake_done = std.atomic.Value(bool).init(false);
         const wd_thread = std.Thread.spawn(.{}, handshakeWatchdog, .{ t, &handshake_done, timeout_ms }) catch null;
         defer if (wd_thread) |th| th.join(); // polls are short — join is fast
-        defer handshake_done.store(true, .release);
+        // Registration order matters: defers run in reverse order, so `done`
+        // is registered AFTER the errdefer close — it stores before close
+        // can free the transport. A watchdog firing in between would call
+        // killPid() on freed memory otherwise.
         errdefer t.close(io);
+        defer handshake_done.store(true, .release);
 
-        const init_params = try std.fmt.allocPrint(self.allocator, "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}", .{mod.protocol_version});
+        const init_params = try std.fmt.allocPrint(self.allocator, "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"{s}\"}}}}", .{ mod.protocol_version, version_mod.version });
         defer self.allocator.free(init_params);
-        _ = try t.sendRequest(io, "initialize", init_params);
+        const init_id = try t.sendRequest(io, "initialize", init_params);
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const init_reply = (try t.readMessage(io, arena.allocator())) orelse return error.HandshakeFailed;
+        const init_reply = (try t.readReply(io, arena.allocator(), init_id)) orelse return error.HandshakeFailed;
         if (init_reply.err != null) return error.HandshakeFailed;
         const a = self.allocator;
         if (init_reply.result) |res| {
-            if (res.object.get("serverInfo")) |si| {
-                if (si.object.get("name")) |n| {
-                    if (n == .string) self.server_name = try a.dupe(u8, n.string);
-                }
-                if (si.object.get("version")) |v| {
-                    if (v == .string) self.server_version = try a.dupe(u8, v.string);
+            if (res == .object) {
+                if (res.object.get("serverInfo")) |si| {
+                    if (si == .object) {
+                        if (si.object.get("name")) |n| {
+                            if (n == .string) self.server_name = try a.dupe(u8, n.string);
+                        }
+                        if (si.object.get("version")) |v| {
+                            if (v == .string) self.server_version = try a.dupe(u8, v.string);
+                        }
+                    }
                 }
             }
         }
 
         try t.sendNotification(io, "notifications/initialized", null);
-        _ = try t.sendRequest(io, "tools/list", null);
-        const list_reply = (try t.readMessage(io, arena.allocator())) orelse return error.ToolsListFailed;
-        if (list_reply.err != null) return error.ToolsListFailed;
-        const tools = list_reply.result.?.object.get("tools") orelse return error.ToolsListFailed;
-
-        // Cache tool metadata (arena dies — dupe into the session).
-        for (tools.array.items) |tool| {
-            const name_v = tool.object.get("name") orelse continue;
-            if (name_v != .string) continue;
-            try self.tool_names.append(a, try a.dupe(u8, name_v.string));
-            const desc = if (tool.object.get("description")) |d|
-                (if (d == .string) try a.dupe(u8, d.string) else try a.dupe(u8, ""))
-            else
-                try a.dupe(u8, "");
-            const schema = blk: {
-                const s = tool.object.get("inputSchema") orelse break :blk try a.dupe(u8, "{\"type\":\"object\"}");
-                var buf: std.ArrayList(u8) = .empty;
-                var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
-                try std.json.Stringify.value(s, .{}, &aw.writer);
-                buf = aw.toArrayList();
-                break :blk try buf.toOwnedSlice(a);
-            };
-            try self.tool_defs.append(a, .{
-                .description = desc,
-                .schema = schema,
-                .read_only = toolIsReadOnly(tool),
-            });
-        }
+        try self.listToolsStdio(t, io, arena.allocator());
 
         self.transport = .{ .stdio = t };
         self.connected = true;
@@ -146,20 +129,28 @@ pub const McpSession = struct {
     fn connectHttp(self: *Self, io: std.Io, cfg: ServerConfig) !void {
         _ = io;
         const t = try http_mod.HttpTransport.spawn(self.allocator, self.allocator_io orelse return error.NoIo, cfg.url.?);
+        // Every early return below must release the transport and its
+        // pooled connections — spawn only cleans up its own allocation
+        // failures, so a dead URL leaked one HttpTransport per retry.
+        errdefer t.deinit();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const init_params = try std.fmt.allocPrint(arena.allocator(), "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"0.5.0\"}}}}", .{mod.protocol_version});
+        const init_params = try std.fmt.allocPrint(arena.allocator(), "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"ziv\",\"version\":\"{s}\"}}}}", .{ mod.protocol_version, version_mod.version });
         const init_reply = (try t.roundTrip(arena.allocator(), "initialize", init_params)) orelse return error.HandshakeFailed;
         if (init_reply.err != null) return error.HandshakeFailed;
         const a = self.allocator;
         if (init_reply.result) |res| {
-            if (res.object.get("serverInfo")) |si| {
-                if (si.object.get("name")) |n| {
-                    if (n == .string) self.server_name = try a.dupe(u8, n.string);
-                }
-                if (si.object.get("version")) |v| {
-                    if (v == .string) self.server_version = try a.dupe(u8, v.string);
+            if (res == .object) {
+                if (res.object.get("serverInfo")) |si| {
+                    if (si == .object) {
+                        if (si.object.get("name")) |n| {
+                            if (n == .string) self.server_name = try a.dupe(u8, n.string);
+                        }
+                        if (si.object.get("version")) |v| {
+                            if (v == .string) self.server_version = try a.dupe(u8, v.string);
+                        }
+                    }
                 }
             }
         }
@@ -167,18 +158,57 @@ pub const McpSession = struct {
         // request; playwright rejects tools/list without it.
         _ = try t.roundTrip(arena.allocator(), "notifications/initialized", null);
 
-        const list_reply = (try t.roundTrip(arena.allocator(), "tools/list", null)) orelse return error.ToolsListFailed;
-        if (list_reply.err != null) return error.ToolsListFailed;
-        const tools = list_reply.result.?.object.get("tools") orelse return error.ToolsListFailed;
-        try self.captureTools(a, arena.allocator(), tools);
+        try self.listToolsHttp(t, arena.allocator());
         self.transport = .{ .http = t };
         self.connected = true;
     }
 
+    /// tools/list over stdio, following cursor pagination (a server MAY
+    /// split the tool list; ignoring nextCursor silently hides every tool
+    /// beyond the first page).
+    fn listToolsStdio(self: *Self, t: *stdio.StdioTransport, io: std.Io, arena: std.mem.Allocator) !void {
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < 16) : (pages += 1) {
+            const params: ?[]const u8 = if (cursor) |c| try encodeCursorParam(arena, c) else null;
+            const list_id = try t.sendRequest(io, "tools/list", params);
+            const list_reply = (try t.readReply(io, arena, list_id)) orelse return error.ToolsListFailed;
+            cursor = try self.captureToolsPage(list_reply);
+            if (cursor == null) return;
+        }
+        return error.ToolsListFailed; // unbounded pagination — refuse, don't loop
+    }
+
+    /// tools/list over Streamable HTTP, same pagination contract.
+    fn listToolsHttp(self: *Self, t: *http_mod.HttpTransport, arena: std.mem.Allocator) !void {
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < 16) : (pages += 1) {
+            const params: ?[]const u8 = if (cursor) |c| try encodeCursorParam(arena, c) else null;
+            const list_reply = (try t.roundTrip(arena, "tools/list", params)) orelse return error.ToolsListFailed;
+            cursor = try self.captureToolsPage(list_reply);
+            if (cursor == null) return;
+        }
+        return error.ToolsListFailed; // unbounded pagination — refuse, don't loop
+    }
+
+    /// Validate one tools/list reply, capture its tools, return the next
+    /// page cursor (null = last page). Malformed replies are errors, never
+    /// tagged-union panics — the server controls this JSON.
+    fn captureToolsPage(self: *Self, reply: jsonrpc.Incoming) !?[]const u8 {
+        if (reply.err != null) return error.ToolsListFailed;
+        const result_v = reply.result orelse return error.ToolsListFailed;
+        if (result_v != .object) return error.ToolsListFailed;
+        const tools = result_v.object.get("tools") orelse return error.ToolsListFailed;
+        if (tools != .array) return error.ToolsListFailed;
+        try self.captureTools(self.allocator, tools);
+        return nextCursor(result_v);
+    }
+
     /// Shared tools/list metadata capture (dupe out of the arena).
-    fn captureTools(self: *Self, a: std.mem.Allocator, arena: std.mem.Allocator, tools: std.json.Value) !void {
-        _ = arena;
+    fn captureTools(self: *Self, a: std.mem.Allocator, tools: std.json.Value) !void {
         for (tools.array.items) |tool| {
+            if (tool != .object) continue;
             const name_v = tool.object.get("name") orelse continue;
             if (name_v != .string) continue;
             try self.tool_names.append(a, try a.dupe(u8, name_v.string));
@@ -223,14 +253,28 @@ pub const McpSession = struct {
         const reply = switch (self.transport orelse return error.NotConnected) {
             .http => |t| (try t.roundTrip(arena, "tools/call", params)) orelse return error.CallFailed,
             .stdio => |t| blk: {
-                _ = try t.sendRequest(io, "tools/call", params);
-                break :blk (try t.readMessage(io, arena)) orelse return error.CallFailed;
+                const call_id = t.sendRequest(io, "tools/call", params) catch |err| {
+                    // Pipe gone — server died. Flip connected so /mcp
+                    // connect's stale-session reaper respawns instead of
+                    // answering "already connected" to a dead process.
+                    self.connected = false;
+                    return err;
+                };
+                const maybe_reply = t.readReply(io, arena, call_id) catch |err| {
+                    self.connected = false;
+                    return err;
+                };
+                break :blk maybe_reply orelse {
+                    self.connected = false; // EOF mid-call: server died
+                    return error.CallFailed;
+                };
             },
         };
         if (reply.err) |e| {
             return .{ .text = try std.fmt.allocPrint(arena, "MCP error {d}: {s}", .{ e.code, e.message }), .is_error = true };
         }
         const res = reply.result orelse return error.CallFailed;
+        if (res != .object) return error.CallFailed;
         const is_err = if (res.object.get("isError")) |v| (v == .bool and v.bool) else false;
         var text: std.ArrayList(u8) = .empty;
         if (res.object.get("content")) |content| {
@@ -287,6 +331,24 @@ fn handshakeWatchdog(t: *stdio.StdioTransport, done: *std.atomic.Value(bool), ti
     // Timeout: kill the server; the parked read gets EOF and connect()
     // returns an error instead of freezing the caller forever.
     t.killPid();
+}
+
+/// `{"cursor":"<escaped>"}` params for a paginated tools/list request.
+fn encodeCursorParam(arena: std.mem.Allocator, cursor: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    var aw = std.Io.Writer.Allocating.fromArrayList(arena, &buf);
+    try aw.writer.writeAll("{\"cursor\":");
+    try message_mod.writeJsonString(&aw.writer, cursor);
+    try aw.writer.writeAll("}");
+    buf = aw.toArrayList();
+    return buf.toOwnedSlice(arena);
+}
+
+/// nextCursor of a tools/list result — null when absent/empty/非字符串.
+fn nextCursor(result_v: std.json.Value) ?[]const u8 {
+    const nc = result_v.object.get("nextCursor") orelse return null;
+    if (nc != .string or nc.string.len == 0) return null;
+    return nc.string;
 }
 
 /// Bridge (M6): register every session tool into the runtime registry as
@@ -364,11 +426,53 @@ test "captureTools parses annotations.readOnlyHint" {
         \\ {"name":"plain_tool","description":"d"}]
     , .{});
 
-    try sess.captureTools(alloc, arena.allocator(), tools);
+    try sess.captureTools(alloc, tools);
 
     try std.testing.expectEqual(@as(usize, 3), sess.tool_defs.items.len);
     try std.testing.expect(sess.tool_defs.items[0].read_only);
     try std.testing.expect(!sess.tool_defs.items[1].read_only);
     try std.testing.expect(!sess.tool_defs.items[2].read_only);
     try std.testing.expectEqualStrings("ro_tool", sess.tool_names.items[0]);
+}
+
+test "captureToolsPage validates reply shape and follows cursor" {
+    const alloc = std.testing.allocator;
+    var sess = McpSession{ .allocator = alloc, .name = "t" };
+    defer sess.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    // Well-formed page with a nextCursor.
+    const page1 = jsonrpc.parseIncoming(arena.allocator(),
+        \\{"jsonrpc":"2.0","id":9,"result":{"tools":[{"name":"a","description":"d"}],"nextCursor":"p2"}}
+    ) orelse return error.TestUnexpectedResult;
+    const cur = try sess.captureToolsPage(page1);
+    try std.testing.expectEqualStrings("p2", cur.?);
+    try std.testing.expectEqual(@as(usize, 1), sess.tool_names.items.len);
+
+    // Final page: no cursor.
+    const page2 = jsonrpc.parseIncoming(arena.allocator(),
+        \\{"jsonrpc":"2.0","id":10,"result":{"tools":[{"name":"b","description":"d"}]}}
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((try sess.captureToolsPage(page2)) == null);
+    try std.testing.expectEqual(@as(usize, 2), sess.tool_names.items.len);
+
+    // result:null used to unwrap into a tagged-union panic.
+    const null_result = jsonrpc.parseIncoming(arena.allocator(),
+        \\{"jsonrpc":"2.0","id":11,"result":null}
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectError(error.ToolsListFailed, sess.captureToolsPage(null_result));
+
+    // result present but tools not an array.
+    const bad_tools = jsonrpc.parseIncoming(arena.allocator(),
+        \\{"jsonrpc":"2.0","id":12,"result":{"tools":"nope"}}
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectError(error.ToolsListFailed, sess.captureToolsPage(bad_tools));
+}
+
+test "encodeCursorParam JSON-escapes the cursor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try encodeCursorParam(arena.allocator(), "a\"b");
+    try std.testing.expectEqualStrings("{\"cursor\":\"a\\\"b\"}", p);
 }

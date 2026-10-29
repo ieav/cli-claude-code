@@ -67,10 +67,27 @@ pub const RawGuard = struct {
     active: bool = false,
 
     pub fn enter(self: *RawGuard) void {
+        self.enterImpl(false);
+    }
+
+    /// Raw mode with ISIG off: Ctrl-C/Ctrl-Z arrive as plain bytes the
+    /// caller handles (e.g. double-Ctrl-C graceful exit) instead of the
+    /// line discipline turning them into process-killing signals.
+    pub fn enterNoSig(self: *RawGuard) void {
+        self.enterImpl(true);
+    }
+
+    fn enterImpl(self: *RawGuard, no_sig: bool) void {
         if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
         var raw = self.orig;
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
+        if (no_sig) raw.lflag.ISIG = false;
+        // Deliver Enter verbatim as CR. The line discipline's ICRNL flag
+        // (on in most cooked terminals) rewrites every \r to \n before the
+        // program sees it — the editor needs \r=submit vs \n=newline to be
+        // distinguishable (Ctrl+J / Shift+Enter).
+        raw.iflag.ICRNL = false;
         raw.cc[@backingInt(std.c.V.MIN)] = 1;
         raw.cc[@backingInt(std.c.V.TIME)] = 0;
         if (std.c.tcsetattr(0, .NOW, &raw) == 0) self.active = true;
@@ -153,6 +170,7 @@ pub fn select(
     items: []const []const u8,
     start: usize,
 ) !?usize {
+    if (items.len == 0) return null; // @min(start, len-1) would underflow
     var guard = RawGuard{};
     guard.enter();
     defer guard.restore();
@@ -180,11 +198,18 @@ pub fn select(
                 try std.Io.File.Writer.flush(file_writer);
                 return null;
             },
-            .ignore => {},
+            .ignore => continue, // junk key: no re-render (a piped byte stream used to redraw a frame per byte)
         }
         try render(w, title, items, idx);
         try std.Io.File.Writer.flush(file_writer);
     }
+}
+
+/// Interactive pickers need BOTH ends interactive: stdin piped spins the
+/// selector on the byte stream, stdout piped (ziv | cat) renders frames
+/// into the pipe while the user types blind.
+pub fn isTty() bool {
+    return std.c.isatty(0) == 1 and std.c.isatty(1) == 1;
 }
 
 /// Read one line of text (cooked mode restored first) — for entering values
@@ -192,9 +217,27 @@ pub fn select(
 pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, prompt: []const u8, buf: []u8) ![]const u8 {
     try w.print("{s}", .{prompt});
     try std.Io.File.Writer.flush(file_writer);
-    var bw = std.Io.Writer.fixed(buf);
-    const n = std.Io.Reader.streamDelimiter(r, &bw, '\n') catch return "";
-    r.toss(1);
+    // CR or LF both end a line (RawGuard disables ICRNL, so a terminal
+    // Enter arrives as \r); a CRLF pair counts as one terminator.
+    var n: usize = 0;
+    while (true) {
+        const avail = r.peekGreedy(1) catch break;
+        if (avail.len == 0) break; // EOF
+        const c = avail[0];
+        if (c == '\r' or c == '\n') {
+            r.toss(1);
+            if (c == '\r') {
+                const a2 = r.peekGreedy(1) catch break;
+                if (a2.len > 0 and a2[0] == '\n') r.toss(1);
+            }
+            break;
+        }
+        if (n < buf.len) {
+            buf[n] = c;
+            n += 1;
+        }
+        r.toss(1);
+    }
     return std.mem.trim(u8, buf[0..n], " \t\r\n");
 }
 

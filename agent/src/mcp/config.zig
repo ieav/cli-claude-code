@@ -119,6 +119,12 @@ pub const McpConfig = struct {
             const new_cmd = try self.allocator.dupe(u8, command);
             if (existing.command.len > 0) self.allocator.free(existing.command);
             existing.command = new_cmd;
+            // command and url are exclusive transports; connect prefers
+            // url, so a stale one would silently keep the OLD transport.
+            if (existing.url) |u| {
+                self.allocator.free(u);
+                existing.url = null;
+            }
         } else {
             try self.servers.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, name),
@@ -134,6 +140,12 @@ pub const McpConfig = struct {
             const new_url = try self.allocator.dupe(u8, url);
             if (existing.url) |u| self.allocator.free(u);
             existing.url = new_url;
+            // Mirror upsert: drop a stale stdio command when switching to
+            // HTTP, or the entry carries both and confuses /mcp list.
+            if (existing.command.len > 0) {
+                self.allocator.free(existing.command);
+                existing.command = "";
+            }
         } else {
             try self.servers.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, name),

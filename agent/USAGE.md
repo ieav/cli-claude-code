@@ -3,7 +3,7 @@
 > 一个用 Zig 构建的支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库）的 CLI Agent。
 > 核心算法由三大数学常数驱动：**pi** 圆融信息、**e** 控制增长、**phi** 浓缩知识。
 > v0.4.0 — 自学习闭环：记忆/反思飞轮 + 知识图谱 + /research /diagnose + 工具并行编排（π/e/φ 全落地）。
-> v0.5.0 — 工具自动调用（模型自主决定，无需 /run）· v0.5.1 — MCP 接入（stdio + Streamable HTTP）+ Skill 系统。
+> v0.5.0 — 工具自动调用（模型自主决定，无需 /run）· v0.5.x — MCP 接入（stdio + Streamable HTTP）+ Skill 系统（已随 v0.5.0 二进制提供，/version 显示 0.5.0）。
 
 ---
 
@@ -42,9 +42,9 @@ zig build install
 **日常发布 SOP（三步）**：
 
 ```bash
-# ① 改版本号 —— 两处必须同步改（漏改会被 release.sh 防呆拦截，见下）
-vim src/main.zig        # :110  启动 banner  "Agent v0.5.2"
-vim src/repl.zig        # :713  /version 输出 "Ziv v0.5.2"（release.sh 以此为准）
+# ① 改版本号 —— 只改一处：版本单一事实源
+#    （启动 banner、/version、--version、MCP clientInfo、release.sh 全部读它）
+vim src/util/version.zig   # pub const version = "0.5.2";
 
 # ② 构建 + 安装包打包（唯一入口，产物见下方表格）
 ./release.sh
@@ -54,15 +54,13 @@ vim src/repl.zig        # :713  /version 输出 "Ziv v0.5.2"（release.sh 以此
 scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./install.sh
 ```
 
-也可以显式传版本号 `./release.sh 0.5.2`，但**必须先完成 ① 的两处修改**——传参只用于覆盖，不做 bump。
+也可以显式传版本号 `./release.sh 0.5.2`，但**传参不构成 bump**——必须先改 `src/util/version.zig`，传参与源码不符会被拒绝。
 
-**版本防呆**：脚本启动即校验 `main.zig` 与 `repl.zig` 两处版本串一致、且与传参相符，不一致直接拒绝构建并打印修改位置：
+**版本防呆**：脚本从 `src/util/version.zig` 抽取版本；显式传参必须与源码一致，否则拒绝构建：
 
 ```
-✗ version mismatch: repl.zig='0.5.0' main.zig='0.5.0' arg='0.5.1'
-  bump BOTH version strings, then rerun:
-    src/main.zig:110  startup banner   (Agent vX.Y.Z)
-    src/repl.zig:713  /version output  (Ziv vX.Y.Z — release.sh reads this)
+✗ version mismatch: src/util/version.zig='0.5.0' arg='0.5.1'
+  bump src/util/version.zig, then rerun (or omit the argument)
 ```
 
 脚本流程：
@@ -89,10 +87,14 @@ scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./instal
 
 ### 2.2 运行打包产物
 
-产物为单文件可执行，免安装；配置读取与开发版完全一致（`~/.config/ziv/settings.json` + 启动目录 `.ziv/`）。四种安装方式按需选：
+产物为单文件可执行，免安装；配置读取与开发版完全一致（`~/.config/ziv/settings.json` + 启动目录 `.ziv/`）。
+
+命令行参数：`ziv --version`（或 `-V`）打印版本退出；`ziv --help`（或 `-h`）打印用法退出；无参数进入交互 REPL。版本号唯一来源是 `src/util/version.zig`（启动 banner、REPL `/version`、`--version`、release.sh 同读一处）。
+
+四种安装方式按需选：
 
 ```bash
-cd agent/dist/ziv-v0.5.1
+cd agent/dist/ziv-v0.5.0
 
 # 方式一：离线安装脚本（自动识别平台；默认 /usr/local，无写权限自动回退 ~/.local）
 ./install.sh
@@ -128,18 +130,52 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — Zig 自学习 Agent v0.5.0      ║
-║  pi 圆融 · e 增长 · phi 浓缩         ║
+║  Ziv — v0.5.0 | (Self-learning)     ║
+║  π 圆融 · e 增长 · φ 浓缩            ║
 ╚══════════════════════════════════════╝
+  π   = 3.1415926536
+  e   = 2.7182818285
+  φ   = 0.6180339887
+
+  cwd: ~/projects/xxx        ← 当前工作目录（~ 压缩，数据落在其 .ziv/）
 ```
+
+启动自检（编译进二进制的全量单元测试）**成功时静默**，失败才红字提示。
+
+### 多行输入（Claude Code 风格）
+
+**Enter 提交；以下按键插入换行**：
+
+| 按键 | 说明 |
+|------|------|
+| `\` + Enter | 行尾反斜杠续行（回车前删掉 `\` 并换行）——所有终端可用 |
+| Ctrl+J | 字面换行符 |
+| Option/Alt + Enter | 发送 `ESC+CR` 的终端（macOS Terminal 等） |
+| Shift+Enter | 需终端支持 kitty/modifyOtherKeys 协议（发送 `CSI 13;2u`）；iTerm2/WezTerm/VS Code 终端可配置 |
+| **粘贴多行文本** | 自动走 bracketed paste：整段作为**一条**输入（不会被逐行执行），CRLF 归一为 LF |
+
+多行缓冲的编辑体验：编辑器显示**光标所在行**，行尾灰色 `⏎ i/N` 标记折叠位置与总行数；↑/↓ 在多行缓冲的行间移动（首行↑/末行↓仍走历史）；超过 4 KiB 的粘贴自动扩容（上限 1 MiB）。多行输入一律作为消息发给模型（不会被当作斜杠命令）；多行内容仅本会话内 ↑ 召回，不写入跨会话历史文件。
+
+**行编辑快捷键（Emacs 系）**：`Ctrl+A`/`Ctrl+E` 行首/行尾 · `Ctrl+B`/`Ctrl+F` 左/右一字符 · `Ctrl+W` 删前一个词 · `Ctrl+U` 删到行首 · `Ctrl+K` 删到行尾 · `Ctrl+H` 退格 · `Ctrl+D` 空行=退出、非空=向后删。
+
+**Ctrl+R 历史搜索**：按 `Ctrl+R` 进入反向搜索，输入关键词实时匹配（不区分大小写，覆盖会话内全部历史含多行）；再按 `Ctrl+R` 翻更早匹配；`Enter` 选中并发送；`Esc` 保留当前内容退出搜索；无匹配显示红色 `(failing)`。
+
+**Shift+Enter 一键配置**：`/terminal-setup` 按当前终端（iTerm2 / VS Code / WezTerm / 其他）打印对应配置步骤。
+
+### Esc / Ctrl-C 中断与撤回
+
+- **生成期间按 Esc（或 Ctrl-C）**：立刻中断当前回复流，刚发出的消息**自动回到输入框**（可编辑后回车重发），期间你提前打的字也会接在后面
+- **提交后 5 秒内在空输入框按 Esc**：同样把刚发的消息撤回到输入框（回答已飞快完成时兜底）
+- 中断是干净的：已收到的部分不会写入对话历史
 
 ### 内置命令
 
 | 命令 | 说明 |
 |------|------|
 | `/help`, `/h` | 显示帮助信息 |
-| `/quit`, `/q`, `/exit` | 退出 Ziv |
+| `/quit`, `/q`, `/exit` | 退出 Ziv（**大小写不敏感**）；等价退出：空行 Ctrl-D、提示符下 3 秒内**连按两次 Ctrl-C**——三者都走完整收尾（反思 + 记忆提取 + Goodbye） |
 | `/version` | 显示版本号 (v0.5.0) |
+| `/terminal-setup` | Shift+Enter 换行的终端配置指引 |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
 | `/run <ToolName> <json>` | 直接执行工具 |
@@ -147,10 +183,10 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/model`、`/models` | 显示当前模型和可用模型列表 |
 | `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`） |
 | `/mode` | 切换权限模式 |
-| `/config` | 打开交互式配置菜单（API Key、模型、权限等） |
+| `/config` | 打开交互式配置菜单（API Key、模型、权限等），改动**即时生效**（含权限模式） |
 | **对话管理** | |
 | `/compact` | LLM 摘要压缩（Claude 式）：摘要替换历史，上下文被浓缩而非丢弃 |
-| **输入行编辑** | ↑↓ 翻输入历史时整行**粗体品红**（`\x1b[1;35m`），一眼区分历史回显与草稿；编辑/Ctrl-C 退出浏览即恢复。注意：需先提交过至少一行输入，历史非空时 ↑ 才有内容可翻；**改动生效需退出并重启 ziv 会话**（运行中的旧会话仍执行旧二进制） |
+| **输入行编辑** | **发送的消息以粗体品红定格在对话记录中**（`\x1b[1;35m`，回车提交时重绘着色；超终端宽度的长行回退素色以防错位）；↑↓ 翻输入历史时回溯行同样品红。历史**跨会话持久化**于 `.ziv/input_history`（最近 500 条，重启后 ↑ 照常可翻）；**升级二进制后需退出并重启 ziv 会话**（运行中的旧会话仍执行旧二进制）。**Ctrl-C**：单击清行（防误触，兼顾复制习惯），3 秒内连按两次优雅退出；**Ctrl-Z** 挂起照常可用。注意：LLM/工具执行期间 Ctrl-C 仍是强杀（无清理），等长任务请先用 /quit |
 | `/compact phi` | φ 截断压缩：保留 system + 最近 61.8% 消息，最旧的直接丢弃（无 LLM 调用，自动压缩同此策略） |
 | `/clear` | 清空对话，重新开始（别名: `/reset`, `/new`） |
 | `/context` | 显示当前上下文/token 用量 |
@@ -161,7 +197,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/memory` | 查看本会话注入的记忆条数与最近存储的记忆 |
 | `/research <topic>` | 网络自主研究：φ 生成多组查询并发搜索、精选方案并给出 ★ 推荐 |
 | `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链，定位低于 φ 置信度的环节并给建议 |
-| `/knowledge` | 查看知识图谱统计（节点/边） |
+| `/knowledge` | 查看知识图谱统计（节点总数与最近节点） |
 | **MCP & Skill (v0.5.1)** | |
 | `/skills` | 列出已安装 Skill（详见下文 v0.5.1 节） |
 | `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见下文 v0.5.1 节） |
@@ -191,6 +227,8 @@ default → accept_edits → plan → bypass → default
 4. **Safety paths** — 保护路径检测（.git/、系统文件等）
 5. **Mode behavior** — 当前模式行为
 6. **Allow rules** — 全局允许规则
+
+**bypass 不是免死金牌**：第 2/3/4 步在 bypass 之前执行且不受其豁免——配置了 `ask_rules`、命令/路径涉及保护位置（`.git/`、`/etc/` 等）、或工具自身判定需确认时，bypass 模式下依然会问。这是有意设计（防绕过），不是 bug。
 
 ### 工具执行示例
 
@@ -254,6 +292,9 @@ ziv[edit]> /rewind
 ### 普通对话 (Agent Loop)
 
 输入非 `/` 开头的文本即为对话消息。Ziv 现在是完整的 Agent：
+
+- **系统提示词已注入当前本地日期时间**（`system_prompt.zig` 构建时嵌入，/clear 时刷新）——问"今天几号/几点"直接回答，**不再花一次 Bash 工具往返**；跨午夜长会话记得 /clear 刷新
+- 推理模型（GLM reasoning_content / Claude thinking）思考期间显示暗色 `(thinking…)` 指示，不再是死寂等待
 
 - 每次请求携带**系统提示词 + 完整对话历史**
 - LLM 返回 `tool_use` 时**自动执行工具**并将结果反馈，循环直到完成
@@ -549,7 +590,10 @@ auto 模式下的工具分类：
 | **EventBus** | 事件发布/订阅，pi ring buffer 存储 |
 | **CronScheduler** | 定时任务，pi/phi/e 周期 |
 
-内置定时任务间隔：
+> ⚠️ 组件就绪、REPL 未接线：CronScheduler/EventBus/monitor 目前不随 REPL 启动。
+> 下表为设计间隔；实际生效的只有反思触发——它在每轮查询后内联评估（每 10 轮或 π×10min，会话启动即武装）。
+
+内置定时任务间隔（设计值）：
 - 反思任务：pi x 10 min ≈ 31.4 min
 - 知识更新：phi x 60 min ≈ 37.1 min
 - 记忆衰减：e x 30 min ≈ 81.5 min
@@ -562,7 +606,7 @@ auto 模式下的工具分类：
 |----|------|------|------|
 | **工作记忆** | 内存 LRU | 当前会话上下文 | ✅ 已接线（store 持有防御拷贝） |
 | **情景记忆** | SQLite (`.ziv/memory.db`) | 跨会话记忆 | ✅ 已接线（全链路见下） |
-| **语义记忆** | 知识图谱 | 提取的结构化知识 | ⚠️ API 就绪、暂无写入方 |
+| **语义记忆** | 知识图谱 | 提取的结构化知识 | ✅ 已接线（提取建节点 + co_extracted 边，含去重） |
 
 **情景记忆完整闭环（v0.3.x 已实现）**：
 - **提取**：`/quit`、`/clear` 时启发式扫描 user/assistant 消息（中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…），φ 浓缩只保重要性前 61.8% 后入库
@@ -639,6 +683,8 @@ Ziv 支持 5 层配置源，后者覆盖前者：
   cli_args         → 命令行参数
   session          → 运行时设置
 ```
+
+**热重载（即时生效）**：每个提示符处 ziv 校对三个 settings 文件的内容指纹，检测到外部编辑（vim/脚本改配置）即整包重载并打印 `[settings reloaded | mode: …]`——改配置**无需重启**，下一个提示符即生效。ziv 自身的保存（/config、/model、/mode）会刷新基线，不会误触发。即时应用的字段：`permission_mode`（权限门当轮生效）、`allow/deny/ask_rules`、`api_keys`（key/网关变更会使对应 provider 缓存失效并按新凭据重建）、`max_tokens`。注意 `system_prompt` 已烘焙进会话历史，重载后需 `/clear` 或重启才替换。
 
 ### 6.2 配置文件格式
 

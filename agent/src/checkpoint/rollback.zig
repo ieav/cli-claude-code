@@ -60,13 +60,14 @@ pub const RollbackEngine = struct {
 
         for (self.op_log.records.items) |rec| {
             if (rec.rollback_safe and rec.snapshot_id != null) {
-                // Count files in the snapshot for this operation
+                // Evicted snapshot (past the max-snapshots cap): the point
+                // can no longer restore anything — listing it offered a
+                // "rewind" that truncated the dialogue but restored no files.
+                const snap_idx = self.history.findSnapshotForMessage(rec.snapshot_id.?) orelse continue;
                 var files_affected: usize = 0;
-                if (self.history.findSnapshotForMessage(rec.snapshot_id.?)) |snap_idx| {
-                    var iter = self.history.snapshots.items[snap_idx].backups.iterator();
-                    while (iter.next()) |_| {
-                        files_affected += 1;
-                    }
+                var iter = self.history.snapshots.items[snap_idx].backups.iterator();
+                while (iter.next()) |_| {
+                    files_affected += 1;
                 }
                 try points.append(self.allocator, .{
                     .op_id = rec.op_id,
@@ -180,8 +181,24 @@ pub const RollbackEngine = struct {
                     for (result.deleted) |fp| {
                         try deleted_list.append(self.allocator, fp);
                     }
+                    // Per-file IO failures — static messages: freeResult
+                    // treats error strings as literals.
+                    for (result.failed) |fp| {
+                        try error_list.append(self.allocator, .{
+                            .file_path = fp,
+                            .message = "restore failed (backup missing or target unwritable)",
+                        });
+                    }
                     self.allocator.free(result.restored);
                     self.allocator.free(result.deleted);
+                    self.allocator.free(result.failed);
+                } else {
+                    // Snapshot evicted: say so instead of silently leaving
+                    // this op's files modified while still truncating the log.
+                    try error_list.append(self.allocator, .{
+                        .file_path = "(evicted snapshot)",
+                        .message = "snapshot no longer available — files not restored",
+                    });
                 }
             }
         }

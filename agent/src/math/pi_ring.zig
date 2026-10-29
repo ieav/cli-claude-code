@@ -67,9 +67,11 @@ pub fn PiRingBuffer(comptime T: type, comptime capacity: usize) type {
             pos: usize = 0,
 
             pub fn next(self: *PiIterator) ?T {
+                // Single increment per iteration (the continue expression):
+                // a manual advance here double-stepped past the entry
+                // following every invalid π slot.
                 while (self.pos < self.ring.count) : (self.pos += 1) {
                     const item = self.ring.getByPiIndex(self.pos);
-                    self.pos += 1;
                     if (item) |v| return v;
                 }
                 return null;

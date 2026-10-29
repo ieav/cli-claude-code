@@ -7,8 +7,10 @@ const rules = @import("rules.zig");
 pub fn checkMemory(ctx: *rules.RuntimeContext) rules.CheckResult {
     if (ctx.memory_limit_bytes == 0) return .pass;
     const ratio = @as(f64, @floatFromInt(ctx.memory_used_bytes)) / @as(f64, @floatFromInt(ctx.memory_limit_bytes));
-    const pressure = math.sigmoid(2.0 * (ratio - 0.7));
-    if (pressure > 0.8) {
+    // Direct ratio compare: the old sigmoid(2*(ratio-0.7)) > 0.8 only fired
+    // at ratio ≈ 1.39 — the process would be OOM-dead long before this rule
+    // ever "detected" high memory. The 0.8 threshold below is now literal.
+    if (ratio > 0.8) {
         return .{
             .fail = .{
                 .rule_id = "mem_usage_high",
@@ -152,29 +154,6 @@ pub fn checkConcurrency(ctx: *rules.RuntimeContext) rules.CheckResult {
     return .pass;
 }
 
-// ──── Rule 8: Decision quality (φ threshold on confidence) ────
-pub fn checkDecisionQuality(ctx: *rules.RuntimeContext) rules.CheckResult {
-    // Reuse context_overflow metric as proxy for decision quality
-    // Low confidence decisions tracked via episodic memory
-    if (ctx.max_tokens == 0) return .pass;
-    const util = @as(f64, @floatFromInt(ctx.current_tokens)) / @as(f64, @floatFromInt(ctx.max_tokens));
-    if (util > 0.95) {
-        return .{
-            .fail = .{
-                .rule_id = "decision_quality",
-                .message = "决策空间不足，上下文几乎耗尽",
-                .metric_current = util,
-                .metric_threshold = 0.95,
-                .suggested_fixes = &.{
-                    .{ .description = "触发紧急浓缩", .action_type = .auto_fixable, .auto_fixable = true },
-                    .{ .description = "回溯最近决策", .action_type = .user_input_needed, .auto_fixable = false },
-                },
-            },
-        };
-    }
-    return .pass;
-}
-
 pub const builtin_rules = &[_]rules.RuntimeRule{
     .{ .id = "mem_usage_high", .name = "内存使用", .severity = .warning, .check_fn = checkMemory },
     .{ .id = "api_rate_limit", .name = "API 限速", .severity = .warning, .check_fn = checkApiRate },
@@ -183,11 +162,14 @@ pub const builtin_rules = &[_]rules.RuntimeRule{
     .{ .id = "task_health", .name = "任务健康", .severity = .@"error", .check_fn = checkTaskHealth },
     .{ .id = "network_connectivity", .name = "网络连通", .severity = .@"error", .check_fn = checkNetwork },
     .{ .id = "concurrency_pressure", .name = "并发压力", .severity = .warning, .check_fn = checkConcurrency },
-    .{ .id = "decision_quality", .name = "决策质量", .severity = .@"error", .check_fn = checkDecisionQuality },
+    // Removed decision_quality: it reused context_overflow's metric with a
+    // HIGHER threshold (0.95 > φ), so context_overflow always fired first —
+    // an unreachable duplicate. The designed rule needs a real confidence
+    // data source (registered in TODO.md).
 };
 
 test "builtin_rules: all rules are defined" {
-    try std.testing.expectEqual(@as(usize, 8), builtin_rules.len);
+    try std.testing.expectEqual(@as(usize, 7), builtin_rules.len);
 }
 
 test "checkContextOverflow triggers at φ threshold" {

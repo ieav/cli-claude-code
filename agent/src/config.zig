@@ -1,5 +1,7 @@
 /// Configuration system — hierarchical settings loading from multiple sources.
-/// Priority: session > cli_args > local_settings > project_settings > user_settings
+/// Priority (implemented): local_settings > project_settings > user_settings,
+/// with environment variables filling only unset API keys / base URLs.
+/// (The session/cli_args tiers from the original design were never built.)
 const std = @import("std");
 const system_dirs = @import("util/system_dirs.zig");
 const json_helpers = @import("util/json_helpers.zig");
@@ -97,6 +99,28 @@ pub fn loadSettings(allocator: std.mem.Allocator, io: std.Io) !Settings {
     return settings;
 }
 
+/// Content fingerprint of every settings file that exists (user + project +
+/// local). The REPL compares this between prompts and hot-reloads external
+/// edits — a settings.json change applies on the next prompt instead of
+/// requiring a restart. Content-based (not mtime): `touch` stays a no-op.
+pub fn settingsFingerprint(allocator: std.mem.Allocator, io: std.Io) u64 {
+    var h: u64 = 0x9e3779b97f4a7c15;
+    const user_dir = system_dirs.configDir(allocator) catch return h;
+    defer allocator.free(user_dir);
+    const user_path = std.fs.path.join(allocator, &.{ user_dir, "settings.json" }) catch return h;
+    defer allocator.free(user_path);
+    h = h *% 1000003 +% hashSettingsFile(user_path, allocator, io);
+    h = h *% 1000003 +% hashSettingsFile(".ziv/settings.json", allocator, io);
+    h = h *% 1000003 +% hashSettingsFile(".ziv/settings.local.json", allocator, io);
+    return h;
+}
+
+fn hashSettingsFile(path: []const u8, allocator: std.mem.Allocator, io: std.Io) u64 {
+    const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, allocator, std.Io.Limit.limited(64 * 1024)) catch return 0;
+    defer allocator.free(contents);
+    return std.hash.Wyhash.hash(0, contents);
+}
+
 fn loadFromUserSettings(settings: *Settings, allocator: std.mem.Allocator, io: std.Io) !void {
     const dir = system_dirs.configDir(allocator) catch return;
     defer allocator.free(dir);
@@ -144,7 +168,7 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
 
     // Parse permission mode
     if (json_helpers.getString(value, "permission_mode")) |mode_str| {
-        if (std.mem.eql(u8, mode_str, "default")) settings.permission_mode = .default else if (std.mem.eql(u8, mode_str, "accept_edits")) settings.permission_mode = .accept_edits else if (std.mem.eql(u8, mode_str, "plan")) settings.permission_mode = .plan else if (std.mem.eql(u8, mode_str, "bypass")) settings.permission_mode = .bypass else if (std.mem.eql(u8, mode_str, "auto")) settings.permission_mode = .auto;
+        if (std.mem.eql(u8, mode_str, "default")) settings.permission_mode = .default else if (std.mem.eql(u8, mode_str, "accept_edits")) settings.permission_mode = .accept_edits else if (std.mem.eql(u8, mode_str, "plan")) settings.permission_mode = .plan else if (std.mem.eql(u8, mode_str, "bypass")) settings.permission_mode = .bypass else if (std.mem.eql(u8, mode_str, "dont_ask")) settings.permission_mode = .dont_ask else if (std.mem.eql(u8, mode_str, "auto")) settings.permission_mode = .auto;
     }
 
     if (json_helpers.getString(value, "default_backend")) |b| {

@@ -17,6 +17,10 @@ pub const Database = struct {
         var db: ?*c.sqlite3 = null;
         const path_c = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_c);
+        // Owned copy taken BEFORE open: dupe-after-open leaked the handle
+        // when the copy failed (open/close asymmetry on the error path).
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
 
         const rc = c.sqlite3_open(path_c.ptr, &db);
         if (rc != c.SQLITE_OK) {
@@ -31,7 +35,7 @@ pub const Database = struct {
         return .{
             .allocator = allocator,
             .db = db,
-            .path = try allocator.dupe(u8, path),
+            .path = owned_path,
         };
     }
 

@@ -1,6 +1,7 @@
 /// LLM Provider abstraction — comptime vtable pattern for multi-model support.
 /// Each backend (Claude, OpenAI, Ollama) implements this vtable.
 const std = @import("std");
+const logger = @import("../util/log.zig");
 
 pub const MessageRole = enum {
     system,
@@ -110,6 +111,87 @@ pub const ProviderError = error{
     ServerError,
     Unknown,
 };
+
+// ── HTTP error-response handling (shared by all backends) ──
+
+/// Best-effort read of an HTTP error response body (≤4 KiB). The gateway's
+/// rejection reason ("messages with role 'tool' must follow a 'tool_calls'
+/// message", "maximum context length is …") lives here — a bare status code
+/// is undiagnosable. Returns "" when the body cannot be read. Caller frees.
+pub fn readErrorBody(alloc: std.mem.Allocator, response: anytype) []const u8 {
+    var buf: [4096]u8 = undefined;
+    const reader = response.reader(&buf);
+    return reader.allocRemaining(alloc, .limited(4096)) catch "";
+}
+
+/// Read the gateway's error body, log it on one [ERR] line, and map the
+/// status to a ProviderError. Every backend funnels its non-2xx responses
+/// through here so a 400 always carries its actual reason into the log
+/// instead of a bare `status=400`.
+pub fn failRequest(alloc: std.mem.Allocator, tag: []const u8, response: anytype) ProviderError {
+    const status: u16 = @backingInt(response.head.status);
+    const body = readErrorBody(alloc, response);
+    defer if (body.len > 0) alloc.free(@constCast(body));
+
+    if (body.len == 0) {
+        logger.err("{s} error: status={d} (no error body)", .{ tag, status });
+    } else {
+        // Collapse newlines and cap at 300 chars so the [ERR] log stays a
+        // single greppable line.
+        var flat: [300]u8 = undefined;
+        var n: usize = 0;
+        for (body) |c| {
+            if (n >= flat.len) break;
+            flat[n] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
+            n += 1;
+        }
+        logger.err("{s} error: status={d} body={s}", .{ tag, status, flat[0..n] });
+    }
+
+    if (status == 400 and isContextOverflowBody(body)) return error.ContextOverflow;
+    return switch (status) {
+        401, 403 => error.AuthFailed,
+        429 => error.RateLimit,
+        400, 404, 422 => error.InvalidRequest,
+        else => error.ServerError,
+    };
+}
+
+/// Heuristic: does a 400 body say the input no longer fits the model's
+/// context? Remedy differs from a generic InvalidRequest (compact vs fix
+/// the request), and gateways word it in at least three languages.
+fn isContextOverflowBody(body: []const u8) bool {
+    const markers = [_][]const u8{
+        "context length", "context window", "maximum context", "too long",
+        "too many tokens", "token limit",    "input length",  "最大",
+    };
+    for (markers) |m| {
+        if (containsIgnoreCase(body, m)) return true;
+    }
+    return false;
+}
+
+/// ASCII case-insensitive substring search (std has no such helper in 0.17).
+/// Non-ASCII bytes compare verbatim, so UTF-8 needles work byte-wise.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len and std.ascii.toLower(haystack[i + j]) == std.ascii.toLower(needle[j])) j += 1;
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+test "isContextOverflowBody recognizes gateway overflow wording" {
+    try std.testing.expect(isContextOverflowBody("This model's maximum context length is 8192 tokens"));
+    try std.testing.expect(isContextOverflowBody("{\"error\":{\"message\":\"prompt is too long: 200000 tokens > 128000 maximum\"}}"));
+    try std.testing.expect(isContextOverflowBody("{\"error\":{\"message\":\"输入长度超出模型最大限制\"}}"));
+    // A structural rejection must not be misread as overflow.
+    try std.testing.expect(!isContextOverflowBody("{\"error\":{\"message\":\"Invalid parameter: messages with role 'tool'\"}}"));
+}
 
 pub const ProviderVTable = struct {
     complete_fn: *const fn (*anyopaque, []const Message, CompleteOptions) anyerror!CompleteResponse,

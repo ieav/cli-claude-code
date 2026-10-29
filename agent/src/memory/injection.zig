@@ -25,7 +25,15 @@ pub fn decayScore(updated_at: i64, now: i64) f64 {
 /// null when nothing fits. Entries are consumed in the given order (most
 /// recent first) until the token budget is spent; at least one entry is
 /// always attempted.
-pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.MemoryEntry, budget_tokens: u32) !?[]u8 {
+/// Built memory block: the text for the system prompt plus how many entries
+/// actually fit the budget — the caller displays the count, and it must not
+/// claim entries the budget truncated away.
+pub const MemoryBlock = struct {
+    text: []u8,
+    included: usize,
+};
+
+pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.MemoryEntry, budget_tokens: u32) !?MemoryBlock {
     if (entries.len == 0) return null;
 
     // Rank entries: 0.5 × e-decay freshness + 0.5 × topical similarity to
@@ -89,12 +97,12 @@ pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.Mem
     if (included == 0) return null;
     var list = aw.toArrayList();
     defer list.deinit(allocator);
-    return try allocator.dupe(u8, list.items);
+    return .{ .text = try allocator.dupe(u8, list.items), .included = included };
 }
 
 /// Cap a slice at `max` bytes but never mid-UTF-8-rune: back off to the
 /// nearest leading byte (ASCII and 4-byte scripts like CJK survive intact).
-fn utf8Boundary(text: []const u8, max: usize) usize {
+pub fn utf8Boundary(text: []const u8, max: usize) usize {
     if (text.len <= max) return text.len;
     var cut = max;
     while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
@@ -133,9 +141,10 @@ test "buildMemoryBlock orders by decay freshness" {
         .{ .id = @splat(2), .mem_type = .user, .name = "new", .description = "", .content = "NEW_MARKER memory", .access_count = 0, .created_at = 0, .updated_at = now },
     };
     const block = (try buildMemoryBlock(std.testing.allocator, &entries, 800)).?;
-    defer std.testing.allocator.free(block);
-    const new_pos = std.mem.indexOf(u8, block, "NEW_MARKER").?;
-    const old_pos = std.mem.indexOf(u8, block, "OLD_MARKER").?;
+    defer std.testing.allocator.free(block.text);
+
+    const new_pos = std.mem.indexOf(u8, block.text, "NEW_MARKER").?;
+    const old_pos = std.mem.indexOf(u8, block.text, "OLD_MARKER").?;
     try std.testing.expect(new_pos < old_pos); // fresh first under a tight budget too
 }
 
@@ -161,15 +170,17 @@ test "buildMemoryBlock respects budget and includes keyword" {
 
     // Generous budget: all three lines fit.
     const block = (try buildMemoryBlock(std.testing.allocator, &entries, 800)).?;
-    defer std.testing.allocator.free(block);
-    try std.testing.expect(std.mem.indexOf(u8, block, "ZIG_MEMORY_KEYWORD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, block, "Relevant memories") != null);
+    defer std.testing.allocator.free(block.text);
+
+    try std.testing.expect(std.mem.indexOf(u8, block.text, "ZIG_MEMORY_KEYWORD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block.text, "Relevant memories") != null);
 
     // Starved budget: at most the first line, never an empty block.
     const tight = (try buildMemoryBlock(std.testing.allocator, &entries, 20)).?;
-    defer std.testing.allocator.free(tight);
-    try std.testing.expect(std.mem.indexOf(u8, tight, "ZIG_MEMORY_KEYWORD") != null);
-    const lines = std.mem.count(u8, tight, "\n- [");
+    defer std.testing.allocator.free(tight.text);
+
+    try std.testing.expect(std.mem.indexOf(u8, tight.text, "ZIG_MEMORY_KEYWORD") != null);
+    const lines = std.mem.count(u8, tight.text, "\n- [");
     try std.testing.expect(lines <= 1);
 }
 
@@ -204,6 +215,7 @@ test "end-to-end: store via EpisodicStore, reload, inject" {
     try std.testing.expect(entries.len == 1);
 
     const block = (try buildMemoryBlock(std.testing.allocator, entries, 800)).?;
-    defer std.testing.allocator.free(block);
-    try std.testing.expect(std.mem.indexOf(u8, block, "E2E_MARKER") != null);
+    defer std.testing.allocator.free(block.text);
+
+    try std.testing.expect(std.mem.indexOf(u8, block.text, "E2E_MARKER") != null);
 }

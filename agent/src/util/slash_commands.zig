@@ -11,15 +11,17 @@ pub const commands = [_][]const u8{
     "/run",   "/mode",  "/model", "/models", "/config", "/compact",
     "/clear", "/reset", "/new",   "/context", "/memory", "/research",
     "/knowledge", "/diagnose", "/undo", "/history", "/rewind", "/stats",
-    "/skills",
-    "/version",
+    "/skills", "/mcp",
+    "/version", "/terminal-setup",
 };
 
 /// True when `tok` (a full first token like "/run") is a known command.
 /// Partial words ("/mod") are not commands — they color dim until complete.
 pub fn isKnownCommand(tok: []const u8) bool {
     for (commands) |c| {
-        if (std.mem.eql(u8, tok, c)) return true;
+        // Case-insensitive: /QUIT must highlight like /quit (the REPL also
+        // accepts the exit trio in any case).
+        if (std.ascii.eqlIgnoreCase(tok, c)) return true;
     }
     return false;
 }

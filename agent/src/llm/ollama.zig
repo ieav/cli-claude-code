@@ -84,11 +84,7 @@ pub const OllamaProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            switch (@backingInt(response.head.status)) {
-                400 => return provider.ProviderError.InvalidRequest,
-                404 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "Ollama stream", &response);
         }
 
         // Ollama streaming: each line is a JSON object (line-delimited, not SSE)
@@ -131,7 +127,7 @@ pub const OllamaProvider = struct {
                         line_buf.shrinkRetainingCapacity(0);
                     }
                 } else {
-                    line_buf.append(self.allocator, byte) catch {};
+                    try line_buf.append(self.allocator, byte);
                 }
             }
         }
@@ -211,7 +207,13 @@ pub const OllamaProvider = struct {
             var has_tool_use = false;
             for (msg.content) |block| {
                 switch (block) {
-                    .text => |t| try content_buf.appendSlice(self.allocator, t),
+                    .text => |t| {
+                        // Separator between blocks: without it the system
+                        // prompt, memory block and skill manifest concatenate
+                        // into "...ToolSearch.Relevant memories...".
+                        if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
+                        try content_buf.appendSlice(self.allocator, t);
+                    },
                     .thinking => |t| {
                         if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
                         try content_buf.appendSlice(self.allocator, t);
@@ -310,11 +312,7 @@ pub const OllamaProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            switch (@backingInt(response.head.status)) {
-                400 => return provider.ProviderError.InvalidRequest,
-                404 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "Ollama API", &response);
         }
 
         // 64 KiB I/O buffer instead of a 1 MiB stack array — see openai.zig.
@@ -402,6 +400,13 @@ pub const OllamaProvider = struct {
         defer line_arena.deinit();
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, line_arena.allocator(), line, .{}) catch return .{};
         if (parsed != .object) return .{};
+
+        // In-band error line (model load failure etc.): without this the
+        // line is dropped and the truncated stream completes "normally".
+        if (parsed.object.get("error") != null) {
+            try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
+            return .{ .finished = true };
+        }
 
         if (parsed.object.get("done")) |done| {
             if (done == .bool and done.bool) {

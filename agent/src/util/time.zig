@@ -67,6 +67,51 @@ pub fn sleepMs(ms: u64) void {
     std.time.sleep(ms * std.time.ns_per_ms);
 }
 
+/// Local date/time parts. `weekday` is 0=Sunday .. 6=Saturday.
+pub const DateTime = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    weekday: u8,
+};
+
+const Ctm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: ?[*:0]const u8,
+};
+
+extern "c" fn localtime_r(t: *const i64, tm: *Ctm) ?*Ctm;
+
+/// Local time via C localtime_r — honors the host timezone without parsing
+/// zoneinfo. libc is already linked (SQLite dep).
+pub fn localDateTime(ts_ms: i64) DateTime {
+    const secs: i64 = @divTrunc(ts_ms, 1000);
+    var tm: Ctm = undefined;
+    if (localtime_r(&secs, &tm) == null) {
+        // Epoch (1970-01-01) was a Thursday.
+        return .{ .year = 1970, .month = 1, .day = 1, .hour = 0, .minute = 0, .weekday = 4 };
+    }
+    return .{
+        .year = @intCast(tm.year + 1900),
+        .month = @intCast(tm.mon + 1),
+        .day = @intCast(tm.mday),
+        .hour = @intCast(tm.hour),
+        .minute = @intCast(tm.min),
+        .weekday = @intCast(tm.wday),
+    };
+}
+
 /// Calculate elapsed milliseconds since a start timestamp.
 pub fn elapsedSince(start_ms: i64) i64 {
     return nowMillis() - start_ms;
@@ -77,4 +122,16 @@ test "formatIso" {
     const iso = try formatIso(alloc, 1700000000000);
     defer alloc.free(iso);
     try std.testing.expect(iso.len == 20);
+}
+
+test "localDateTime sanity" {
+    const dt = localDateTime(nowMillis());
+    try std.testing.expect(dt.year >= 2026);
+    try std.testing.expect(dt.month >= 1 and dt.month <= 12);
+    try std.testing.expect(dt.day >= 1 and dt.day <= 31);
+    try std.testing.expect(dt.weekday <= 6);
+    // Fixed instant: 2026-10-28 12:34:56 UTC — local date may shift a day
+    // with timezone, but the parts must be internally consistent.
+    const fixed = localDateTime(1793678096000);
+    try std.testing.expect(fixed.year == 2026 or fixed.year == 2027 or fixed.year == 2025);
 }

@@ -5,7 +5,6 @@ const std = @import("std");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
-const logger = @import("../util/log.zig");
 
 pub const ClaudeConfig = struct {
     api_key: []const u8,
@@ -91,13 +90,7 @@ pub const ClaudeProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            logger.err("Claude stream error: status={d}", .{@backingInt(response.head.status)});
-            switch (@backingInt(response.head.status)) {
-                401 => return provider.ProviderError.AuthFailed,
-                429 => return provider.ProviderError.RateLimit,
-                400 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "Claude stream", &response);
         }
 
         // Stream: read chunks and parse SSE events incrementally
@@ -125,7 +118,7 @@ pub const ClaudeProvider = struct {
             @memcpy(chunk_buf[0..n], avail[0..n]);
             resp_reader.toss(n);
 
-            _ = sse_parser.feed(chunk_buf[0..n]) catch {};
+            _ = try sse_parser.feed(chunk_buf[0..n]);
             const events = sse_parser.drain();
             defer {
                 for (events) |evt| {
@@ -226,6 +219,10 @@ pub const ClaudeProvider = struct {
         var msg_idx: usize = 0;
         for (messages) |msg| {
             if (msg.role == .system) continue;
+            // Skip empty messages — serializing them as "content":""
+            // diverges from the OpenAI/Ollama wire path (which drops them),
+            // and some endpoints reject empty content outright.
+            if (msg.content.len == 0) continue;
             if (msg_idx > 0) try writer.writeAll(",");
             try writer.writeAll("{\"role\":");
             const role_str: []const u8 = switch (msg.role) {
@@ -343,13 +340,7 @@ pub const ClaudeProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            logger.err("Claude API error: status={d} path={s}", .{ @backingInt(response.head.status), path });
-            switch (@backingInt(response.head.status)) {
-                401 => return provider.ProviderError.AuthFailed,
-                429 => return provider.ProviderError.RateLimit,
-                400 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "Claude API", &response);
         }
 
         // 64 KiB I/O buffer instead of a 1 MiB stack array — see openai.zig.
@@ -368,31 +359,41 @@ pub const ClaudeProvider = struct {
         }
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch
             return provider.ProviderError.InvalidRequest;
+        if (parsed != .object) return provider.ProviderError.InvalidRequest;
 
         // Check for Anthropic error format
         if (parsed.object.get("error")) |err_val| {
-            if (err_val.object.get("type")) |err_type| {
-                if (std.mem.eql(u8, err_type.string, "authentication_error"))
-                    return provider.ProviderError.AuthFailed;
-                if (std.mem.eql(u8, err_type.string, "rate_limit_error"))
-                    return provider.ProviderError.RateLimit;
+            if (err_val == .object) {
+                if (err_val.object.get("type")) |err_type| {
+                    if (err_type == .string) {
+                        if (std.mem.eql(u8, err_type.string, "authentication_error"))
+                            return provider.ProviderError.AuthFailed;
+                        if (std.mem.eql(u8, err_type.string, "rate_limit_error"))
+                            return provider.ProviderError.RateLimit;
+                    }
+                }
             }
             return provider.ProviderError.InvalidRequest;
         }
 
         const content_arr = parsed.object.get("content") orelse return provider.ProviderError.InvalidRequest;
+        if (content_arr != .array) return provider.ProviderError.InvalidRequest;
 
         var content_blocks: std.ArrayList(provider.ContentBlock) = .empty;
         for (content_arr.array.items) |block| {
+            if (block != .object) continue;
             const block_type = block.object.get("type") orelse continue;
+            if (block_type != .string) continue;
             if (std.mem.eql(u8, block_type.string, "text")) {
                 const text = block.object.get("text") orelse continue;
-                if (text.string.len > 0) {
+                if (text == .string and text.string.len > 0) {
                     try content_blocks.append(self.allocator, .{ .text = text.string });
                 }
             } else if (std.mem.eql(u8, block_type.string, "tool_use")) {
                 const id = block.object.get("id") orelse continue;
+                if (id != .string) continue;
                 const name = block.object.get("name") orelse continue;
+                if (name != .string) continue;
                 const input = block.object.get("input") orelse continue;
 
                 try content_blocks.append(self.allocator, .{
@@ -404,7 +405,7 @@ pub const ClaudeProvider = struct {
                 });
             } else if (std.mem.eql(u8, block_type.string, "thinking")) {
                 const thinking = block.object.get("thinking") orelse continue;
-                if (thinking.string.len > 0) {
+                if (thinking == .string and thinking.string.len > 0) {
                     try content_blocks.append(self.allocator, .{ .thinking = thinking.string });
                 }
             }
@@ -423,9 +424,16 @@ pub const ClaudeProvider = struct {
         };
 
         const usage_obj = parsed.object.get("usage");
-        const usage: provider.Usage = if (usage_obj) |u| .{
-            .input_tokens = @intCast(u.object.get("input_tokens").?.integer),
-            .output_tokens = @intCast(u.object.get("output_tokens").?.integer),
+        const usage: provider.Usage = if (usage_obj) |u| blk: {
+            if (u != .object) break :blk .{ .input_tokens = 0, .output_tokens = 0 };
+            const it = u.object.get("input_tokens");
+            const ot = u.object.get("output_tokens");
+            if (it == null or it.? != .integer or ot == null or ot.? != .integer)
+                break :blk .{ .input_tokens = 0, .output_tokens = 0 };
+            break :blk .{
+                .input_tokens = @intCast(it.?.integer),
+                .output_tokens = @intCast(ot.?.integer),
+            };
         } else .{ .input_tokens = 0, .output_tokens = 0 };
 
         return .{

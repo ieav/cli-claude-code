@@ -6,15 +6,17 @@
 set -e
 cd "$(dirname "$0")"
 
-REPL_V=$(rg -o 'Ziv v[0-9.]+' src/repl.zig | head -1 | rg -o '[0-9.]+')
-MAIN_V=$(rg -o 'Agent v[0-9.]+' src/main.zig | head -1 | rg -o '[0-9.]+')
-VERSION="${1:-$REPL_V}"
-# 防呆：两处版本串不一致、或显式传参与 banner 不符 → 拒绝构建，避免"目录 vX、程序自报 vY"
-if [ "$REPL_V" != "$MAIN_V" ] || { [ -n "${1:-}" ] && [ "$1" != "$REPL_V" ]; }; then
-  echo "✗ version mismatch: repl.zig='$REPL_V' main.zig='$MAIN_V' arg='${1:-none}'"
-  echo "  bump BOTH version strings, then rerun:"
-  echo "    src/main.zig:110  startup banner   (Agent vX.Y.Z)"
-  echo "    src/repl.zig:713  /version output  (Ziv vX.Y.Z — release.sh reads this)"
+# 版本单一事实源：src/util/version.zig（banner、/version、--version 都引用它）
+VERSION=$(rg -o 'pub const version = "[0-9.]+"' src/util/version.zig | head -1 | rg -o '[0-9.]+')
+if [ -z "${VERSION:-}" ]; then
+  echo "✗ cannot read version from src/util/version.zig"
+  echo "  expected: pub const version = \"X.Y.Z\";"
+  exit 1
+fi
+# 防呆：显式传参必须与源码一致 → 拒绝"目录 vX、程序自报 vY"
+if [ -n "${1:-}" ] && [ "$1" != "$VERSION" ]; then
+  echo "✗ version mismatch: src/util/version.zig='$VERSION' arg='$1'"
+  echo "  bump src/util/version.zig, then rerun (or omit the argument)"
   exit 1
 fi
 OUT="dist/ziv-v$VERSION"
@@ -136,10 +138,15 @@ EOF
 chmod +x "$OUT/install.sh"
 
 # ── checksums (all artifacts in $OUT; dotfiles like .DS_Store excluded by glob)
+# POSIX-portable: the old `for f in *(N)` used a zsh-only glob qualifier and
+# crashed the script at this line when run via sh/bash (everything before it
+# happened to be portable, so only the checksum step died).
 cd "$OUT"
-files=()
-for f in *(N); do [[ "$f" == SHA256SUMS.txt ]] || files+=("$f"); done
-shasum -a 256 "${files[@]}" > SHA256SUMS.txt
+rm -f SHA256SUMS.txt
+for f in *; do
+  [ "$f" = "SHA256SUMS.txt" ] && continue
+  shasum -a 256 "$f"
+done > SHA256SUMS.txt
 cd - >/dev/null
 
 echo "── done:"

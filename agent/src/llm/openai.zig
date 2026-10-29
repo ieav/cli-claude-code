@@ -5,7 +5,6 @@ const std = @import("std");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
-const logger = @import("../util/log.zig");
 
 pub const OpenAIConfig = struct {
     api_key: []const u8,
@@ -91,13 +90,7 @@ pub const OpenAIProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            logger.err("OpenAI stream error: status={d}", .{@backingInt(response.head.status)});
-            switch (@backingInt(response.head.status)) {
-                401 => return provider.ProviderError.AuthFailed,
-                429 => return provider.ProviderError.RateLimit,
-                400 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "OpenAI stream", &response);
         }
 
         // Stream: read chunks and parse SSE events incrementally
@@ -125,7 +118,7 @@ pub const OpenAIProvider = struct {
             @memcpy(chunk_buf[0..n], avail[0..n]);
             resp_reader.toss(n);
 
-            _ = sse_parser.feed(chunk_buf[0..n]) catch {};
+            _ = try sse_parser.feed(chunk_buf[0..n]);
             const events = sse_parser.drain();
             defer {
                 for (events) |evt| {
@@ -222,7 +215,13 @@ pub const OpenAIProvider = struct {
             var has_tool_use = false;
             for (msg.content) |block| {
                 switch (block) {
-                    .text => |t| try content_buf.appendSlice(self.allocator, t),
+                    .text => |t| {
+                        // Separator between blocks: without it the system
+                        // prompt, memory block and skill manifest concatenate
+                        // into "...ToolSearch.Relevant memories...".
+                        if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
+                        try content_buf.appendSlice(self.allocator, t);
+                    },
                     .thinking => |t| {
                         if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
                         try content_buf.appendSlice(self.allocator, t);
@@ -339,13 +338,7 @@ pub const OpenAIProvider = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (response.head.status.class() != .success) {
-            logger.err("OpenAI API error: status={d} path={s}", .{ @backingInt(response.head.status), path });
-            switch (@backingInt(response.head.status)) {
-                401 => return provider.ProviderError.AuthFailed,
-                429 => return provider.ProviderError.RateLimit,
-                400 => return provider.ProviderError.InvalidRequest,
-                else => return provider.ProviderError.ServerError,
-            }
+            return provider.failRequest(self.allocator, "OpenAI API", &response);
         }
 
         // 64 KiB I/O buffer instead of a 1 MiB stack array — complete() is
@@ -366,13 +359,15 @@ pub const OpenAIProvider = struct {
         }
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch
             return provider.ProviderError.InvalidRequest;
+        if (parsed != .object) return provider.ProviderError.InvalidRequest;
 
         const choices = parsed.object.get("choices") orelse return provider.ProviderError.InvalidRequest;
-        if (choices.array.items.len == 0) return provider.ProviderError.InvalidRequest;
+        if (choices != .array or choices.array.items.len == 0) return provider.ProviderError.InvalidRequest;
 
         const choice = choices.array.items[0];
         if (choice != .object) return provider.ProviderError.InvalidRequest;
         const message_obj = choice.object.get("message") orelse return provider.ProviderError.InvalidRequest;
+        if (message_obj != .object) return provider.ProviderError.InvalidRequest;
         const finish_reason = choice.object.get("finish_reason");
 
         var content_blocks: std.ArrayList(provider.ContentBlock) = .empty;
@@ -434,9 +429,18 @@ pub const OpenAIProvider = struct {
         };
 
         const usage_obj = parsed.object.get("usage");
-        const usage: provider.Usage = if (usage_obj) |u| .{
-            .input_tokens = @intCast(u.object.get("prompt_tokens").?.integer),
-            .output_tokens = @intCast(u.object.get("completion_tokens").?.integer),
+        const usage: provider.Usage = if (usage_obj) |u| blk: {
+            // Malformed/absent usage fields must not take the whole parse
+            // down — some gateways emit "usage":null on error paths.
+            if (u != .object) break :blk .{ .input_tokens = 0, .output_tokens = 0 };
+            const pt = u.object.get("prompt_tokens");
+            const ct = u.object.get("completion_tokens");
+            if (pt == null or pt.? != .integer or ct == null or ct.? != .integer)
+                break :blk .{ .input_tokens = 0, .output_tokens = 0 };
+            break :blk .{
+                .input_tokens = @intCast(pt.?.integer),
+                .output_tokens = @intCast(ct.?.integer),
+            };
         } else .{ .input_tokens = 0, .output_tokens = 0 };
 
         return .{
@@ -507,6 +511,14 @@ pub const OpenAIProvider = struct {
             defer line_arena.deinit();
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, line_arena.allocator(), data, .{}) catch return;
             if (parsed != .object) return;
+
+            // In-band error payload (HTTP 200, then {"error":{...}} mid-
+            // stream): without this the chunk is dropped, the stream ends
+            // at EOF, and the truncated response completes "successfully".
+            if (parsed.object.get("error") != null) {
+                try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
+                return;
+            }
 
             // The final chunk (stream_options.include_usage) carries
             // top-level usage with empty/absent choices — capture it.

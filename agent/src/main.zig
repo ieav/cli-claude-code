@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const version_mod = @import("util/version.zig");
+
 pub const math = @import("math/mod.zig");
 pub const llm_mod = @import("llm/mod.zig");
 pub const decision_trace = @import("runtime/decision_trace.zig");
@@ -27,6 +29,7 @@ test {
     _ = @import("llm/mod.zig");
     _ = @import("llm/ollama.zig");
     _ = @import("llm/openai.zig");
+    _ = @import("llm/provider.zig");
     _ = @import("llm/streaming.zig");
     _ = @import("math/constants.zig");
     _ = @import("math/e_growth.zig");
@@ -63,6 +66,8 @@ test {
     _ = @import("util/lineinput.zig");
     _ = @import("util/slash_commands.zig");
     _ = @import("mcp/mod.zig");
+    _ = @import("mcp/jsonrpc.zig");
+    _ = @import("mcp/session.zig");
     _ = @import("skills/loader.zig");
     _ = @import("tools/runtime_registry.zig");
     _ = @import("util/binary_check.zig");
@@ -72,6 +77,7 @@ test {
     _ = @import("util/file_cache.zig");
     _ = @import("util/find_executable.zig");
     _ = @import("util/format.zig");
+    _ = @import("util/version.zig");
     _ = @import("util/fs_ops.zig");
     _ = @import("util/glob_match.zig");
     _ = @import("util/hash.zig");
@@ -91,7 +97,7 @@ test {
     _ = @import("util/uuid.zig");
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Create I/O context (Zig 0.16 Threaded Io)
     var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     defer io_state.deinit();
@@ -105,27 +111,104 @@ pub fn main() !void {
     var file_writer = std.Io.File.Writer.initStreaming(stdout_file, io, &write_buf);
     const w = &file_writer.interface;
 
+    // CLI arguments: version/help short-circuit BEFORE the banner and
+    // self-tests — `ziv --version` is a probe, not a REPL launch.
+    var args_it = std.process.Args.iterate(init.minimal.args);
+    _ = args_it.next(); // skip argv[0]
+    while (args_it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            try std.Io.Writer.print(w, "ziv {s} (Zig {s})\n", .{ version_mod.version, @import("builtin").zig_version_string });
+            try std.Io.File.Writer.flush(&file_writer);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try std.Io.Writer.writeAll(w,
+                \\ziv — self-learning agent CLI
+                \\
+                \\Usage:
+                \\  ziv                start the interactive REPL
+                \\  ziv --version      print version and exit
+                \\  ziv --help         show this help and exit
+                \\
+                \\Inside the REPL, /help lists slash commands.
+                \\
+            );
+            try std.Io.File.Writer.flush(&file_writer);
+            return;
+        }
+    }
+
+    // Startup banner. Naming, for whoever reads this cold:
+    //   · "ziv"  — the project name, nothing more (no acronym; see
+    //     DESIGN.md Context).
+    //   · version — from util/version.zig, the single source release.sh
+    //     also reads.
+    //   · "(Self-learning)" — the memory→reflection→injection flywheel
+    //     (DESIGN §一/§六: extract → φ-condense → store → e-decay inject).
+    //   · π/e/φ — the three math constants driving every threshold.
+    // Alignment: lines are padded PROGRAMMATICALLY to the box width (38)
+    // via format.writePadded — hand-counted spaces broke whenever an
+    // ambiguous-width char (em-dash renders 1 OR 2 columns depending on
+    // the terminal font) was off by one guess. Banner text therefore uses
+    // ASCII hyphens; CJK chars (always 2) and π/φ/· (1 in practice) are
+    // what displayWidth() models.
+    const banner_mod = @import("util/format.zig");
+    const BOX_INNER = 38;
     try std.Io.Writer.writeAll(w,
         \\╔══════════════════════════════════════╗
-        \\║  Ziv — Zig 自学习 Agent v0.5.0      ║
-        \\║  pi 圆融 · e 增长 · phi 浓缩         ║
+        \\
+    );
+    try std.Io.Writer.writeAll(w, "║  ");
+    try banner_mod.writePadded(w, "Ziv - v" ++ version_mod.version ++ " | (Self-learning)", BOX_INNER - 2);
+    try std.Io.Writer.writeAll(w, "║\n║  ");
+    try banner_mod.writePadded(w, "π 圆融 · e 增长 · φ 浓缩", BOX_INNER - 2);
+    try std.Io.Writer.writeAll(w,
+        \\║
         \\╚══════════════════════════════════════╝
         \\
     );
-    try std.Io.Writer.print(w, "  pi  = {d:.10}\n", .{math.constants.PI});
+    try std.Io.Writer.print(w, "  π   = {d:.10}\n", .{math.constants.PI});
     try std.Io.Writer.print(w, "  e   = {d:.10}\n", .{math.constants.E});
-    try std.Io.Writer.print(w, "  phi = {d:.10}\n\n", .{math.constants.PHI});
-    try std.Io.File.Writer.flush(&file_writer);
+    try std.Io.Writer.print(w, "  φ   = {d:.10}\n\n", .{math.constants.PHI});
 
-    // Self-test
-    @import("util/log.zig").initFromEnv();
-    try std.Io.Writer.writeAll(w, "Running self-tests...\n");
-    const result = runTests();
-    switch (result) {
-        .ok => try std.Io.Writer.writeAll(w, "  ok - All tests passed\n\n"),
-        .fail => |err| try std.Io.Writer.print(w, "  FAIL: {}\n\n", .{err}),
+    // Working directory, ~-compressed under $HOME and highlighted: ziv's
+    // memory/checkpoint data lands in the .ziv/ of THIS directory — one
+    // glance at the banner says where that is.
+    {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.process.currentPath(io, &cwd_buf)) |len| {
+            const cwd = cwd_buf[0..len];
+            var disp_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var shown: []const u8 = cwd;
+            if (@import("util/env.zig").homeDir()) |home| {
+                if (cwd.len >= home.len and std.mem.startsWith(u8, cwd, home)) {
+                    const rest = cwd[home.len..];
+                    if (rest.len == 0) {
+                        shown = "~";
+                    } else if (rest[0] == '/') {
+                        if (std.fmt.bufPrint(&disp_buf, "~{s}", .{rest})) |s| {
+                            shown = s;
+                        } else |_| {}
+                    }
+                }
+            }
+            try std.Io.Writer.print(w, "  \x1b[1;36mcwd: {s}\x1b[0m\n\n", .{shown});
+        } else |_| {}
     }
     try std.Io.File.Writer.flush(&file_writer);
+
+    // Startup self-check: the full unit-test suite compiled into the
+    // binary (same set as `zig build test`) — proof the build is alive on
+    // THIS platform. Silent on success; failures are loud.
+    @import("util/log.zig").initFromEnv();
+    const result = runTests();
+    switch (result) {
+        .ok => {},
+        .fail => |err| {
+            try std.Io.Writer.print(w, "\x1b[1;31m  ⚠ self-test FAILED: {}\x1b[0m\n\n", .{err});
+            try std.Io.File.Writer.flush(&file_writer);
+        },
+    }
 
     // Start REPL
     const repl = @import("repl.zig");

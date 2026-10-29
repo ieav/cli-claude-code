@@ -1,5 +1,9 @@
 # Ziv — Zig 自学习 Agent 完整设计文档
 
+## 项目名
+
+**ziv** 是项目名，仅此而已——不是缩写、没有隐藏含义（作者命名）。实现语言为 Zig；"自学习"指本设计的核心闭环：会话提取记忆 → φ 浓缩入库 → e 衰减注入 → 反思引擎产出洞察（§一/§六）。启动 banner `Ziv — vX.Y.Z | (Self-learning)` 与 `π 圆融 · e 增长 · φ 浓缩` 均为同一语义的展示层。
+
 ## Context
 
 用 Zig 构建一个支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库自动更新）的 CLI Agent 工具。新增要求：
@@ -2108,23 +2112,32 @@ src/
 | 设计章节 | 落地情况 |
 |---------|---------|
 | 六、Agent Loop | v0.3.0 完整实现；工具结果经权限管道执行 |
-| 记忆（三层之情景层） | 完整闭环：`/quit`/`/clear` 启发式提取（中英关键词）→ φ 浓缩（保 61.8%）→ 内容 hash 幂等入库（`INSERT OR REPLACE`）→ 重启加载 → **e 衰减排序**（30 天半衰）→ 800 token 预算截断注入 system prompt。`/memory` 查看 |
-| 反思引擎 | 查询窗口（≤20 条 + 工具/错误计数）；每 10 轮或 **π×10min** 触发；会话结束强制收尾；insights 以 `.feedback` 记忆入库，跨会话注入生效 |
-| 十、自主优化研究 | `/research <topic>`：φ 生成 3 组查询 → 并发搜索 → φ 精选 → ★ 推荐 + 理由。真网络（实测 2.8s / 3 源 / 30 候选） |
-| 九、自诊断 | `/diagnose <concern>`：真实会话统计构造决策链（注入置信/工具错误率/生成置信）→ 找 confidence < φ 环节 → root cause + 建议。与记忆系统联动（库空时诊断出检索薄弱） |
-| 八、权限系统 | 6 模式 + 6 步管道；**规则模式匹配已实现**（glob 匹配 command/path，带 pattern 的规则精确命中才生效） |
-| 三、运行时检测/监控 | builtin_rules 8 条 + monitor 循环（nanosleep） |
+| 记忆（三层之情景层） | 完整闭环：`/quit`/`/clear` 启发式提取（中英关键词）→ φ 浓缩（保 61.8%）→ 内容 hash 幂等入库（`INSERT OR REPLACE`）→ 重启加载 → **e 衰减排序**（30 天时间常数，衰减至 36.8%）→ 800 token 预算截断注入 system prompt。`/memory` 查看 |
+| 反思引擎 | 查询窗口（≤20 条 + 工具/错误计数）；每 10 轮或 **π×10min** 触发（会话启动即武装）；/quit、Ctrl-D、/clear 三路收尾；insights 以 `.feedback` 记忆入库，跨会话注入生效 |
+| 十、自主优化研究 | `/research <topic>`：φ 生成 3 组查询 → **并发搜索**（每查询一线程）→ φ 精选 → ★ 推荐 + 理由（真实候选数）；推荐结果以记忆 + 图谱节点落库 |
+| 九、自诊断 | `/diagnose <concern>`：优先读 live 决策链（每查询 7 类埋点：memory_retrieval / context_assembly / llm_generation / response_postprocess / tool_selection / tool_execution / reflection_trigger，含真实耗时）→ 逐步 ✓/⚠ 走查 → confidence < φ 定位 root cause → 诊断结论以 `.feedback` 入库 |
+| 八、权限系统 | 6 模式 + 6 步管道；**规则模式匹配已实现**（glob 匹配 command/path，带 pattern 的规则精确命中才生效）；Default 模式只读免确认、dont_ask 只拒"需确认项"；连续拒绝看护（denial_tracker 接线） |
+| 三、运行时检测/监控 | **组件就绪、未接线**：builtin_rules 7 条 + monitor 循环（nanosleep）已实现，但 REPL 不启动 monitor/cron/event_bus（见 14.2） |
 | 操作记录与回滚 | `/rewind` 支持 `[0] 会话初始态` 哨兵（撤销全部文件改动），preview→confirm→restore→日志收缩全链实测 |
 
 ### 14.2 与设计的偏差
 
+> 2026-10-29 设计符合性审计后对账：下列前五行为此前登记、现已闭环（移入 14.1）；
+> 其后为**现行**偏差清单。
+
 | 设计 | 实际 | 原因/计划 |
 |------|------|----------|
-| 语义记忆（知识图谱）全量接入 | API 参数化就绪、**无写入方** | 迭代四候选：提取/反思产物建节点边 + `/knowledge` 检索 |
-| 决策链 7 阶段逐步记录 | `/diagnose` 用 3 步静态置信构造 | 真实决策链需 agent loop 内逐步埋点，已列待办 |
-| 工具并行（编排） | `executeBatches` 真并行（e 上限线程池 + 保序回收）**但 REPL 未接入**，多 tool_use 仍串行 | 接线是待办 |
-| 注入按相似度检索 | 按 e 衰减排序 | 向量化（hash 词袋嵌入起步）在待办 |
-| 反思调 LLM 总结 | 纯启发式（零成本、可离线） | 可选增强 |
+| ~~语义记忆无写入方~~ | ✅ 已接入：提取建节点 + co_extracted 边（含去重），`/knowledge` 检索 | — |
+| ~~决策链 3 步静态构造~~ | ✅ live trace 每查询 7 类埋点（含真实耗时），/diagnose live 优先 + 学习入库；alternatives 仍恒空（设计该字段亦为桩） | alternatives 填充列待办 |
+| ~~编排 REPL 未接入~~ | ✅ agent 循环 phase1 串行预检 + phase2 `executeBatches` 真并行（e 上限随负载数自适应） | — |
+| ~~注入按 e 衰减非相似度~~ | ✅ 0.5×e 衰减 + 0.5×余弦混合排序（64 维 hash 词袋），候选池 200 | — |
+| ~~反思不调 LLM~~ | ✅ provider 可达且窗口 ≥3 条时 LLM 增强总结，启发式兜底 | — |
+| 二、任务系统运行时接线 | ThreadPool/CronScheduler/EventBus 已实现但 REPL 零实例化；反思/记忆提取在主循环内联 | 接线另立任务（TODO P29 遗留） |
+| Task 生命周期（cancel/progress/retry） | cancel() 桩、progress/max_retries 字段无读写、TaskContext 不存在；submit 不读 priority（队列纯 FIFO）；Event payload 退化为字符串（设计的结构化 task_completed/user_query_end 无发射者） | 随任务系统接线一并设计 |
+| monitor 自动修复半环 | RuntimeRule 无 auto_fix_fn 字段，runChecks 无修复尝试 | 待 monitor 接线时补 |
+| 检测规则集与设计差异 | knowledge_conflict 未实现（缺 recent_conflicts 数据源）；decision_quality 因与 context_overflow 同指标且阈值更高（永不可达）已删除 | knowledge_conflict 需先定义冲突数据源 |
+| 第一章数学场景部分未落地 | RoPE π-旋转、φ 嵌入降维、黄金分割超参搜索、ε 探索衰减均未实现且此前未登记；知识检索相关度为名次线性（非 e-时间衰减）；π 分散索引（pi_ring getByPiIndex/piIterator）能力就绪但生产零消费（EventBus 读路径走 FIFO） | 已补登记（TODO P37） |
+| 十章研究工作流首尾 | Step1 本地库预检、Step5 用户选择交互未实现（Step6 学习存储 2026-10-29 补最小版：推荐入记忆+图谱） | 交互环列待办 |
 
 ### 14.3 基础设施重大修复（设计文档未预见）
 
@@ -2135,3 +2148,4 @@ src/
 ### 14.4 版本基线
 
 - v0.4.0：Zig 0.17.0 / 179 测试全绿 / 记忆-反思飞轮运转。已知债已清偿（allocPrint、DOM 泄漏、facade 吞错，P20）；剩余低优先项见 USAGE §8
+- 2026-10-29 增量：**241 测试（236 pass / 5 skip / 0 fail）**；两轮多 agent 审计（逻辑闭环 + 设计符合性）修复 40+ 项并完成 14.1/14.2 对账（明细 TODO P37）

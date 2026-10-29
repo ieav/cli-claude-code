@@ -107,7 +107,13 @@ pub const HttpTransport = struct {
         // Read the body (either JSON or SSE).
         var transfer_buf: [8192]u8 = undefined;
         const reader = response.reader(&transfer_buf);
-        const raw = readCapped(arena, reader) catch return null;
+        const raw = readCapped(arena, reader) catch |err| {
+            // Surface an oversized body as its own error — swallowing it
+            // made the caller report a generic CallFailed for a tool that
+            // actually succeeded with a huge result.
+            if (err == error.ResponseTooLarge) return err;
+            return null;
+        };
 
         if (std.mem.indexOf(u8, content_type, "text/event-stream") != null) {
             // First `data:` line holding a JSON-RPC object.
@@ -129,10 +135,14 @@ pub const HttpTransport = struct {
     fn readCapped(arena: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
         var chunk: [8192]u8 = undefined;
-        while (list.items.len < 1024 * 1024) {
+        while (true) {
             const n = reader.readSliceShort(&chunk) catch break;
             if (n == 0) break;
             try list.appendSlice(arena, chunk[0..n]);
+            // A hard cap beats an unbounded read, but stopping silently
+            // mid-JSON turns into a parse failure (generic CallFailed) —
+            // report the actual reason instead.
+            if (list.items.len > 1024 * 1024) return error.ResponseTooLarge;
         }
         return list.toOwnedSlice(arena);
     }

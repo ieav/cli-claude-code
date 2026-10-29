@@ -5,7 +5,8 @@ const std = @import("std");
 const constants = @import("constants.zig");
 
 /// Fibonacci hashing — the most uniform hash distribution for integer keys.
-/// Uses φ × 2^64 = 11400714819323198549 as multiplier.
+/// Uses floor(φ × 2^64) = 0x9E3779B97F4A7C15 (Knuth's golden-ratio
+/// multiplier) as the multiplier.
 /// table_size_log2 must be in [1, 63].
 pub fn fibonacciHash(key: u64, table_size_log2: u6) usize {
     if (table_size_log2 == 0) return 0;

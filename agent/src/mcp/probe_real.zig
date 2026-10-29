@@ -21,11 +21,11 @@ pub fn main() !void {
     const t = try stdio.StdioTransport.spawn(alloc, io, argv.items);
     defer t.close(io);
 
-    _ = try t.sendRequest(io, "initialize",
+    const init_id = try t.sendRequest(io, "initialize",
         "{\"protocolVersion\":\"" ++ mod.protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv-probe\",\"version\":\"0.1\"}}");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const init_reply = (try t.readMessage(io, arena.allocator())) orelse return error.NoInitReply;
+    const init_reply = (try t.readReply(io, arena.allocator(), init_id)) orelse return error.NoInitReply;
     if (init_reply.err) |e| {
         std.debug.print("initialize error: {d} {s}\n", .{ e.code, e.message });
         return error.InitFailed;
@@ -37,8 +37,8 @@ pub fn main() !void {
     });
 
     try t.sendNotification(io, "notifications/initialized", null);
-    _ = try t.sendRequest(io, "tools/list", null);
-    const list_reply = (try t.readMessage(io, arena.allocator())) orelse return error.NoListReply;
+    const list_id = try t.sendRequest(io, "tools/list", null);
+    const list_reply = (try t.readReply(io, arena.allocator(), list_id)) orelse return error.NoListReply;
     if (list_reply.err) |e| {
         std.debug.print("tools/list error: {d} {s}\n", .{ e.code, e.message });
         return error.ListFailed;

@@ -1,5 +1,6 @@
 /// MCP (Model Context Protocol) client — stdio transport, JSON-RPC 2.0.
 const std = @import("std");
+const version_mod = @import("../util/version.zig");
 
 pub const jsonrpc = @import("jsonrpc.zig");
 pub const stdio = @import("stdio.zig");
@@ -8,7 +9,7 @@ pub const config = @import("config.zig");
 pub const http = @import("http.zig");
 
 pub const protocol_version = "2025-06-18";
-pub const client_info = "ziv/0.5.0";
+
 
 test {
     _ = jsonrpc;
@@ -33,7 +34,7 @@ test "MCP stdio spike: initialize, tools/list, tools/call against mock" {
     defer t.close(io);
 
     // 1. initialize
-    const init_params = "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"0.5.0\"}}";
+    const init_params = "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"" ++ version_mod.version ++ "\"}}";
     const init_id = try t.sendRequest(io, "initialize", init_params);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -95,7 +96,7 @@ test "MCP real handshake: Playwright server lists browser tools" {
     const t = try stdio.StdioTransport.spawn(alloc, io, argv.items);
     defer t.close(io);
 
-    const init_params = "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"0.5.0\"}}";
+    const init_params = "{\"protocolVersion\":\"" ++ protocol_version ++ "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"" ++ version_mod.version ++ "\"}}";
     _ = try t.sendRequest(io, "initialize", init_params);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -137,7 +138,7 @@ test "MCP HTTP transport: initialize, tools/list, tools/call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const init_reply = (try t.roundTrip(arena.allocator(), "initialize",
-        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"0.5.0\"}}")) orelse return error.NoInitReply;
+        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ziv\",\"version\":\"" ++ version_mod.version ++ "\"}}")) orelse return error.NoInitReply;
     try std.testing.expect(init_reply.err == null);
     try std.testing.expectEqualStrings("mock-http",
         init_reply.result.?.object.get("serverInfo").?.object.get("name").?.string);

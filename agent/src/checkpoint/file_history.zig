@@ -98,9 +98,20 @@ pub const FileHistoryState = struct {
         }
         const snap = &self.snapshots.items[snap_idx.?];
 
-        // Try to read current file content
+        // Try to read current file content. A read FAILURE is not "file
+        // doesn't exist": a >100 MB or unreadable (EACCES) existing file
+        // used to fall into the "new file" branch below, and rollback would
+        // then DELETE it — data loss beyond the edit being undone. Only
+        // FileNotFound means new; any other failure leaves the file out of
+        // rollback coverage (same policy as a failed backup write).
         const cwd = std.Io.Dir.cwd();
-        const content = std.Io.Dir.readFileAlloc(cwd, io, file_path, self.allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch null;
+        const content: ?[]u8 = std.Io.Dir.readFileAlloc(cwd, io, file_path, self.allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| blk: {
+            if (err != error.FileNotFound) {
+                logger.warning("Backup read failed ({s}) — {s} left out of rollback coverage", .{ @errorName(err), file_path });
+                return;
+            }
+            break :blk null;
+        };
 
         if (content) |data| {
             defer self.allocator.free(data);
@@ -189,6 +200,11 @@ pub const FileHistoryState = struct {
     pub const RestoreResult = struct {
         restored: []const []const u8,
         deleted: []const []const u8,
+        /// Files whose restore attempt failed (backup unreadable, target
+        /// unwritable, delete failed) — surfaced instead of silently
+        /// skipped, so "Rollback complete" can no longer report success
+        /// over unrestored files.
+        failed: []const []const u8,
     };
 
     pub fn restoreSnapshot(self: *Self, snapshot_idx: usize, io: std.Io) !RestoreResult {
@@ -200,6 +216,8 @@ pub const FileHistoryState = struct {
         defer restored.deinit(self.allocator);
         var deleted = std.ArrayList([]const u8).empty;
         defer deleted.deinit(self.allocator);
+        var failed = std.ArrayList([]const u8).empty;
+        defer failed.deinit(self.allocator);
 
         const cwd = std.Io.Dir.cwd();
         const snap = &self.snapshots.items[snapshot_idx];
@@ -210,13 +228,24 @@ pub const FileHistoryState = struct {
 
             if (bkp.backup_path) |bp| {
                 // Restore from backup file
-                const data = std.Io.Dir.readFileAlloc(cwd, io, bp, self.allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch continue;
+                const data = (std.Io.Dir.readFileAlloc(cwd, io, bp, self.allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch {
+                    try failed.append(self.allocator, try self.allocator.dupe(u8, fp));
+                    continue;
+                });
                 defer self.allocator.free(data);
-                cwd.writeFile(io, .{ .sub_path = fp, .data = data }) catch continue;
+                cwd.writeFile(io, .{ .sub_path = fp, .data = data }) catch {
+                    logger.warning("Restore write failed: {s}", .{fp});
+                    try failed.append(self.allocator, try self.allocator.dupe(u8, fp));
+                    continue;
+                };
                 try restored.append(self.allocator, try self.allocator.dupe(u8, fp));
             } else {
                 // File was newly created — delete on rollback
-                cwd.deleteFile(io, fp) catch continue;
+                cwd.deleteFile(io, fp) catch {
+                    logger.warning("Restore delete failed: {s}", .{fp});
+                    try failed.append(self.allocator, try self.allocator.dupe(u8, fp));
+                    continue;
+                };
                 try deleted.append(self.allocator, try self.allocator.dupe(u8, fp));
             }
         }
@@ -224,6 +253,7 @@ pub const FileHistoryState = struct {
         return .{
             .restored = try restored.toOwnedSlice(self.allocator),
             .deleted = try deleted.toOwnedSlice(self.allocator),
+            .failed = try failed.toOwnedSlice(self.allocator),
         };
     }
 

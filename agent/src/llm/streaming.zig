@@ -244,6 +244,10 @@ pub const ClaudeStreamState = struct {
             return true;
         } else if (std.mem.eql(u8, t, "error")) {
             try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
+            // Terminal: an error event ends the conversation — returning
+            // false let the loop run to EOF and emit a trailing .done,
+            // violating the "done = clean completion" contract.
+            return true;
         }
         return false;
     }

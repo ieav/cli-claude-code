@@ -133,6 +133,23 @@ pub const StdioTransport = struct {
         }
     }
 
+    /// Read messages until the response for `id` arrives, skipping server
+    /// notifications (the spec allows them at any moment) and stale replies
+    /// to abandoned requests. This is the contract sendRequest documents:
+    /// reading positionally desynchronizes replies the moment a server
+    /// emits one notification between two calls. Null on EOF.
+    pub fn readReply(self: *Self, io: std.Io, arena: std.mem.Allocator, id: i64) anyerror!?jsonrpc.Incoming {
+        var skipped: usize = 0;
+        while (skipped < 64) : (skipped += 1) {
+            const msg = (try self.readMessage(io, arena)) orelse return null;
+            if (msg.id) |mid| {
+                if (mid == id) return msg;
+            }
+            // Notification or stale response — drop it and keep reading.
+        }
+        return error.NotificationFlood; // a server that never answers: stop, don't spin
+    }
+
     /// Close stdin (server sees EOF and exits), then force-kill if still
     /// alive. Idempotent; frees the transport.
     pub fn close(self: *Self, io: std.Io) void {

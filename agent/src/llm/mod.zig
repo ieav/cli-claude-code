@@ -21,7 +21,7 @@ pub const OllamaConfig = ollama.OllamaConfig;
 pub const ClaudeProvider = claude.ClaudeProvider;
 pub const ClaudeConfig = claude.ClaudeConfig;
 
-/// Model backend type — determines which provider handles a given model.
+/// Model backend type - determines which provider handles a given model.
 pub const BackendType = enum {
     openai,
     claude,
@@ -65,15 +65,15 @@ pub const ModelEntry = struct {
 };
 
 pub const KNOWN_MODELS = [_]ModelEntry{
-    .{ .name = "claude-opus-4-6", .backend = .claude, .description = "Claude Opus 4.6 — most capable" },
-    .{ .name = "claude-sonnet-4-6", .backend = .claude, .description = "Claude Sonnet 4.6 — balanced" },
-    .{ .name = "claude-haiku-4-5", .backend = .claude, .description = "Claude Haiku 4.5 — fast" },
-    .{ .name = "gpt-4o", .backend = .openai, .description = "GPT-4o — OpenAI flagship" },
-    .{ .name = "gpt-4o-mini", .backend = .openai, .description = "GPT-4o Mini — fast & cheap" },
-    .{ .name = "o3-mini", .backend = .openai, .description = "O3 Mini — reasoning" },
-    .{ .name = "llama3.2", .backend = .ollama, .description = "Llama 3.2 — local (Ollama)" },
-    .{ .name = "qwen2.5", .backend = .ollama, .description = "Qwen 2.5 — local (Ollama)" },
-    .{ .name = "deepseek-r1", .backend = .ollama, .description = "DeepSeek R1 — local (Ollama)" },
+    .{ .name = "claude-opus-4-6", .backend = .claude, .description = "Claude Opus 4.6 - most capable" },
+    .{ .name = "claude-sonnet-4-6", .backend = .claude, .description = "Claude Sonnet 4.6 - balanced" },
+    .{ .name = "claude-haiku-4-5", .backend = .claude, .description = "Claude Haiku 4.5 - fast" },
+    .{ .name = "gpt-4o", .backend = .openai, .description = "GPT-4o - OpenAI flagship" },
+    .{ .name = "gpt-4o-mini", .backend = .openai, .description = "GPT-4o Mini - fast & cheap" },
+    .{ .name = "o3-mini", .backend = .openai, .description = "O3 Mini - reasoning" },
+    .{ .name = "llama3.2", .backend = .ollama, .description = "Llama 3.2 - local (Ollama)" },
+    .{ .name = "qwen2.5", .backend = .ollama, .description = "Qwen 2.5 - local (Ollama)" },
+    .{ .name = "deepseek-r1", .backend = .ollama, .description = "DeepSeek R1 - local (Ollama)" },
 };
 
 /// Find a known model by exact name (returns null for custom model names).

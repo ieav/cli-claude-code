@@ -64,3 +64,34 @@ test "formatDuration" {
     defer alloc.free(d2);
     try std.testing.expectEqualStrings("2.5s", d2);
 }
+
+/// Display width of a UTF-8 string: CJK/emoji count 2 terminal columns,
+/// ASCII 1, continuation bytes 0 (mirrors the editor's charWidth). Byte
+/// counting misaligns every column that contains Chinese text.
+pub fn displayWidth(s: []const u8) usize {
+    var w: usize = 0;
+    for (s) |c| {
+        if (c < 0x20) continue;
+        if (c < 0x80) {
+            w += 1;
+        } else if (c >= 0xC0 and c < 0xE0) {
+            w += 1;
+        } else if (c >= 0xE0) {
+            w += 2;
+        }
+    }
+    return w;
+}
+
+/// Write `s`, then pad with spaces up to `width` DISPLAY columns (no
+/// truncation — an over-wide cell just pushes the column).
+pub fn writePadded(writer: *std.Io.Writer, s: []const u8, width: usize) !void {
+    try writer.writeAll(s);
+    const pad = width -| displayWidth(s);
+    for (0..pad) |_| try writer.writeByte(' ');
+}
+
+test "displayWidth counts CJK as double columns" {
+    try std.testing.expectEqual(@as(usize, 3), displayWidth("abc"));
+    try std.testing.expectEqual(@as(usize, 8), displayWidth("中文abcd")); // 2+2+4
+}

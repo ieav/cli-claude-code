@@ -16,8 +16,7 @@
 - **最新修复**: std.time.milliTimestamp (10 文件 19 处 → util/time.zig nowMillis)、ArrayList.init(allocator) (13 文件 33 处 → .empty)、unused parameter 警告 (3 处)
 
 ### P4: util/uuid.zig 中 std.crypto.random 兼容性
-- **状态**: 待确认
-- **描述**: uuid.zig 使用了 std.crypto.random.bytes()，该 API 在当前 Zig 0.16.0 构建中尚未被触发（uuid 模块存在但测试未实际编译 uuid 函数体）。需要确认实际运行时是否可用。
+- **状态**: ✅ 已解决（P13 重写为 ChaCha20+SplitMix64，见 util/uuid.zig；2026-10-29 审计复核关闭）
 
 ### P5: checkpoint/file_history.zig 实际备份逻辑
 - **状态**: ✅ 已完成
@@ -28,8 +27,7 @@
 - **描述**: subprocess.zig 的 isAvailable() 修复为 PATH 遍历查找，不再使用 std.testing.allocator。ripgrep 封装（ripgrep.zig）已适配 Zig 0.16 std.Io API。
 
 ### P7: config.zig 中的 readFileAlloc API
-- **状态**: 需要确认
-- **描述**: config.zig 中使用了 std.Io.Dir.readFileAlloc，但 io 参数传递需要确认是否正确
+- **状态**: ✅ 已解决（config 加载链 P26/P27 端到端验证通过；2026-10-29 审计复核关闭）
 
 ### P8: streamDelimiter 不消费分隔符
 - **状态**: ✅ 已完成
@@ -408,3 +406,18 @@
 - **🟡→✅ allow 规则优先于 classifier**（auth_mode.zig Step 2a auto 分支）：用户显式配的 `allow_rules` 是确定性授权，不是给 LLM 的提示——原先 auto 下 classifier 终决在前，allow 规则完全无效且每次白付 LLM 调用。修复：auto 分支先查 allow（提取 `allowRulesMatch` 与 Step 2b 共用，链段 fail-closed 语义一致），命中直接放行零 LLM。deny(1a)/ask(1b)/safety(1d) 优先级与 plan/accept_edits 等模式行为不变。e2e 决定性验证：mock 一律答 BLOCK，allow 命中的 FileWrite 仍执行 + classifier 请求 0 次
 - **🟢→✅ 缓存 key 加模型标识**（classifier.zig）：key = tool + model + input——换模型（glm→claude）后重新判定而非沿用旧模型决议；PermissionContext 增加 model_name 字段（repl 构造处传 switcher.modelName()），LLMClassifier.init 三层穿透。单测覆盖换模型 miss
 - **验证**：233 测试（228 pass / 5 skip / 0 fail，新增 auto-allow 优先级单测：无 provider 时 allow 命中返回 .allow = classifier 未跑的构造性证明；未命中回落 .ask）
+
+### P37（2026-10-29）设计符合性审计：两轮多 agent 评审 + 对账
+
+**第一轮（逻辑闭环，5 agent / 40 条 / 37 修复）**：400 InvalidRequest 四根因（tool_use/tool_result 配对断裂 ×3 手术点、CJK 估算低估 2×、错误体日志缺失、溢出自愈重试）；MCP 8+1（JSON-RPC 按 id 匹配——位置读在 notification 下 panic/结果错位、connectHttp 泄漏、1MB 截断假 CallFailed、server 死后 connected 不翻转、5 处裸解引用、分页丢失、watchdog UAF、upsert 双字段）；REPL（window_queries 未填充→反思死路、live_trace 未初始化、热重载模型/提示词双源分裂、/clear 丢 manifest、dont_ask 能存不能读、/stats 恒 0、$ARGUMENTS 双释放、空转 undo bump）；LLM（200+在带 error 丢弃→截断当完成、parseResponse 裸解引用、多 text 块粘连、空 assistant 入史、死代码 message.zig）；存储（trackEdit 读失败当不存在→rewind 删大文件、快照逐出静默、恢复失败谎报 0 errors、sqlite init 泄漏）；记忆数学（addEdge 无去重膨胀、checkMemory sigmoid 阈值要 139% 内存、PHI_64 差 +0x40、PiIterator 双步进、search 解析泄漏）。e2e：假网关 400 体、注毒 MCP server、溢出自愈均实测。
+
+**第二轮（设计↔实现对口径，5 agent）**：
+- ✅ 修复：Default 模式只读免确认（原一切弹窗）；dont_ask 只拒需确认项（原全拒）；/mode 六态全循环；checkpoint 开关/上限生效（原安慰剂）；AskUserQuestion 接真 reader（原桩）；denial_tracker 连续拒绝看护；/model 报错后端修正；/clear 补反思+π 定时器启动武装；/research 并发搜索（原串行）+真实候选数+结果落库（记忆+图谱）；注入候选池 200+included 口径+UTF-8 边界；编排 e-并发喂负载数；error_handler 接线（分类+修复项+★）；live trace 补 memory_retrieval+真实耗时；/diagnose 逐步 ✓/⚠+诊断学习入库；decision_quality 影子规则删除
+- 📋 登记（DESIGN 14.2 已同步）：任务系统接线（P29 遗留）；Task cancel/progress/retry 空壳；monitor auto_fix_fn 半环；knowledge_conflict 数据源；RoPE/φ 降维/黄金分割搜索/ε 探索未实现；知识检索名次线性；研究 Step1 预检/Step5 交互；alternatives 恒空（设计亦桩）
+- 📄 文档对账：DESIGN 14.1 五行失实/过时修正（监控"未接线"、编排/图谱/决策链/反思 LLM/混合排序移入已落地）；14.2 现行偏差重列；14.4 增量注记（241 测试 236 pass/5 skip）；USAGE dist 路径、/knowledge 统计、定时任务注记、语义记忆状态、版本口径
+- 版本 bump（代码 /version 0.5.0 → 0.5.1 + dist 重打）**留给发版流程**，未擅自执行
+- 📋 补记（audit-math #9/#10，2026-10-29）：π 分散索引（pi_ring）生产零消费——保留为能力，任务系统接线时用于经验回放采样（getRecentEvents 的 FIFO 语义对"最近事件"是正确的，不改）；TaskPriority 五级语义空心（submit 不读、队列 FIFO）+ EventBus 结构化 payload 退化——随任务系统接线一并设计（DESIGN 14.2 已同步）
+- ✅ 多行输入（2026-10-29，Claude Code 风格）：Enter=提交，`\`+Enter / Ctrl+J / Option+Enter / CSI 13;2u（Shift+Enter 协议）=换行；bracketed paste 整段单输入（CRLF 归一、流式 201~ 终止符匹配、1MiB 上限、自动扩容）；编辑器渲染光标行 + `⏎ i/N` 折叠标记；↑/↓ 行间移动（首/末行回退历史）。**根修 RawGuard 不清 ICRNL**——终端 Enter 的 \r 一直被内核翻译成 \n 才到达（旧代码两键同义提交所以从未暴露）；menu.readLine 同步双终止符。PTY 端到端实测：三行粘贴=1 次提交、双 Ctrl-C 优雅退出。CSI 解析重写为收集-分类（未知序列不再泄漏参数字节进缓冲）
+- ✅ 输入框与界面优化（2026-10-29 第三批）：Esc/Ctrl-C 生成期中断+撤回（流式期间保持 raw——readLine 返回后的 cooked 行律曾让 Esc 卡在行缓冲直到下个 \r 冲行、ICRNL 把 \r 翻成 \n 泄入编辑器、0x7f 被行律 ERASE 吞；streamComplete 包 RawGuard 后 50ms 内可见）；typeahead 保留生成期击键（\r 丢弃）；空提示符 5s 内 Esc 撤回；/terminal-setup 按终端打印 Shift+Enter 配置；模型表格数据行补 │ 边框+显示宽度填充（em-dash 类 Ambiguous 宽度字符改 ASCII）；/models 管道直出表格（选择器不再逐字节重绘风暴）；[tool_use] 重复宣告行删除（保留流式 [calling tool]）
+- ✅ 输入框第三批增强（2026-10-29，用户选定）：Emacs 行编辑键（Ctrl+A/E/B/F/W/U/K/D 语义，deleteWordBack 空白分词+UTF-8）；Ctrl+R 反向历史搜索（实时不区分大小写匹配、Ctrl+R 翻旧、Enter 发送、Esc 保留、failing 红标）；工具调用行升级为 Claude Code 式 `⏺ Bold(参数摘要)`（interesting 字段优先 command/path/pattern/query/topic/url/name，回退 JSON，48 显示列+省略号，控制字节滤除）。PTY 实测：Emacs 键链路、Ctrl+R 全链路（搜索→匹配→提交）；信息命令保持列表风（用户选定）
+- ✅ 启动屏定制（2026-10-29，用户指定）：banner 主行改 `Ziv — vX.Y.Z | (Self-learning)`；第二行 pi/phi 换希腊字母 `π 圆融 · e 增长 · φ 浓缩`（常量标签同步 π/φ）；新增加粗青色 `cwd: ~/...` 行（HOME 前缀压缩，数据落点可见性）；启动自检成功改完全静默、失败红字 ⚠；banner 命名含义写入 main.zig 注释 + DESIGN「项目名」节（ziv=项目名无缩写含义）

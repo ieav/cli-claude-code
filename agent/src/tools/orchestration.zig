@@ -86,7 +86,12 @@ pub fn executeBatches(
     defer results.deinit(allocator);
 
     const hw = std.Thread.getCpuCount() catch 4;
-    const cap = @max(math.effectiveConcurrency(0, hw), 1);
+    // Feed the designed e-adaptive concurrency its pressure input (total
+    // queued calls) — the load=0 call kept the sigmoid branch dead and the
+    // wave pinned at hw/2.
+    var total_calls: usize = 0;
+    for (batches) |batch| total_calls += batch.calls.len;
+    const cap = @max(math.effectiveConcurrency(total_calls, hw), 1);
 
     for (batches) |batch| {
         if (batch.is_concurrency_safe and batch.calls.len > 1) {

@@ -75,6 +75,21 @@ pub const KnowledgeGraph = struct {
     }
 
     pub fn addEdge(self: *Self, from_id: i64, to_id: i64, relation: []const u8, weight: f32) !void {
+        // SELECT-first like addNode: extractSessionMemories re-runs over the
+        // full history on every /clear and session end, and an unconditional
+        // INSERT re-added the same co_extracted edges once per run — the
+        // edge table grew without bound across sessions.
+        var exists = try database.Statement.prepare(
+            self.allocator,
+            self.db,
+            "SELECT rowid FROM knowledge_edges WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3",
+        );
+        defer exists.finalize();
+        try exists.bindInt64(1, from_id);
+        try exists.bindInt64(2, to_id);
+        try exists.bindText(3, relation);
+        if (try exists.step()) return; // edge already recorded
+
         var stmt = try database.Statement.prepare(
             self.allocator,
             self.db,

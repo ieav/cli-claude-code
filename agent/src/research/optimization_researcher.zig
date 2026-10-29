@@ -127,21 +127,49 @@ pub const OptimizationResearcher = struct {
             self.allocator.free(search_queries);
         }
 
-        // Step 3: Execute searches concurrently
+        // Step 3: Execute searches concurrently — the designed pipeline runs
+        // the φ-generated queries in parallel; the old serial for-loop paid
+        // every network round trip in sequence.
         var all_results = std.ArrayList(knowledge_search.SearchResult).empty;
         defer all_results.deinit(self.allocator);
 
         const deadline = start_time + @as(i64, @intCast(time_budget_ms));
-        var sources_searched: u32 = 0;
 
+        const QueryJob = struct {
+            q: []const u8,
+            results: []const knowledge_search.SearchResult = &.{},
+        };
+        const jobs = try self.allocator.alloc(QueryJob, search_queries.len);
+        defer self.allocator.free(jobs);
+        var n_jobs: usize = 0;
         for (search_queries) |search_q| {
             // Check time budget (e-controlled)
             if (time_mod.nowMillis() > deadline) break;
+            jobs[n_jobs] = .{ .q = search_q };
+            n_jobs += 1;
+        }
 
-            const results = self.web_search.search(search_q, 20) catch &.{};
+        const searchWorker = struct {
+            fn run(researcher: *Self, job: *QueryJob) void {
+                job.results = researcher.web_search.search(job.q, 20) catch &.{};
+            }
+        }.run;
+        const threads = try self.allocator.alloc(std.Thread, n_jobs);
+        defer self.allocator.free(threads);
+        var n_threads: usize = 0;
+        for (jobs[0..n_jobs]) |*job| {
+            threads[n_threads] = std.Thread.spawn(.{}, searchWorker, .{ self, job }) catch {
+                searchWorker(self, job); // spawn failed: inline, don't drop the query
+                continue;
+            };
+            n_threads += 1;
+        }
+        for (threads[0..n_threads]) |t| t.join();
+
+        var sources_searched: u32 = 0;
+        for (jobs[0..n_jobs]) |job| {
             sources_searched += 1;
-
-            for (results) |r| {
+            for (job.results) |r| {
                 try all_results.append(self.allocator, r);
             }
         }
@@ -171,7 +199,7 @@ pub const OptimizationResearcher = struct {
         const recommendation_index = self.selectRecommendation(solutions, intent);
 
         // Step 8: Generate reasoning
-        const reasoning = try self.generateReasoning(solutions, intent, recommendation_index);
+        const reasoning = try self.generateReasoning(solutions, intent, recommendation_index, candidates_count);
 
         const elapsed = time_mod.nowMillis() - start_time;
 
@@ -437,6 +465,7 @@ pub const OptimizationResearcher = struct {
         solutions: []const Solution,
         intent: ResearchIntent,
         recommendation_idx: usize,
+        candidates_count: u32,
     ) ![]const u8 {
         if (solutions.len == 0) {
             return self.allocator.dupe(u8, "未找到相关方案，建议调整搜索关键词");
@@ -474,7 +503,10 @@ pub const OptimizationResearcher = struct {
 
         if (solutions.len > 1) {
             try writer.print("\n共找到 {d} 个方案，经过 φ 精选后保留 {d} 个", .{
-                solutions.len + solutions.len, // approximate total before condensation
+                // Real pre-condensation count — the old len+len approximation
+                // contradicted the true candidates figure printed one line
+                // above in the REPL.
+                candidates_count,
                 solutions.len,
             });
         }

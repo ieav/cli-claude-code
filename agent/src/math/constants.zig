@@ -6,7 +6,7 @@ pub const PI: f64 = 3.14159265358979323846;
 pub const E: f64 = 2.71828182845904523536;
 pub const PHI: f64 = 0.61803398874989484820;
 pub const PHI_INVERSE: f64 = 1.61803398874989484820; // 1/φ = (1+√5)/2
-pub const PHI_64: u64 = 11400714819323198549; // φ × 2^64 for Fibonacci hashing
+pub const PHI_64: u64 = 0x9E3779B97F4A7C15; // floor(φ × 2^64) — Knuth's golden-ratio multiplier (the old value was off by +0x40)
 
 test "constants sanity" {
     try std.testing.expectApproxEqAbs(PI, std.math.pi, 1e-10);

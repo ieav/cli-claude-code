@@ -139,17 +139,22 @@ pub const WebSearch = struct {
         const results_array = web_results.object.get("results") orelse return &.{};
 
         var output = std.ArrayList(SearchResult).empty;
+        // Any `try` below (OOM) must not leak the entries already built.
+        errdefer {
+            for (output.items) |*r| r.deinit(self.allocator);
+        }
         const count = @min(results_array.array.items.len, max_results);
 
         for (results_array.array.items[0..count], 0..) |item, i| {
-            const title = if (item.object.get("title")) |t|
-                if (t == .string) try self.allocator.dupe(u8, t.string) else continue
-            else
-                continue;
-            const url_val = if (item.object.get("url")) |u|
-                if (u == .string) try self.allocator.dupe(u8, u.string) else continue
-            else
-                continue;
+            // Validate tags BEFORE duping anything: the old order duped the
+            // title first and `continue`d on a missing/非字符串 url, leaking
+            // it on every malformed item.
+            const title_val = item.object.get("title") orelse continue;
+            if (title_val != .string) continue;
+            const url_field = item.object.get("url") orelse continue;
+            if (url_field != .string) continue;
+            const title = try self.allocator.dupe(u8, title_val.string);
+            const url_val = try self.allocator.dupe(u8, url_field.string);
             const snippet = if (item.object.get("description")) |d|
                 if (d == .string) try self.allocator.dupe(u8, d.string) else try self.allocator.dupe(u8, "")
             else
@@ -211,17 +216,21 @@ pub const WebSearch = struct {
         const results_array = parsed.value.object.get("results") orelse return &.{};
 
         var output = std.ArrayList(SearchResult).empty;
+        // Any `try` below (OOM) must not leak the entries already built.
+        errdefer {
+            for (output.items) |*r| r.deinit(self.allocator);
+        }
         const count = @min(results_array.array.items.len, max_results);
 
         for (results_array.array.items[0..count], 0..) |item, i| {
-            const title = if (item.object.get("title")) |t|
-                if (t == .string) try self.allocator.dupe(u8, t.string) else continue
-            else
-                continue;
-            const url_val = if (item.object.get("url")) |u|
-                if (u == .string) try self.allocator.dupe(u8, u.string) else continue
-            else
-                continue;
+            // Validate tags BEFORE duping anything — same leak as the Brave
+            // parser: a duped title was abandoned by the url `continue`.
+            const title_val = item.object.get("title") orelse continue;
+            if (title_val != .string) continue;
+            const url_field = item.object.get("url") orelse continue;
+            if (url_field != .string) continue;
+            const title = try self.allocator.dupe(u8, title_val.string);
+            const url_val = try self.allocator.dupe(u8, url_field.string);
             const snippet = if (item.object.get("content")) |c|
                 if (c == .string) try self.allocator.dupe(u8, c.string) else try self.allocator.dupe(u8, "")
             else

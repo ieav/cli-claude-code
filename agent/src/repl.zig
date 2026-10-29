@@ -14,6 +14,8 @@ const runtime_registry = @import("tools/runtime_registry.zig");
 const skills_mod = @import("skills/mod.zig");
 const mcp_mod = @import("mcp/mod.zig");
 const registry = @import("tools/registry.zig");
+const denial_tracker_mod = @import("tools/denial_tracker.zig");
+const version_mod = @import("util/version.zig");
 const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
 const rollback_mod = @import("checkpoint/rollback.zig");
@@ -24,6 +26,7 @@ const util_time = @import("util/time.zig");
 const file_cache_mod = @import("util/file_cache.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const logger = @import("util/log.zig");
+const fs_ops = @import("util/fs_ops.zig");
 const memory_mod = @import("memory/mod.zig");
 const injection_mod = @import("memory/injection.zig");
 const extraction_mod = @import("memory/extraction.zig");
@@ -34,12 +37,19 @@ const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
+const format_mod = @import("util/format.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
+const error_handler = @import("runtime/error_handler.zig");
 const allocator = std.heap.smp_allocator;
 
 const MAX_AGENT_ITERATIONS: usize = 50;
 const MAX_CONTEXT_TOKENS: u32 = 128_000;
+
+/// Baseline fingerprint of all settings files, refreshed by (a) startup,
+/// (b) every own-save (autoSaveSettings, /mode, model picker). When a prompt
+/// observes a different fingerprint, the file was edited externally → reload.
+var settings_fp_baseline: u64 = 0;
 
 /// Active model state — holds the current model name and the provider instance.
 const ModelSwitcher = struct {
@@ -209,7 +219,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     const r = &file_reader.interface;
 
     // Load settings
-    var settings = config_mod.loadSettings(allocator, io) catch config_mod.Settings{};
+    const settings = config_mod.loadSettings(allocator, io) catch config_mod.Settings{};
 
     // Initialize model switcher
     var switcher = ModelSwitcher.init(settings, io);
@@ -217,6 +227,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
     // Session state
     var current_mode: auth.PermissionMode = switcher.settings.permission_mode;
+    settings_fp_baseline = config_mod.settingsFingerprint(allocator, io);
     var log = op_log.OperationLog.init(allocator);
     defer log.deinit();
     // Process-wide FileRead cache (repeat reads of unchanged files skip IO
@@ -224,6 +235,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     file_cache_mod.globalInit(allocator);
     defer file_cache_mod.deinitGlobal();
     var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, ".ziv/checkpoints"));
+    // The /config snapshot cap used to be write-only — the state hardcoded
+    // 100 and nothing read the setting.
+    fhist.max_snapshots = switcher.settings.max_snapshots;
     defer fhist.deinit();
     var rollback_engine = rollback_mod.RollbackEngine.init(allocator, &fhist, &log);
     var message_count: usize = 0;
@@ -281,16 +295,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
     // Add system prompt as first message, appending cross-session memories
     // recovered from .ziv/memory.db (most recent first, token-budgeted).
-    const sys_prompt = switcher.settings.system_prompt orelse system_prompt_mod.default_system_prompt;
+    // The runtime build embeds the current date/time so date questions don't
+    // cost a Bash round trip; on build failure fall back to the static prompt.
+    var sys_prompt_owned = system_prompt_mod.buildSystemPrompt(allocator, switcher.settings.system_prompt) catch null;
+    defer if (sys_prompt_owned) |sp| allocator.free(sp);
+    var sys_prompt: []const u8 = sys_prompt_owned orelse system_prompt_mod.default_system_prompt;
+    // What the baked history[0] prompt was built from — /config and the
+    // settings hot reload compare against it to know when to rebuild.
+    var applied_prompt_setting: ?[]const u8 = switcher.settings.system_prompt;
     var memory_block: ?[]u8 = null;
     defer if (memory_block) |mb| allocator.free(mb);
     if (mem_sys) |*ms| {
-        if (ms.episodic_mem.retrieveRecent(20) catch null) |entries| {
+        // Candidate pool of 200, not 20: the e-decay + cosine ranking only
+        // reorders what SQL already returned — with LIMIT 20, older
+        // high-value memories were evicted before ranking ever saw them.
+        if (ms.episodic_mem.retrieveRecent(200) catch null) |entries| {
             defer ms.episodic_mem.freeEntries(entries);
-            memory_block = injection_mod.buildMemoryBlock(allocator, entries, 800) catch null;
-            if (memory_block != null) {
-                injected_count = entries.len;
-                logger.info("memory: injected {d} entries into system prompt", .{entries.len});
+            if (injection_mod.buildMemoryBlock(allocator, entries, 800) catch null) |block| {
+                memory_block = block.text;
+                // Truthful count: entries that FIT the budget, not the
+                // candidate pool size (the old count over-reported when
+                // truncation hit).
+                injected_count = block.included;
+                logger.info("memory: injected {d} entries into system prompt", .{block.included});
             }
         }
     }
@@ -320,6 +347,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // ──── Reflection window (M4: periodic self-review) ────
     var reflector = reflection_mod.ReflectionEngine.init(allocator);
     defer reflector.deinit();
+    // Arm the π×10min timer from session START — it used to stay 0 until
+    // the first successful reflection, so short sessions (<10 queries)
+    // never got a time-based trigger.
+    reflector.last_reflection_at.store(util_time.nowMillis(), .monotonic);
     var window_queries: std.ArrayList([]u8) = .empty;
     defer {
         for (window_queries.items) |q| allocator.free(q);
@@ -339,12 +370,37 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var reg = runtime_registry.RuntimeRegistry.init(allocator);
     defer reg.deinit();
 
+    // AskUserQuestion: hand the stub the live REPL reader/writer so "ask
+    // the user" actually asks (it used to return "(Awaiting user response)"
+    // and the model kept going on a fabricated answer). Attached before any
+    // defs cache is built.
+    var ask_ctx = AskUserCtx{ .r = r, .w = w, .file_writer = &file_writer };
+    for (reg.entries.items) |*entry| {
+        if (std.mem.eql(u8, entry.def.name, "AskUserQuestion")) {
+            entry.def.execute_ctx_fn = askUserExecute;
+            entry.def.execute_ctx = @ptrCast(&ask_ctx);
+        }
+    }
+
+    // Consecutive-denial watchdog (designed anti-loop for dont_ask/auto
+    // modes): after N denials in a row, say so instead of silently
+    // starving the agent.
+    var denial_state = denial_tracker_mod.DenialTracker.init(5);
+
     // Input history for the line editor (up/down navigation).
     var input_history: std.ArrayList([]u8) = .empty;
     defer {
         for (input_history.items) |h| allocator.free(h);
         input_history.deinit(allocator);
     }
+    // Last submitted input — the Esc-recall source (interrupt or short
+    // window after submit). Owned here; lineinput only borrows it.
+    var last_sent: ?[]u8 = null;
+    defer if (last_sent) |ls| allocator.free(ls);
+    // Cross-session: ↑-recall survives restarts. Without this a fresh ziv
+    // shows no history (the magenta recall styling silently did nothing)
+    // until the user submits a new line — reported as "feature broken".
+    loadInputHistory(allocator, io, &input_history);
 
     try std.Io.Writer.writeAll(w,
         \\Type your message (or /help for commands):
@@ -353,6 +409,31 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     try std.Io.File.Writer.flush(&file_writer);
 
     while (true) {
+        // Hot-reload: a settings file changed on disk since the last prompt
+        // (external edit) → reload everything and resync the live permission
+        // mode. Own saves refresh the baseline, so this never fires for them.
+        const settings_fp = config_mod.settingsFingerprint(allocator, io);
+        if (settings_fp != settings_fp_baseline) {
+            settings_fp_baseline = settings_fp;
+            if (config_mod.loadSettings(allocator, io)) |fresh| {
+                const old_model = switcher.modelName();
+                applyReloadedSettings(&switcher, fresh);
+                current_mode = switcher.settings.permission_mode;
+                // Model changed on disk: re-apply to the live name buffer,
+                // or the prompt and every request keep the OLD model while
+                // /config shows the new one (双源状态分裂).
+                if (!std.mem.eql(u8, fresh.default_model, old_model)) {
+                    switcher.switchModel(fresh.default_model) catch |err| {
+                        logger.warning("reload: model switch to {s} failed: {}", .{ fresh.default_model, err });
+                    };
+                }
+                reapplySystemPromptIfNeeded(&applied_prompt_setting, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt);
+                logger.info("settings reloaded: mode={s}", .{@tagName(current_mode)});
+                try std.Io.Writer.print(w, "  [settings reloaded | mode: {s}]\n\n", .{auth.modeLabel(current_mode)});
+                try std.Io.File.Writer.flush(&file_writer);
+            } else |_| {}
+        }
+
         // Prompt with mode indicator + model + context usage
         const mode_str = switch (current_mode) {
             .default => "ziv",
@@ -368,28 +449,42 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
 
         // Read line via the raw-mode editor: arrows move the cursor,
-        // up/down walk history, Backspace/Delete/Home/End work. Pipes
-        // (non-TTY) transparently fall back to plain line reading.
-        var line_buf: [4096]u8 = undefined;
-        const maybe_n = lineinput.readLine(w, r, &file_writer, prompt, &line_buf, &input_history, allocator) catch |err| {
+        // up/down walk history (or move between lines on multi-line input),
+        // Backspace/Delete/Home/End work, pasted multi-line text arrives as
+        // ONE input. The returned slice is allocator-owned and may exceed
+        // 4 KiB after a big paste — freed at the end of this iteration.
+        const maybe_line = lineinput.readLine(w, r, &file_writer, prompt, &input_history, allocator) catch |err| {
             std.debug.print("Error reading input: {}\n", .{err});
             return;
         };
-        const n = maybe_n orelse {
+        const line = maybe_line orelse {
+            // Ctrl-D on an empty line (EOF): same session-end cleanup as
+            // /quit — this path used to skip reflection + memory extraction,
+            // silently losing the session's learnings on a common exit habit.
+            if (mem_sys != null and window_queries.items.len > 0) {
+                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
+            }
+            if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
             return;
         };
+        // Loop-body scope: freed on every continue/break/return below.
+        defer allocator.free(line);
 
-        if (n == 0) continue;
+        if (line.len == 0) continue;
 
-        const input = std.mem.trim(u8, line_buf[0..n], " \t\r\n");
+        const input = std.mem.trim(u8, line, " \t\r\n");
         if (input.len == 0) continue;
+        saveInputHistory(allocator, &input_history);
 
         var skill_injected = false;
         // ──── Meta commands ────
-        if (std.mem.startsWith(u8, input, "/")) {
-            if (std.mem.eql(u8, input, "/quit") or std.mem.eql(u8, input, "/q") or std.mem.eql(u8, input, "/exit")) {
+        // Multi-line input (pasted text, `\`+Enter drafts) is always a
+        // MESSAGE — a pasted blob that happens to start with '/' must not
+        // trip the command dispatcher.
+        if (std.mem.startsWith(u8, input, "/") and std.mem.indexOfScalar(u8, input, '\n') == null) {
+            if (std.ascii.eqlIgnoreCase(input, "/quit") or std.ascii.eqlIgnoreCase(input, "/q") or std.ascii.eqlIgnoreCase(input, "/exit")) {
                 // M4: session-end reflection on whatever the window still holds.
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
@@ -533,7 +628,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 };
-                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, &file_writer)) continue;
+                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, &file_writer, &denial_state)) continue;
 
                 // Backup file before modification (for /run commands)
                 var run_snap_id: ?[16]u8 = null;
@@ -544,8 +639,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         for (&sid, 0..) |*byte, i| {
                             byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
                         }
-                        fhist.trackEdit(fp, sid, io) catch {};
-                        run_snap_id = sid;
+                        if (switcher.settings.checkpointing_enabled) {
+                            fhist.trackEdit(fp, sid, io) catch {};
+                            run_snap_id = sid;
+                        }
                     }
                 }
 
@@ -573,6 +670,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // every restart silently fell back to the configured mode.
                 switcher.settings.permission_mode = current_mode;
                 config_mod.saveSettings(&switcher.settings, allocator, io) catch {};
+                settings_fp_baseline = config_mod.settingsFingerprint(allocator, io);
                 try std.Io.Writer.print(w, "  Permission mode: {s} (已保存)\n\n", .{auth.modeLabel(current_mode)});
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -587,8 +685,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const new_model = input[7..];
                 switcher.switchModel(new_model) catch |err| {
                     if (err == error.MissingApiKey) {
-                        const detected = llm.detectBackend(new_model);
-                        try std.Io.Writer.print(w, "  Error: API key not configured for {s} backend.\n", .{detected.label()});
+                        // Report the backend that VALIDATED the key
+                        // (effectiveBackend honors default_backend) — the
+                        // name-prefix detector could point at Ollama
+                        // (keyless) while the gateway backend rejected us.
+                        try std.Io.Writer.print(w, "  Error: API key not configured for {s} backend.\n", .{switcher.effectiveBackend(new_model).label()});
                         try std.Io.Writer.writeAll(w, "  Use /config to set API keys, or add to ~/.config/ziv/settings.json.\n\n");
                     } else {
                         try std.Io.Writer.print(w, "  Error switching model: {}\n\n", .{err});
@@ -601,8 +702,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 continue;
             } else if (std.mem.eql(u8, input, "/config")) {
                 try runConfigMenu(w, r, &file_writer, &switcher, allocator, io);
-                // Re-sync settings reference after config may have changed
-                settings = switcher.settings;
+                // The live permission gate reads `current_mode`, which the
+                // menu never touched — without this resync a mode picked in
+                // /config never reached the gate until restart.
+                current_mode = switcher.settings.permission_mode;
+                // A changed system prompt must reach the baked history[0]
+                // this session, not after the next restart.
+                reapplySystemPromptIfNeeded(&applied_prompt_setting, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt);
                 continue;
             } else if (std.mem.eql(u8, input, "/compact")) {
                 // Claude-style: LLM summarizes the conversation, the summary
@@ -617,6 +723,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
+                // Reflect BEFORE the window is orphaned: /quit and Ctrl-D
+                // both reflect first; /clear used to skip it, leaking the
+                // cleared conversation's queries into the next one's
+                // reflection window.
+                if (mem_sys != null and window_queries.items.len > 0) {
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
+                }
                 if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -625,8 +738,22 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // with the cleared one's memories.
                 if (memory_block) |mb| {
                     allocator.free(mb);
-                    const fresh_blocks = try allocator.alloc(llm.ContentBlock, 1);
+                    // Rebuild the prompt so the embedded date/time is fresh —
+                    // a session crossing midnight must not keep answering
+                    // date questions with yesterday. (defer frees whatever
+                    // sys_prompt_owned holds at scope exit, so swapping here
+                    // stays single-ownership.)
+                    if (sys_prompt_owned) |sp| allocator.free(sp);
+                    sys_prompt_owned = system_prompt_mod.buildSystemPrompt(allocator, switcher.settings.system_prompt) catch null;
+                    sys_prompt = sys_prompt_owned orelse system_prompt_mod.default_system_prompt;
+                    const fresh_count: usize = 1 + @as(usize, @intFromBool(skill_manifest != null));
+                    const fresh_blocks = try allocator.alloc(llm.ContentBlock, fresh_count);
                     fresh_blocks[0] = .{ .text = sys_prompt };
+                    // The skill manifest must survive /clear — rebuilding a
+                    // single-block message dropped it, leaving the model
+                    // blind to every /<skill> until restart (the manifest
+                    // string stays owned by the outer defer).
+                    if (skill_manifest) |sm| fresh_blocks[1] = .{ .text = sm };
                     allocator.free(history.items[0].content);
                     history.items[0].content = fresh_blocks;
                     memory_block = null; // the end-of-session defer must not double-free
@@ -652,7 +779,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 if (topic.len == 0) {
                     try std.Io.Writer.writeAll(w, "  Usage: /research <topic>\n\n");
                 } else {
-                    try runResearch(topic, allocator, io, w);
+                    try runResearch(topic, allocator, io, w, switcher.settings.api_keys.brave_api_key, if (mem_sys) |*ms| ms else null, if (kgraph) |*g| g else null);
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -666,13 +793,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 if (concern.len == 0) {
                     try std.Io.Writer.writeAll(w, "  Usage: /diagnose <your concern about the last answer>\n\n");
                 } else {
-                    try runDiagnose(if (live_trace) |*t| t else null, concern, injected_count, window_tools, window_errors, allocator, w);
+                    try runDiagnose(if (live_trace) |*t| t else null, concern, injected_count, window_tools, window_errors, if (mem_sys) |*ms| ms else null, allocator, w);
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/undo")) {
-                try undoLastExchange(&history, allocator, w);
-                log.bumpEpoch();
+                // Only invalidate older rewind points when something was
+                // actually removed — a no-op undo must not rewrite history.
+                if (try undoLastExchange(&history, allocator, w) > 0) {
+                    log.bumpEpoch();
+                }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/history")) {
@@ -709,8 +839,60 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 });
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
+            } else if (std.mem.eql(u8, input, "/terminal-setup")) {
+                // Claude-Code-style Shift+Enter enabler: ziv understands the
+                // sequences; this tells the TERMINAL to actually send one.
+                const term = env.get("TERM_PROGRAM") orelse "";
+                try std.Io.Writer.writeAll(w,
+                    \\  Shift+Enter 换行配置指引（ziv 已支持以下全部信号；另有通用回退）
+                    \\
+                    \\  ─ 通用（所有终端立即可用）────────────────────────
+                    \\    · 行尾反斜杠 `\` + Enter   续行
+                    \\    · Ctrl+J                  插入换行
+                    \\
+                );
+                if (std.mem.eql(u8, term, "vscode")) {
+                    try std.Io.Writer.writeAll(w,
+                        \\
+                        \\  ─ VS Code 集成终端 ────────────────────────────
+                        \\    Settings → Keyboard Shortcuts → Terminal: Run Recent Command?
+                        \\    简单做法：keybindings.json 加一条
+                        \\      { "key": "shift+enter", "command": "workbench.action.terminal.sendSequence",
+                        \\        "args": { "text": "\n" }, "when": "terminalFocus" }
+                        \\
+                    );
+                } else if (std.mem.eql(u8, term, "iTerm.app")) {
+                    try std.Io.Writer.writeAll(w,
+                        \\
+                        \\  ─ iTerm2 ──────────────────────────────────────
+                        \\    Settings → Profiles → Keys → Key Mappings → +:
+                        \\      Shortcut: Shift+Enter  Action: Send Escape Sequence
+                        \\      Esc+ 输入: \r    （ziv 识别 ESC+CR 为换行）
+                        \\
+                    );
+                } else if (std.mem.eql(u8, term, "WezTerm")) {
+                    try std.Io.Writer.writeAll(w,
+                        \\
+                        \\  ─ WezTerm ─────────────────────────────────────
+                        \\    wezterm.lua:
+                        \\      keys = { { key="Enter", mods="SHIFT", action=wezterm.action{SendString="\n"} } }
+                        \\
+                    );
+                } else {
+                    try std.Io.Writer.writeAll(w,
+                        \\
+                        \\  ─ 其他终端（含 Apple Terminal）─────────────────
+                        \\    Apple Terminal 不支持单键改映射，推荐用 `\`+Enter 或 Ctrl+J。
+                        \\    kitty/foot 等支持 kitty keyboard 协议的终端：
+                        \\      ziv 已直接识别其 Shift+Enter（CSI 13;2u），无需配置。
+                        \\
+                    );
+                }
+                try std.Io.Writer.writeAll(w, "\n");
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
             } else if (std.mem.eql(u8, input, "/version")) {
-                try std.Io.Writer.writeAll(w, "  Ziv v0.5.0 (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
+                try std.Io.Writer.writeAll(w, "  Ziv v" ++ version_mod.version ++ " (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (input.len > 1 and skill_loader.findByName(if (std.mem.indexOfScalar(u8, input[1..], ' ')) |sp| input[1 .. 1 + sp] else input[1..]) != null) {
@@ -729,8 +911,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 var did_subst = false;
                 if (std.mem.indexOf(u8, body, "$ARGUMENTS") != null) {
                     const arg_val = if (task.len > 0) task else "";
-                    expanded = std.mem.replaceOwned(u8, allocator, body, "$ARGUMENTS", arg_val) catch body;
-                    did_subst = true;
+                    // Only mark ownership on success — the old catch-body
+                    // fallback aliased `expanded` to `body` while did_subst
+                    // stayed true, double-freeing one of them at scope exit.
+                    if (std.mem.replaceOwned(u8, allocator, body, "$ARGUMENTS", arg_val)) |replaced| {
+                        expanded = replaced;
+                        did_subst = true;
+                    } else |_| {}
                 }
                 defer if (did_subst) allocator.free(expanded);
                 const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
@@ -775,10 +962,46 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             });
         }
 
+        // Reflection window + message counter (M4): reflect() bails on an
+        // empty window — without this append the whole reflection subsystem
+        // silently never ran (the block was dropped in the skill commit).
+        message_count += 1;
+        if (allocator.dupe(u8, input)) |q| {
+            window_queries.append(allocator, q) catch allocator.free(q);
+            if (window_queries.items.len > 20) {
+                allocator.free(window_queries.orderedRemove(0));
+            }
+        } else |_| {}
+
+        // Arm Esc-recall: Esc during generation (interrupt) or within a few
+        // seconds at the next empty prompt pulls this text back into the
+        // editor for editing/resending.
+        if (last_sent) |ls| allocator.free(ls);
+        last_sent = allocator.dupe(u8, input) catch null;
+        lineinput.recall_text = last_sent;
+
+        // M8-deep: one fresh decision trace per query; /diagnose reads it
+        // live instead of always synthesizing the static fallback.
+        if (live_trace) |*t| t.deinit();
+        if (allocator.dupe(u8, input)) |q| {
+            live_trace = decision_trace.DecisionTrace.init(allocator, q);
+        } else |_| {}
+
+        // First link of the designed 7-phase chain. The static fallback in
+        // runDiagnose carries this phase, but once live traces exist that
+        // fallback never runs — without this step no live trace could ever
+        // flag the memory tier as a diagnosis root cause.
+        if (live_trace) |*t| {
+            traceAddStep(t, .memory_retrieval, if (injected_count > 0) 0.8 else 0.3, "session start", "memory block", if (injected_count > 0) "recency-ranked e-decay injection" else "no memories injected", 0, allocator) catch {};
+        }
+
         // Agent loop
         var agent_iterations: usize = 0;
         var result_blocks = std.ArrayList(llm.ContentBlock).empty;
         defer result_blocks.deinit(allocator);
+        // One emergency compaction per turn on ContextOverflow — a second
+        // overflow after compacting falls through to the manual hint.
+        var overflow_compacted = false;
 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
             // Compaction check + context estimate in one pass.
@@ -799,9 +1022,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             if (live_trace) |*t| {
                 var ctx_buf: [96]u8 = undefined;
                 const out_desc = std.fmt.bufPrint(&ctx_buf, "history={d} ctx~{d}t", .{ history.items.len, est_ctx }) catch "history";
-                traceAddStep(t, .context_assembly, if (est_ctx < MAX_CONTEXT_TOKENS) 0.9 else 0.5, "messages + memory block", out_desc, "compaction-checked assembly", allocator) catch {};
+                traceAddStep(t, .context_assembly, if (est_ctx < MAX_CONTEXT_TOKENS) 0.9 else 0.5, "messages + memory block", out_desc, "compaction-checked assembly", 0, allocator) catch {};
             }
-            logger.notice("LLM call: model={s} history_len={d} max_tokens={d}", .{
+            // Pre-call log demoted to debug: the user-facing summary line after
+            // the call carries model/history/tokens — printing both cluttered
+            // the REPL with a duplicate [INF] line per turn.
+            logger.debug("LLM call: model={s} history_len={d} max_tokens={d}", .{
                 switcher.modelName(), history.items.len, switcher.settings.max_tokens,
             });
             // Stream the response: text deltas print live as they arrive.
@@ -811,9 +1037,57 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 .temperature = 0.7,
                 // Declare the tools so the model can actually call them.
                 .tools = reg.toolSpecs(),
-            }, w, &file_writer, allocator) catch |err| {
+            }, r, w, &file_writer, allocator) catch |err| {
+                if (err == error.EscCancelled) {
+                    // Esc: abort this exchange and pull the input back into
+                    // the editor (history keeps the user message; no
+                    // assistant reply was appended).
+                    try std.Io.Writer.print(w, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
+                    lineinput.recall_text = last_sent;
+                    lineinput.recall_prefill = true;
+                    try std.Io.File.Writer.flush(&file_writer);
+                    break;
+                }
                 logger.err("LLM call failed: {}", .{err});
-                try std.Io.Writer.print(w, "  [LLM error: {}]\n\n", .{err});
+                // Context overflow: compact once and retry instead of
+                // stranding the session — every retry would otherwise send
+                // the same oversized history and fail identically.
+                if (err == error.ContextOverflow and !overflow_compacted) {
+                    overflow_compacted = true;
+                    compactHistoryImpl(&history, allocator);
+                    log.bumpEpoch();
+                    try std.Io.Writer.print(w, "  [Context overflow — history auto-compacted, retrying]\n", .{});
+                    try std.Io.File.Writer.flush(&file_writer);
+                    continue;
+                }
+                try std.Io.Writer.print(w, "  [LLM error: {}]\n", .{err});
+                // Designed error-feedback closure (§四): classified analysis
+                // + numbered fixes with the recommended one marked. The
+                // formatter existed since v0.3 with zero callers.
+                {
+                    const err_code: []const u8 = switch (err) {
+                        error.NetworkTimeout => "network_timeout",
+                        error.RateLimit => "api_rate_limit",
+                        error.ContextOverflow => "context_overflow",
+                        else => @errorName(err),
+                    };
+                    if (error_handler.formatErrorReport(allocator, err_code, @errorName(err))) |report| {
+                        defer {
+                            allocator.free(report.analysis);
+                            allocator.free(report.fixes);
+                        }
+                        try std.Io.Writer.print(w, "  {s}\n", .{report.analysis});
+                        for (report.fixes) |f| {
+                            try std.Io.Writer.print(w, "    [{d}] {s}{s}\n", .{ f.index, f.description, if (f.is_recommended) " ★" else "" });
+                        }
+                    } else |_| {}
+                }
+                if (err == error.ContextOverflow) {
+                    try std.Io.Writer.print(w, "  [Still too long after compaction — try /compact phi or /clear]\n", .{});
+                } else if (err == error.InvalidRequest) {
+                    try std.Io.Writer.print(w, "  [The gateway rejected the request — its reason is on the [ERR] body line above]\n", .{});
+                }
+                try std.Io.Writer.writeAll(w, "\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
             };
@@ -833,16 +1107,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             if (live_trace) |*t| {
                 const gen_conf: f64 = if (response.usage.output_tokens > 0) 0.9 else 0.4;
                 const out_desc: []const u8 = if (response.content.len > 0) "content blocks" else "empty response";
-                traceAddStep(t, .llm_generation, gen_conf, "history + system prompt", out_desc, @tagName(response.stop_reason), allocator) catch {};
+                traceAddStep(t, .llm_generation, gen_conf, "history + system prompt", out_desc, @tagName(response.stop_reason), @intCast(util_time.nowMillis() - llm_t0), allocator) catch {};
             }
 
             // Text/thinking deltas were already printed live by streamComplete;
-            // only tool info remains to show here.
+            // tool calls too ([calling tool: X] on the stream event) — a
+            // second announce here was pure duplication.
             for (response.content) |block| {
                 switch (block) {
-                    .tool_use => |tc| {
-                        try std.Io.Writer.print(w, "  [tool_use: {s}]\n", .{tc.name});
-                    },
+                    .tool_use => {},
                     .tool_result => |tr| {
                         const label = if (tr.is_error) "error" else "result";
                         try std.Io.Writer.print(w, "  [tool {s}: {s}]\n", .{ label, tr.content });
@@ -851,9 +1124,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
             }
             const llm_elapsed_s = @as(f64, @floatFromInt(util_time.nowMillis() - llm_t0)) / 1000.0;
-            try std.Io.Writer.print(w, "  [tokens: in={d} out={d} | stop: {s} | {d:.1}s]\n", .{
+            try std.Io.Writer.print(w, "  [{s} | in={d} out={d} | hist={d} | stop: {s} | {d:.1}s]\n", .{
+                switcher.modelName(),
                 response.usage.input_tokens,
                 response.usage.output_tokens,
+                history.items.len,
                 @tagName(response.stop_reason),
                 llm_elapsed_s,
             });
@@ -864,16 +1139,25 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // session allocator; no DOM arena involved), so no deep copy
             // or arena release is needed here.
             const stop_reason = response.stop_reason;
-            try history.append(allocator, .{
-                .role = .assistant,
-                .content = response.content,
-                .timestamp = util_time.nowMillis(),
-            });
+            // Skip fully-empty responses: they pollute history, and the
+            // Claude wire format would carry them as an empty-content
+            // message some endpoints reject (OpenAI/Ollama skip them).
+            if (response.content.len > 0) {
+                try history.append(allocator, .{
+                    .role = .assistant,
+                    .content = response.content,
+                    .timestamp = util_time.nowMillis(),
+                });
+            } else {
+                // Ownership never moved to history — release the (empty)
+                // block slice ourselves; zero-length free is a no-op-safe.
+                allocator.free(@constCast(response.content));
+            }
 
             // Record in operation log
             _ = log.record("LLMResponse", input, "response", null, false, 0) catch {};
             if (live_trace) |*t| {
-                traceAddStep(t, .response_postprocess, 0.95, "stream aggregation", "blocks appended to history", "REPL-owned copy", allocator) catch {};
+                traceAddStep(t, .response_postprocess, 0.95, "stream aggregation", "blocks appended to history", "REPL-owned copy", 0, allocator) catch {};
             }
 
             // Check if tool calling is needed
@@ -920,14 +1204,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             for (&sid, 0..) |*byte, i| {
                                 byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
                             }
-                            fhist.trackEdit(fp, sid, io) catch {};
-                            snap_id = sid;
+                            // The /config toggle used to be a placebo —
+                            // snapshots were taken unconditionally.
+                            if (switcher.settings.checkpointing_enabled) {
+                                fhist.trackEdit(fp, sid, io) catch {};
+                                snap_id = sid;
+                            }
                         }
                     }
 
                     // Permission check (shared gate; auto mode may delegate
                     // the ambiguous ask case to the LLM classifier).
-                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, &file_writer);
+                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, &file_writer, &denial_state);
                     if (!approved) {
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = try allocator.dupe(u8, tc.id),
@@ -950,7 +1238,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const conf: f64 = if (total_calls == 0) 0.9 else @as(f64, @floatFromInt(prepared.items.len)) / @as(f64, @floatFromInt(total_calls));
                     var sel_buf: [96]u8 = undefined;
                     const out_desc = std.fmt.bufPrint(&sel_buf, "approved={d} rejected={d}", .{ prepared.items.len, total_calls - prepared.items.len }) catch "selection";
-                    traceAddStep(t, .tool_selection, conf, "tool_use blocks", out_desc, "permission gate", allocator) catch {};
+                    traceAddStep(t, .tool_selection, conf, "tool_use blocks", out_desc, "permission gate", 0, allocator) catch {};
                 }
             }
 
@@ -968,6 +1256,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     for (batches) |b| allocator.free(b.calls);
                     allocator.free(batches);
                 }
+                const batch_t0 = util_time.nowMillis();
                 const results = try orchestration_mod.executeBatches(batches, allocator, io, reg.definitions());
                 defer allocator.free(results);
 
@@ -986,7 +1275,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
                     var step_buf: [96]u8 = undefined;
                     const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
-                    traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", allocator) catch {};
+                    traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", @intCast(util_time.nowMillis() - batch_t0), allocator) catch {};
                 }
             }
 
@@ -1014,7 +1303,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         if (mem_sys != null and reflector.shouldReflect()) {
             runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null);
             if (live_trace) |*t| {
-                traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", allocator) catch {};
+                traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", 0, allocator) catch {};
             }
         }
 
@@ -1074,7 +1363,7 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
                 .user_preference => .user,
                 .project_context, .technical_fact, .error_solution, .pattern_observed => .project,
             },
-            .name = f.content[0..@min(48, f.content.len)],
+            .name = f.content[0..injection_mod.utf8Boundary(f.content, 48)],
             .description = @tagName(f.fact_type),
             .content = f.content,
             .access_count = 0,
@@ -1113,13 +1402,17 @@ fn runReflection(
     w: *std.Io.Writer,
     provider: ?llm.Provider,
 ) void {
+    const reflect_t0 = util_time.nowMillis();
     const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
 
     // LLM augmentation: when a provider is reachable, ask it to summarize
     // the query window into one improvement insight; heuristics stay as
-    // the fallback (and quality score source).
+    // the fallback (and quality score source). Only for windows with real
+    // signal (>= 3 queries) — trivial windows used to pay a full blocking
+    // LLM round trip for nothing, stalling the prompt for seconds.
     var llm_insights: ?[]u8 = null;
-    if (provider) |p| {
+    if (provider != null and window_queries.items.len >= 3) {
+        const p = provider.?;
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         const pw = &aw.writer;
@@ -1169,7 +1462,7 @@ fn runReflection(
         .updated_at = now,
     }) catch {};
     logger.info("reflection: quality={d:.2} insights stored (llm={})", .{ reflection.quality_score, llm_insights != null });
-    w.print("  [Reflection] {s}\n", .{insights}) catch {};
+    w.print("  [Reflection {d}ms] {s}\n", .{ util_time.nowMillis() - reflect_t0, insights }) catch {};
 
     // Reset the window.
     for (window_queries.items) |q| alloc.free(q);
@@ -1206,10 +1499,13 @@ fn printMemoryStatus(mem_sys: ?*memory_mod.MemorySystem, injected_count: usize, 
 
 /// M8: /research — run the φ-curated optimization researcher over the web
 /// (same backend selection as the WebSearch tool) and print its report.
-fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *std.Io.Writer) !void {
+/// `configured_brave_key` is the /config-stored key — the env var wins,
+/// but without this fallback a key entered in the menu was write-only and
+/// /research silently stayed on DuckDuckGo.
+fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, configured_brave_key: ?[]const u8, mem: ?*memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph) !void {
     try std.Io.Writer.writeAll(w, "  Researching (φ-optimized queries, ~30s budget)…\n");
 
-    const brave_key = env.get("BRAVE_API_KEY");
+    const brave_key = env.get("BRAVE_API_KEY") orelse configured_brave_key;
     const backend: knowledge_search.SearchBackend = if (brave_key != null) .brave else .duckduckgo;
     var ws = knowledge_search.WebSearch.init(alloc, io, backend, if (brave_key) |k| try alloc.dupe(u8, k) else null);
     defer ws.deinit();
@@ -1230,6 +1526,33 @@ fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *std.
         try std.Io.Writer.print(w, "\n  {s}\n", .{result.reasoning});
     }
     try std.Io.Writer.writeAll(w, "\n");
+
+    // Designed Step 6 (learning closure): the recommended solution used to
+    // vanish with the printout. Persist it as a memory + knowledge node so
+    // later sessions (and /knowledge) can retrieve what the research found.
+    if (result.top_solutions.len > 0) {
+        const sol = result.top_solutions[result.recommendation_index];
+        var buf: [700]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "[research:{s}] {s} — {s} ({s})", .{ topic, sol.name, sol.description, sol.source }) catch null;
+        if (summary) |s| {
+            if (mem) |m| {
+                const now = util_time.nowMillis();
+                m.store(.{
+                    .id = injection_mod.memoryId(s, "research"),
+                    .mem_type = .reference,
+                    .name = "research result",
+                    .description = "web research recommendation",
+                    .content = s,
+                    .access_count = 0,
+                    .created_at = now,
+                    .updated_at = now,
+                }) catch {};
+            }
+            if (kg) |g| {
+                _ = g.addNode(s, .technology, "research") catch {};
+            }
+        }
+    }
 }
 
 /// M8: /diagnose — build a lightweight decision trace from real session
@@ -1240,6 +1563,7 @@ fn runDiagnose(
     injected_count: usize,
     window_tools: u32,
     window_errors: u32,
+    mem: ?*memory_mod.MemorySystem,
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
 ) !void {
@@ -1301,6 +1625,13 @@ fn runDiagnose(
     const source: []const u8 = if (live != null) "live agent-loop trace" else "static fallback";
     try std.Io.Writer.print(w, "  Diagnosing ({s}, {d} steps)…\n", .{ source, trace.getSteps().len });
 
+    // Designed step-by-step review (§九): walk the chain with ✓/⚠ per step
+    // (conf ≥ φ passes) before the gap summary.
+    for (trace.getSteps()) |step| {
+        const mark: []const u8 = if (step.confidence >= math_mod.constants.PHI) "✓" else "⚠";
+        try std.Io.Writer.print(w, "  {s} {s} (conf {d:.2}, {d}ms)\n", .{ mark, @tagName(step.phase), step.confidence, step.duration_ms });
+    }
+
     var diag = self_diagnostic.SelfDiagnostic.init(alloc);
     const report = diag.diagnose(trace, concern) catch {
         try std.Io.Writer.writeAll(w, "  Diagnosis failed.\n\n");
@@ -1316,6 +1647,30 @@ fn runDiagnose(
         try std.Io.Writer.print(w, "  → {s}\n", .{s.suggestion});
     }
     try std.Io.Writer.writeAll(w, "\n");
+
+    // Designed learning closure (§九 step 5): persist the diagnosis as a
+    // .feedback memory so the next session's injection can surface it —
+    // reports used to be printed and dropped. Working/episodic store both
+    // copy, so a stack buffer is safe to hand over.
+    if (mem) |m| {
+        if (report.root_cause) |rc| {
+            var buf: [512]u8 = undefined;
+            const summary = std.fmt.bufPrint(&buf, "诊断「{s}」根因: {s}", .{ concern, rc.description }) catch null;
+            if (summary) |s| {
+                const now = util_time.nowMillis();
+                m.store(.{
+                    .id = injection_mod.memoryId(s, "diagnosis"),
+                    .mem_type = .feedback,
+                    .name = "diagnosis learning",
+                    .description = "self-diagnosis",
+                    .content = s,
+                    .access_count = 0,
+                    .created_at = now,
+                    .updated_at = now,
+                }) catch {};
+            }
+        }
+    }
 }
 
 /// Deep-copy a json.Value tree onto `alloc` (the response DOM is arena-owned
@@ -1444,6 +1799,7 @@ fn traceAddStep(
     input: []const u8,
     output: []const u8,
     reasoning: []const u8,
+    duration_ms: i64,
     alloc: std.mem.Allocator,
 ) !void {
     try t.addStep(.{
@@ -1454,7 +1810,7 @@ fn traceAddStep(
         .output = try alloc.dupe(u8, output),
         .reasoning = try alloc.dupe(u8, reasoning),
         .confidence = confidence,
-        .duration_ms = 0,
+        .duration_ms = duration_ms,
         .alternatives = &.{},
         .dependencies = &.{},
     });
@@ -1471,6 +1827,15 @@ const StreamAgg = struct {
     usage: llm.provider.Usage = .{ .input_tokens = 0, .output_tokens = 0 },
     stop_reason: llm.provider.CompleteResponse.StopReason = .end_turn,
     saw_error: ?llm.provider.ProviderError = null,
+    /// One-shot dim "(thinking…)" marker: reasoning streams (GLM
+    /// reasoning_content / Claude thinking) used to render as dead silence
+    /// for seconds, reading like a hang.
+    thinking_shown: bool = false,
+    thinking_newline_needed: bool = false,
+    /// Esc-interrupt: when set, streamCb polls stdin (throttled) so Esc
+    /// cancels generation and recalls the input for editing.
+    esc_probe_r: ?*std.Io.Reader = null,
+    last_esc_check: i64 = 0,
 
     fn deinit(self: *StreamAgg) void {
         self.text.deinit(self.alloc);
@@ -1479,18 +1844,102 @@ const StreamAgg = struct {
     }
 };
 
+/// Claude-Code-style one-line tool call display: `⏺ Bash(ls -la)`. Picks
+/// the most informative argument field for the tool; falls back to the raw
+/// JSON. Returned slice is caller-owned (arena/temporary use); empty when
+/// nothing useful to show.
+fn toolArgSummary(alloc: std.mem.Allocator, tool: []const u8, input: std.json.Value) []const u8 {
+    _ = tool;
+    const interesting = [_][]const u8{ "command", "path", "pattern", "query", "topic", "url", "name" };
+    var pick: []const u8 = "";
+    for (interesting) |field| {
+        if (input == .object) {
+            if (input.object.get(field)) |v| {
+                if (v == .string and v.string.len > 0) {
+                    pick = v.string;
+                    break;
+                }
+            }
+        }
+    }
+    if (pick.len == 0) {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        std.json.Stringify.value(input, .{}, &aw.writer) catch return "";
+        pick = aw.written();
+        if (pick.len <= 2) return ""; // "{}"
+    }
+    const s = summarize(alloc, pick) catch return "";
+    return std.fmt.allocPrint(alloc, "({s})", .{s}) catch "";
+}
+
+/// "(summary)" — first line, display-width-capped (CJK-aware, per CHAR not
+/// per byte), control bytes stripped, never cut mid-UTF-8.
+fn summarize(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var end = @min(s.len, std.mem.indexOfScalar(u8, s, '\n') orelse s.len);
+    if (end > 80) end = 80;
+    // Back off to a char boundary (byte cuts used to split CJK chars and
+    // print mojibake).
+    while (end > 0 and end < s.len and (s[end] & 0xC0) == 0x80) end -= 1;
+
+    var out = std.ArrayList(u8).empty;
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < end) {
+        const c = s[i];
+        if (c < 0x20) {
+            i += 1;
+            continue;
+        }
+        const cw: usize = if (c >= 0xE0) 2 else 1;
+        if (w + cw > 48) break;
+        var j = i + 1;
+        while (j < end and (s[j] & 0xC0) == 0x80) j += 1;
+        try out.appendSlice(alloc, s[i..j]);
+        w += cw;
+        i = j;
+    }
+    if (i < s.len or w >= 48) try out.appendSlice(alloc, "…");
+    return out.toOwnedSlice(alloc);
+}
+
 fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!void {
     const self: *StreamAgg = @ptrCast(@alignCast(ctx_opaque.?));
+    // Esc interrupts generation (Claude-Code style): poll stdin at most
+    // every 50 ms — an error return here aborts the provider stream.
+    if (self.esc_probe_r != null) {
+        const now = util_time.nowMillis();
+        if (now - self.last_esc_check >= 50) {
+            self.last_esc_check = now;
+            if (lineinput.escProbe(self.esc_probe_r.?)) {
+                return error.EscCancelled;
+            }
+        }
+    }
     switch (event) {
         .content_delta => |d| {
+            // Close the "(thinking…)" marker line before the first real text.
+            if (self.thinking_newline_needed) {
+                self.thinking_newline_needed = false;
+                try std.Io.Writer.writeAll(self.w, "\n");
+            }
             // Live print: this is the whole point of streaming.
             try std.Io.Writer.writeAll(self.w, d);
             std.Io.File.Writer.flush(self.file_writer) catch {};
             try self.text.appendSlice(self.alloc, d);
         },
-        .thinking_delta => {},
+        .thinking_delta => {
+            if (!self.thinking_shown) {
+                self.thinking_shown = true;
+                self.thinking_newline_needed = true;
+                try std.Io.Writer.writeAll(self.w, "\x1b[2m(thinking…)\x1b[0m");
+                std.Io.File.Writer.flush(self.file_writer) catch {};
+            }
+        },
         .tool_call => |tu| {
-            try std.Io.Writer.print(self.w, "\n  [calling tool: {s}]\n", .{tu.name});
+            // Per-event arena: the summary strings are print-and-done.
+            var sum_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer sum_arena.deinit();
+            try self.w.print("\n  ⏺ \x1b[1m{s}\x1b[0m{s}\n", .{ tu.name, toolArgSummary(sum_arena.allocator(), tu.name, tu.input) });
             std.Io.File.Writer.flush(self.file_writer) catch {};
             try self.tools.append(self.alloc, .{
                 .id = try self.alloc.dupe(u8, tu.id),
@@ -1511,14 +1960,46 @@ fn streamComplete(
     prov: llm.Provider,
     history: []const llm.Message,
     opts: llm.provider.CompleteOptions,
+    r: ?*std.Io.Reader,
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     alloc: std.mem.Allocator,
 ) !llm.provider.CompleteResponse {
-    var agg = StreamAgg{ .alloc = alloc, .w = w, .file_writer = file_writer };
+    var agg = StreamAgg{ .alloc = alloc, .w = w, .file_writer = file_writer, .esc_probe_r = r };
     defer agg.deinit();
 
-    try prov.stream(history, opts, @ptrCast(&agg), streamCb);
+    // Keep the terminal RAW for the whole generation: readLine restores
+    // cooked mode when it returns, and under cooked input discipline the
+    // Esc probe is crippled — ESC parks in the line buffer until some
+    // later \r flushes the line (ICRNL rewriting it to \n on the way in,
+    // which then leaked into the editor as a newline), and 0x7f is eaten
+    // as ERASE, deleting the queued Esc entirely. Raw makes Esc visible
+    // within one 50 ms probe.
+    var esc_guard = menu.RawGuard{};
+    if (r != null) {
+        esc_guard.enterNoSig();
+        if (esc_guard.active) {
+            // Drain bytes that queued during the cooked tool-execution
+            // window between two generations: an Esc pressed THERE must
+            // not cancel this generation's very first stream event. The
+            // drain loop keeps ordinary typed-ahead bytes (escProbe stashes
+            // them) and drops the stale Esc.
+            while (lineinput.escProbe(r.?)) {}
+        }
+    }
+    defer if (r != null) esc_guard.restore();
+
+    prov.stream(history, opts, @ptrCast(&agg), streamCb) catch |err| {
+        // Hard transport failure before any event: the saw_error path below
+        // never runs, so free the duped tool strings here — they never
+        // reached history.
+        for (agg.tools.items) |*tu| {
+            alloc.free(tu.id);
+            alloc.free(tu.name);
+            freeJsonValue(alloc, tu.input);
+        }
+        return err;
+    };
     if (agg.saw_error) |e| {
         // These dupes never made it into history — free them here.
         for (agg.tools.items) |*tu| {
@@ -1631,6 +2112,33 @@ fn connectMcpServer(
     try std.Io.File.Writer.flush(file_writer);
 }
 
+/// AskUserQuestion execution context: the live REPL reader/writer.
+const AskUserCtx = struct {
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+};
+
+/// Real AskUserQuestion body — prompt the user and return their answer.
+fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
+    _ = io;
+    const ctx: *AskUserCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.NoAskContext));
+    const question = registry.getStringField(input, "question") orelse
+        return registry.ToolResult{ .output = "Missing required field: question", .is_error = true };
+    try std.Io.Writer.print(ctx.w, "\n  [model asks] {s}\n  Your answer (Enter to skip): ", .{question});
+    try std.Io.File.Writer.flush(ctx.file_writer);
+    var ans_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer ans_aw.deinit();
+    _ = std.Io.Reader.streamDelimiter(ctx.r, &ans_aw.writer, '\n') catch {
+        return registry.ToolResult{ .output = "user input unavailable", .is_error = true };
+    };
+    ctx.r.toss(1);
+    const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
+    return registry.ToolResult{
+        .output = try alloc.dupe(u8, if (ans.len > 0) ans else "(no answer given)"),
+    };
+}
+
 /// Shared permission gate for the agent loop and /run.
 /// deny → prints and returns false; allow → true; ask → interactive y/N,
 /// except in auto mode where a reachable LLM classifier decides (with the
@@ -1644,6 +2152,7 @@ fn permissionGate(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
+    denials: *denial_tracker_mod.DenialTracker,
 ) !bool {
     const perm_ctx = registry.PermissionContext{
         .mode = mode,
@@ -1676,11 +2185,17 @@ fn permissionGate(
 
     switch (decision) {
         .deny => |d| {
+            if (denials.recordDenial()) {
+                try std.Io.Writer.print(w, "  [{d} consecutive denials — the agent is being starved; try /mode, an allow rule, or /config]\n", .{denials.consecutive_denials});
+            }
             try std.Io.Writer.print(w, "  [Permission denied: {s}]\n", .{d.message});
             try std.Io.File.Writer.flush(file_writer);
             return false;
         },
-        .allow => return true,
+        .allow => {
+            denials.recordApproval();
+            return true;
+        },
         .ask => |a| {
             try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
             try std.Io.File.Writer.flush(file_writer);
@@ -1698,10 +2213,12 @@ fn permissionGate(
             r.toss(1);
             const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
             if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
+                _ = denials.recordDenial();
                 try std.Io.Writer.writeAll(w, "  [Denied by user]\n");
                 try std.Io.File.Writer.flush(file_writer);
                 return false;
             }
+            denials.recordApproval();
             return true;
         },
     }
@@ -1778,14 +2295,29 @@ fn estimateHistoryTokens(history: []const llm.Message) u32 {
     for (history) |msg| {
         for (msg.content) |block| {
             switch (block) {
-                .text => |t| total += @intCast(t.len / 4),
+                .text => |t| total += estimateTextTokens(t),
                 .tool_use => total += 50,
-                .tool_result => |tr| total += @intCast(tr.content.len / 4),
-                .thinking => |t| total += @intCast(t.len / 4),
+                .tool_result => |tr| total += estimateTextTokens(tr.content),
+                .thinking => |t| total += estimateTextTokens(t),
             }
         }
     }
     return total;
+}
+
+/// ASCII runs ~4 bytes/token, but CJK text runs ~2 bytes/token under
+/// GLM-class tokenizers. The old uniform bytes/4 under-counted Chinese-heavy
+/// sessions by ~2×, so real requests could blow past the model's context
+/// (a 400 on every subsequent call) long before the estimate ever reached
+/// the auto-compaction threshold. Over-estimating is safe (compacts a
+/// little early); under-estimating strands the session.
+fn estimateTextTokens(text: []const u8) u32 {
+    var ascii: usize = 0;
+    var wide: usize = 0;
+    for (text) |c| {
+        if (c < 0x80) ascii += 1 else wide += 1;
+    }
+    return @intCast(ascii / 4 + wide / 2);
 }
 
 /// Auto-compact if history exceeds phi threshold. Returns the history's
@@ -1931,12 +2463,57 @@ fn compactHistoryImpl(history: *std.ArrayList(llm.Message), alloc: std.mem.Alloc
         const msg = history.orderedRemove(1);
         freeMessage(msg, alloc);
     }
+
+    // An index-based cut can split a tool_use/tool_result pair at the head;
+    // repair trims the orphan so the next request stays wire-valid.
+    repairToolPairing(history, alloc);
 }
 
 /// Clear history, keep only system prompt.
 /// Free one history message's content blocks (strings + JSON trees).
 fn freeMessage(msg: llm.Message, alloc: std.mem.Allocator) void {
     freeContentBlocks(alloc, msg.content);
+}
+
+/// True when every block is a tool_result — the agent loop's feedback
+/// message. On the OpenAI wire each block becomes a standalone
+/// `role:"tool"` message that is only valid right after the assistant
+/// `tool_calls` message it answers.
+fn isPureToolResultMessage(msg: llm.Message) bool {
+    if (msg.content.len == 0) return false;
+    for (msg.content) |block| {
+        if (block != .tool_result) return false;
+    }
+    return true;
+}
+
+fn messageHasToolUse(msg: llm.Message) bool {
+    for (msg.content) |block| {
+        if (block == .tool_use) return true;
+    }
+    return false;
+}
+
+/// Repair tool_use/tool_result pairing after history surgery (compaction,
+/// undo, rewind). Strict OpenAI-compatible gateways 400 the entire request
+/// when a `role:"tool"` message outlives the assistant `tool_calls` it
+/// answered (orphan head), or an assistant `tool_calls` loses its result
+/// messages (dangling tail) — so both ends are trimmed back to a valid
+/// boundary.
+fn repairToolPairing(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
+    // Head: orphan tool results — the assistant tool_use before them was
+    // removed by an index-based cut.
+    while (history.items.len > 1 and isPureToolResultMessage(history.items[1])) {
+        const msg = history.orderedRemove(1);
+        freeMessage(msg, alloc);
+    }
+    // Tail: dangling tool_use — the results message after it was removed.
+    while (history.items.len > 1) {
+        const last = history.items[history.items.len - 1];
+        if (last.role != .assistant or !messageHasToolUse(last)) break;
+        const msg = history.pop().?;
+        freeMessage(msg, alloc);
+    }
 }
 
 fn clearHistory(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
@@ -1972,11 +2549,14 @@ fn showContext(history: *std.ArrayList(llm.Message), total_in: u64, total_out: u
 }
 
 /// Undo last exchange (remove last assistant + any tool results).
-fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+/// Returns how many messages were actually removed — callers must only
+/// bumpEpoch on a non-zero result (a no-op undo used to invalidate every
+/// older rollback point's dialogue rewind).
+fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !usize {
     // Need at least system prompt + one user message + one assistant message
     if (history.items.len < 3) {
         try std.Io.Writer.writeAll(w, "  Nothing to undo.\n\n");
-        return;
+        return 0;
     }
 
     var removed: usize = 0;
@@ -2021,11 +2601,18 @@ fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocat
         }
     }
 
+    // Removing the results message above can strand the assistant tool_use
+    // it answered — a dangling tool_calls gets the next request 400'd.
+    const len_before_repair = history.items.len;
+    repairToolPairing(history, alloc);
+    removed += len_before_repair - history.items.len;
+
     if (removed == 0) {
         try std.Io.Writer.writeAll(w, "  Nothing to undo.\n\n");
     } else {
         try std.Io.Writer.print(w, "  Undone: removed {d} message(s). History now has {d} messages.\n\n", .{ removed, history.items.len });
     }
+    return removed;
 }
 
 /// Rewind: show rollback points and restore files to a previous checkpoint.
@@ -2155,6 +2742,11 @@ fn rewindOperation(
         freeMessage(msg, alloc);
         dropped += 1;
     }
+    // The recorded history_len can fall between a tool_use and its results —
+    // trim the stranded pair end so the next request stays wire-valid.
+    const len_before_repair = history.items.len;
+    repairToolPairing(history, alloc);
+    dropped += len_before_repair - history.items.len;
 
     try std.Io.Writer.print(w, "  ({d} restored, {d} deleted, {d} errors, {d} messages rewound)\n\n", .{
         result.restored_files.len,
@@ -2173,8 +2765,137 @@ fn autoSaveSettings(w: *std.Io.Writer, file_writer: *std.Io.File.Writer, switche
         w.print("  保存失败: {any}\n", .{err}) catch {};
         return;
     };
+    // Own save — refresh the hot-reload baseline so the next prompt does
+    // not "reload" what we just wrote ourselves.
+    settings_fp_baseline = config_mod.settingsFingerprint(alloc, io);
     w.writeAll("  ✓ 已自动保存\n") catch {};
     std.Io.File.Writer.flush(file_writer) catch {};
+}
+
+/// Cross-session input history for the line editor: `.ziv/input_history` in
+/// the working directory, newest last, capped at INPUT_HISTORY_MAX entries.
+/// Whole-file rewrite on every commit (≤ ~50 KB) — no append mode needed and
+/// rotation comes for free.
+const INPUT_HISTORY_FILE = ".ziv/input_history";
+const INPUT_HISTORY_MAX: usize = 500;
+
+fn loadInputHistory(alloc: std.mem.Allocator, io: std.Io, history: *std.ArrayList([]u8)) void {
+    const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, INPUT_HISTORY_FILE, alloc, std.Io.Limit.limited(256 * 1024)) catch return;
+    defer alloc.free(contents);
+    // Collect first, keep the TAIL: breaking early on an oversized file would
+    // recall the OLDEST entries and silently drop the newest ones.
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        lines.append(alloc, line) catch return;
+    }
+    const start = if (lines.items.len > INPUT_HISTORY_MAX) lines.items.len - INPUT_HISTORY_MAX else 0;
+    for (lines.items[start..]) |line| {
+        if (history.items.len > 0 and std.mem.eql(u8, history.items[history.items.len - 1], line)) continue;
+        const owned = alloc.dupe(u8, line) catch return;
+        history.append(alloc, owned) catch {
+            alloc.free(owned);
+            return;
+        };
+    }
+}
+
+/// Persist the in-memory input history (the line editor already appended the
+/// just-committed line, with consecutive-duplicate suppression).
+fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8)) void {
+    if (history.items.len == 0) return;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    const start = if (history.items.len > INPUT_HISTORY_MAX) history.items.len - INPUT_HISTORY_MAX else 0;
+    for (history.items[start..]) |line| {
+        // The file is one entry per line — multi-line entries (pastes)
+        // would corrupt it; they stay session-only (up-arrow recall works).
+        if (std.mem.indexOfScalar(u8, line, '\n') != null) continue;
+        buf.appendSlice(alloc, line) catch return;
+        buf.append(alloc, '\n') catch return;
+    }
+    fs_ops.ensureDir(".ziv") catch return;
+    fs_ops.writeFile(INPUT_HISTORY_FILE, buf.items) catch
+        logger.warning("input history save failed", .{});
+}
+
+/// Swap in freshly loaded (hot-reloaded) settings, dropping cached providers
+/// whose credentials changed so the next getProvider() rebuilds them.
+fn applyReloadedSettings(switcher: *ModelSwitcher, fresh: config_mod.Settings) void {
+    invalidateStaleProviders(switcher, &fresh);
+    switcher.settings = fresh;
+}
+
+/// True when both slice-optionals are null or hold equal bytes.
+fn sameOptSlice(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Rebuild the baked system-prompt text (history[0] block 0) after the
+/// setting changed via /config or a settings hot reload. Without this the
+/// menu reported "(已保存)" while the model kept answering with the old
+/// prompt until /clear or restart — the baked-in variant of
+/// "配置仅启动加载" (bug-patterns.md).
+fn reapplySystemPromptIfNeeded(
+    applied: *?[]const u8,
+    owned: *?[]u8,
+    prompt: *[]const u8,
+    history: *std.ArrayList(llm.Message),
+    alloc: std.mem.Allocator,
+    setting: ?[]const u8,
+) void {
+    if (sameOptSlice(applied.*, setting)) return;
+    applied.* = setting;
+    if (owned.*) |sp| alloc.free(sp);
+    owned.* = system_prompt_mod.buildSystemPrompt(alloc, setting) catch null;
+    prompt.* = owned.* orelse system_prompt_mod.default_system_prompt;
+    if (history.items.len == 0) return;
+    // Content blocks are const — rebuild the slice with the new prompt,
+    // carrying over any memory/skill-manifest blocks after it.
+    const old = history.items[0].content;
+    const nb = alloc.alloc(llm.ContentBlock, old.len) catch return;
+    nb[0] = .{ .text = prompt.* };
+    for (old[1..], 1..) |b, i| nb[i] = b;
+    alloc.free(@constCast(old));
+    history.items[0].content = nb;
+}
+
+/// Old settings slices are intentionally not freed: reloads happen once per
+/// external file edit (rare), and a bounded leak is cheaper than retrofitting
+/// ownership through every Settings consumer.
+fn invalidateStaleProviders(switcher: *ModelSwitcher, fresh: *const config_mod.Settings) void {
+    const differs = struct {
+        fn f(a: ?[]const u8, b: ?[]const u8) bool {
+            if (a == null and b == null) return false;
+            if (a == null or b == null) return true;
+            return !std.mem.eql(u8, a.?, b.?);
+        }
+    }.f;
+    const old = switcher.settings;
+    if (switcher.openai_provider != null and
+        (differs(old.api_keys.openai, fresh.api_keys.openai) or
+            differs(old.api_keys.openai_base_url, fresh.api_keys.openai_base_url)))
+    {
+        if (switcher.openai_provider) |*p| p.deinit();
+        switcher.openai_provider = null;
+    }
+    if (switcher.claude_provider != null and
+        (differs(old.api_keys.anthropic, fresh.api_keys.anthropic) or
+            differs(old.api_keys.anthropic_base_url, fresh.api_keys.anthropic_base_url)))
+    {
+        if (switcher.claude_provider) |*p| p.deinit();
+        switcher.claude_provider = null;
+    }
+    if (switcher.ollama_provider != null and
+        !std.mem.eql(u8, old.api_keys.ollama_host, fresh.api_keys.ollama_host))
+    {
+        if (switcher.ollama_provider) |*p| p.deinit();
+        switcher.ollama_provider = null;
+    }
 }
 
 /// Arrow-key driven configuration menu. Every change auto-saves to
@@ -2578,6 +3299,12 @@ fn maskKey(key: []const u8) []const u8 {
 
 /// Interactive model picker: arrow keys + Enter to switch at runtime.
 fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, switcher: *ModelSwitcher, io: std.Io) !void {
+    // Pipes/scripts get the text table directly — the interactive picker
+    // used to spin its redraw loop on the piped byte stream.
+    if (!menu.isTty()) {
+        try printModelInfo(w, switcher);
+        return;
+    }
     var labels: [llm.KNOWN_MODELS.len + 2][]const u8 = undefined;
     for (&llm.KNOWN_MODELS, 0..) |entry, i| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.modelName())) " ●" else "";
@@ -2610,6 +3337,7 @@ fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.Fil
     };
     switcher.settings.default_model = name;
     config_mod.saveSettings(&switcher.settings, std.heap.smp_allocator, io) catch {};
+    settings_fp_baseline = config_mod.settingsFingerprint(std.heap.smp_allocator, io);
     try std.Io.Writer.print(w, "  ✓ 已切换: {s} ({s})\n\n", .{ switcher.modelName(), switcher.backendLabel() });
 }
 
@@ -2618,19 +3346,31 @@ fn printModelInfo(w: *std.Io.Writer, switcher: *ModelSwitcher) !void {
     try std.Io.Writer.print(w, "{s} ({s})\n\n", .{ switcher.modelName(), switcher.backendLabel() });
 
     try std.Io.Writer.writeAll(w, "  Available models:\n");
-    try std.Io.Writer.writeAll(w, "  ┌─────────────────────┬──────────┬──────────────────────────────┐\n");
-    try std.Io.Writer.writeAll(w, "  │ Model               │ Backend  │ Description                  │\n");
-    try std.Io.Writer.writeAll(w, "  ├─────────────────────┼──────────┼──────────────────────────────┤\n");
+    try std.Io.Writer.writeAll(w, "  ┌─────────────────────┬──────────┬────────────────────────────────┐\n");
+    try std.Io.Writer.writeAll(w, "  │ Model               │ Backend  │ Description                    │\n");
+    try std.Io.Writer.writeAll(w, "  ├─────────────────────┼──────────┼────────────────────────────────┤\n");
 
     for (&llm.KNOWN_MODELS) |entry| {
-        const marker = if (std.mem.eql(u8, entry.name, switcher.modelName())) " *" else "  ";
+        const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.modelName())) "*" else " ";
         const backend_str = switch (entry.backend) {
             .claude => "Claude",
             .openai => "OpenAI",
             .ollama => "Ollama",
         };
-        try std.Io.Writer.print(w, " {s} {s:<20} {s:<10} {s}\n", .{ marker, entry.name, backend_str, entry.description });
+        // Bordered rows matching the header (the old space-padded rows
+        // under a box header were the "table that isn't a table"); padding
+        // is display-width aware so non-ASCII stays aligned.
+        var cell: [40]u8 = undefined;
+        const name_cell = std.fmt.bufPrint(&cell, "{s} {s}", .{ marker, entry.name }) catch entry.name;
+        try std.Io.Writer.writeAll(w, "  │ ");
+        try format_mod.writePadded(w, name_cell, 19);
+        try std.Io.Writer.writeAll(w, " │ ");
+        try format_mod.writePadded(w, backend_str, 8);
+        try std.Io.Writer.writeAll(w, " │ ");
+        try format_mod.writePadded(w, entry.description, 30);
+        try std.Io.Writer.writeAll(w, " │\n");
     }
+    try std.Io.Writer.writeAll(w, "  └─────────────────────┴──────────┴────────────────────────────────┘\n");
 
     try std.Io.Writer.writeAll(w, "\n  * = current model\n");
     try std.Io.Writer.writeAll(w, "  Usage: /model <name>  (e.g. /model claude-sonnet-4-6)\n\n");
@@ -2664,6 +3404,8 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /research <topic> Web research with phi-curated solutions
         \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
         \\  /knowledge         Browse the knowledge graph (semantic tier)
+        \\  /skills            List available skills (/<name> to invoke)
+        \\  /mcp               MCP servers: list/connect/disconnect
         \\
         \\Models (use /model to switch):
         \\  Claude:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
@@ -2675,6 +3417,8 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  Accept Edits  — Auto-accept file edits
         \\  Plan          — Read-only mode
         \\  Bypass        — Skip all permission checks
+        \\  Don't Ask     — Auto-deny whatever would ask (reads still run)
+        \\  Auto          — LLM classifier decides
         \\
         \\Example:
         \\  /config                       Open configuration menu
@@ -2790,4 +3534,128 @@ test "clearHistory survives assistant tool_use + tool_result pair (no double fre
     clearHistory(&history, alloc);
     alloc.free(history.items[0].content[0].text);
     alloc.free(@constCast(history.items[0].content));
+}
+
+test "estimateTextTokens weights CJK above bytes/4" {
+    // 8 CJK chars = 24 bytes: bytes/4 says 6 tokens, real usage is 8-12 —
+    // the old uniform estimate under-counted Chinese-heavy sessions ~2×.
+    try std.testing.expectEqual(@as(u32, 12), estimateTextTokens("一二三四五六七八"));
+    try std.testing.expect(estimateTextTokens("一二三四五六七八") > "一二三四五六七八".len / 4);
+    // ASCII keeps the classic chars/4 approximation.
+    try std.testing.expectEqual(@as(u32, 1), estimateTextTokens("abcd"));
+}
+
+test "compactHistoryImpl repairs tool pairing after the phi cut" {
+    // Regression for the mid-session 400: the index-based cut could leave an
+    // orphan tool_result at the head — on the OpenAI wire a role:"tool"
+    // message whose assistant tool_calls was dropped, which strict gateways
+    // reject wholesale.
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer history.deinit(alloc);
+
+    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    sys_blocks[0] = .{ .text = try alloc.dupe(u8, "sys") };
+    try history.append(alloc, .{ .role = .system, .content = sys_blocks, .timestamp = 0 });
+
+    // 4 full exchanges: user → assistant(tool_use) → user(tool_result).
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const q = try alloc.alloc(llm.ContentBlock, 1);
+        q[0] = .{ .text = try alloc.dupe(u8, "question") };
+        try history.append(alloc, .{ .role = .user, .content = q, .timestamp = 0 });
+
+        const id = try std.fmt.allocPrint(alloc, "call_{d}", .{i});
+        const tu = try alloc.alloc(llm.ContentBlock, 1);
+        tu[0] = .{ .tool_use = .{ .id = id, .name = try alloc.dupe(u8, "Bash"), .input = .null } };
+        try history.append(alloc, .{ .role = .assistant, .content = tu, .timestamp = 0 });
+
+        const tr = try alloc.alloc(llm.ContentBlock, 1);
+        tr[0] = .{ .tool_result = .{
+            .tool_use_id = try alloc.dupe(u8, id),
+            .content = try alloc.dupe(u8, "ok"),
+        } };
+        try history.append(alloc, .{ .role = .user, .content = tr, .timestamp = 0 });
+        // `id` ownership moved into the tool_use block — history frees it.
+    }
+    try std.testing.expectEqual(@as(usize, 13), history.items.len);
+
+    compactHistoryImpl(&history, alloc);
+
+    // Head must not be an orphan tool-result message; tail must not be a
+    // dangling assistant tool_use.
+    try std.testing.expect(!isPureToolResultMessage(history.items[1]));
+    const last = history.items[history.items.len - 1];
+    try std.testing.expect(!(last.role == .assistant and messageHasToolUse(last)));
+
+    clearHistory(&history, alloc);
+    alloc.free(history.items[0].content[0].text);
+    alloc.free(@constCast(history.items[0].content));
+}
+
+test "undoLastExchange strips a stranded assistant tool_use" {
+    // [sys, user, assistant(tool_use), user(tool_results), assistant(final)]
+    // — undo drops the last two, which used to strand the tool_use: the next
+    // request carried tool_calls with no tool responses (a 400 on strict
+    // gateways).
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer history.deinit(alloc);
+
+    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
+    sys_blocks[0] = .{ .text = try alloc.dupe(u8, "sys") };
+    try history.append(alloc, .{ .role = .system, .content = sys_blocks, .timestamp = 0 });
+
+    const q = try alloc.alloc(llm.ContentBlock, 1);
+    q[0] = .{ .text = try alloc.dupe(u8, "run ls") };
+    try history.append(alloc, .{ .role = .user, .content = q, .timestamp = 0 });
+
+    const tu = try alloc.alloc(llm.ContentBlock, 1);
+    tu[0] = .{ .tool_use = .{ .id = try alloc.dupe(u8, "call_1"), .name = try alloc.dupe(u8, "Bash"), .input = .null } };
+    try history.append(alloc, .{ .role = .assistant, .content = tu, .timestamp = 0 });
+
+    const tr = try alloc.alloc(llm.ContentBlock, 1);
+    tr[0] = .{ .tool_result = .{
+        .tool_use_id = try alloc.dupe(u8, "call_1"),
+        .content = try alloc.dupe(u8, "file_a"),
+    } };
+    try history.append(alloc, .{ .role = .user, .content = tr, .timestamp = 0 });
+
+    const fin = try alloc.alloc(llm.ContentBlock, 1);
+    fin[0] = .{ .text = try alloc.dupe(u8, "done") };
+    try history.append(alloc, .{ .role = .assistant, .content = fin, .timestamp = 0 });
+
+    var out_buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out_buf);
+    _ = try undoLastExchange(&history, alloc, &w);
+
+    // The tool_use message must be gone too — history ends at the prompt.
+    try std.testing.expectEqual(@as(usize, 2), history.items.len);
+    try std.testing.expect(history.items[1].role == .user);
+
+    clearHistory(&history, alloc);
+    alloc.free(history.items[0].content[0].text);
+    alloc.free(@constCast(history.items[0].content));
+}
+
+test "toolArgSummary picks the informative field and caps length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cmd = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"command\":\"ls -la /tmp\"}", .{});
+    try std.testing.expectEqualStrings("(ls -la /tmp)", toolArgSummary(a, "Bash", cmd));
+
+    const path = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"/etc/hosts\"}", .{});
+    try std.testing.expectEqualStrings("(/etc/hosts)", toolArgSummary(a, "FileRead", path));
+
+    // Empty object: nothing to show.
+    const empty = try std.json.parseFromSliceLeaky(std.json.Value, a, "{}", .{});
+    try std.testing.expectEqualStrings("", toolArgSummary(a, "ToolSearch", empty));
+
+    // Long command gets the ellipsis cap.
+    const longv = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        "{\"command\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", .{});
+    const out = toolArgSummary(a, "Bash", longv);
+    try std.testing.expect(std.mem.endsWith(u8, out, "…)"));
 }

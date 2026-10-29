@@ -14,14 +14,16 @@ pub const PermissionContext = registry.PermissionContext;
 pub const PermissionDecision = registry.PermissionDecision;
 
 /// Get the next mode in the cycle (Shift+Tab behavior).
-/// Cycle: default → accept_edits → plan → bypass → default
+/// Cycle: default → accept_edits → plan → bypass → dont_ask → auto → default
+/// (dont_ask/auto used to drop out of the cycle back to default — the only
+/// way in was /config, and /mode silently forgot them.)
 pub fn nextMode(current: PermissionMode) PermissionMode {
     return switch (current) {
         .default => .accept_edits,
         .accept_edits => .plan,
         .plan => .bypass,
-        .bypass => .default,
-        .dont_ask => .default,
+        .bypass => .dont_ask,
+        .dont_ask => .auto,
         .auto => .default,
     };
 }
@@ -104,11 +106,21 @@ pub fn checkToolPermission(
             // Everything else still needs approval (or an explicit allow rule)
         },
         .dont_ask => {
-            // Auto-deny everything that would ask
+            // Deny only what would otherwise ASK (design: "自动拒绝需要确认
+            // 的操作"). An unconditional deny came before the allow rules and
+            // starved the agent of every tool — reads and explicit allow
+            // rules included.
+            if (allowRulesMatch(ctx.allow_rules, tool, input)) return .allow;
+            if (tool.isReadOnly(input)) return .allow;
             return .{ .deny = .{ .message = "auto-denied in dont_ask mode" } };
         },
         .default => {
-            // Will fall through to allow rules check
+            // Design: Default asks for DANGEROUS operations only. Read-only
+            // calls never ask (the pipeline's designed "tool check" step
+            // was dead code — every tool fell through to the blanket ask,
+            // so plain reads like `ls` prompted [y/N] every call).
+            if (tool.isReadOnly(input)) return .allow;
+            // Writes fall through to allow rules, then ask.
         },
         .auto => {
             // Explicit user allow rules outrank the classifier: a configured
@@ -233,7 +245,9 @@ test "nextMode cycle" {
     try std.testing.expect(nextMode(.default) == .accept_edits);
     try std.testing.expect(nextMode(.accept_edits) == .plan);
     try std.testing.expect(nextMode(.plan) == .bypass);
-    try std.testing.expect(nextMode(.bypass) == .default);
+    try std.testing.expect(nextMode(.bypass) == .dont_ask);
+    try std.testing.expect(nextMode(.dont_ask) == .auto);
+    try std.testing.expect(nextMode(.auto) == .default);
 }
 
 test "checkToolPermission bypass mode" {
@@ -266,7 +280,7 @@ test "content patterns: table-driven deny/allow matching" {
         // Deny rules (blanket + pattern)
         .{ .pattern = null, .command = "ls", .want = .deny }, // blanket deny
         .{ .pattern = "rm *", .command = "rm -rf /tmp/x", .want = .deny }, // pattern hit
-        .{ .pattern = "rm *", .command = "ls -la", .want = .ask }, // pattern miss -> falls to ask
+        .{ .pattern = "rm *", .command = "git commit -m x", .want = .ask }, // pattern miss -> falls to ask (write cmd; reads auto-allow in default now)
         .{ .pattern = "git push*", .command = "git push origin main", .want = .deny },
         // Allow rules
         .{ .pattern = null, .command = "echo hi", .want = .allow }, // blanket allow
