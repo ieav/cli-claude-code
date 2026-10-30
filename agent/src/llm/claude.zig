@@ -2,6 +2,7 @@
 /// Uses the Messages API (https://api.anthropic.com/v1/messages).
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
+const llm_watchdog = @import("../util/llm_watchdog.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
@@ -83,6 +84,10 @@ pub const ClaudeProvider = struct {
             .extra_headers = &extra_headers,
         });
         defer req.deinit();
+        // Stall watchdog: the gateway sometimes never answers — without
+        // this the caller blocks in recvmsg forever (see llm_watchdog).
+        const wd = llm_watchdog.arm(&req);
+        defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
@@ -333,6 +338,10 @@ pub const ClaudeProvider = struct {
             .extra_headers = &extra_headers,
         });
         defer req.deinit();
+        // Stall watchdog: the gateway sometimes never answers — without
+        // this the caller blocks in recvmsg forever (see llm_watchdog).
+        const wd = llm_watchdog.arm(&req);
+        defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 

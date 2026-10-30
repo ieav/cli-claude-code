@@ -2,6 +2,7 @@
 /// Uses Ollama's /api/chat endpoint (https://github.com/ollama/ollama).
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
+const llm_watchdog = @import("../util/llm_watchdog.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 
@@ -77,6 +78,10 @@ pub const OllamaProvider = struct {
             .extra_headers = &extra_headers,
         });
         defer req.deinit();
+        // Stall watchdog: the gateway sometimes never answers — without
+        // this the caller blocks in recvmsg forever (see llm_watchdog).
+        const wd = llm_watchdog.arm(&req);
+        defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
@@ -305,6 +310,10 @@ pub const OllamaProvider = struct {
             .extra_headers = &extra_headers,
         });
         defer req.deinit();
+        // Stall watchdog: the gateway sometimes never answers — without
+        // this the caller blocks in recvmsg forever (see llm_watchdog).
+        const wd = llm_watchdog.arm(&req);
+        defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
@@ -493,6 +502,8 @@ pub const OllamaProvider = struct {
             .extra_headers = &extra_headers,
         }) catch return false;
         defer req.deinit();
+        const wd = llm_watchdog.arm(&req);
+        defer wd.finish();
 
         req.sendBodyComplete(@constCast("")) catch return false;
 
