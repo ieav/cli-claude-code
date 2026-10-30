@@ -3,3 +3,4 @@ zig-out/
 .ziv/
 ziv_stderr.log
 .DS_Store
+dist/
