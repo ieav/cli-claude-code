@@ -455,7 +455,7 @@ pub const task_create_tool: ToolDefinition = .{
     .name = "TaskCreate",
     .description = "Create a new task for tracking",
     .input_schema =
-    \\{"type":"object","properties":{"subject":{"type":"string","description":"Task title"},"description":{"type":"string","description":"Task description"}},"required":["subject"]}
+    \\{"type":"object","properties":{"subject":{"type":"string","description":"Task title"},"description":{"type":"string","description":"Task description"},"priority":{"type":"integer","description":"Priority 1-5, 5 highest (default 3)"}},"required":["subject"]}
     ,
     .execute_fn = @import("task_create.zig").execute,
     .is_read_only = false,

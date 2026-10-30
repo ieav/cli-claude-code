@@ -46,6 +46,8 @@ const env = @import("util/env.zig");
 const format_mod = @import("util/format.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
+const runtime_monitor = @import("runtime/monitor.zig");
+const runtime_rules = @import("runtime/rules.zig");
 const error_handler = @import("runtime/error_handler.zig");
 const allocator = std.heap.smp_allocator;
 
@@ -305,6 +307,57 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     else
         null;
 
+    // ──── P3: runtime layer — typed event bus + cron (main-thread exec) ────
+    // Threading contract: the bus emits ONLY on the main thread; the cron
+    // scheduler thread never runs task code, it just queues due indices
+    // which the loop-top drain executes here (SQLite THREADSAFE=0 rule).
+    var evbus = task_mod.EventBus.init(allocator);
+    defer evbus.deinit();
+    var monitor = runtime_monitor.RuntimeMonitor.init(allocator);
+    defer monitor.deinit();
+    monitor.setEventBus(&evbus);
+    // Live stats the health check reads (updated in the main loop below).
+    var live_llm_calls = std.atomic.Value(u32).init(0);
+    var live_est_tokens = std.atomic.Value(u32).init(0);
+    // Test hook: ZIV_CRON_SCALE=60 compresses the timeline (81.5min → ~82s)
+    // so scheduled maintenance is observable in a smoke run.
+    var cron_scale: u64 = 1;
+    if (env.get("ZIV_CRON_SCALE")) |v| {
+        if (std.fmt.parseInt(u64, v, 10)) |s| {
+            if (s >= 1) cron_scale = s;
+        } else |_| {}
+    }
+    var decay_ctx = MemoryDecayCtx{ .mem = if (mem_sys) |*ms| ms else null };
+    var health_ctx = HealthCtx{
+        .monitor = &monitor,
+        .bus = &evbus,
+        .w = w,
+        .max_tokens = switcher.settings.max_tokens,
+        .llm_calls = &live_llm_calls,
+        .est_tokens = &live_est_tokens,
+    };
+    var cron = task_mod.CronScheduler.init(allocator);
+    defer cron.deinit();
+    if (mem_db != null) {
+        cron.addTask(.{
+            .name = "memory_decay",
+            .interval_ms = task_mod.cron.CronScheduler.MEMORY_DECAY_INTERVAL / cron_scale,
+            .last_run = std.atomic.Value(i64).init(0),
+            .enabled = std.atomic.Value(bool).init(true),
+            .task_fn = memoryDecayTask,
+            .ctx = @ptrCast(&decay_ctx),
+        }) catch {};
+    }
+    cron.addTask(.{
+        .name = "health_check",
+        .interval_ms = task_mod.cron.CronScheduler.HEALTH_CHECK_INTERVAL / cron_scale,
+        .last_run = std.atomic.Value(i64).init(0),
+        .enabled = std.atomic.Value(bool).init(true),
+        .task_fn = healthCheckTask,
+        .ctx = @ptrCast(&health_ctx),
+    }) catch {};
+    cron.start() catch logger.warning("cron: scheduler unavailable", .{});
+
     // MCP (T3/T4/M6): mcp.json config + live stdio sessions. Tools are
     // bridged into the runtime registry as mcp__<server>__<tool> on connect.
     var mcp_cfg = mcp_mod.config.McpConfig.init(allocator, io);
@@ -445,6 +498,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             entry.def.execute_ctx_fn = askUserExecute;
             entry.def.execute_ctx = @ptrCast(&ask_ctx);
         }
+    }
 
     // T6.3: register the parallel-subagent dispatch tool. ctx borrows
     // stable references (model_name_buf updates in place on hot switches;
@@ -455,6 +509,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .io = io,
         .tools = &reg,
         .concurrency = &switcher.settings.subagent_concurrency,
+        .bus = &evbus,
         .backend = switcher.backend,
         .model = switcher.modelName(),
         .api_key = switch (switcher.backend) {
@@ -488,7 +543,6 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         @ptrCast(&dispatch_ctx),
         false,
     ) catch |e| logger.warning("agent tool registration failed: {}", .{e});
-    }
 
     // Consecutive-denial watchdog (designed anti-loop for dont_ask/auto
     // modes): after N denials in a row, say so instead of silently
@@ -549,7 +603,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // T3.2: land any background-reflection insights that completed
         // since the last prompt (SQLite writes and printing stay on this
         // thread — the worker only pushed into the inbox).
-        drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
+        drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
+        // P3: run cron tasks that came due (same main-thread contract).
+        cron.drainDue();
 
         // Prompt with mode indicator + model + context usage
         const mode_str = switch (current_mode) {
@@ -561,6 +617,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             .auto => "ziv[auto]",
         };
         var est_ctx = estimateHistoryTokens(history.items);
+        live_est_tokens.store(@intCast(@min(est_ctx, std.math.maxInt(u32))), .monotonic); // P3: health-check context signal
         // Parity: the prompt % uses the SAME adaptive ceiling as maybeCompact
         // (contextEstimate of the active model) — display and decision must
         // not diverge on small-context models.
@@ -585,16 +642,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Extract first, reflect last — see the /quit path note.
             if (mem_sys) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {
-                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously
                 // above — nothing of value blocks on a detached thread).
-                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
             }
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
@@ -622,16 +679,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // used to lose the whole session's learnings.
                 if (mem_sys) |*ms| {
                     const ext_t0 = util_time.nowMillis();
-                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously
                 // above — nothing of value blocks on a detached thread).
-                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -875,16 +932,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // used to lose the whole session's learnings.
                 if (mem_sys) |*ms| {
                     const ext_t0 = util_time.nowMillis();
-                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously
                 // above — nothing of value blocks on a detached thread).
-                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
                 }
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -1170,6 +1227,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         message_count += 1;
         if (allocator.dupe(u8, input)) |q| {
             window_queries.append(allocator, q) catch allocator.free(q);
+            evbus.emit(.{ .user_query_start = {} }); // P3 event record
             if (window_queries.items.len > 20) {
                 allocator.free(window_queries.orderedRemove(0));
             }
@@ -1329,6 +1387,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
             }
             const llm_elapsed_s = @as(f64, @floatFromInt(util_time.nowMillis() - llm_t0)) / 1000.0;
+            _ = live_llm_calls.fetchAdd(1, .monotonic); // P3: health-check api-rate signal
             try std.Io.Writer.print(w, "  [{s} | in={d} out={d} | hist={d} | stop: {s} | {d:.1}s]\n", .{
                 switcher.modelName(),
                 response.usage.input_tokens,
@@ -1472,6 +1531,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     if (errored) {
                         window_errors += 1;
                         batch_errors += 1;
+                        evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
                     }
                 }
 
@@ -1535,8 +1595,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         // M4: periodic reflection on the query window (every N exchanges
         // or after a π-spaced interval; see ReflectionEngine.shouldReflect).
+        evbus.emit(.{ .user_query_end = .{ .tools = window_tools, .errors = window_errors } }); // P3 event record
         if (mem_sys != null and reflector.shouldReflect()) {
-            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend), backgroundLlmConfig(allocator, &switcher));
+            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend), backgroundLlmConfig(allocator, &switcher), &evbus);
             if (live_trace) |*t| {
                 traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", 0, allocator) catch {};
             }
@@ -1618,7 +1679,7 @@ fn isNearDuplicate(accepted: []const extraction_mod.ExtractedFact, content: []co
     return false;
 }
 
-fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), w: *std.Io.Writer) !void {
+fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), bus: ?*task_mod.EventBus, w: *std.Io.Writer) !void {
     var engine = extraction_mod.ExtractionEngine.init(mem.allocator);
     defer engine.deinit();
 
@@ -1686,6 +1747,7 @@ fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.K
     }
     if (stored > 0) {
         try w.print("  Saved {d} memories for future sessions.\n", .{stored});
+        if (bus) |b| b.emit(.{ .memory_updated = .{ .stored = @intCast(@min(stored, 255)) } });
     }
 }
 
@@ -1835,7 +1897,7 @@ fn reflectWorkerOwned(alloc: std.mem.Allocator, queries: [][:0]u8, cfg: Backgrou
 
 /// Drain finished background reflections on the MAIN thread: store as
 /// .feedback memory (SQLite stays main-thread) and print the arrival.
-fn drainReflectionInbox(alloc: std.mem.Allocator, mem: ?*memory_mod.MemorySystem, w: *std.Io.Writer) void {
+fn drainReflectionInbox(alloc: std.mem.Allocator, mem: ?*memory_mod.MemorySystem, bus: ?*task_mod.EventBus, w: *std.Io.Writer) void {
     if (!reflect_inbox_init) return;
     while (reflect_inbox.pop()) |out| {
         defer {
@@ -1856,7 +1918,96 @@ fn drainReflectionInbox(alloc: std.mem.Allocator, mem: ?*memory_mod.MemorySystem
             .updated_at = now,
         }) catch {};
         logger.info("reflection: background llm insight stored ({d}ms)", .{out.elapsed_ms});
+        if (bus) |b| b.emit(.{ .reflection_produced = .{ .quality = @floatCast(out.quality), .background = true } });
         std.Io.Writer.print(w, "  [Reflection+ {d}ms] {s}\n", .{ out.elapsed_ms, out.insights }) catch {};
+    }
+}
+
+const MemoryDecayCtx = struct { mem: ?*memory_mod.MemorySystem };
+
+/// P3 cron task: e-decay + φ condensation sweep. Ranks the recent window
+/// by e^(-age/30d) × (access+1), prunes the bottom 38.2% — but ONLY
+/// entries untouched for 30+ days (fresh entries ride). Runs on the MAIN
+/// thread via cron.drainDue (SQLite rule).
+fn memoryDecayTask(opaque_ctx: ?*anyopaque) anyerror!void {
+    const dc: *MemoryDecayCtx = @ptrCast(@alignCast(opaque_ctx orelse return));
+    const ms = dc.mem orelse return;
+    const entries = try ms.episodic_mem.retrieveRecent(200);
+    defer ms.episodic_mem.freeEntries(entries);
+    const now = util_time.nowMillis();
+    const month_ms: i64 = 30 * 24 * 3600 * 1000;
+    var ids_buf: [200][16]u8 = undefined;
+    var scores: [200]f64 = undefined;
+    var n_cand: usize = 0;
+    for (entries) |e| {
+        if (now - e.updated_at < month_ms) continue;
+        const age_days = @as(f64, @floatFromInt(now - e.updated_at)) / 86_400_000.0;
+        scores[n_cand] = std.math.exp(-age_days / 30.0) * @as(f64, @floatFromInt(e.access_count + 1));
+        ids_buf[n_cand] = e.id;
+        n_cand += 1;
+    }
+    if (n_cand < 4) return; // nothing meaningful to condense
+    const prune_n = @min(n_cand - 1, n_cand * 382 / 1000); // keep φ ≈ 61.8%
+    if (prune_n == 0) return;
+    // lowest-score selection (n ≤ 200, runs every ~81.5min — naive is fine)
+    var used: [200]bool = @splat(false);
+    var prune: [200][16]u8 = undefined;
+    var prune_len: usize = 0;
+    while (prune_len < prune_n) {
+        var lowest: ?usize = null;
+        for (scores[0..n_cand], 0..) |s, i| {
+            if (used[i]) continue;
+            if (lowest == null or s < scores[lowest.?]) lowest = i;
+        }
+        used[lowest.?] = true;
+        prune[prune_len] = ids_buf[lowest.?];
+        prune_len += 1;
+    }
+    const deleted = ms.episodic_mem.deleteByIds(prune[0..prune_len]);
+    if (deleted > 0) {
+        logger.info("memory: φ sweep pruned {d}/{d} stale entries (>30d untouched)", .{ deleted, n_cand });
+        // NOTE: deliberately no memory_updated emit — that event marks
+        // additions; a sweep log line is enough signal.
+    }
+}
+
+const HealthCtx = struct {
+    monitor: *runtime_monitor.RuntimeMonitor,
+    bus: *task_mod.EventBus,
+    w: *std.Io.Writer,
+    max_tokens: u32,
+    llm_calls: *std.atomic.Value(u32),
+    est_tokens: *std.atomic.Value(u32),
+};
+
+/// P3 cron task: runtime monitor checks on the main thread. The api-rate
+/// signal is the LLM-call delta since the previous check (~1/min at the
+/// default 60s interval). Failures print one compact line + a
+/// resource_warning event; suggested fixes stay in the report below it.
+fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
+    const hc: *HealthCtx = @ptrCast(@alignCast(opaque_ctx orelse return));
+    const calls = hc.llm_calls.swap(0, .monotonic);
+    hc.monitor.updateContext(.{
+        .memory_used_bytes = 0, // RSS not cheaply readable; rule idles
+        .memory_limit_bytes = 100 * 1024 * 1024,
+        .memory_entry_count = 0,
+        .api_calls_last_minute = calls,
+        .api_rate_limit = 60,
+        .db_integrity_ok = true,
+        .current_tokens = hc.est_tokens.load(.monotonic),
+        .max_tokens = hc.max_tokens,
+        .task_failed_count = 0,
+        .task_total_count = 0,
+        .network_timeout_count = 0,
+        .active_tasks = 0,
+        .max_concurrent_tasks = 4,
+    });
+    var failures: std.ArrayList(runtime_rules.FailedCheck) = .empty;
+    defer failures.deinit(allocator);
+    try hc.monitor.runChecks(&failures);
+    if (failures.items.len > 0) {
+        std.Io.Writer.print(hc.w, "  [monitor] {d} runtime warning(s) — {s}\n", .{ failures.items.len, failures.items[0].message }) catch {};
+        hc.bus.emit(.{ .resource_warning = .{ .failed_checks = @intCast(failures.items.len) } });
     }
 }
 
@@ -2004,6 +2155,7 @@ fn runReflection(
     provider: ?llm.Provider,
     tier: llm.provider.CapabilityTier,
     bg_cfg: ?BackgroundLlmConfig,
+    bus: ?*task_mod.EventBus,
 ) void {
     const reflect_t0 = util_time.nowMillis();
     const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
@@ -2023,12 +2175,42 @@ fn runReflection(
     // it up next prompt. Single-flight: a still-running reflection means
     // this window's LLM pass is skipped (heuristics already stored).
     // T2.2 gate stays: flash/local tiers never pay an LLM round trip.
+    // P3: π-sampled earlier-session events ride along as one extra line —
+    // the window only sees recent queries, the event ring covers the whole
+    // session, so the reflection gets past the recency horizon.
     if (provider != null and tier == .full and bg_cfg != null and
         window_queries.items.len >= 3 and !reflect_inflight)
     {
+        var events_blurb: ?[]u8 = null;
+        defer if (events_blurb) |eb| alloc.free(eb);
+        if (bus) |b| {
+            if (b.eventCount() >= 3) {
+                var eaw: std.Io.Writer.Allocating = .init(alloc);
+                defer eaw.deinit();
+                const evs = b.getRecentEvents(8);
+                defer b.freeEvents(evs);
+                for (evs) |ev| {
+                    var dbuf: [160]u8 = undefined;
+                    eaw.writer.print("[earlier] {s}\n", .{task_mod.event_bus.EventBus.describe(ev, &dbuf)}) catch break;
+                }
+                var elist = eaw.toArrayList();
+                events_blurb = elist.toOwnedSlice(alloc) catch null;
+            }
+        }
+        var qs_extra: [16][]const u8 = undefined;
+        var n_extra: usize = 0;
+        for (window_queries.items) |q| {
+            if (n_extra >= 15) break;
+            qs_extra[n_extra] = q;
+            n_extra += 1;
+        }
+        if (events_blurb) |eb| {
+            qs_extra[n_extra] = eb;
+            n_extra += 1;
+        }
         dispatchBackgroundReflection(
             alloc,
-            window_queries.items,
+            qs_extra[0..n_extra],
             bg_cfg.?,
             @tagName(reflection.trigger),
             reflection.quality_score,
@@ -2052,6 +2234,7 @@ fn runReflection(
         .updated_at = now,
     }) catch {};
     logger.info("reflection: quality={d:.2} heuristic insights stored (llm dispatched in background)", .{reflection.quality_score});
+    if (bus) |b| b.emit(.{ .reflection_produced = .{ .quality = @floatCast(reflection.quality_score), .background = false } });
     w.print("  [Reflection {d}ms] {s}\n", .{ util_time.nowMillis() - reflect_t0, insights }) catch {};
 
     resetReflectionWindow(window_queries, window_tools, window_errors, alloc);
@@ -4919,10 +5102,10 @@ test "reflection inbox drains, prints, and empties (T3.2 wiring)" {
     try std.testing.expect(reflect_inbox.push(out));
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    drainReflectionInbox(allocator, &mem, &aw.writer);
+    drainReflectionInbox(allocator, &mem, null, &aw.writer);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "insight text from the background llm") != null);
     const len_after_first = aw.written().len;
-    drainReflectionInbox(allocator, &mem, &aw.writer);
+    drainReflectionInbox(allocator, &mem, null, &aw.writer);
     try std.testing.expectEqual(len_after_first, aw.written().len); // drained dry
 }
 

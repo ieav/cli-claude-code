@@ -34,6 +34,29 @@ pub const EpisodicStore = struct {
         if (try stmt.step()) return error.UnexpectedRow;
     }
 
+    /// P3 MEMORY_DECAY sweep: delete memories by id (the caller ranks the
+    /// candidates — see the REPL's φ-condensation cron task). One
+    /// `DELETE ... IN (...)` statement; returns the number deleted.
+    pub fn deleteByIds(self: *Self, ids: []const [16]u8) usize {
+        if (ids.len == 0) return 0;
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(self.allocator);
+        sql.appendSlice(self.allocator, "DELETE FROM memories WHERE id IN (") catch return 0;
+        for (ids, 0..) |_, i| {
+            if (i > 0) sql.append(self.allocator, ',') catch return 0;
+            sql.append(self.allocator, '?') catch return 0;
+        }
+        sql.append(self.allocator, ')') catch return 0;
+        var stmt = database.Statement.prepare(self.allocator, self.db, sql.items) catch return 0;
+        defer stmt.finalize();
+        for (ids, 0..) |*id, i| {
+            stmt.bindBlob(@intCast(i + 1), id) catch return 0;
+        }
+        _ = stmt.step() catch return 0;
+        const n = self.db.changes();
+        return if (n > 0) @intCast(n) else 0;
+    }
+
     /// Most recently updated memories first. Caller owns the returned slice
     /// and each entry's strings; release with freeEntries().
     pub fn retrieveRecent(self: *Self, limit: usize) ![]types.MemoryEntry {

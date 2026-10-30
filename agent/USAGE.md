@@ -178,7 +178,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/terminal-setup` | Shift+Enter 换行的终端配置指引（kitty 协议终端已自动支持，无需配置；Apple Terminal 等不支持协议的终端按指引映射按键） |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
-| `/agent`（实验） | 并行子代理派发工具，**默认关闭**：设 `ZIV_AGENT_TOOL=1` 启用。已知问题：工具轮之后偶发退出挂死（调查中），默认关闭不影响其他功能 |
+| `/agent`（实验） | 并行子代理派发工具，**默认关闭**：设 `ZIV_AGENT_TOOL=1` 启用。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整。运行期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死 |
 | `/run <ToolName> <json>` | 直接执行工具 |
 | **模型 & 配置** | |
 | `/model`、`/models` | 显示当前模型和可用模型列表 |
@@ -731,11 +731,14 @@ Ziv 支持 5 层配置源，后者覆盖前者：
 | `api_keys.anthropic_base_url` | string | null | Anthropic API 自定义地址（也支持 ANTHROPIC_BASE_URL 环境变量） |
 | `api_keys.brave` | string | null | Brave Search API Key（也支持 BRAVE_API_KEY 环境变量） |
 | `api_keys.ollama_host` | string | `"http://localhost:11434"` | Ollama 服务地址 |
+| `subagent_concurrency` | number | `3` | agent 工具的并发子代理数（1-8；1=串行回退），`/config` 菜单可改 |
 | `allow_rules` | string[] | [] | 允许规则列表 |
 | `deny_rules` | string[] | [] | 拒绝规则列表 |
 | `ask_rules` | string[] | [] | 强制确认规则（bypass 模式也不豁免，语法同 allow/deny） |
 
 搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
+
+运行时行为环境变量：`ZIV_LLM_TIMEOUT_MS`（LLM 请求看护狗超时，默认 180000，下限 1000——网关接受请求后不响应时按超时报错恢复而不是永久挂死）；`ZIV_CRON_SCALE`（定时任务时间线压缩倍数，仅测试用，如 600 把 81.5 分钟的记忆清扫压缩到 ~8 秒）；`ZIV_LOG`（日志级别 debug|info|warning，默认 notice，`2>ziv.log` 查看）。
 
 ### 6.3 代码中配置
 

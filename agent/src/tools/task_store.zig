@@ -22,6 +22,9 @@ pub const Task = struct {
     subject: []u8,
     description: []u8,
     status: TaskStatus,
+    /// P3: 1-5, 5 = highest. Drives list ordering (and mirrors the
+    /// subagent dispatch claim order semantics).
+    priority: u8 = 3,
 };
 
 pub const TaskStore = struct {
@@ -59,7 +62,7 @@ pub const TaskStore = struct {
         self.tasks.deinit(self.allocator);
     }
 
-    pub fn create(self: *Self, subject: []const u8, description: []const u8) !usize {
+    pub fn create(self: *Self, subject: []const u8, description: []const u8, priority: u8) !usize {
         self.lockMu();
         defer self.unlockMu();
         const task = Task{
@@ -67,6 +70,7 @@ pub const TaskStore = struct {
             .subject = try self.allocator.dupe(u8, subject),
             .description = try self.allocator.dupe(u8, description),
             .status = .pending,
+            .priority = std.math.clamp(priority, 1, 5),
         };
         try self.tasks.append(self.allocator, task);
         self.next_id += 1;
@@ -106,7 +110,9 @@ pub const TaskStore = struct {
         return n;
     }
 
-    /// Render the list; caller owns the returned string.
+    /// Render the list; caller owns the returned string. P3: active tasks
+    /// first (in_progress over pending), higher priority before lower —
+    /// priority finally has a consumer, not just a stored byte.
     pub fn render(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
@@ -115,9 +121,32 @@ pub const TaskStore = struct {
         if (self.tasks.items.len == 0) {
             try w.writeAll("No tasks.");
         } else {
+            const Order = struct {
+                fn rank(t: Task) u8 {
+                    return switch (t.status) {
+                        .in_progress => 0,
+                        .pending => 1,
+                        .completed => 2,
+                    };
+                }
+                fn lessThan(_: void, a: Task, b: Task) bool {
+                    const ra = rank(a);
+                    const rb = rank(b);
+                    if (ra != rb) return ra < rb;
+                    if (a.priority != b.priority) return a.priority > b.priority;
+                    return a.id < b.id;
+                }
+            };
+            const sorted = try allocator.dupe(Task, self.tasks.items);
+            defer allocator.free(sorted);
+            std.sort.pdq(Task, sorted, {}, Order.lessThan);
+
             try w.print("Tasks ({d}/{d} completed):\n", .{ self.completedCount(), self.tasks.items.len });
-            for (self.tasks.items) |t| {
+            for (sorted) |t| {
                 try w.print("  #{d} {s} — {s}\n", .{ t.id, t.status.label(), t.subject });
+                if (t.priority != 3) {
+                    try w.print("      [优先级 {d}/5]\n", .{t.priority});
+                }
                 if (t.description.len > 0) {
                     try w.print("      {s}\n", .{t.description});
                 }
@@ -166,8 +195,8 @@ test "TaskStore create/update/render lifecycle" {
     var store = TaskStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const id1 = try store.create("Fix parser bug", "SSE delimiter off by one");
-    const id2 = try store.create("Write docs", "");
+    const id1 = try store.create("Fix parser bug", "SSE delimiter off by one", 3);
+    const id2 = try store.create("Write docs", "", 5);
     try std.testing.expectEqual(@as(usize, 1), id1);
     try std.testing.expectEqual(@as(usize, 2), id2);
     try std.testing.expectEqual(@as(usize, 2), store.count());
@@ -181,6 +210,12 @@ test "TaskStore create/update/render lifecycle" {
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "1/2 completed") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "#1 ● completed — Fix parser bug") != null);
+    // P3 priority ordering: pending #2 (priority 5) renders before the
+    // completed #1, and the non-default priority is visible.
+    const idx2 = std.mem.indexOf(u8, rendered, "#2").?;
+    const idx1 = std.mem.indexOf(u8, rendered, "#1").?;
+    try std.testing.expect(idx2 < idx1);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[优先级 5/5]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "SSE delimiter off by one") != null);
 }
 

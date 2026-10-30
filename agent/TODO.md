@@ -422,3 +422,21 @@
 - ✅ 输入框第三批增强（2026-10-29，用户选定）：Emacs 行编辑键（Ctrl+A/E/B/F/W/U/K/D 语义，deleteWordBack 空白分词+UTF-8）；Ctrl+R 反向历史搜索（实时不区分大小写匹配、Ctrl+R 翻旧、Enter 发送、Esc 保留、failing 红标）；工具调用行升级为 Claude Code 式 `⏺ Bold(参数摘要)`（interesting 字段优先 command/path/pattern/query/topic/url/name，回退 JSON，48 显示列+省略号，控制字节滤除）。PTY 实测：Emacs 键链路、Ctrl+R 全链路（搜索→匹配→提交）；信息命令保持列表风（用户选定）
 - ✅ 启动屏定制（2026-10-29，用户指定）：banner 主行改 `Ziv — vX.Y.Z | (Self-learning)`；第二行 pi/phi 换希腊字母 `π 圆融 · e 增长 · φ 浓缩`（常量标签同步 π/φ）；新增加粗青色 `cwd: ~/...` 行（HOME 前缀压缩，数据落点可见性）；启动自检成功改完全静默、失败红字 ⚠；banner 命名含义写入 main.zig 注释 + DESIGN「项目名」节（ziv=项目名无缩写含义）
 - ✅ 反思退出改造 + 输出左边距（2026-10-29 第四批，含评审修复）：反思门控（Reflection.actionable，判据在 reflect() 分支唯一置位——好会话退出零等待/零输出/零入库，不再每次塞"良好"垃圾记忆）；LLM 增强带 3s 硬顶看护狗（worker 线程+轮询+超时 detach 弃结果）；三处退出路径换序"先提取后反思"（关窗不丢会话记忆）。评审坐实三雷全修：Shared 堆分配（原栈上声明，detach 后 worker 写死帧）；switcher 加 retired 槽（换模型不再就地 deinit 可能仍被 detached worker 使用的 provider）；queries 先行 dupe（借用不变量成文）。文案按用户要求一字未动。输出左边距：模型回复所有行 1 空格（writeMarginLines 跨 chunk 行首感知，仅显示层）、工具预览续行 2 空格。252 测试全绿；PTY 验证静默退出/模型切换/多行边距
+
+## P38（2026-10-30）风险闭环四连修 + RCA 破案 + 任务系统通电（P1/P2/P3）
+
+**背景**：四项历史遗留（agent 挂死 / 并发封锁 / cron+eventbus+monitor 死代码 / 任务系统空壳）当日全部闭环。
+
+- **🔴 RCA 破案（agent 间歇挂死）**：后台 agent 真机压测 22:09 命中挂死并抓全现场（lldb 全线程栈/lsof/sample/sigterm 测试）。根因链：网关（open.bigmodel.cn）概率性**接受请求后永不响应**（TCP ESTABLISHED 零字节）× provider 层零超时 → 主线程永久阻塞 recvmsg（0% CPU）；SIGTERM handler 只设标志位而 syscall 自动重启 → "杀不死"假象。**与动态工具/线程/stdio 全都无关**——此前 bisect 被"无 LLM 骨架复现"（实为 pty 假象）误导。历史"并发更易挂"= 并发只是更多 LLM 调用=更高撞网关停摆概率。
+- **P1 看护狗（51ab5b8）**：`util/llm_watchdog.zig`——每请求 detached 看护狗持连接 fd，超时 `shutdown(2)` 唤醒阻塞读（libc 直调，不跨线程碰 Io）；7 个请求点三后端全接。`ZIV_LLM_TIMEOUT_MS` 覆盖（默认 180s，下限 1s）。E2E：mock 永不响应网关 + 3s 超时 → 3.6s 报错回提示符、进程存活、干净退出（旧行为=永久挂死）。超时错误接入既有重试/跳过恢复菜单。
+- **P2 并发恢复（38e5200）**：T6.4 串行封锁解除。每任务一线程 + B-pattern 私有 Io/Provider + 原子索引申领（优先级降序，agent 工具可选 priorities 数组）；调用线程参与干活；spawn 失败优雅降级。`subagent_concurrency` 配置（settings + /config 菜单，1-8，默认 3，ctx 持指针实时生效）。零消费者空转的 REPL ThreadPool 移除。真机 E2E：3 路并发 ×2 轮全跑通、零挂死零 crash、提交-后-应答健康。
+- **🔴 顺手破案（注册吞作用域）**：P3 调试中发现 T6.3 接线时 `for (reg.entries)` 循环**漏闭合花括号**——dispatch_ctx 与 agent 注册被吞进循环体：12 次注册（1 成功 11 ToolNameTaken）+ **注册 ctx 指向循环体内死栈槽**（悬垂，昨日 E2E 通过纯属栈运气）。修复后 0 告警。教训入 bug-patterns。
+- **P3 任务系统通电**：
+  - **EventBus 类型化**：EventData union（纯数值载荷，π 环生命周期安全）；REPL 六类 emit 点（query start/end、error、reflection×2、memory、task×2、resource_warning）
+  - **cron 主线程执行**：调度线程只投递到期索引（BoundedMPSC），loop-top drainDue 执行（SQLite 铁律）；内置 MEMORY_DECAY（e 衰减排序 + φ 保 61.8% 清扫 >30d 未触条目，episodic 新增 deleteByIds 批删）+ HEALTH_CHECK（RuntimeMonitor.runChecks，live token/调用率上下文）；`ZIV_CRON_SCALE` 测试倍速
+  - **协作取消**：dispatch 期间装 SIGINT handler（cooked 模式 Ctrl-C=真信号）→ 原子 cancel → 子代理每轮/每工具检查 → "(canceled by user)"；merge 注记"(已按 Ctrl-C 取消…)"；handler 恢复
+  - **重试**：快速失败（≤3 轮）job 1s 退避重试 1 次（P1 超时错误正是此类）
+  - **TaskPriority**：TaskCreate priority 1-5 参数 + 列表排序（in_progress > pending 高优先 > completed）+ agent 派发优先级申领语义一致
+  - **π 索引消费**：反思 prompt 注入事件环 π 采样行（"[earlier] ..."），突破近因视野
+  - 子代理 prompt 引导：权限被拒不重试同类操作（实测：被拒后如实报告而非撞满 10 轮）
+- **E2E 全绿**：φ 清扫 6→4（fresh 保留）+ Ctrl-C 取消 + 取消后应答 + 优先级标记 + 干净退出。283 测试（278 pass/5 skip/0 fail）。USAGE.md 补 env/config 说明。

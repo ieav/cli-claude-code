@@ -79,7 +79,7 @@ pub const RuntimeMonitor = struct {
 
                     // Emit event if bus is available
                     if (self.event_bus_ref) |bus| {
-                        bus.emit(.error_detected, info.message);
+                        bus.emit(.{ .error_detected = .{ .errors = 1 } });
                     }
                 },
             }

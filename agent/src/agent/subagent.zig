@@ -38,6 +38,13 @@ pub const SubagentConfig = struct {
     tools: *runtime_registry.RuntimeRegistry,
     /// Hard turn cap; the caller may lower it further.
     max_turns: usize = MAX_TURNS,
+    /// P3 cooperative cancel: checked before every LLM turn and every
+    /// tool call — a canceled subagent exits with "(canceled...)" instead
+    /// of burning the remaining turns.
+    cancel: ?*const std.atomic.Value(bool) = null,
+    /// P3 progress: the current turn number (1..max_turns), stored before
+    /// each LLM call so a dispatcher can observe live progress.
+    progress: ?*std.atomic.Value(u32) = null,
 };
 
 pub const SubagentResult = struct {
@@ -60,7 +67,9 @@ const headless_system_prompt =
     \\available, then reply with a concise result (what you found / did,
     \\key file paths, and anything the caller must know). You have no
     \\access to task tracking or user questions — work autonomously and
-    \\report at the end.
+    \\report at the end. You are READ-ONLY: if a tool call is denied by
+    \\permissions, do NOT retry the same kind of operation — switch to a
+    \\different allowed approach or report the denial as your result.
 ;
 
 /// Run one subagent to completion. Errors are folded into the summary so
@@ -115,6 +124,12 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
     var tokens_in: u32 = 0;
     var tokens_out: u32 = 0;
     while (turn < cfg.max_turns) : (turn += 1) {
+        if (cfg.cancel) |c| {
+            if (c.load(.acquire)) {
+                return .{ .summary = try alloc.dupe(u8, "(canceled by user)"), .turns_used = turn + 1, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };
+            }
+        }
+        if (cfg.progress) |p| p.store(@intCast(turn + 1), .release);
         const resp = try cfg.provider.complete(history.items, .{
             .max_tokens = 2048,
             .tools = specs.items,
@@ -149,6 +164,11 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
         try history.append(alloc, .{ .role = .assistant, .content = asst_blocks, .timestamp = 0 });
 
         for (tool_uses.items) |tu| {
+            if (cfg.cancel) |c| {
+                if (c.load(.acquire)) {
+                    return .{ .summary = try alloc.dupe(u8, "(canceled by user)"), .turns_used = turn + 1, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };
+                }
+            }
             tool_calls += 1;
             const out = executeWhitelisted(cfg, tu) catch |e| blk: {
                 break :blk std.fmt.allocPrint(alloc, "tool error: {s}", .{@errorName(e)}) catch "tool error";

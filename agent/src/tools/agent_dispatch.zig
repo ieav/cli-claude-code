@@ -13,6 +13,7 @@ const runtime_registry = @import("runtime_registry.zig");
 const llm = @import("../llm/mod.zig");
 const subagent = @import("../agent/subagent.zig");
 const tokens = @import("../util/tokens.zig");
+const event_bus = @import("../task/event_bus.zig");
 const openai = @import("../llm/openai.zig");
 const claude = @import("../llm/claude.zig");
 const ollama = @import("../llm/ollama.zig");
@@ -37,6 +38,10 @@ pub const DispatchCtx = struct {
     /// Clamped to 1..8 at the config layer; 1 runs everything on the
     /// calling thread (the serial escape hatch).
     concurrency: *const u32,
+    /// P3: session event bus for task_completed/task_failed emits
+    /// (main-thread emit only — the dispatch itself runs on the calling
+    /// thread, which IS the main thread).
+    bus: ?*event_bus.EventBus = null,
 };
 
 /// One job slot: the task text (owned by ctx.alloc) plus its result,
@@ -46,6 +51,11 @@ const AgentJob = struct {
     task_text: []u8,
     result: ?subagent.SubagentResult = null,
     failed: bool = false,
+    /// P3: live turn counter (observed by the subagent's progress hook)
+    /// and the retry bookkeeping.
+    progress: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    failed_turns: usize = 0,
+    retried: bool = false,
 };
 
 pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
@@ -106,6 +116,23 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         .order_len = n,
         .next = std.atomic.Value(u32).init(0),
     };
+
+    // P3 cancel: during a dispatch the terminal is in COOKED mode with
+    // ISIG on, so Ctrl-C arrives as a real SIGINT — route it to the
+    // cooperative flag instead of killing the session. Restored after.
+    const int_act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onDispatchSigint },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old_int: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.INT, &int_act, &old_int);
+    active_cancel = &wctx.cancel;
+    defer {
+        active_cancel = null;
+        std.posix.sigaction(.INT, &old_int, null);
+    }
+
     const conc = @min(@as(usize, @max(ctx.concurrency.*, 1)), n);
     var threads: [MAX_SUBAGENTS - 1]?std.Thread = @splat(null);
     var spawned: usize = 0;
@@ -115,7 +142,20 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     workerMain(&wctx); // the calling thread is the last worker
     for (threads[0..spawned]) |t| t.?.join();
 
-    const tr = try mergeJobs(alloc, ctx, jobs, n);
+    const canceled = wctx.cancel.load(.acquire);
+    if (ctx.bus) |b| {
+        var ok_jobs: u8 = 0;
+        var fail_jobs: u8 = 0;
+        for (jobs[0..n]) |*j| {
+            if (j.result != null) ok_jobs += 1 else fail_jobs += 1;
+        }
+        if (fail_jobs == 0) {
+            b.emit(.{ .task_completed = .{ .jobs = ok_jobs } });
+        } else {
+            b.emit(.{ .task_failed = .{ .ok = ok_jobs, .failed = fail_jobs } });
+        }
+    }
+    const tr = try mergeJobs(alloc, ctx, jobs, n, canceled);
     alloc.destroy(jobs);
     return tr;
 }
@@ -126,7 +166,19 @@ const WorkerCtx = struct {
     order: [MAX_SUBAGENTS]usize,
     order_len: usize,
     next: std.atomic.Value(u32),
+    /// P3 cooperative cancel — set by the dispatch SIGINT handler; checked
+    /// before claiming a job and inside the subagent every turn/tool.
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
+
+/// Active dispatch cancel flag for the SIGINT handler (async-signal-safe:
+/// the handler only does an atomic store). Null outside a dispatch, where
+/// SIGINT keeps its default disposition.
+var active_cancel: ?*std.atomic.Value(bool) = null;
+
+fn onDispatchSigint(_: std.posix.SIG) callconv(.c) void {
+    if (active_cancel) |c| c.store(true, .release);
+}
 
 /// One worker: private io + provider created AND destroyed on THIS thread
 /// (B-pattern, same as the background reflection worker), reused across
@@ -139,17 +191,45 @@ fn workerMain(w: *WorkerCtx) void {
     const provider = makeProviderInto(w.ctx, wio, &storage);
     defer provider.deinit();
     while (true) {
+        if (w.cancel.load(.acquire)) break;
         const c = w.next.fetchAdd(1, .monotonic);
         if (c >= w.order_len) break;
         const idx = w.order[c];
-        const res = subagent.run(.{
+        runJob(w, idx, provider, wio);
+    }
+}
+
+fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
+    const res = subagent.run(.{
+        .task = w.jobs[idx].task_text,
+        .alloc = w.ctx.alloc,
+        .io = wio,
+        .provider = provider,
+        .tools = w.ctx.tools,
+        .cancel = &w.cancel,
+        .progress = &w.jobs[idx].progress,
+    });
+    finishJob(&w.jobs[idx], res);
+    // P3 retry: fail-FAST jobs (≤3 turns in) get exactly one 1s-backoff
+    // retry — the P1 watchdog converts gateway stalls into exactly this
+    // failure class. Jobs that already made real progress keep their
+    // failure: rerunning from zero would just double the bill.
+    if (w.jobs[idx].failed and !w.jobs[idx].retried and
+        w.jobs[idx].failed_turns <= 3 and !w.cancel.load(.acquire))
+    {
+        w.jobs[idx].retried = true;
+        var ts: std.c.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = std.c.nanosleep(&ts, null);
+        const res2 = subagent.run(.{
             .task = w.jobs[idx].task_text,
             .alloc = w.ctx.alloc,
             .io = wio,
             .provider = provider,
             .tools = w.ctx.tools,
+            .cancel = &w.cancel,
+            .progress = &w.jobs[idx].progress,
         });
-        finishJob(&w.jobs[idx], res);
+        finishJob(&w.jobs[idx], res2);
     }
 }
 
@@ -157,6 +237,7 @@ fn finishJob(job: *AgentJob, res: subagent.SubagentResult) void {
     job.result = res;
     if (std.mem.startsWith(u8, res.summary, "subagent failed")) {
         job.failed = true;
+        job.failed_turns = res.turns_used;
         res.deinit(job.ctx.alloc);
         job.result = null;
     }
@@ -164,10 +245,11 @@ fn finishJob(job: *AgentJob, res: subagent.SubagentResult) void {
 
 /// T6.5: merge — each summary capped at ~500 tokens with per-agent stats.
 /// Frees job payloads; the arrays themselves are freed by the caller.
-fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]AgentJob, n: usize) !registry.ToolResult {
+fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]AgentJob, n: usize, canceled: bool) !registry.ToolResult {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     const w = &aw.writer;
+    if (canceled) try w.writeAll("(已按 Ctrl-C 取消：未完成的子任务被中断)\n");
     var i: usize = 0;
     while (i < n) : (i += 1) {
         defer if (jobs[i].result) |r| r.deinit(ctx.alloc);
