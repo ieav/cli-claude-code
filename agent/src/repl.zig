@@ -332,7 +332,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .monitor = &monitor,
         .bus = &evbus,
         .w = w,
-        .max_tokens = switcher.settings.max_tokens,
+        .switcher = &switcher,
         .llm_calls = &live_llm_calls,
         .est_tokens = &live_est_tokens,
     };
@@ -1277,6 +1277,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // One emergency compaction per turn on ContextOverflow — a second
         // overflow after compacting falls through to the manual hint.
         var overflow_compacted = false;
+        // P5 per-turn write cap (context protection — see the batch loop).
+        var turn_writes: usize = 0;
+        const MAX_TURN_WRITES: usize = 15;
 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
             // Compaction check + context estimate in one pass.
@@ -1403,12 +1406,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
             const llm_elapsed_s = @as(f64, @floatFromInt(util_time.nowMillis() - llm_t0)) / 1000.0;
             _ = live_llm_calls.fetchAdd(1, .monotonic); // P3: health-check api-rate signal
-            try std.Io.Writer.print(w, "  [{s} | in={d} out={d} | hist={d} | stop: {s} | {d:.1}s]\n", .{
+            // Compact dim stat line — in/out is the number user asked about
+            // by name; hist/stop reason carried no decision value.
+            try std.Io.Writer.print(w, "\x1b[2m  [{s} · in {d} → out {d} · {d:.1}s]\x1b[0m\n", .{
                 switcher.modelName(),
                 response.usage.input_tokens,
                 response.usage.output_tokens,
-                history.items.len,
-                @tagName(response.stop_reason),
                 llm_elapsed_s,
             });
             try std.Io.File.Writer.flush(&file_writer);
@@ -1542,6 +1545,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 var batch_errors: u32 = 0;
                 for (prepared.items, 0..) |p, i| {
                     window_tools += 1;
+                    // P5 write cap: "写一点就行" turns used to run away into
+                    // 50-iteration file-writing marathons that blew up the
+                    // context (user-side repro: 62 checkpoints in ONE turn).
+                    if (std.mem.eql(u8, p.call.tool_name, "FileWrite") or std.mem.eql(u8, p.call.tool_name, "FileEdit")) {
+                        turn_writes += 1;
+                    }
                     const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, &file_writer, history.items.len);
                     if (errored) {
                         window_errors += 1;
@@ -1593,11 +1602,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 std.Io.File.Writer.flush(&file_writer) catch {};
             }
 
+            // P5: write cap reached — end the TURN (not the session) with
+            // an explicit notice. The results so far stay in history; a
+            // fresh user message continues where this stopped.
+            if (turn_writes >= MAX_TURN_WRITES) {
+                try std.Io.Writer.print(w, "\x1b[2m  [本回合写操作已达上限（{d}）— 上下文保护。发送新消息继续。]\x1b[0m\n", .{MAX_TURN_WRITES});
+                try std.Io.File.Writer.flush(&file_writer);
+                break;
+            }
+
             try std.Io.File.Writer.flush(&file_writer);
         }
 
         if (agent_iterations >= MAX_AGENT_ITERATIONS) {
-            try std.Io.Writer.print(w, "  [Agent loop limit ({d}) reached]\n", .{MAX_AGENT_ITERATIONS});
+            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached]\x1b[0m\n", .{MAX_AGENT_ITERATIONS});
         }
 
         // T1.3: topic-drift re-anchor — checked after EVERY completed turn
@@ -2018,9 +2036,17 @@ const HealthCtx = struct {
     monitor: *runtime_monitor.RuntimeMonitor,
     bus: *task_mod.EventBus,
     w: *std.Io.Writer,
-    max_tokens: u32,
+    /// Live model context (window re-estimated at check time — the model
+    /// can switch mid-session). The first wiring compared against
+    /// settings.max_tokens — the RESPONSE cap (4096!) — so every active
+    /// session read "context window near limit" as a false positive.
+    switcher: *ModelSwitcher,
     llm_calls: *std.atomic.Value(u32),
     est_tokens: *std.atomic.Value(u32),
+    /// Dedup: print only when the failing-rule signature CHANGES — the
+    /// same warning every 60s used to stack into noise walls.
+    last_warn_count: usize = std.math.maxInt(usize),
+    last_warn_first: []const u8 = "",
 };
 
 /// P3 cron task: runtime monitor checks on the main thread. The api-rate
@@ -2038,7 +2064,9 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         .api_rate_limit = 60,
         .db_integrity_ok = true,
         .current_tokens = hc.est_tokens.load(.monotonic),
-        .max_tokens = hc.max_tokens,
+        // The real context WINDOW for the live model (e.g. glm-5.3 →
+        // 131072), not the response cap.
+        .max_tokens = llm.provider.contextEstimate(hc.switcher.modelName(), hc.switcher.backend),
         .task_failed_count = 0,
         .task_total_count = 0,
         .network_timeout_count = 0,
@@ -2049,8 +2077,19 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
     defer failures.deinit(allocator);
     try hc.monitor.runChecks(&failures);
     if (failures.items.len > 0) {
-        std.Io.Writer.print(hc.w, "  [monitor] {d} runtime warning(s) — {s}\n", .{ failures.items.len, failures.items[0].message }) catch {};
+        const changed = failures.items.len != hc.last_warn_count or
+            !std.mem.eql(u8, failures.items[0].rule_id, hc.last_warn_first);
+        if (changed) {
+            hc.last_warn_count = failures.items.len;
+            hc.last_warn_first = failures.items[0].rule_id;
+            std.Io.Writer.print(hc.w, "\x1b[2m  [monitor] {d} runtime warning(s) — {s}\x1b[0m\n", .{ failures.items.len, failures.items[0].message }) catch {};
+        }
+        // Events flow regardless (π ring feeds reflection) — only the
+        // print is deduped.
         hc.bus.emit(.{ .resource_warning = .{ .failed_checks = @intCast(failures.items.len) } });
+    } else {
+        hc.last_warn_count = 0;
+        hc.last_warn_first = "";
     }
 }
 
