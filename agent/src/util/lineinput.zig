@@ -485,17 +485,158 @@ pub var last_submit_ms: i64 = 0;
 pub var typeahead_buf: [256]u8 = undefined;
 pub var typeahead_len: usize = 0;
 
+/// ── P4: generation-period live input ─────────────────────────────────────
+/// While the model streams, the stream callback's stdin poll feeds the
+/// pending line below (live dim echo) instead of silently buffering.
+/// Enter QUEUES the text as a message: the agent loop injects it between
+/// tool rounds (the model sees it one round later — no interruption), and
+/// anything still queued when the turn ends auto-submits as the next
+/// message. Unsubmitted pending merges into typeahead at readLine entry.
+pub var pending_buf: [2048]u8 = undefined;
+pub var pending_len: usize = 0;
+/// The dim echo line is currently drawn at the cursor (no \n yet).
+pub var pending_shown: bool = false;
+
+pub const QUEUED_MAX: usize = 4;
+pub const QUEUED_CAP: usize = 2048;
+pub var queued_msgs: [QUEUED_MAX][QUEUED_CAP]u8 = undefined;
+pub var queued_lens: [QUEUED_MAX]usize = @splat(0);
+pub var queued_count: usize = 0;
+/// Read cursor: slots below it are consumed. Slots are NOT shifted on
+/// take — an eager shift used to overwrite the very slice being returned
+/// (take #1 handed out slot 0's bytes AFTER copying message 2 into it).
+/// Compaction happens only when the queue drains fully.
+pub var queued_read: usize = 0;
+
+/// True while unconsumed messages remain.
+pub fn queuedHas() bool {
+    return queued_read < queued_count;
+}
+
+/// Hand out the oldest unconsumed message. The slice stays valid until
+/// the queue fully drains (compaction) — read or dupe it promptly.
+pub fn queuedTake() ?[]const u8 {
+    if (queued_read >= queued_count) {
+        queued_count = 0;
+        queued_read = 0;
+        @memset(&queued_lens, 0);
+        return null;
+    }
+    const out = queued_msgs[queued_read][0..queued_lens[queued_read]];
+    queued_read += 1;
+    return out;
+}
+
+/// Display-capped tail of the pending buffer, cut at a UTF-8 boundary.
+fn pendingDisplay() []const u8 {
+    const s = pending_buf[0..pending_len];
+    // ~60 display cols from the tail (newest keystrokes stay visible)
+    var i = s.len;
+    var cols: usize = 0;
+    while (i > 0) {
+        // walk back one rune
+        var start = i - 1;
+        while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
+        const rune_cols: usize = if (s[start] >= 0xE0) 2 else 1;
+        if (cols + rune_cols > 60) break;
+        cols += rune_cols;
+        i = start;
+    }
+    return s[i..];
+}
+
+/// (Re)draw the dim pending-input echo line at the cursor. Single line,
+/// display-capped — safe for \r + clear-line redraw.
+pub fn renderPendingLine(w: *std.Io.Writer) void {
+    if (pending_len == 0) {
+        if (pending_shown) {
+            std.Io.Writer.writeAll(w, "\r\x1b[2K") catch {};
+        }
+        pending_shown = false;
+        return;
+    }
+    std.Io.Writer.print(w, "\r\x1b[2K\x1b[2m⌨ {s}\x1b[0m", .{pendingDisplay()}) catch {};
+    pending_shown = true;
+}
+
+/// Seal the echo line before stream output prints: freeze it into
+/// scrollback with a newline so output flows BELOW it (chat-app style).
+/// The pending buffer itself survives and redraws on the next keystroke.
+pub fn pendingSealLine(w: *std.Io.Writer) void {
+    if (pending_shown) {
+        std.Io.Writer.writeAll(w, "\n") catch {};
+        pending_shown = false;
+    }
+}
+
+fn pendingAppend(c: u8, w: ?*std.Io.Writer) void {
+    if (pending_len >= pending_buf.len) return; // hard cap, drop silently
+    pending_buf[pending_len] = c;
+    pending_len += 1;
+    if (w) |ww| renderPendingLine(ww);
+}
+
+fn pendingBackspace(w: ?*std.Io.Writer) void {
+    if (pending_len == 0) return;
+    pending_len -= 1;
+    while (pending_len > 0 and (pending_buf[pending_len] & 0xC0) == 0x80) pending_len -= 1;
+    if (w) |ww| renderPendingLine(ww);
+}
+
+/// Enter pressed during generation: queue the pending text as a message
+/// (mid-turn injection / auto-send at turn end). Returns true when a
+/// message was queued.
+fn pendingSubmit(w: ?*std.Io.Writer) bool {
+    if (pending_len == 0) return false;
+    if (queued_count >= QUEUED_MAX) return false;
+    @memcpy(queued_msgs[queued_count][0..pending_len], pending_buf[0..pending_len]);
+    queued_lens[queued_count] = pending_len;
+    queued_count += 1;
+    pending_len = 0;
+    if (w) |ww| {
+        pendingSealLine(ww);
+        std.Io.Writer.writeAll(ww, "  \x1b[2m↳ 已排队（本轮生效或回合后自动发送）\x1b[0m\n") catch {};
+    }
+    return true;
+}
+
+/// Merge unsubmitted pending into typeahead (readLine entry) — the old
+/// behavior (bytes survive into the editor) is preserved for text typed
+/// without Enter.
+pub fn pendingMergeIntoTypeahead() void {
+    var i: usize = 0;
+    while (i < pending_len and typeahead_len < typeahead_buf.len) : (i += 1) {
+        typeahead_buf[typeahead_len] = pending_buf[i];
+        typeahead_len += 1;
+    }
+    pending_len = 0;
+    pending_shown = false;
+}
+
 /// Non-blocking Esc probe for the streaming callback: true when the user
 /// pressed Esc (a following CSI sequence is swallowed so arrow keys don't
-/// leak into the prompt). Any non-Esc bytes go to the type-ahead buffer.
+/// leak into the prompt). Other bytes feed the P4 live pending line:
+/// printable/CR-LF echo live, Backspace edits, CR queues the message.
+/// `w` is null in drain contexts (post-cancel) — capture without echo.
 /// Checks the reader's OWN buffer first — a burst "text…ESC" lands in one
 /// read and the kernel fd goes dry, so polling fd alone never sees the Esc
 /// (same trap menu.readKey fixed with its bufferedLen check).
-pub fn escProbe(r: *std.Io.Reader) bool {
-    if (r.bufferedLen() == 0) {
-        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        if (std.c.poll(&pfd, 1, 0) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+pub fn escProbe(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
+    // Drain ALL pending bytes per invocation: the old take-one-byte-per-
+    // call shape capped live input at ~20 bytes/s (one byte per 50ms
+    // throttle window) — a typed supplement outlived the stream and its
+    // Enter leaked into the next prompt.
+    while (true) {
+        if (r.bufferedLen() == 0) {
+            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&pfd, 1, 0) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+        }
+        const esc = escProbeOne(r, w);
+        if (esc) return true;
     }
+}
+
+fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
     const c = r.takeByte() catch return false;
     if (c == 0x03) {
         // Ctrl-C during generation interrupts like Esc (generation runs in
@@ -509,12 +650,12 @@ pub fn escProbe(r: *std.Io.Reader) bool {
         return true;
     }
     if (c != 0x1b) {
-        // Keep typed-ahead bytes (LF too — multi-line paste during
-        // generation survives), but drop CR: its meaning ("submit") cannot
-        // survive into a pre-filled buffer.
-        if (c != '\r' and (c >= 0x20 or c == '\n') and typeahead_len < typeahead_buf.len) {
-            typeahead_buf[typeahead_len] = c;
-            typeahead_len += 1;
+        if (c == '\r') {
+            _ = pendingSubmit(w);
+        } else if (c == 0x7f) {
+            pendingBackspace(w);
+        } else if (c >= 0x20 or c == '\n') {
+            pendingAppend(c, w);
         }
         return false;
     }
@@ -1219,6 +1360,9 @@ pub fn readLine(
             ed.insertBytes(t) catch {};
         }
     }
+    // P4: live-typed pending during generation (never submitted with
+    // Enter) becomes the editor seed through the existing typeahead path.
+    pendingMergeIntoTypeahead();
     if (typeahead_len > 0) {
         ed.insertBytes(typeahead_buf[0..typeahead_len]) catch {};
         typeahead_len = 0;
@@ -2041,4 +2185,56 @@ test "folded paste renders as a pill and keeps the block tiny" {
     try std.testing.expect(std.mem.indexOfScalar(u8, out, 0) == null); // no NUL leaked
     try std.testing.expectEqual(@as(usize, 1), ed.last_rows);
     alloc.free(pd);
+}
+
+// ── P4: generation-period live input tests ──
+
+fn resetPendingState() void {
+    pending_len = 0;
+    pending_shown = false;
+    queued_count = 0;
+    queued_read = 0;
+    @memset(&queued_lens, 0);
+    typeahead_len = 0;
+}
+
+test "pending submit queues FIFO and queuedTake pops in order" {
+    resetPendingState();
+    // "abc" + Enter, then CJK "\u{7B2C}\u{4E8C}" (di-er) + Enter — UTF-8 multibyte
+    const cjk = "\u{7B2C}\u{4E8C}";
+    for ("abc") |c| pendingAppend(c, null);
+    try std.testing.expect(pendingSubmit(null));
+    for (cjk) |c| pendingAppend(c, null);
+    try std.testing.expect(pendingSubmit(null));
+    try std.testing.expectEqual(@as(usize, 2), queued_count);
+
+    const first = queuedTake().?;
+    try std.testing.expectEqualStrings("abc", first);
+    const second = queuedTake().?;
+    try std.testing.expectEqualStrings(cjk, second);
+    try std.testing.expect(queuedTake() == null);
+    try std.testing.expectEqual(@as(usize, 0), queued_count);
+}
+
+test "pending backspace removes whole runes; empty submit is a no-op" {
+    resetPendingState();
+    const cjk2 = "\u{4E2D}\u{6587}x"; // zhong-wen + x
+    for (cjk2) |c| pendingAppend(c, null);
+    pendingBackspace(null); // drop 'x'
+    pendingBackspace(null); // drop the second CJK rune atomically
+    try std.testing.expectEqual(@as(usize, 3), pending_len);
+    try std.testing.expectEqualSlices(u8, "\u{4E2D}", pending_buf[0..pending_len]);
+    pendingBackspace(null);
+    try std.testing.expectEqual(@as(usize, 0), pending_len);
+    try std.testing.expect(!pendingSubmit(null));
+    try std.testing.expectEqual(@as(usize, 0), queued_count);
+}
+
+test "unsubmitted pending merges into typeahead for the editor" {
+    resetPendingState();
+    for ("draft") |c| pendingAppend(c, null);
+    pendingMergeIntoTypeahead();
+    try std.testing.expectEqual(@as(usize, 0), pending_len);
+    try std.testing.expectEqualSlices(u8, "draft", typeahead_buf[0..typeahead_len]);
+    try std.testing.expectEqual(@as(usize, 0), queued_count);
 }

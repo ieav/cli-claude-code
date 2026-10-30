@@ -570,6 +570,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     );
     try std.Io.File.Writer.flush(&file_writer);
 
+    // P4: a message queued during generation (Enter pressed mid-stream)
+    // that never hit a tool-round injection point auto-sends as the next
+    // turn — the main loop consumes it instead of calling readLine.
+    var auto_submit: ?[]u8 = null;
+
     while (true) {
         // Hot-reload: a settings file changed on disk since the last prompt
         // (external edit) → reload everything and resync the live permission
@@ -631,10 +636,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // Backspace/Delete/Home/End work, pasted multi-line text arrives as
         // ONE input. The returned slice is allocator-owned and may exceed
         // 4 KiB after a big paste — freed at the end of this iteration.
-        const maybe_line = lineinput.readLine(w, r, &file_writer, prompt, &input_history, allocator) catch |err| {
-            std.debug.print("Error reading input: {}\n", .{err});
-            return;
-        };
+        var from_auto_queue = false;
+        var maybe_line: ?[]u8 = null;
+        if (auto_submit) |a| {
+            from_auto_queue = true;
+            auto_submit = null;
+            maybe_line = a;
+            lineinput.pendingSealLine(w);
+            std.Io.Writer.print(w, "  ↳ 自动发送排队消息\n", .{}) catch {};
+        } else {
+            maybe_line = lineinput.readLine(w, r, &file_writer, prompt, &input_history, allocator) catch |err| {
+                std.debug.print("Error reading input: {}\n", .{err});
+                return;
+            };
+        }
         const line = maybe_line orelse {
             // Ctrl-D on an empty line (EOF): same session-end cleanup as
             // /quit — this path used to skip reflection + memory extraction,
@@ -664,7 +679,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         const input = std.mem.trim(u8, line, " \t\r\n");
         if (input.len == 0) continue;
-        saveInputHistory(allocator, &input_history);
+        if (!from_auto_queue) saveInputHistory(allocator, &input_history);
 
         var skill_injected = false;
         // ──── Meta commands ────
@@ -1556,6 +1571,28 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 });
             }
 
+            // P4 mid-turn injection: messages the user typed + Enter'd
+            // while the model was generating enter the conversation HERE —
+            // the next iteration's request includes them, so supplements
+            // land one tool-round later without interrupting anything.
+            while (lineinput.queuedTake()) |qm| {
+                const q = try allocator.dupe(u8, qm); // slot shifts on next take
+                const qb = try allocator.alloc(llm.ContentBlock, 1);
+                qb[0] = .{ .text = q };
+                try history.append(allocator, .{
+                    .role = .user,
+                    .content = qb,
+                    .timestamp = util_time.nowMillis(),
+                });
+                // Same bookkeeping as a regular query: reflection window +
+                // event record (the insight may later reference it).
+                window_queries.append(allocator, q) catch allocator.free(q);
+                evbus.emit(.{ .user_query_start = {} });
+                lineinput.pendingSealLine(w);
+                std.Io.Writer.print(w, "  ↳ 补充已进入本轮对话: {s}\n", .{q[0..@min(q.len, 60)]}) catch {};
+                std.Io.File.Writer.flush(&file_writer) catch {};
+            }
+
             try std.Io.File.Writer.flush(&file_writer);
         }
 
@@ -1601,6 +1638,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             if (live_trace) |*t| {
                 traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", 0, allocator) catch {};
             }
+        }
+
+        // P4: queue survivors (queued during the FINAL stream, after the
+        // last tool round) auto-send as the next turn.
+        if (lineinput.queuedHas()) {
+            if (lineinput.queuedTake()) |qm| auto_submit = allocator.dupe(u8, qm) catch null;
         }
 
         try std.Io.Writer.writeAll(w, "\n");
@@ -2683,13 +2726,16 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
         const now = util_time.nowMillis();
         if (now - self.last_esc_check >= 50) {
             self.last_esc_check = now;
-            if (lineinput.escProbe(self.esc_probe_r.?)) {
+            if (lineinput.escProbe(self.esc_probe_r.?, self.w)) {
                 return error.EscCancelled;
             }
         }
     }
     switch (event) {
         .content_delta => |d| {
+            // P4: freeze the live pending-input echo line so output flows
+            // below it (the pending buffer survives, redraws on next key).
+            lineinput.pendingSealLine(self.w);
             // Close the "(thinking…)" marker line before the first real text.
             if (self.thinking_newline_needed) {
                 self.thinking_newline_needed = false;
@@ -2702,6 +2748,7 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             try self.text.appendSlice(self.alloc, d);
         },
         .thinking_delta => {
+            lineinput.pendingSealLine(self.w);
             if (!self.thinking_shown) {
                 self.thinking_shown = true;
                 self.thinking_newline_needed = true;
@@ -2710,6 +2757,7 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             }
         },
         .tool_call => |tu| {
+            lineinput.pendingSealLine(self.w);
             // Per-event arena: the summary strings are print-and-done.
             var sum_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer sum_arena.deinit();
@@ -2758,7 +2806,7 @@ fn streamComplete(
             // not cancel this generation's very first stream event. The
             // drain loop keeps ordinary typed-ahead bytes (escProbe stashes
             // them) and drops the stale Esc.
-            while (lineinput.escProbe(r.?)) {}
+            while (lineinput.escProbe(r.?, null)) {}
         }
     }
     defer if (r != null) esc_guard.restore();
