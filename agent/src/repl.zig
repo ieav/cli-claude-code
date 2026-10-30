@@ -35,6 +35,7 @@ const database_mod = @import("storage/database.zig");
 const math_mod = @import("math/mod.zig");
 const embedding_mod = @import("util/embedding.zig");
 const tokens_mod = @import("util/tokens.zig");
+const task_mod = @import("task/mod.zig");
 const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
@@ -350,6 +351,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     defer if (plan_block) |pb| allocator.free(pb);
     var plan_raw_last: ?[]u8 = null;
     defer if (plan_raw_last) |pr| allocator.free(pr);
+    // T4.2: key-facts block distilled by every compaction — survives
+    // truncation in the system prompt (≤200 tokens).
+    var facts_block: ?[]u8 = null;
+    defer if (facts_block) |f| allocator.free(f);
+    // T3.1: the task pool (e-bounded workers) — serves the subagent fan-out
+    // (T6.4). Started eagerly, joined on every exit path; queued work at
+    // exit completes or dies with the process (by design).
+    var pool: task_mod.ThreadPool = task_mod.ThreadPool.init(allocator) catch {
+        logger.warning("thread pool unavailable — subagents will run inline", .{});
+        unreachable; // init only allocates a struct; failure = OOM
+    };
+    pool.start() catch {
+        logger.warning("thread pool start failed — subagents will run inline", .{});
+    };
+    defer pool.deinit();
     if (mem_sys) |*ms| {
         // Candidate pool of 200, not 20: the e-decay + cosine ranking only
         // reorders what SQL already returned — with LIMIT 20, older
@@ -498,7 +514,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             .auto => "ziv[auto]",
         };
         var est_ctx = estimateHistoryTokens(history.items);
-        const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(MAX_CONTEXT_TOKENS)) * 100.0));
+        // Parity: the prompt % uses the SAME adaptive ceiling as maybeCompact
+        // (contextEstimate of the active model) — display and decision must
+        // not diverge on small-context models.
+        const ctx_ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
+        const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ctx_ceiling)) * 100.0));
         var prompt_buf: [160]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
 
@@ -516,7 +536,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // /quit — this path used to skip reflection + memory extraction,
             // silently losing the session's learnings on a common exit habit.
             // Extract first, reflect last — see the /quit path note.
-            if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+            if (mem_sys) |*ms| {
+                const ext_t0 = util_time.nowMillis();
+                extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
+            }
             if (mem_sys != null and window_queries.items.len > 0) {
                 runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
             }
@@ -544,7 +568,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // Extract memories FIRST (valuable, durable, ms) — reflection
                 // is best-effort behind it; killing the window mid-exit
                 // used to lose the whole session's learnings.
-                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                if (mem_sys) |*ms| {
+                    const ext_t0 = util_time.nowMillis();
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                    logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
+                }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
                 }
@@ -777,7 +805,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             } else if (std.mem.eql(u8, input, "/compact phi")) {
                 // Original φ truncation strategy, kept as an explicit option
                 // (also what auto-compaction runs).
-                try compactHistoryPhi(&history, allocator, w, &log);
+                try compactHistoryPhi(&history, allocator, w, &log, &facts_block);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
@@ -788,7 +816,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // Extract memories FIRST (valuable, durable, ms) — reflection
                 // is best-effort behind it; killing the window mid-exit
                 // used to lose the whole session's learnings.
-                if (mem_sys) |*ms| extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                if (mem_sys) |*ms| {
+                    const ext_t0 = util_time.nowMillis();
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, w) catch {};
+                    logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
+                }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
                 }
@@ -923,6 +955,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     switcher.backendLabel(),
                     @tagName(llm.provider.capabilityTier(switcher.modelName(), switcher.backend)),
                 });
+                const ps = pool.stats();
+                try std.Io.Writer.print(w, "  Pool: {d}/{d} active | {d} done {d} failed\n", .{ ps.active, ps.max_concurrent, ps.completed, ps.failed });
                 try std.Io.Writer.print(w, "  Total: {d} in / {d} out tokens\n\n", .{
                     total_input_tokens,
                     total_output_tokens,
@@ -1099,7 +1133,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
             // Compaction check + context estimate in one pass.
-            est_ctx = maybeCompact(&history, allocator, w, &file_writer, &log);
+            est_ctx = maybeCompact(&history, allocator, w, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
 
             // Get provider
             const prov = switcher.getProvider() catch |err| {
@@ -1148,7 +1182,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // the same oversized history and fail identically.
                 if (err == error.ContextOverflow and !overflow_compacted) {
                     overflow_compacted = true;
-                    compactHistoryImpl(&history, allocator);
+                    applyFactsUpdate(&history, &facts_block, allocator, compactHistoryImpl(&history, allocator, facts_block));
                     log.bumpEpoch();
                     try std.Io.Writer.print(w, "  [Context overflow — history auto-compacted, retrying]\n", .{});
                     try std.Io.File.Writer.flush(&file_writer);
@@ -1752,7 +1786,11 @@ fn runReflection(
     // flash/local models produce noise insights that poison the next
     // session's injected memories (defect ⑧). Heuristics still run.
     if (provider != null and tier == .full and window_queries.items.len >= 3) {
-        llm_insights = reflectLlmWithTimeout(provider.?, window_queries.items, alloc, 3000);
+        // T3.2 (approved deviation): 1s cap, not full backgrounding —
+        // SQLITE_THREADSAFE=0 forbids pool-side DB writes and the engine
+        // keeps mutable archive state, so the turn pays ≤1s only when the
+        // full tier + actionable gates have already passed.
+        llm_insights = reflectLlmWithTimeout(provider.?, window_queries.items, alloc, 1000);
     }
     const insights: []const u8 = llm_insights orelse reflection.insights;
     defer if (llm_insights) |li| alloc.free(li);
@@ -2636,11 +2674,15 @@ fn estimateTextTokens(text: []const u8) u32 {
 /// token estimate AFTER any compaction — callers reuse it instead of
 /// re-scanning the whole history (the loop used to run the same O(n)
 /// estimate twice per iteration).
-fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog) u32 {
+fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog, facts: *?[]u8, model: []const u8, backend: llm.BackendType) u32 {
     const current_tokens = estimateHistoryTokens(history.items);
-    if (!compaction.needsCompaction(current_tokens, MAX_CONTEXT_TOKENS)) return current_tokens;
+    // T4.1: the ceiling follows the ACTIVE model's context estimate, not
+    // the old hardcoded 128K — an 8K local model now compacts at ~5K
+    // instead of overflowing first.
+    const ceiling = llm.provider.contextEstimate(model, backend);
+    if (!compaction.needsCompaction(current_tokens, ceiling)) return current_tokens;
 
-    compactHistoryImpl(history, alloc);
+    applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
     log.bumpEpoch();
     std.Io.Writer.print(w, "  [Context auto-compacted: {d} messages remaining]\n", .{history.items.len}) catch {};
     std.Io.File.Writer.flush(file_writer) catch {};
@@ -2747,38 +2789,142 @@ fn replaceHistoryWithSummary(history: *std.ArrayList(llm.Message), alloc: std.me
 /// Force compact via phi truncation (used by /compact phi). This is the
 /// original strategy: keep the system prompt + most recent 61.8% of
 /// messages, drop the rest.
-fn compactHistoryPhi(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, log: *op_log.OperationLog) !void {
+fn compactHistoryPhi(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, log: *op_log.OperationLog, facts: *?[]u8) !void {
     if (history.items.len <= 2) {
         try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
         return;
     }
     const before = history.items.len;
-    compactHistoryImpl(history, alloc);
+    applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
     log.bumpEpoch();
     const est = estimateHistoryTokens(history.items);
     try std.Io.Writer.print(w, "  Compacted (phi): {d} → {d} messages (~{d} tokens)\n\n", .{ before, history.items.len, est });
 }
 
+/// T4.2: fold compaction's returned facts into the owned block + the
+/// live history (swap by identity; append on first use). No-op on null
+/// (nothing new — the block stays byte-identical, cache intact).
+fn applyFactsUpdate(history: *std.ArrayList(llm.Message), facts: *?[]u8, alloc: std.mem.Allocator, new_facts: ?[]u8) void {
+    const nf = new_facts orelse return;
+    if (facts.*) |of| {
+        const swapped = swapMemoryBlockText(history, alloc, of, nf);
+        if (!swapped) {
+            if (!appendSystemBlock(history, alloc, nf)) {
+                alloc.free(nf);
+                return; // OOM: keep the old block
+            }
+        }
+        alloc.free(of);
+    } else if (!appendSystemBlock(history, alloc, nf)) {
+        alloc.free(nf);
+        return;
+    }
+    facts.* = nf;
+}
+
+/// T4.2 signal words: lines from DROPPED messages that carry irreversible
+/// facts (decisions, paths, constraints) survive truncation in a bounded
+/// "key facts" block instead of being lost with the phi cut.
+const fact_markers = [_][]const u8{
+    "决定", "改用", "换成", "选定", "decision", "switch to", "instead", "let's", "we'll", "use ",
+    "必须", "不要", "禁止", "不能", "must", "never", "always", "require",
+};
+const path_hint_bytes = "/";
+
+fn lineIsKeyFact(line: []const u8) bool {
+    if (line.len < 8 or line.len > 300) return false;
+    for (fact_markers) |m| {
+        if (std.mem.indexOf(u8, line, m) != null) return true;
+    }
+    return std.mem.indexOf(u8, line, path_hint_bytes) != null and
+        (std.mem.indexOf(u8, line, ".zig") != null or
+            std.mem.indexOf(u8, line, ".rs") != null or
+            std.mem.indexOf(u8, line, ".ts") != null or
+            std.mem.indexOf(u8, line, ".py") != null or
+            std.mem.indexOf(u8, line, ".md") != null or
+            std.mem.indexOf(u8, line, ".sql") != null or
+            std.mem.indexOf(u8, line, ".json") != null);
+}
+
+/// Build/merge the key-facts text: NEW facts first (recent decisions
+/// matter more), then surviving old ones, capped at ~200 tokens.
+fn mergeKeyFacts(alloc: std.mem.Allocator, dropped: []const llm.Message, existing: ?[]const u8) ?[]u8 {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    aw.writer.writeAll("Key facts kept through compaction:\n") catch return null;
+    var count: usize = 0;
+    var i = dropped.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = dropped[i];
+        if (msg.role != .user and msg.role != .assistant) continue;
+        for (msg.content) |block| switch (block) {
+            .text => |t| {
+                var lines = std.mem.splitScalar(u8, t, '\n');
+                while (lines.next()) |ln| {
+                    const t2 = std.mem.trim(u8, ln, " \t>-*# ");
+                    if (!lineIsKeyFact(t2)) continue;
+                    // dedupe against what we already collected
+                    if (std.mem.indexOf(u8, aw.written(), t2) != null) continue;
+                    if (existing) |ex| {
+                        if (std.mem.indexOf(u8, ex, t2) != null and count >= 8) continue; // keep old copy only via merge below
+                    }
+                    aw.writer.print("- {s}\n", .{t2}) catch return null;
+                    count += 1;
+                    if (tokens_mod.estimateTokens(aw.written()) > 180) break;
+                }
+            },
+            else => {},
+        };
+        if (tokens_mod.estimateTokens(aw.written()) > 180) break;
+    }
+    // Append surviving old facts that still fit (they were already paid for).
+    if (existing) |ex| {
+        var lines = std.mem.splitScalar(u8, ex, '\n');
+        while (lines.next()) |ln| {
+            const t2 = std.mem.trim(u8, ln, " \t-");
+            if (t2.len == 0 or std.mem.startsWith(u8, t2, "Key facts")) continue;
+            if (std.mem.indexOf(u8, aw.written(), t2) != null) continue;
+            if (tokens_mod.estimateTokens(aw.written()) + tokens_mod.estimateTokens(t2) > 200) break;
+            aw.writer.print("- {s}\n", .{t2}) catch break;
+        }
+    }
+    if (count == 0 and existing == null) return null;
+    return alloc.dupe(u8, aw.written()) catch null;
+}
+
 /// Core compaction: keep system prompt + recent 61.8% of messages.
-fn compactHistoryImpl(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
-    if (history.items.len <= 2) return;
+/// T4.2: before freeing the dropped messages, irreversible facts
+/// (decisions/paths/constraints) are distilled into `facts_out`.
+fn compactHistoryImpl(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, existing_facts: ?[]const u8) ?[]u8 {
+    if (history.items.len <= 2) return null;
 
     // Keep system prompt (index 0) and recent messages up to phi target
     const total = history.items.len - 1; // exclude system prompt
     const target = compaction.condensationTarget(total);
-    if (target >= total) return;
+    if (target >= total) return null;
 
     // Remove the oldest non-system messages down to the phi target,
     // freeing their content — previously every removal leaked.
     const new_len = 1 + target; // system + remaining
+    var dropped: std.ArrayList(llm.Message) = .empty;
+    defer dropped.deinit(alloc);
     while (history.items.len > new_len) {
         const msg = history.orderedRemove(1);
-        freeMessage(msg, alloc);
+        dropped.append(alloc, msg) catch freeMessage(msg, alloc);
     }
+
+    // T4.2: distill key facts from the dropped tail; free the messages
+    // only after extraction. The RETURNED slice belongs to the caller —
+    // it swaps the block into history and frees the previous text. Null
+    // means "nothing new" (keep the existing block byte-identical).
+    const new_facts = mergeKeyFacts(alloc, dropped.items, existing_facts);
+    for (dropped.items) |msg| freeMessage(msg, alloc);
 
     // An index-based cut can split a tool_use/tool_result pair at the head;
     // repair trims the orphan so the next request stays wire-valid.
     repairToolPairing(history, alloc);
+    return new_facts;
 }
 
 /// Clear history, keep only system prompt.
@@ -4219,7 +4365,7 @@ test "compactHistoryImpl repairs tool pairing after the phi cut" {
     }
     try std.testing.expectEqual(@as(usize, 13), history.items.len);
 
-    compactHistoryImpl(&history, alloc);
+    if (compactHistoryImpl(&history, alloc, null)) |nf| std.testing.allocator.free(nf);
 
     // Head must not be an orphan tool-result message; tail must not be a
     // dangling assistant tool_use.
@@ -4383,6 +4529,59 @@ test "plan summary, append and remove system blocks (T8)" {
     try std.testing.expectEqual(@as(usize, 1), history.items[0].content.len);
     try std.testing.expectEqualStrings("SYSTEM", history.items[0].content[0].text);
     try std.testing.expect(!removeSystemBlockByText(&history, alloc, summary)); // gone: no-op
+}
+
+test "key facts survive repeated phi compaction (T4.2)" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeContentBlocks(alloc, m.content);
+        history.deinit(alloc);
+    }
+    const appendTurn = struct {
+        fn f(a: std.mem.Allocator, h: *std.ArrayList(llm.Message), text: []const u8) !void {
+            const b = try a.alloc(llm.ContentBlock, 1);
+            b[0] = .{ .text = try a.dupe(u8, text) }; // HEAP: blocks free their text
+            try h.append(a, .{ .role = .user, .content = b, .timestamp = 0 });
+        }
+    }.f;
+
+    // Index 0 is always kept as the system prompt — the DECISION must sit
+    // at index 1 so phi actually drops it (that's the point of the test).
+    try appendTurn(alloc, &history, "SYSTEM-PROMPT");
+    try appendTurn(alloc, &history, "我们决定使用 sqlite WAL 模式，数据库文件是 data/app.db，不要改成 delete 模式");
+    // Filler turns so phi actually drops the head.
+    for (0..40) |i| {
+        var tb: [64]u8 = undefined;
+        const t = try std.fmt.bufPrint(&tb, "regular exchange number {d} nothing worth keeping", .{i});
+        try appendTurn(alloc, &history, t);
+    }
+    // NOTE: the facts block lives in history[0]'s blocks — its text is
+    // freed by the message cleanup below, so NO separate facts defer.
+    var facts: ?[]u8 = null;
+
+    var rounds: usize = 0;
+    while (rounds < 3) : (rounds += 1) {
+        // replenish filler so each round actually compacts again
+        for (0..20) |i| {
+            var tb: [64]u8 = undefined;
+            const t = try std.fmt.bufPrint(&tb, "later padding {d} for the round", .{i});
+            try appendTurn(alloc, &history, t);
+        }
+        applyFactsUpdate(&history, &facts, alloc, compactHistoryImpl(&history, alloc, facts));
+    }
+    const f = facts orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, f, "sqlite WAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f, "data/app.db") != null);
+    // And the block is anchored in history[0].
+    var anchored = false;
+    for (history.items[0].content) |b| switch (b) {
+        .text => |t| if (std.mem.indexOf(u8, t, "sqlite WAL") != null) {
+            anchored = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(anchored);
 }
 
 test "isLowSignal and near-duplicate gates (T2.3)" {
