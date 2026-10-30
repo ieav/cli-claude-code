@@ -358,18 +358,6 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // truncation in the system prompt (≤200 tokens).
     var facts_block: ?[]u8 = null;
     defer if (facts_block) |f| allocator.free(f);
-    // T3.1: the task pool (e-bounded workers) — serves the subagent fan-out
-    // (T6.4). Started eagerly, joined on every exit path; queued work at
-    // exit completes or dies with the process (by design).
-    var pool: task_mod.ThreadPool = task_mod.ThreadPool.init(allocator) catch {
-        logger.warning("thread pool unavailable — subagents will run inline", .{});
-        unreachable; // init only allocates a struct; failure = OOM
-    };
-    pool.start() catch {
-        logger.warning("thread pool start failed — subagents will run inline", .{});
-    };
-    defer pool.deinit();
-
 
     if (mem_sys) |*ms| {
         // Candidate pool of 200, not 20: the e-decay + cosine ranking only
@@ -466,7 +454,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .alloc = allocator,
         .io = io,
         .tools = &reg,
-        .pool = &pool,
+        .concurrency = &switcher.settings.subagent_concurrency,
         .backend = switcher.backend,
         .model = switcher.modelName(),
         .api_key = switch (switcher.backend) {
@@ -1029,8 +1017,6 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     switcher.backendLabel(),
                     @tagName(llm.provider.capabilityTier(switcher.modelName(), switcher.backend)),
                 });
-                const ps = pool.stats();
-                try std.Io.Writer.print(w, "  Pool: {d}/{d} active | {d} done {d} failed\n", .{ ps.active, ps.max_concurrent, ps.completed, ps.failed });
                 try std.Io.Writer.print(w, "  Total: {d} in / {d} out tokens\n\n", .{
                     total_input_tokens,
                     total_output_tokens,
@@ -3942,11 +3928,13 @@ fn runConfigMenu(
         var b4: [64]u8 = undefined;
         var b5: [64]u8 = undefined;
         var b6: [64]u8 = undefined;
+        var b7: [64]u8 = undefined;
         const items = [_][]const u8{
             "API Keys",
             try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
             try_std_fmt(&b2, "最大 tokens: {d}", .{switcher.settings.max_tokens}),
             try_std_fmt(&b6, "记忆注入预算: {d} tokens", .{switcher.settings.memory_budget_tokens}),
+            try_std_fmt(&b7, "子代理并发: {d}", .{switcher.settings.subagent_concurrency}),
             try_std_fmt(&b3, "权限模式: {s}", .{auth.modeLabel(switcher.settings.permission_mode)}),
             try_std_fmt(&b4, "检查点: {s}", .{if (switcher.settings.checkpointing_enabled) "开" else "关"}),
             try_std_fmt(&b5, "系统提示词: {s}", .{if (switcher.settings.system_prompt != null) "(自定义)" else "(默认)"}),
@@ -3984,17 +3972,30 @@ fn runConfigMenu(
                 } else try std.Io.Writer.writeAll(w, "  超出范围\n");
             },
             4 => {
+                var scbuf: [32]u8 = undefined;
+                const sval = menu.readLine(r, w, file_writer, "  子代理并发数 (1-8，1=串行): ", &scbuf) catch continue;
+                if (sval.len == 0) continue;
+                const sc = std.fmt.parseInt(u32, sval, 10) catch {
+                    try std.Io.Writer.writeAll(w, "  无效数字\n");
+                    continue;
+                };
+                if (sc >= 1 and sc <= 8) {
+                    switcher.settings.subagent_concurrency = sc;
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                } else try std.Io.Writer.writeAll(w, "  超出范围\n");
+            },
+            5 => {
                 const mode_items = [_][]const u8{ "Default — 危险操作询问", "Accept Edits — 自动接受编辑", "Plan — 只读", "Bypass — 跳过检查", "Don't Ask — 自动拒绝", "Auto — LLM 分类" };
                 const mode_map = [_]auth.PermissionMode{ .default, .accept_edits, .plan, .bypass, .dont_ask, .auto };
                 const mp = (menu.select(w, r, file_writer, "选择权限模式:", &mode_items, 0) catch continue) orelse continue;
                 switcher.settings.permission_mode = mode_map[mp];
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
             },
-            5 => {
+            6 => {
                 switcher.settings.checkpointing_enabled = !switcher.settings.checkpointing_enabled;
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
             },
-            6 => {
+            7 => {
                 const sp_items = [_][]const u8{ "输入自定义提示词", "恢复默认", "返回" };
                 const sp = (menu.select(w, r, file_writer, "系统提示词:", &sp_items, 0) catch continue) orelse continue;
                 if (sp == 0) {
@@ -4009,7 +4010,7 @@ fn runConfigMenu(
                     autoSaveSettings(w, file_writer, switcher, alloc, io);
                 }
             },
-            7 => break,
+            8 => break,
             else => {},
         }
     }

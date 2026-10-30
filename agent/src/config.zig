@@ -36,6 +36,10 @@ pub const Settings = struct {
     /// starved mature projects; larger defaults wait for the extraction
     /// quality gate (T2.x) to land first.
     memory_budget_tokens: u32 = 1200,
+    /// P2: concurrent subagent workers per agent dispatch. 1 = serial
+    /// (escape hatch); clamped to 1..8 on load — values beyond the
+    /// per-dispatch task cap (3) simply mean "all tasks parallel".
+    subagent_concurrency: u32 = 3,
     max_snapshots: u32 = 100,
     checkpointing_enabled: bool = true,
     system_prompt: ?[]const u8 = null,
@@ -171,6 +175,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getInt(value, "memory_budget_tokens")) |mb| {
         if (mb >= 200 and mb <= 8000) {
             settings.memory_budget_tokens = @intCast(mb);
+        }
+    }
+    if (json_helpers.getInt(value, "subagent_concurrency")) |sc| {
+        if (sc >= 1 and sc <= 8) {
+            settings.subagent_concurrency = @intCast(sc);
         }
     }
     if (json_helpers.getBool(value, "checkpointing_enabled")) |ce| {
@@ -351,6 +360,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     // max_tokens / max_snapshots
     buf.print(allocator, "  \"max_tokens\": {d},\n", .{settings.max_tokens}) catch {};
     buf.print(allocator, "  \"memory_budget_tokens\": {d},\n", .{settings.memory_budget_tokens}) catch {};
+    buf.print(allocator, "  \"subagent_concurrency\": {d},\n", .{settings.subagent_concurrency}) catch {};
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};
