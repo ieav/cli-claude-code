@@ -8,7 +8,6 @@ const runtime_registry = @import("runtime_registry.zig");
 const llm = @import("../llm/mod.zig");
 const subagent = @import("../agent/subagent.zig");
 const task_pool = @import("../task/thread_pool.zig");
-const task_mod = @import("../task/mod.zig");
 const tokens = @import("../util/tokens.zig");
 const util_time = @import("../util/time.zig");
 const openai = @import("../llm/openai.zig");
@@ -17,7 +16,6 @@ const ollama = @import("../llm/ollama.zig");
 
 pub const MAX_SUBAGENTS: usize = 3;
 const SUMMARY_TOKEN_CAP: u32 = 500;
-const DISPATCH_TIMEOUT_MS: i64 = 120_000;
 
 /// Context built once by the REPL: everything a worker needs to construct
 /// its OWN provider instance (no sharing with the streaming main loop)
@@ -65,25 +63,15 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     }
     const n = @min(tasks.items.len, MAX_SUBAGENTS);
 
-    // HEAP jobs: on the timeout path workers keep running and must never
-    // touch a dead stack frame — ownership of unfinished jobs stays with
-    // their workers (bounded leak, logged).
+    // Heap jobs: uniform cleanup (merge frees payloads, destroy frees the
+    // array) regardless of how many tasks ran.
     const jobs = try alloc.create([MAX_SUBAGENTS]AgentJob);
-    _ = try alloc.create([MAX_SUBAGENTS]task_pool.Task); // freed below with jobs
-    var submitted: usize = 0;
 
     var i: usize = 0;
     while (i < n) : (i += 1) {
         jobs[i] = .{ .ctx = ctx, .task_text = try ctx.alloc.dupe(u8, tasks.items[i]) };
     }
-    _ = &submitted;
 
-    // T6.4 (as designed, probe-verified): jobs run on the POOL — tool
-    // calls execute truly in parallel; LLM calls serialize through one
-    // shared provider under a mutex (probe A2: 5/5; probe A — unsynchronized
-    // sharing — asserts in std.http.Client.deinit). One provider instead of
-    // per-job instances avoids the multi-instance teardown deadlock (3/3).
-    _ = &submitted;
     // T6.4 (settled): subagents run SERIALLY, each on the calling thread
     // with a private provider in caller-owned storage. Root causes found
     // and fixed along the way: (1) makeProvider used to return providers
@@ -144,12 +132,6 @@ fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]
     }
     var list = aw.toArrayList();
     return registry.ToolResult{ .output = try list.toOwnedSlice(alloc) };
-}
-
-fn logger_dispatch_timeout() void {
-    // stderr note without the logger dependency (tools stay UI-agnostic).
-    const msg = "agent dispatch: timed out waiting for subagents; they will finish in the background\n";
-    _ = std.c.write(2, msg.ptr, msg.len);
 }
 
 /// Provider STORAGE (probe-crash root cause): OpenAIProvider.init returns

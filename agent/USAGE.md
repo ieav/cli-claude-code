@@ -178,6 +178,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/terminal-setup` | Shift+Enter 换行的终端配置指引（kitty 协议终端已自动支持，无需配置；Apple Terminal 等不支持协议的终端按指引映射按键） |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
+| `/agent`（实验） | 并行子代理派发工具，**默认关闭**：设 `ZIV_AGENT_TOOL=1` 启用。已知问题：工具轮之后偶发退出挂死（调查中），默认关闭不影响其他功能 |
 | `/run <ToolName> <json>` | 直接执行工具 |
 | **模型 & 配置** | |
 | `/model`、`/models` | 显示当前模型和可用模型列表 |

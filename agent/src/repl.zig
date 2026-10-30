@@ -1886,7 +1886,8 @@ fn reflectWorker(
     const provider: ?llm.Provider = makeBackgroundProviderInto(alloc, wio, backend, model, api_key, base_url, ollama_host, &bg_storage);
     defer if (provider) |p| p.deinit();
 
-    // Prompt mirrors the proven reflectLlmWithTimeout wording.
+    // Prompt wording kept identical to the retired timeout worker so
+    // insight style stays continuous across the rework.
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     const pw = &aw.writer;
@@ -1973,101 +1974,6 @@ fn makeBackgroundProviderInto(alloc: std.mem.Allocator, io: std.Io, backend: llm
     return storage.provider();
 }
 
-
-fn reflectLlmWithTimeout(
-    provider: llm.Provider,
-    queries: []const []const u8,
-    alloc: std.mem.Allocator,
-    deadline_ms: i64,
-) ?[]u8 {
-    const Shared = struct {
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        result: ?[]u8 = null,
-    };
-    const shared = alloc.create(Shared) catch return null;
-    shared.* = .{};
-
-    // Own copies of the query strings (see contract above).
-    const qs = alloc.alloc([]const u8, queries.len) catch {
-        alloc.destroy(shared);
-        return null;
-    };
-    var filled: usize = 0;
-    for (queries) |q| {
-        qs[filled] = alloc.dupe(u8, q) catch {
-            for (qs[0..filled]) |d| alloc.free(d);
-            alloc.free(qs);
-            alloc.destroy(shared);
-            return null;
-        };
-        filled += 1;
-    }
-
-    const Worker = struct {
-        fn run(p: llm.Provider, q_list: []const []const u8, a: std.mem.Allocator, sh: *Shared) void {
-            var aw: std.Io.Writer.Allocating = .init(a);
-            defer aw.deinit();
-            const pw = &aw.writer;
-            pw.writeAll("Recent queries in this session:\n") catch {
-                sh.done.store(true, .release);
-                return;
-            };
-            for (q_list) |q| {
-                pw.print("- {s}\n", .{q}) catch break;
-            }
-            var prompt_list = aw.toArrayList();
-            defer prompt_list.deinit(a);
-
-            const sys_blocks = a.alloc(llm.ContentBlock, 1) catch null;
-            if (sys_blocks) |sb| {
-                sb[0] = .{ .text = "你是反思引擎。用一句中文总结这些交互的改进点，不超过40字，只输出总结本身。" };
-                const user_blocks = a.alloc(llm.ContentBlock, 1) catch null;
-                if (user_blocks) |ub| {
-                    ub[0] = .{ .text = prompt_list.items };
-                    const msgs = [_]llm.Message{
-                        .{ .role = .system, .content = sb, .timestamp = util_time.nowMillis() },
-                        .{ .role = .user, .content = ub, .timestamp = util_time.nowMillis() },
-                    };
-                    if (p.complete(&msgs, .{ .max_tokens = 100, .temperature = 0.3 })) |resp| {
-                        var r = resp;
-                        defer r.free(a);
-                        if (r.content.len > 0 and r.content[0] == .text) {
-                            sh.result = a.dupe(u8, r.content[0].text) catch null;
-                        }
-                    } else |_| {}
-                    a.free(ub);
-                }
-                a.free(sb);
-            }
-            sh.done.store(true, .release);
-        }
-    }.run;
-
-    const t = std.Thread.spawn(.{}, Worker, .{ provider, qs, alloc, shared }) catch {
-        Worker(provider, qs, alloc, shared); // spawn failed: inline fallback
-        const res = shared.result;
-        for (qs) |d| alloc.free(d);
-        alloc.free(qs);
-        alloc.destroy(shared);
-        return res;
-    };
-    const t0 = util_time.nowMillis();
-    while (util_time.nowMillis() - t0 < deadline_ms) {
-        if (shared.done.load(.acquire)) {
-            t.join();
-            const res = shared.result;
-            for (qs) |d| alloc.free(d);
-            alloc.free(qs);
-            alloc.destroy(shared);
-            return res;
-        }
-        var poll_req: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&poll_req, null);
-    }
-    t.detach();
-    logger.warning("reflection LLM exceeded {d}ms — heuristic fallback", .{deadline_ms});
-    return null; // worker + shared + dupes leak with the process (by design)
-}
 
 fn runReflection(
     reflector: *reflection_mod.ReflectionEngine,
@@ -4762,41 +4668,6 @@ test "toolArgSummary picks the informative field and caps length" {
         "{\"command\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", .{});
     const out = toolArgSummary(a, "Bash", longv);
     try std.testing.expect(std.mem.endsWith(u8, out, "…)"));
-}
-
-test "reflectLlmWithTimeout abandons a hung gateway" {
-    const alloc = std.testing.allocator;
-    const Fake = struct {
-        fn complete(_: *anyopaque, _: []const llm.provider.Message, _: llm.provider.CompleteOptions) anyerror!llm.provider.CompleteResponse {
-            var req: std.c.timespec = .{ .sec = 10, .nsec = 0 }; // "hang"
-            _ = std.c.nanosleep(&req, null);
-            return error.Hung;
-        }
-        fn stream(_: *anyopaque, _: []const llm.provider.Message, _: llm.provider.CompleteOptions, _: ?*anyopaque, _: *const llm.provider.StreamCallback) anyerror!void {}
-        fn yes(_: *anyopaque) bool {
-            return true;
-        }
-        fn noop(_: *anyopaque) void {}
-    };
-    const vt = llm.provider.ProviderVTable{
-        .complete_fn = Fake.complete,
-        .stream_fn = Fake.stream,
-        .count_tokens_fn = null,
-        .supports_tool_use_fn = Fake.yes,
-        .supports_streaming_fn = Fake.yes,
-        .deinit_fn = Fake.noop,
-    };
-    const fake = llm.Provider{ .ptr = @ptrFromInt(16), .vtable = &vt };
-    const queries = [_][]const u8{"hung-gateway-probe"};
-    const t0 = util_time.nowMillis();
-    // page_allocator: the detached hung worker's prompt allocations are
-    // intentionally abandoned — the leak-checking allocator would flag them.
-    _ = alloc;
-    const res = reflectLlmWithTimeout(fake, &queries, std.heap.page_allocator, 300);
-    const elapsed = util_time.nowMillis() - t0;
-    try std.testing.expect(res == null);
-    // Returned at the 300 ms deadline (± scheduling slack), not after 60 s.
-    try std.testing.expect(elapsed < 2500);
 }
 
 test "writeMarginLines keeps the margin across chunk splits" {
