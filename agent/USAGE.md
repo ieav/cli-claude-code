@@ -3,7 +3,7 @@
 > 一个用 Zig 构建的支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库）的 CLI Agent。
 > 核心算法由三大数学常数驱动：**pi** 圆融信息、**e** 控制增长、**phi** 浓缩知识。
 > v0.4.0 — 自学习闭环：记忆/反思飞轮 + 知识图谱 + /research /diagnose + 工具并行编排（π/e/φ 全落地）。
-> v0.5.0 — 工具自动调用（模型自主决定，无需 /run）· v0.5.x — MCP 接入（stdio + Streamable HTTP）+ Skill 系统（已随 v0.5.0 二进制提供，/version 显示 0.5.0）。
+> v0.5.0 — 工具自动调用 · v0.5.x — MCP + Skill 系统 · **v0.6.0 — 输入系统重写（块渲染/kitty 协议/粘贴折叠）、记忆飞轮升级（自适应注入/漂移重锚/质量门控/后台反思）、/plan 计划文件、压缩自适应+关键事实保留、搜索双源回退、/agent 子代理（默认关闭）**。
 
 ---
 
@@ -94,7 +94,7 @@ scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./instal
 四种安装方式按需选：
 
 ```bash
-cd agent/dist/ziv-v0.5.0
+cd agent/dist/ziv-v0.6.0
 
 # 方式一：离线安装脚本（自动识别平台；默认 /usr/local，无写权限自动回退 ~/.local）
 ./install.sh
@@ -130,7 +130,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — v0.5.0 | (Self-learning)     ║
+║  Ziv — v0.6.0 | (Self-learning)     ║
 ║  π 圆融 · e 增长 · φ 浓缩            ║
 ╚══════════════════════════════════════╝
   π   = 3.1415926536
@@ -174,7 +174,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 |------|------|
 | `/help`, `/h` | 显示帮助信息 |
 | `/quit`, `/q`, `/exit` | 退出 Ziv（**大小写不敏感**）；等价退出：空行 Ctrl-D、提示符下 3 秒内**连按两次 Ctrl-C**——三者都走完整收尾（反思 + 记忆提取 + Goodbye） |
-| `/version` | 显示版本号 (v0.5.0) |
+| `/version` | 显示版本号 (v0.6.0) |
 | `/terminal-setup` | Shift+Enter 换行的终端配置指引（kitty 协议终端已自动支持，无需配置；Apple Terminal 等不支持协议的终端按指引映射按键） |
 | `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
 | `/tools` | 列出所有已注册工具（含安全属性） |
