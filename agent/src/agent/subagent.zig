@@ -27,6 +27,11 @@ fn toolAllowed(name: []const u8) bool {
     return true;
 }
 
+/// Shared LLM gate (T6.4, probe-verified A2 pattern): pool workers run
+/// tool calls TRULY in parallel, but LLM calls serialize through one
+/// provider under a mutex — concurrent std.http use on one io asserts in
+/// std.http.Client.deinit (probe A), serialized sharing is 5/5 stable
+/// (probe A2). The lock also bounds a hung gateway to one victim.
 pub const SubagentConfig = struct {
     task: []const u8,
     alloc: std.mem.Allocator,

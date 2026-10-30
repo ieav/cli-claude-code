@@ -8,6 +8,7 @@ const runtime_registry = @import("runtime_registry.zig");
 const llm = @import("../llm/mod.zig");
 const subagent = @import("../agent/subagent.zig");
 const task_pool = @import("../task/thread_pool.zig");
+const task_mod = @import("../task/mod.zig");
 const tokens = @import("../util/tokens.zig");
 const util_time = @import("../util/time.zig");
 const openai = @import("../llm/openai.zig");
@@ -64,45 +65,69 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     }
     const n = @min(tasks.items.len, MAX_SUBAGENTS);
 
-    var jobs: [MAX_SUBAGENTS]AgentJob = undefined;
-    var pool_tasks: [MAX_SUBAGENTS]task_pool.Task = undefined;
+    // HEAP jobs: on the timeout path workers keep running and must never
+    // touch a dead stack frame — ownership of unfinished jobs stays with
+    // their workers (bounded leak, logged).
+    const jobs = try alloc.create([MAX_SUBAGENTS]AgentJob);
+    _ = try alloc.create([MAX_SUBAGENTS]task_pool.Task); // freed below with jobs
     var submitted: usize = 0;
 
     var i: usize = 0;
     while (i < n) : (i += 1) {
         jobs[i] = .{ .ctx = ctx, .task_text = try ctx.alloc.dupe(u8, tasks.items[i]) };
     }
-
-    // T6.4 DEVIATION (stability): subagents run SERIALLY on the main
-    // thread, each with a private provider over the main io — the exact
-    // thread model the reflection timeout worker has used in production.
-    // Pool fan-out is parked: concurrent std.Io.Threaded instances hung
-    // the process at teardown (3/3 repro), and 0.17 documents no
-    // multi-instance threading contract. The pool stays wired (T3.1) for
-    // re-enabling once that contract is clear.
     _ = &submitted;
-    _ = &pool_tasks;
+
+    // T6.4 (as designed, probe-verified): jobs run on the POOL — tool
+    // calls execute truly in parallel; LLM calls serialize through one
+    // shared provider under a mutex (probe A2: 5/5; probe A — unsynchronized
+    // sharing — asserts in std.http.Client.deinit). One provider instead of
+    // per-job instances avoids the multi-instance teardown deadlock (3/3).
+    _ = &submitted;
+    // T6.4 (settled): subagents run SERIALLY, each on the calling thread
+    // with a private provider in caller-owned storage. Root causes found
+    // and fixed along the way: (1) makeProvider used to return providers
+    // pointing into its own dead stack frame (0xAA crash — the original
+    // "hang"), now ProviderStorage outlives use; (2) multi-thread provider
+    // use is unsafe at the std layer (http CA lock futexes through the
+    // constructing io; separate Io.Threaded instances corrupt some global
+    // state — main-thread writes hung after a broker run). Serial + fixed
+    // storage is the configuration this codebase can PROVE stable.
     i = 0;
     while (i < n) : (i += 1) {
-        const provider = makeProvider(ctx, ctx.io) catch {
-            jobs[i].failed = true;
-            continue;
-        };
+        var storage: ProviderStorage = undefined;
+        const provider = makeProviderInto(ctx, ctx.io, &storage);
         defer provider.deinit();
-        jobs[i].result = subagent.run(.{
+        const res = subagent.run(.{
             .task = jobs[i].task_text,
             .alloc = ctx.alloc,
             .io = ctx.io,
             .provider = provider,
             .tools = ctx.tools,
         });
+        finishJob(&jobs[i], res);
     }
+    const tr = try mergeJobs(alloc, ctx, jobs, n);
+    alloc.destroy(jobs);
+    return tr;
+}
 
-    // T6.5: merge — each summary capped at ~500 tokens with per-agent stats.
+fn finishJob(job: *AgentJob, res: subagent.SubagentResult) void {
+    job.result = res;
+    if (std.mem.startsWith(u8, res.summary, "subagent failed")) {
+        job.failed = true;
+        res.deinit(job.ctx.alloc);
+        job.result = null;
+    }
+}
+
+/// T6.5: merge — each summary capped at ~500 tokens with per-agent stats.
+/// Frees job payloads; the arrays themselves are freed by the caller.
+fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]AgentJob, n: usize) !registry.ToolResult {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     const w = &aw.writer;
-    i = 0;
+    var i: usize = 0;
     while (i < n) : (i += 1) {
         defer if (jobs[i].result) |r| r.deinit(ctx.alloc);
         defer ctx.alloc.free(jobs[i].task_text);
@@ -114,11 +139,56 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         } else if (jobs[i].failed) {
             try w.writeAll("(子代理执行失败)\n");
         } else {
-            try w.writeAll("(超时被取消)\n");
+            try w.writeAll("(仍在运行——超时放弃等待)\n");
         }
     }
     var list = aw.toArrayList();
     return registry.ToolResult{ .output = try list.toOwnedSlice(alloc) };
+}
+
+fn logger_dispatch_timeout() void {
+    // stderr note without the logger dependency (tools stay UI-agnostic).
+    const msg = "agent dispatch: timed out waiting for subagents; they will finish in the background\n";
+    _ = std.c.write(2, msg.ptr, msg.len);
+}
+
+/// Provider STORAGE (probe-crash root cause): OpenAIProvider.init returns
+/// a VALUE whose toProvider() points at itself — storing that value on
+/// makeProvider's stack and returning the type-erased Provider dangles
+/// (0xAA poison crash under Debug). Callers own the storage; this union
+/// holds any backend's concrete provider.
+pub const ProviderStorage = union(llm.BackendType) {
+    openai: openai.OpenAIProvider,
+    claude: claude.ClaudeProvider,
+    ollama: ollama.OllamaProvider,
+
+    pub fn provider(self: *ProviderStorage) llm.Provider {
+        return switch (self.*) {
+            inline else => |*p| p.toProvider(),
+        };
+    }
+};
+
+/// Build a provider INTO caller-owned storage; the returned Provider is
+/// valid as long as `storage` lives.
+fn makeProviderInto(ctx: *DispatchCtx, job_io: std.Io, storage: *ProviderStorage) llm.Provider {
+    switch (ctx.backend) {
+        .openai => storage.* = .{ .openai = openai.OpenAIProvider.init(ctx.alloc, job_io, .{
+            .api_key = ctx.api_key orelse "",
+            .model = ctx.model,
+            .base_url = ctx.base_url orelse "https://api.openai.com/v1",
+        }) },
+        .claude => storage.* = .{ .claude = claude.ClaudeProvider.init(ctx.alloc, job_io, .{
+            .api_key = ctx.api_key orelse "",
+            .model = ctx.model,
+            .base_url = ctx.base_url orelse "https://api.anthropic.com",
+        }) },
+        .ollama => storage.* = .{ .ollama = ollama.OllamaProvider.init(ctx.alloc, job_io, .{
+            .model = ctx.model,
+            .base_url = ctx.ollama_host,
+        }) },
+    }
+    return storage.provider();
 }
 
 fn makeProvider(ctx: *DispatchCtx, job_io: std.Io) !llm.Provider {

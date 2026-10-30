@@ -475,7 +475,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
     };
-    reg.registerDynamic(
+    // T6.4 status: the subagent dispatch tool is DISABLED by default —
+    // after an agent-tool turn, the next prompt submit intermittently
+    // blocks in an uninterruptible stdio wait (SIGTERM-unreachable, 0% CPU;
+    // memory safety was ruled out with a DebugAllocator build; a pure
+    // single-thread skeleton with no LLM reproduced it, so the trigger is
+    // the dynamic-tool path interacting with something in std — needs
+    // root-level tooling to pin). Opt back in with ZIV_AGENT_TOOL=1.
+    const agent_tool_enabled = blk: {
+        const v = env.get("ZIV_AGENT_TOOL") orelse break :blk false;
+        break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    };
+    if (agent_tool_enabled) reg.registerDynamic(
         "agent",
         "Run 1-3 focused read-only subagents in parallel. Each gets its own context and the read-only tools, then reports back. Use for independent research or verification subtasks (e.g. 'check X in the codebase', 'verify the failing paths'), NOT for sequential work.",
         "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-3 self-contained task descriptions\"}},\"required\":[\"tasks\"]}",
@@ -579,7 +590,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {
-                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
+                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
             }
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
@@ -611,7 +622,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -859,7 +870,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
                 }
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -1513,7 +1524,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // M4: periodic reflection on the query window (every N exchanges
         // or after a π-spaced interval; see ReflectionEngine.shouldReflect).
         if (mem_sys != null and reflector.shouldReflect()) {
-            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
+            runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend), backgroundLlmConfig(allocator, &switcher));
             if (live_trace) |*t| {
                 traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", 0, allocator) catch {};
             }
@@ -1712,6 +1723,257 @@ fn resetReflectionWindow(
 ///     while a slow worker is still copying them.
 ///   · on timeout the worker, the Shared block and the dupes are all
 ///     abandoned (leak with the process) — never freed under a live worker.
+/// Snapshot of everything a background LLM worker needs to build its OWN
+/// provider — values copied at dispatch time so settings hot-reloads and
+/// model switches cannot dangle under a running worker.
+const BackgroundLlmConfig = struct {
+    backend: llm.BackendType,
+    model: []u8, // alloc-owned copy
+    api_key: ?[]u8 = null,
+    base_url: ?[]u8 = null,
+    ollama_host: []u8,
+
+    fn deinit(self: BackgroundLlmConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.model);
+        if (self.api_key) |k| alloc.free(k);
+        if (self.base_url) |b| alloc.free(b);
+        alloc.free(self.ollama_host);
+    }
+};
+
+/// Snapshot the current provider config for a background worker.
+fn backgroundLlmConfig(alloc: std.mem.Allocator, switcher: *ModelSwitcher) ?BackgroundLlmConfig {
+    const model = alloc.dupe(u8, switcher.modelName()) catch return null;
+    errdefer alloc.free(model);
+    const oh = alloc.dupe(u8, switcher.settings.api_keys.ollama_host) catch {
+        alloc.free(model);
+        return null;
+    };
+    return switch (switcher.backend) {
+        .openai => BackgroundLlmConfig{
+            .backend = .openai,
+            .model = model,
+            .api_key = if (switcher.settings.api_keys.openai) |k| (alloc.dupe(u8, k) catch null) else null,
+            .base_url = if (switcher.settings.api_keys.openai_base_url) |b| (alloc.dupe(u8, b) catch null) else null,
+            .ollama_host = oh,
+        },
+        .claude => BackgroundLlmConfig{
+            .backend = .claude,
+            .model = model,
+            .api_key = if (switcher.settings.api_keys.anthropic) |k| (alloc.dupe(u8, k) catch null) else null,
+            .base_url = if (switcher.settings.api_keys.anthropic_base_url) |b| (alloc.dupe(u8, b) catch null) else null,
+            .ollama_host = oh,
+        },
+        .ollama => BackgroundLlmConfig{
+            .backend = .ollama,
+            .model = model,
+            .ollama_host = oh,
+        },
+    };
+}
+
+/// Dispatch the background reflection (fire-and-forget; results arrive in
+/// the inbox and are drained at the next prompt).
+fn dispatchBackgroundReflection(
+    alloc: std.mem.Allocator,
+    queries: []const []const u8,
+    cfg: BackgroundLlmConfig,
+    trigger_name: []const u8,
+    quality: f64,
+) void {
+    const t0 = util_time.nowMillis();
+    // deep-copy queries (the window resets as soon as we return)
+    const qs = alloc.alloc([:0]u8, queries.len) catch {
+        cfg.deinit(alloc);
+        return;
+    };
+    var filled: usize = 0;
+    for (queries) |q| {
+        qs[filled] = (alloc.dupe(u8, q) catch break)[0..q.len :0];
+        filled += 1;
+    }
+    if (filled < queries.len) {
+        for (qs[0..filled]) |d| alloc.free(d);
+        alloc.free(qs);
+        cfg.deinit(alloc);
+        return;
+    }
+    reflect_inflight = true;
+    const t = std.Thread.spawn(.{}, reflectWorkerOwned, .{ alloc, qs, cfg, trigger_name, quality, t0 }) catch {
+        reflect_inflight = false;
+        for (qs) |d| alloc.free(d);
+        alloc.free(qs);
+        cfg.deinit(alloc);
+        return;
+    };
+    t.detach(); // single-flight flag is cleared by the worker itself
+}
+
+/// Thin adapter: owns the config snapshot alongside reflectWorker.
+fn reflectWorkerOwned(alloc: std.mem.Allocator, queries: [][:0]u8, cfg: BackgroundLlmConfig, trigger_name: []const u8, quality: f64, t0: i64) void {
+    defer cfg.deinit(alloc);
+    reflectWorker(alloc, queries, cfg.backend, cfg.model, cfg.api_key, cfg.base_url, cfg.ollama_host, trigger_name, quality, t0);
+}
+
+/// Drain finished background reflections on the MAIN thread: store as
+/// .feedback memory (SQLite stays main-thread) and print the arrival.
+fn drainReflectionInbox(alloc: std.mem.Allocator, mem: ?*memory_mod.MemorySystem, w: *std.Io.Writer) void {
+    if (!reflect_inbox_init) return;
+    while (reflect_inbox.pop()) |out| {
+        defer {
+            alloc.free(out.insights);
+            alloc.destroy(out);
+        }
+        if (mem == null) continue;
+        const name = "reflection (background llm)";
+        const now = util_time.nowMillis();
+        mem.?.store(.{
+            .id = injection_mod.memoryId(out.insights, "reflection"),
+            .mem_type = .feedback,
+            .name = name,
+            .description = out.trigger_name,
+            .content = out.insights,
+            .access_count = 0,
+            .created_at = now,
+            .updated_at = now,
+        }) catch {};
+        logger.info("reflection: background llm insight stored ({d}ms)", .{out.elapsed_ms});
+        std.Io.Writer.print(w, "  [Reflection+ {d}ms] {s}\n", .{ out.elapsed_ms, out.insights }) catch {};
+    }
+}
+
+/// T3.2 (as-designed): background reflection result, handed from the
+/// worker to the main thread via a bounded MPSC — the main thread owns
+/// all SQLite writes (THREADSAFE=0) and all printing.
+const ReflectOutcome = struct {
+    insights: []u8, // alloc-owned; freed by the drainer
+    trigger_name: []const u8, // enum tag string (static)
+    quality: f64,
+    elapsed_ms: i64,
+};
+
+var reflect_inbox: task_mod.BoundedMPSC(*ReflectOutcome, 4) = undefined;
+var reflect_inbox_init = false;
+var reflect_inflight = false; // single-flight: one background reflection at a time
+
+/// Background worker (B-pattern from the io probe): private Threaded io
+/// created AND destroyed on this same thread + a private provider — the
+/// only combination measured stable (shared-io concurrent use asserts in
+/// std.http.Client.deinit; multiple live instances deadlock teardown).
+fn reflectWorker(
+    alloc: std.mem.Allocator,
+    queries: [][:0]u8,
+    backend: llm.BackendType,
+    model: []const u8,
+    api_key: ?[]const u8,
+    base_url: ?[]const u8,
+    ollama_host: []const u8,
+    trigger_name: []const u8,
+    quality: f64,
+    t0: i64,
+) void {
+    defer {
+        for (queries) |q| alloc.free(q);
+        alloc.free(queries);
+    }
+    // Lifetime order (probe-verified): provider dies BEFORE its io, and
+    // the io is destroyed on THIS thread (its creator). defers run LIFO:
+    // io deinit registered first → runs last.
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const wio = io_state.io();
+    var bg_storage: BgProviderStorage = undefined;
+    const provider: ?llm.Provider = makeBackgroundProviderInto(alloc, wio, backend, model, api_key, base_url, ollama_host, &bg_storage);
+    defer if (provider) |p| p.deinit();
+
+    // Prompt mirrors the proven reflectLlmWithTimeout wording.
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const pw = &aw.writer;
+    pw.writeAll("Recent queries in this session:\n") catch {
+        reflect_inflight = false;
+        return;
+    };
+    for (queries) |q| pw.print("- {s}\n", .{q}) catch break;
+    pw.writeAll("Summarize the ONE most actionable insight for future sessions (1-3 sentences, specific).") catch {};
+    const prompt = alloc.dupe(u8, aw.written()) catch {
+        reflect_inflight = false;
+        return;
+    };
+    defer alloc.free(prompt);
+    const blocks = [_]llm.ContentBlock{.{ .text = prompt }};
+    const msgs = [_]llm.Message{.{ .role = .user, .content = &blocks, .timestamp = 0 }};
+    var resp = provider.?.complete(&msgs, .{ .max_tokens = 512, .temperature = 0.3 }) catch {
+        reflect_inflight = false;
+        return;
+    };
+    defer resp.free(alloc);
+    var text: []const u8 = "";
+    for (resp.content) |b| switch (b) {
+        .text => |t| if (t.len > 0) {
+            text = t;
+            break;
+        },
+        else => {},
+    };
+    const owned = alloc.dupe(u8, text) catch {
+        reflect_inflight = false;
+        return;
+    };
+    const out = alloc.create(ReflectOutcome) catch {
+        alloc.free(owned);
+        reflect_inflight = false;
+        return;
+    };
+    out.* = .{
+        .insights = owned,
+        .trigger_name = trigger_name,
+        .quality = quality,
+        .elapsed_ms = util_time.nowMillis() - t0,
+    };
+    if (!reflect_inbox.push(out)) {
+        alloc.free(owned);
+        alloc.destroy(out);
+    }
+    reflect_inflight = false;
+}
+
+/// Provider storage for the background reflection worker (see
+/// agent_dispatch.ProviderStorage — providers must outlive their maker's
+/// frame or toProvider() dangles).
+const BgProviderStorage = union(llm.BackendType) {
+    openai: llm.OpenAIProvider,
+    claude: llm.ClaudeProvider,
+    ollama: llm.OllamaProvider,
+
+    fn provider(self: *BgProviderStorage) llm.Provider {
+        return switch (self.*) {
+            inline else => |*p| p.toProvider(),
+        };
+    }
+};
+
+fn makeBackgroundProviderInto(alloc: std.mem.Allocator, io: std.Io, backend: llm.BackendType, model: []const u8, api_key: ?[]const u8, base_url: ?[]const u8, ollama_host: []const u8, storage: *BgProviderStorage) ?llm.Provider {
+    switch (backend) {
+        .openai => storage.* = .{ .openai = llm.OpenAIProvider.init(alloc, io, .{
+            .api_key = api_key orelse return null,
+            .model = model,
+            .base_url = base_url orelse "https://api.openai.com/v1",
+        }) },
+        .claude => storage.* = .{ .claude = llm.ClaudeProvider.init(alloc, io, .{
+            .api_key = api_key orelse return null,
+            .model = model,
+            .base_url = base_url orelse "https://api.anthropic.com",
+        }) },
+        .ollama => storage.* = .{ .ollama = llm.OllamaProvider.init(alloc, io, .{
+            .model = model,
+            .base_url = ollama_host,
+        }) },
+    }
+    return storage.provider();
+}
+
+
 fn reflectLlmWithTimeout(
     provider: llm.Provider,
     queries: []const []const u8,
@@ -1817,6 +2079,7 @@ fn runReflection(
     w: *std.Io.Writer,
     provider: ?llm.Provider,
     tier: llm.provider.CapabilityTier,
+    bg_cfg: ?BackgroundLlmConfig,
 ) void {
     const reflect_t0 = util_time.nowMillis();
     const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
@@ -1829,22 +2092,27 @@ fn runReflection(
         return;
     }
 
-    // LLM augmentation for windows with real signal: sharper insight than
-    // the heuristic template, capped at 3 s so a hung gateway cannot
-    // stall the exit or the prompt.
-    var llm_insights: ?[]u8 = null;
-    // T2.2 quality gate: only the full tier pays the reflection LLM —
-    // flash/local models produce noise insights that poison the next
-    // session's injected memories (defect ⑧). Heuristics still run.
-    if (provider != null and tier == .full and window_queries.items.len >= 3) {
-        // T3.2 (approved deviation): 1s cap, not full backgrounding —
-        // SQLITE_THREADSAFE=0 forbids pool-side DB writes and the engine
-        // keeps mutable archive state, so the turn pays ≤1s only when the
-        // full tier + actionable gates have already passed.
-        llm_insights = reflectLlmWithTimeout(provider.?, window_queries.items, alloc, 1000);
+    // T3.2 (as designed): full-quality LLM augmentation runs IN THE
+    // BACKGROUND — the turn never waits for it. The heuristic result is
+    // stored immediately (0-blocking, complete on its own); the LLM
+    // insight lands as a second .feedback memory when the drainer picks
+    // it up next prompt. Single-flight: a still-running reflection means
+    // this window's LLM pass is skipped (heuristics already stored).
+    // T2.2 gate stays: flash/local tiers never pay an LLM round trip.
+    if (provider != null and tier == .full and bg_cfg != null and
+        window_queries.items.len >= 3 and !reflect_inflight)
+    {
+        dispatchBackgroundReflection(
+            alloc,
+            window_queries.items,
+            bg_cfg.?,
+            @tagName(reflection.trigger),
+            reflection.quality_score,
+        );
+    } else if (bg_cfg) |c| {
+        c.deinit(alloc); // gated out: nobody owns the snapshot anymore
     }
-    const insights: []const u8 = llm_insights orelse reflection.insights;
-    defer if (llm_insights) |li| alloc.free(li);
+    const insights: []const u8 = reflection.insights;
 
     var name_buf: [64]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "reflection q={d} tools={d}", .{ window_queries.items.len, window_tools.* }) catch "reflection";
@@ -1859,7 +2127,7 @@ fn runReflection(
         .created_at = now,
         .updated_at = now,
     }) catch {};
-    logger.info("reflection: quality={d:.2} insights stored (llm={})", .{ reflection.quality_score, llm_insights != null });
+    logger.info("reflection: quality={d:.2} heuristic insights stored (llm dispatched in background)", .{reflection.quality_score});
     w.print("  [Reflection {d}ms] {s}\n", .{ util_time.nowMillis() - reflect_t0, insights }) catch {};
 
     resetReflectionWindow(window_queries, window_tools, window_errors, alloc);
