@@ -33,20 +33,59 @@ pub const MemoryBlock = struct {
     included: usize,
 };
 
+/// Context-adaptive budget (T1.2): scales the manual setting by the model's
+/// estimated context window — piecewise-linear in log2 space with exact
+/// anchors 8K→x0.66 / 32K→x1.0 / 128K→x1.66, clamped flat outside. (A
+/// logistic curve was rejected: its asymptotes cannot hit the anchors
+/// exactly, and anchor-exactness is what the tests pin down.)
+pub fn effectiveBudget(manual: u32, context_window: u32) u32 {
+    const base: f64 = @floatFromInt(manual);
+    const lw = std.math.log2(@as(f64, @floatFromInt(@max(context_window, 4096))));
+    var factor: f64 = undefined;
+    if (lw <= 13.0) {
+        factor = 0.66; // ≤8K: lean workspace for small contexts
+    } else if (lw <= 15.0) {
+        const t = (lw - 13.0) / 2.0; // 8K..32K → 0.66..1.0
+        factor = 0.66 + t * 0.34;
+    } else if (lw <= 17.0) {
+        const t = (lw - 15.0) / 2.0; // 32K..128K → 1.0..1.66
+        factor = 1.0 + t * 0.66;
+    } else {
+        factor = 1.66; // ≥128K: recall headroom
+    }
+    const scaled: u32 = @intFromFloat(base * factor);
+    return std.math.clamp(scaled, 200, 8000);
+}
+
 pub fn buildMemoryBlock(allocator: std.mem.Allocator, entries: []const types.MemoryEntry, budget_tokens: u32) !?MemoryBlock {
+    return buildMemoryBlockAnchored(allocator, entries, budget_tokens, null);
+}
+
+/// Same as buildMemoryBlock, but an explicit topic anchor (T1.3): null
+/// keeps the legacy "most recently updated entry" proxy; a live-topic
+/// vector (mean of recent user turns) re-ranks around what the session is
+/// actually about. The anchor is BORROWED — only an internally created one
+/// is freed here.
+pub fn buildMemoryBlockAnchored(allocator: std.mem.Allocator, entries: []const types.MemoryEntry, budget_tokens: u32, anchor: ?[]const f32) !?MemoryBlock {
     if (entries.len == 0) return null;
 
     // Rank entries: 0.5 × e-decay freshness + 0.5 × topical similarity to
-    // the most recently updated memory (a cheap proxy for "what the user is
-    // currently about"). Scores are precomputed so the comparator stays
+    // the anchor (the live topic when re-anchoring, else the most recently
+    // updated memory — a cheap proxy for "what the user is currently
+    // about"). Scores are precomputed so the comparator stays
     // allocation-free.
     const now = time_mod.nowMillis();
-    var anchor_idx: usize = 0;
-    for (entries, 0..) |e, i| {
-        if (e.updated_at > entries[anchor_idx].updated_at) anchor_idx = i;
-    }
-    const anchor_vec: ?[]f32 = embedding.embed(allocator, entries[anchor_idx].content) catch null;
-    defer if (anchor_vec) |v| allocator.free(v);
+    var owned_anchor: ?[]f32 = null;
+    defer if (owned_anchor) |v| allocator.free(v);
+    const anchor_vec: ?[]const f32 = anchor orelse blk: {
+        var anchor_idx: usize = 0;
+        for (entries, 0..) |e, i| {
+            if (e.updated_at > entries[anchor_idx].updated_at) anchor_idx = i;
+        }
+        const v = embedding.embed(allocator, entries[anchor_idx].content) catch break :blk null;
+        owned_anchor = v;
+        break :blk @as([]const f32, v);
+    };
 
     const Rank = struct { idx: usize, score: f64 };
     const ranks = try allocator.alloc(Rank, entries.len);
@@ -151,6 +190,52 @@ test "buildMemoryBlock orders by decay freshness" {
 test "buildMemoryBlock empty returns null" {
     const block = try buildMemoryBlock(std.testing.allocator, &.{}, 800);
     try std.testing.expect(block == null);
+}
+
+test "effectiveBudget anchors and clamps (T1.2)" {
+    // Exact anchors at 8K / 32K / 128K with the 1200 default.
+    try std.testing.expectEqual(@as(u32, 792), effectiveBudget(1200, 8192));
+    try std.testing.expectEqual(@as(u32, 1200), effectiveBudget(1200, 32768));
+    try std.testing.expectEqual(@as(u32, 1992), effectiveBudget(1200, 131072));
+    // Manual bounds still hold after scaling.
+    try std.testing.expectEqual(@as(u32, 200), effectiveBudget(200, 8192)); // floor
+    try std.testing.expectEqual(@as(u32, 8000), effectiveBudget(8000, 131072)); // ceiling
+    // Monotone in context size.
+    try std.testing.expect(effectiveBudget(1200, 16384) <= effectiveBudget(1200, 65536));
+}
+
+test "buildMemoryBlockAnchored re-ranks around the live topic (T1.3)" {
+    // Two disjoint-topic entries with identical timestamps: with no anchor
+    // the tie is arbitrary, with an explicit topic anchor the matching
+    // entry must rank FIRST (it gets the 0.5 cosine half-score).
+    var entries: [2]types.MemoryEntry = undefined;
+    const topics = [2][]const u8{
+        "user prefers alpha bravo charlie delta for builds",
+        "user stores xray yankee zulu whiskey in vault",
+    };
+    for (&entries, 0..) |*e, i| {
+        e.* = .{
+            .id = @splat(@intCast(i)),
+            .mem_type = .user,
+            .name = "topic",
+            .description = "d",
+            .content = topics[i],
+            .access_count = 0,
+            .created_at = 0,
+            .updated_at = 1000,
+        };
+    }
+    const anchor = try embedding.embed(std.testing.allocator, "alpha bravo charlie question");
+    defer std.testing.allocator.free(anchor);
+    const block = (try buildMemoryBlockAnchored(std.testing.allocator, &entries, 800, anchor)).?;
+    defer std.testing.allocator.free(block.text);
+    try std.testing.expect(std.mem.indexOf(u8, block.text, "alpha bravo charlie") != null);
+    // The matching line comes first.
+    try std.testing.expect(std.mem.indexOf(u8, block.text, "alpha bravo").? < std.mem.indexOf(u8, block.text, "xray yankee").?);
+    // No anchor → legacy behavior must still include both.
+    const legacy = (try buildMemoryBlock(std.testing.allocator, &entries, 800)).?;
+    defer std.testing.allocator.free(legacy.text);
+    try std.testing.expect(std.mem.indexOf(u8, legacy.text, "xray yankee") != null);
 }
 
 test "buildMemoryBlock respects budget and includes keyword" {

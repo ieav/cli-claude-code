@@ -160,6 +160,49 @@ pub fn failRequest(alloc: std.mem.Allocator, tag: []const u8, response: anytype)
 /// Heuristic: does a 400 body say the input no longer fits the model's
 /// context? Remedy differs from a generic InvalidRequest (compact vs fix
 /// the request), and gateways word it in at least three languages.
+/// Rough context-window estimate for the active model (T1.2): no backend
+/// reports windows reliably through the chat API, so known families map to
+/// their typical sizes and everything else conserves at 32K. Feeds the
+/// memory-budget scaler; being off by 2x only shifts the budget one notch.
+pub fn contextEstimate(model: []const u8, backend: anytype) u32 {
+    if (backend == .ollama) return 8192; // local models: assume the small end
+    var buf: [128]u8 = undefined;
+    if (model.len > buf.len) return 32_768; // absurd name: default, no assert panic
+    const name = std.ascii.lowerString(&buf, model);
+    if (std.mem.indexOf(u8, name, "claude") != null) return 200_000;
+    if (std.mem.indexOf(u8, name, "gpt-4") != null or
+        std.mem.indexOf(u8, name, "gpt-5") != null or
+        std.mem.indexOf(u8, name, "glm-4") != null or
+        std.mem.indexOf(u8, name, "glm-5") != null or
+        std.mem.indexOf(u8, name, "deepseek") != null or
+        std.mem.indexOf(u8, name, "qwen") != null or
+        std.mem.indexOf(u8, name, "kimi") != null or
+        std.mem.indexOf(u8, name, "moonshot") != null) return 131_072;
+    return 32_768;
+}
+
+
+/// Model capability tier (T2.1): gates the memory flywheel's auxiliary
+/// LLM calls — weak/local models produce noise insights that poison the
+/// next session's injected memories (defect ⑧).
+pub const CapabilityTier = enum {
+    full, // strong tool-use model: reflection LLM augmentation allowed
+    flash, // fast/cheap tier: heuristics only, no LLM insights
+    local, // ollama & friends: heuristics only, lean budgets
+};
+
+pub fn capabilityTier(model: []const u8, backend: anytype) CapabilityTier {
+    if (backend == .ollama) return .local;
+    var buf: [128]u8 = undefined;
+    if (model.len > buf.len) return .full; // absurd name: default, no assert panic
+    const name = std.ascii.lowerString(&buf, model);
+    const flash_markers = [_][]const u8{ "flash", "mini", "haiku", "lite", "small", "turbo" };
+    for (flash_markers) |m| {
+        if (std.mem.indexOf(u8, name, m) != null) return .flash;
+    }
+    return .full;
+}
+
 fn isContextOverflowBody(body: []const u8) bool {
     const markers = [_][]const u8{
         "context length", "context window", "maximum context", "too long",

@@ -30,6 +30,12 @@ pub const Settings = struct {
     /// can be routed through a configured compatible gateway.
     default_backend: ?[]const u8 = null,
     max_tokens: u32 = 4096,
+    /// Cross-session memory injection budget (tokens): how much of the
+    /// system prompt the memory block may occupy. Manual knob (T1.1);
+    /// adaptive per-model scaling arrives with T1.2. 1200 default — 800
+    /// starved mature projects; larger defaults wait for the extraction
+    /// quality gate (T2.x) to land first.
+    memory_budget_tokens: u32 = 1200,
     max_snapshots: u32 = 100,
     checkpointing_enabled: bool = true,
     system_prompt: ?[]const u8 = null,
@@ -160,6 +166,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getInt(value, "max_tokens")) |mt| {
         if (mt > 0 and mt <= 128000) {
             settings.max_tokens = @intCast(mt);
+        }
+    }
+    if (json_helpers.getInt(value, "memory_budget_tokens")) |mb| {
+        if (mb >= 200 and mb <= 8000) {
+            settings.memory_budget_tokens = @intCast(mb);
         }
     }
     if (json_helpers.getBool(value, "checkpointing_enabled")) |ce| {
@@ -339,6 +350,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     writeJsonTopField(allocator, &buf, "default_model", settings.default_model);
     // max_tokens / max_snapshots
     buf.print(allocator, "  \"max_tokens\": {d},\n", .{settings.max_tokens}) catch {};
+    buf.print(allocator, "  \"memory_budget_tokens\": {d},\n", .{settings.memory_budget_tokens}) catch {};
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};
