@@ -65,6 +65,15 @@ fn watchdogThread(s: *State) void {
     while (!s.done.load(.acquire)) {
         const elapsed: u64 = @intCast(time_mod.nowMillis() - start);
         if (elapsed >= s.timeout_ms) {
+            // Race guard: a request that completed in the poll window may
+            // have already returned its connection to the pool (fd reused).
+            // Re-check done right before acting — the remaining window is
+            // a few instructions, only hit if the request finished within
+            // ~µs of its own deadline.
+            if (s.done.load(.acquire)) {
+                std.heap.smp_allocator.destroy(s);
+                return;
+            }
             // Fails the in-flight recvmsg on the owning thread; the error
             // surfaces through the provider's normal error path.
             _ = std.c.shutdown(s.fd, SHUT_RDWR);
@@ -78,20 +87,18 @@ fn watchdogThread(s: *State) void {
     std.heap.smp_allocator.destroy(s);
 }
 
-var cached_timeout: ?u64 = null;
-
 /// Request timeout: `ZIV_LLM_TIMEOUT_MS` env override, floor 1s so a typo
-/// cannot insta-kill healthy requests. Parsed once, cached.
+/// cannot insta-kill healthy requests. Deliberately NOT cached: providers
+/// arm watchdogs from several threads (main, subagent workers, reflection
+// worker) and a shared mutable cache would be a data race; one getenv per
+/// request is noise.
 pub fn currentTimeoutMs() u64 {
-    if (cached_timeout) |t| return t;
-    var t = DEFAULT_TIMEOUT_MS;
     if (env.get("ZIV_LLM_TIMEOUT_MS")) |v| {
         if (std.fmt.parseInt(u64, v, 10)) |parsed| {
-            t = @max(parsed, 1_000);
+            return @max(parsed, 1_000);
         } else |_| {}
     }
-    cached_timeout = t;
-    return t;
+    return DEFAULT_TIMEOUT_MS;
 }
 
 test "timeout config: default, env parse, and 1s floor" {
