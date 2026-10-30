@@ -18,7 +18,7 @@ pub const MAX_TURNS: usize = 10;
 
 /// Tools a subagent may never see: session-scoped task tracking and
 /// interactive questions make no sense without the REPL around them.
-const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "AskUser" };
+const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "AskUser", "agent" };
 
 fn toolAllowed(name: []const u8) bool {
     for (deny_tools) |d| {
@@ -117,7 +117,7 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
         // reflection timeout worker).
         // Copy out the final text (caller-owned, survives the run).
         var final_text: ?[]u8 = null;
-        var tool_uses: std.ArrayList(llm.ToolUseBlock) = .empty;
+        var tool_uses: std.ArrayList(llm.provider.ToolUseBlock) = .empty;
         defer tool_uses.deinit(alloc);
         for (resp.content) |b| switch (b) {
             .text => |t| {
@@ -153,7 +153,7 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
 }
 
 /// Whitelist + Default-mode permission gate, then execute.
-fn executeWhitelisted(cfg: SubagentConfig, tu: llm.ToolUseBlock) ![]u8 {
+fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 {
     const alloc = cfg.alloc;
     if (!toolAllowed(tu.name)) {
         return alloc.dupe(u8, "tool not available to subagents");
@@ -185,10 +185,47 @@ fn executeWhitelisted(cfg: SubagentConfig, tu: llm.ToolUseBlock) ![]u8 {
     return alloc.dupe(u8, tr.output) catch error.OutOfMemory;
 }
 
-fn jsonFromToolUse(alloc: std.mem.Allocator, tu: llm.ToolUseBlock) !std.json.Value {
+fn jsonFromToolUse(alloc: std.mem.Allocator, tu: llm.provider.ToolUseBlock) !std.json.Value {
     // The registry consumes std.json.Value objects; tool_use.input IS one.
     _ = alloc;
     return tu.input;
+}
+
+/// Cut `s` at a display/token budget, backing off to a UTF-8 boundary.
+pub fn utf8TokenCut(s: []const u8, budget_tokens: u32) []const u8 {
+    if (tokens_estimate(s) <= budget_tokens) return s;
+    // estimateTokens ≈ ascii/4 + wide/2 — walk bytes, tracking the budget.
+    var used: u32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(s[i]) catch return s[0..i];
+        if (i + seq > s.len) return s[0..i];
+        used += if (seq == 1) 1 else 2;
+        if (used > budget_tokens) return s[0..i];
+        i += seq;
+    }
+    return s;
+}
+
+fn tokens_estimate(s_: []const u8) u32 {
+    var ascii: u32 = 0;
+    var wide: u32 = 0;
+    for (s_) |c| {
+        if (c < 0x80) ascii += 1 else wide += 1;
+    }
+    return ascii / 4 + wide / 2;
+}
+
+test "utf8TokenCut respects budget and rune boundaries" {
+    const short = "hello world";
+    try std.testing.expectEqualStrings(short, utf8TokenCut(short, 500));
+    var cjk_buf: [1200]u8 = undefined;
+    var cw: usize = 0;
+    while (cw + 6 <= cjk_buf.len) : (cw += 6) @memcpy(cjk_buf[cw..][0..6], "中文内容"[0..6]);
+    const cjk = cjk_buf[0..cw];
+    const cut = utf8TokenCut(cjk, 50);
+    try std.testing.expect(cut.len < cjk.len);
+    try std.testing.expect((cut.len % 3) == 0); // no mid-rune cut
 }
 
 test "toolAllowed whitelist (T6.2)" {
@@ -197,4 +234,5 @@ test "toolAllowed whitelist (T6.2)" {
     try std.testing.expect(toolAllowed("Grep"));
     try std.testing.expect(toolAllowed("FileRead"));
     try std.testing.expect(toolAllowed("Bash"));
+    try std.testing.expect(!toolAllowed("agent")); // no recursive fan-out
 }

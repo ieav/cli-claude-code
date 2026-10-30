@@ -95,6 +95,7 @@ test {
     _ = @import("util/time.zig");
     _ = @import("util/tokens.zig");
     _ = @import("agent/subagent.zig");
+    _ = @import("tools/agent_dispatch.zig");
     _ = @import("util/uuid.zig");
 }
 

@@ -11,6 +11,10 @@ const tokens = @import("../util/tokens.zig");
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
+    /// T7.1: optional frontmatter `tools:` hint (comma-separated). Purely
+    /// advisory — shown at trigger time so the user sees what the skill
+    /// intends to use. Empty when absent (backward compatible).
+    tools: []const u8 = "",
     when_to_use: ?[]const u8,
     /// Absolute path of the SKILL.md file (body re-read on invoke).
     path: []const u8,
@@ -37,6 +41,7 @@ pub const SkillLoader = struct {
             self.allocator.free(s.name);
             self.allocator.free(s.description);
             if (s.when_to_use) |w| self.allocator.free(w);
+            if (s.tools.len > 0) self.allocator.free(s.tools);
             self.allocator.free(s.path);
         }
         self.skills.deinit(self.allocator);
@@ -103,6 +108,7 @@ pub const SkillLoader = struct {
                 .name = self.allocator.dupe(u8, if (fm.name.len > 0) fm.name else entry.name) catch continue,
                 .description = self.allocator.dupe(u8, fm.description) catch continue,
                 .when_to_use = if (fm.when_to_use.len > 0) (self.allocator.dupe(u8, fm.when_to_use) catch null) else null,
+                .tools = if (fm.tools.len > 0) (self.allocator.dupe(u8, fm.tools) catch continue) else "",
                 .path = self.allocator.dupe(u8, skill_md) catch continue,
                 .source = source,
             };
@@ -113,6 +119,7 @@ pub const SkillLoader = struct {
                 self.allocator.free(existing.name);
                 self.allocator.free(existing.description);
                 if (existing.when_to_use) |w| self.allocator.free(w);
+                if (existing.tools.len > 0) self.allocator.free(existing.tools);
                 self.allocator.free(existing.path);
                 existing.* = skill;
                 continue;
@@ -175,6 +182,7 @@ pub const SkillLoader = struct {
 const Frontmatter = struct {
     name: []const u8 = "",
     description: []const u8 = "",
+    tools: []const u8 = "",
     when_to_use: []const u8 = "",
     body_start: usize = 0,
 };
@@ -207,8 +215,29 @@ pub fn parseFrontmatter(text: []const u8) ?Frontmatter {
             out.description = value;
         } else if (std.mem.eql(u8, key, "when_to_use")) {
             out.when_to_use = value;
+        } else if (std.mem.eql(u8, key, "tools")) {
+            out.tools = value; // T7.1: advisory tool hint, comma-separated
         }
     }
+}
+
+/// T7.1: count the body's top-level list items ("- " lines outside code
+/// fences) — a cheap "how many steps does this skill declare" signal for
+/// the trigger-time preview.
+pub fn countSteps(body: []const u8) usize {
+    var n: usize = 0;
+    var in_fence = false;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \t\r");
+        if (std.mem.startsWith(u8, t, "```")) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if (in_fence) continue;
+        if (std.mem.startsWith(u8, t, "- ")) n += 1;
+    }
+    return n;
 }
 
 // ── Tests ──
@@ -292,4 +321,34 @@ test "SkillLoader discovers and dedupes by name (project wins)" {
     const rm = try std.fmt.allocPrint(std.testing.allocator, "{s}/user-skill/SKILL.md", .{user_root});
     defer std.testing.allocator.free(rm);
     std.Io.Dir.deleteFileAbsolute(io, rm) catch {};
+}
+
+test "frontmatter tools hint parses and body steps count (T7.1)" {
+    const md =
+        \\---
+        \\name: release
+        \\description: Cut a release
+        \\tools: Grep, FileRead, Bash
+        \\---
+        \\Steps:
+        \\- bump version
+        \\- run tests
+        \\- tag
+        \\
+        \\```sh
+        \\- this is code, not a step
+        \\```
+        \\
+    ;
+    const fm = parseFrontmatter(md).?;
+    try std.testing.expectEqualStrings("release", fm.name);
+    try std.testing.expectEqualStrings("Grep, FileRead, Bash", fm.tools);
+    const body = md[@intCast(fm.body_start)..];
+    try std.testing.expectEqual(@as(usize, 3), countSteps(body));
+
+    // Old skill without `tools:` parses unchanged (backward compat).
+    const legacy = "---\nname: x\ndescription: y\n---\nno lists";
+    const fm2 = parseFrontmatter(legacy).?;
+    try std.testing.expectEqualStrings("", fm2.tools);
+    try std.testing.expectEqual(@as(usize, 0), countSteps("no lists"));
 }

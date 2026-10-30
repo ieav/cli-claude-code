@@ -36,6 +36,9 @@ const math_mod = @import("math/mod.zig");
 const embedding_mod = @import("util/embedding.zig");
 const tokens_mod = @import("util/tokens.zig");
 const task_mod = @import("task/mod.zig");
+const agent_dispatch = @import("tools/agent_dispatch.zig");
+
+
 const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
@@ -366,6 +369,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         logger.warning("thread pool start failed — subagents will run inline", .{});
     };
     defer pool.deinit();
+
+
     if (mem_sys) |*ms| {
         // Candidate pool of 200, not 20: the e-decay + cosine ranking only
         // reorders what SQL already returned — with LIMIT 20, older
@@ -446,6 +451,38 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             entry.def.execute_ctx_fn = askUserExecute;
             entry.def.execute_ctx = @ptrCast(&ask_ctx);
         }
+
+    // T6.3: register the parallel-subagent dispatch tool. ctx borrows
+    // stable references (model_name_buf updates in place on hot switches;
+    // retired settings slices are never freed, so key snapshots stay
+    // readable) — workers build their OWN provider per job from these.
+    var dispatch_ctx = agent_dispatch.DispatchCtx{
+        .alloc = allocator,
+        .io = io,
+        .tools = &reg,
+        .pool = &pool,
+        .backend = switcher.backend,
+        .model = switcher.modelName(),
+        .api_key = switch (switcher.backend) {
+            .openai => switcher.settings.api_keys.openai,
+            .claude => switcher.settings.api_keys.anthropic,
+            .ollama => null,
+        },
+        .base_url = switch (switcher.backend) {
+            .openai => switcher.settings.api_keys.openai_base_url,
+            .claude => switcher.settings.api_keys.anthropic_base_url,
+            .ollama => null,
+        },
+        .ollama_host = switcher.settings.api_keys.ollama_host,
+    };
+    reg.registerDynamic(
+        "agent",
+        "Run 1-3 focused read-only subagents in parallel. Each gets its own context and the read-only tools, then reports back. Use for independent research or verification subtasks (e.g. 'check X in the codebase', 'verify the failing paths'), NOT for sequential work.",
+        "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-3 self-contained task descriptions\"}},\"required\":[\"tasks\"]}",
+        agent_dispatch.executeWithCtx,
+        @ptrCast(&dispatch_ctx),
+        false,
+    ) catch |e| logger.warning("agent tool registration failed: {}", .{e});
     }
 
     // Consecutive-denial watchdog (designed anti-loop for dont_ask/auto
@@ -542,7 +579,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {
-                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
+                runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
             }
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
@@ -574,7 +611,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -822,7 +859,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
-                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend));
+                    runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full); // exit path: heuristic-only (detached LLM worker would race the provider deinit)
                 }
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -1032,6 +1069,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const skill = skill_loader.findByName(rest[0..sp_end]).?;
                 const task = std.mem.trim(u8, rest[sp_end..], " \t");
                 const body = skill_loader.readBody(skill, allocator) catch "";
+                // T7.2: trigger-time preview — the user sees the declared
+                // shape (steps + advisory tools) before the model runs it.
+                {
+                    const steps = skills_mod.loader.countSteps(body);
+                    var pb: [96]u8 = undefined;
+                    const prev = std.fmt.bufPrint(&pb, "  ▶ skill {s} · {d} 步{s}{s}\n", .{
+                        skill.name,
+                        steps,
+                        if (skill.tools.len > 0) " · 工具: " else "",
+                        skill.tools,
+                    }) catch "  ▶ skill\n";
+                    try std.Io.Writer.writeAll(w, prev);
+                    try std.Io.File.Writer.flush(&file_writer);
+                }
                 defer if (body.len > 0) allocator.free(body);
                 // $ARGUMENTS substitution: skills can template the whole
                 // argument string into their body (Claude-compatible).
