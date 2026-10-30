@@ -1594,8 +1594,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .timestamp = util_time.nowMillis(),
                 });
                 // Same bookkeeping as a regular query: reflection window +
-                // event record (the insight may later reference it).
-                window_queries.append(allocator, q) catch allocator.free(q);
+                // event record. The window owns its OWN copy — history
+                // frees qb's text on compact/clear and the window's defer
+                // frees its items; one shared pointer double-freed.
+                if (allocator.dupe(u8, q)) |wq| {
+                    window_queries.append(allocator, wq) catch allocator.free(wq);
+                } else |_| {}
                 evbus.emit(.{ .user_query_start = {} });
                 lineinput.pendingSealLine(w);
                 std.Io.Writer.print(w, "  ↳ 补充已进入本轮对话: {s}\n", .{q[0..@min(q.len, 60)]}) catch {};
@@ -2765,6 +2769,10 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
         const now = util_time.nowMillis();
         if (now - self.last_esc_check >= 50) {
             self.last_esc_check = now;
+            // The pending echo must know whether the stream cursor sits
+            // mid-line before it redraws (\r\x1b[2K would eat a partial
+            // output line).
+            lineinput.stream_at_line_start = self.at_line_start;
             if (lineinput.escProbe(self.esc_probe_r.?, self.w)) {
                 return error.EscCancelled;
             }

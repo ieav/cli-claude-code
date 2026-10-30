@@ -496,6 +496,11 @@ pub var pending_buf: [2048]u8 = undefined;
 pub var pending_len: usize = 0;
 /// The dim echo line is currently drawn at the cursor (no \n yet).
 pub var pending_shown: bool = false;
+/// Stream-side cursor state: the stream callback syncs its at_line_start
+/// here BEFORE the esc probe, so the pending echo knows whether the cursor
+/// sits mid-output-line — redrawing with \r\x1b[2K there would EAT the
+/// half-printed line. When mid-line, the echo first moves below it (\n).
+pub var stream_at_line_start: bool = true;
 
 pub const QUEUED_MAX: usize = 4;
 pub const QUEUED_CAP: usize = 2048;
@@ -546,7 +551,8 @@ fn pendingDisplay() []const u8 {
 }
 
 /// (Re)draw the dim pending-input echo line at the cursor. Single line,
-/// display-capped — safe for \r + clear-line redraw.
+/// display-capped — safe for \r + clear-line redraw. When the stream
+/// cursor is mid-output-line, first drop below it (\n) instead of wiping.
 pub fn renderPendingLine(w: *std.Io.Writer) void {
     if (pending_len == 0) {
         if (pending_shown) {
@@ -554,6 +560,10 @@ pub fn renderPendingLine(w: *std.Io.Writer) void {
         }
         pending_shown = false;
         return;
+    }
+    if (!stream_at_line_start) {
+        std.Io.Writer.writeAll(w, "\n") catch {};
+        stream_at_line_start = true;
     }
     std.Io.Writer.print(w, "\r\x1b[2K\x1b[2m⌨ {s}\x1b[0m", .{pendingDisplay()}) catch {};
     pending_shown = true;
@@ -594,6 +604,10 @@ fn pendingSubmit(w: ?*std.Io.Writer) bool {
     queued_count += 1;
     pending_len = 0;
     if (w) |ww| {
+        if (!stream_at_line_start) {
+            std.Io.Writer.writeAll(ww, "\n") catch {};
+            stream_at_line_start = true;
+        }
         pendingSealLine(ww);
         std.Io.Writer.writeAll(ww, "  \x1b[2m↳ 已排队（本轮生效或回合后自动发送）\x1b[0m\n") catch {};
     }
