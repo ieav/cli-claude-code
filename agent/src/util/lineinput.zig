@@ -481,8 +481,9 @@ pub var last_submit_ms: i64 = 0;
 
 /// Type-ahead bytes typed while the LLM was generating (they must not be
 /// lost just because we polled stdin for Esc). Replayed into the next
-/// prompt by readLine.
-pub var typeahead_buf: [256]u8 = undefined;
+/// prompt by readLine. Same capacity as pending so a fully-typed
+/// unsubmitted line never truncates on merge.
+pub var typeahead_buf: [2048]u8 = undefined;
 pub var typeahead_len: usize = 0;
 
 /// ── P4: generation-period live input ─────────────────────────────────────
@@ -625,6 +626,9 @@ pub fn pendingMergeIntoTypeahead() void {
     }
     pending_len = 0;
     pending_shown = false;
+    // Resync: a paste whose stream ended before the terminator would
+    // otherwise keep the probe swallowing prompt bytes as paste content.
+    paste_active = false;
 }
 
 /// Non-blocking Esc probe for the streaming callback: true when the user
@@ -635,6 +639,20 @@ pub fn pendingMergeIntoTypeahead() void {
 /// Checks the reader's OWN buffer first — a burst "text…ESC" lands in one
 /// read and the kernel fd goes dry, so polling fd alone never sees the Esc
 /// (same trap menu.readKey fixed with its bufferedLen check).
+/// Bracketed-paste state for the generation-period input path: a paste
+/// during streaming feeds pending as CONTENT (CR → newline, never submit)
+/// instead of cancelling the generation the way a bare Esc/CSI does.
+pub var paste_active: bool = false;
+
+/// What a captured ESC-following sequence means.
+const EscSeq = enum { cancel, paste_start, paste_end };
+
+fn classifyEscSeq(seq: []const u8) EscSeq {
+    if (std.mem.eql(u8, seq, "[200~")) return .paste_start;
+    if (std.mem.eql(u8, seq, "[201~")) return .paste_end;
+    return .cancel;
+}
+
 pub fn escProbe(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
     // Drain ALL pending bytes per invocation: the old take-one-byte-per-
     // call shape capped live input at ~20 bytes/s (one byte per 50ms
@@ -650,8 +668,58 @@ pub fn escProbe(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
     }
 }
 
+/// Capture the bytes following an ESC promptly (5ms per byte, `~`-styles
+/// are 4-5 long). Returns the captured sequence WITHOUT the ESC. Checks
+/// the reader's OWN buffer before polling the fd — a burst "ESC[200~…"
+/// lands in ONE read and the kernel fd goes dry, so a poll-only loop
+/// would see an empty sequence and misclassify (the escProbe drain trap).
+fn captureEscSeq(r: *std.Io.Reader) [8]u8 {
+    var seq: [8]u8 = @splat(0);
+    var n: usize = 0;
+    while (n < seq.len) {
+        if (r.bufferedLen() == 0) {
+            var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&p2, 1, 5) != 1 or (p2[0].revents & std.c.POLL.IN) == 0) break;
+        }
+        const b = r.takeByte() catch break;
+        seq[n] = b;
+        n += 1;
+        // '[' sits INSIDE the final-byte range — only a byte AFTER the
+        // introducer (or any non-'[' first byte) in 0x40..0x7E ends it.
+        if (n >= 2 and b >= 0x40 and b <= 0x7E) break;
+        if (n == 1 and b != '[') break; // lone Esc — no sequence follows
+    }
+    return seq;
+}
+
 fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
     const c = r.takeByte() catch return false;
+    if (paste_active) {
+        if (c == 0x1b) {
+            const seq = captureEscSeq(r);
+            if (classifyEscSeq(std.mem.sliceTo(&seq, 0)) == .paste_end) {
+                paste_active = false;
+                if (w) |ww| renderPendingLine(ww);
+                return false;
+            }
+            // ESC inside pasted text: keep it as content (plus whatever
+            // sequence bytes were captured).
+            pendingAppend(0x1b, w);
+            for (seq) |b| {
+                if (b == 0) break;
+                pendingAppend(b, w);
+            }
+            return false;
+        }
+        // Paste content: CR becomes a newline (a pasted multi-line blob is
+        // ONE message, never N submits); other control bytes drop.
+        if (c == '\r') {
+            pendingAppend('\n', w);
+        } else if (c >= 0x20 or c == '\n' or c == '\t') {
+            pendingAppend(c, w);
+        }
+        return false;
+    }
     if (c == 0x03) {
         // Ctrl-C during generation interrupts like Esc (generation runs in
         // raw mode with ISIG off, so the byte arrives here instead of as a
@@ -673,17 +741,19 @@ fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
         }
         return false;
     }
-    // Swallow a CSI sequence that follows promptly (arrow keys etc.). '['
-    // sits INSIDE the final-byte range — test it first or the loop breaks
-    // off at the introducer and leaks "A"/"3~" into the prompt.
-    while (true) {
-        var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        if (std.c.poll(&p2, 1, 5) != 1 or (p2[0].revents & std.c.POLL.IN) == 0) break;
-        const b = r.takeByte() catch break;
-        if (b == '[') continue; // CSI introducer
-        if (b >= 0x40 and b <= 0x7E) break; // real final byte
+    // ESC: classify the sequence. Paste markers feed pending; anything
+    // else (arrow keys, plain Esc) cancels the generation, as before.
+    // sliceTo(0): the capture array is fixed-length zero-padded — comparing
+    // the whole [8]u8 never matched and every paste fell through to cancel.
+    const seq = captureEscSeq(r);
+    switch (classifyEscSeq(std.mem.sliceTo(&seq, 0))) {
+        .paste_start => {
+            paste_active = true;
+            return false;
+        },
+        .paste_end => return false, // stray end marker: swallow
+        .cancel => return true,
     }
-    return true;
 }
 
 /// Streaming painter for the input block's content rows: walks soft-wrapped
@@ -2251,4 +2321,41 @@ test "unsubmitted pending merges into typeahead for the editor" {
     try std.testing.expectEqual(@as(usize, 0), pending_len);
     try std.testing.expectEqualSlices(u8, "draft", typeahead_buf[0..typeahead_len]);
     try std.testing.expectEqual(@as(usize, 0), queued_count);
+}
+
+test "esc sequence classification: paste markers vs cancel" {
+    try std.testing.expectEqual(EscSeq.paste_start, classifyEscSeq("[200~"));
+    try std.testing.expectEqual(EscSeq.paste_end, classifyEscSeq("[201~"));
+    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("[A")); // arrow
+    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("")); // bare Esc
+    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("[27u")); // kitty Esc
+}
+
+test "escProbe paste flow: markers feed pending, CR queues, no cancel" {
+    resetPendingState();
+    defer resetPendingState();
+    // Drive the byte machine one byte at a time (escProbe's drain gate
+    // polls fd 0, which has no data under the test runner — Reader.fixed
+    // never reports bufferedLen either). Production drain behavior is
+    // covered by the pty E2Es.
+    const burst = "\x1b[200~hello paste\x1b[201~\r";
+    var fr = std.Io.Reader.fixed(burst);
+    var cancelled = false;
+    for (0..burst.len + 2) |_| {
+        if (escProbeOne(&fr, null)) {
+            cancelled = true;
+            break;
+        }
+    }
+    try std.testing.expect(!cancelled); // paste must NOT cancel
+    // The trailing CR moved the pasted text into the queue (that IS the
+    // design): pending is empty, the queued message holds it.
+    try std.testing.expectEqual(@as(usize, 0), pending_len);
+    try std.testing.expectEqual(@as(usize, 1), queued_count);
+    try std.testing.expectEqualStrings("hello paste", queued_msgs[0][0..queued_lens[0]]);
+    try std.testing.expect(!paste_active);
+
+    // a bare Esc after that still cancels (arrow keys etc. unchanged)
+    var fr2 = std.Io.Reader.fixed("\x1b[A");
+    try std.testing.expect(escProbeOne(&fr2, null));
 }
