@@ -1970,6 +1970,11 @@ fn drainReflectionInbox(alloc: std.mem.Allocator, mem: ?*memory_mod.MemorySystem
             alloc.destroy(out);
         }
         if (mem == null) continue;
+        if (reflectionIsDuplicate(mem.?, out.insights)) {
+            logger.info("reflection: background llm insight near-duplicate — store skipped", .{});
+            std.Io.Writer.print(w, "  [Reflection+ {d}ms] {s}\n", .{ out.elapsed_ms, out.insights }) catch {};
+            continue;
+        }
         const name = "reflection (background llm)";
         const now = util_time.nowMillis();
         mem.?.store(.{
@@ -2095,6 +2100,21 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         hc.last_warn_count = 0;
         hc.last_warn_first = "";
     }
+}
+
+/// Reflection-store near-duplicate gate (mirrors the extraction T2.3
+/// gate): jaccard > 0.8 against any recent stored memory rejects the
+/// store. The extraction path always had this gate; the reflection paths
+/// didn't, so repeated LLM insights about similar patterns piled up
+/// unbounded. Side benefit: an identical canned text no longer refreshes
+/// its own updated_at, so the e-decay actually gets to age it.
+fn reflectionIsDuplicate(mem: *memory_mod.MemorySystem, insight: []const u8) bool {
+    const entries = mem.episodic_mem.retrieveRecent(20) catch return false;
+    defer mem.episodic_mem.freeEntries(entries);
+    for (entries) |e| {
+        if (jaccardTokens(e.content, insight) > 0.8) return true;
+    }
+    return false;
 }
 
 /// T3.2 (as-designed): background reflection result, handed from the
@@ -2308,17 +2328,24 @@ fn runReflection(
 
     var name_buf: [64]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "reflection q={d} tools={d}", .{ window_queries.items.len, window_tools.* }) catch "reflection";
-    const now = util_time.nowMillis();
-    mem.store(.{
-        .id = injection_mod.memoryId(insights, "reflection"),
-        .mem_type = .feedback,
-        .name = name,
-        .description = @tagName(reflection.trigger),
-        .content = insights,
-        .access_count = 0,
-        .created_at = now,
-        .updated_at = now,
-    }) catch {};
+    if (reflectionIsDuplicate(mem, insights)) {
+        // Keep the print + the LLM dispatch (both already happened above);
+        // only the STORE is gated — repeated identical windows must not
+        // refresh the same row forever.
+        logger.info("reflection: heuristic insight near-duplicate — store skipped", .{});
+    } else {
+        const now = util_time.nowMillis();
+        mem.store(.{
+            .id = injection_mod.memoryId(insights, "reflection"),
+            .mem_type = .feedback,
+            .name = name,
+            .description = @tagName(reflection.trigger),
+            .content = insights,
+            .access_count = 0,
+            .created_at = now,
+            .updated_at = now,
+        }) catch {};
+    }
     logger.info("reflection: quality={d:.2} heuristic insights stored (llm dispatched in background)", .{reflection.quality_score});
     if (bus) |b| b.emit(.{ .reflection_produced = .{ .quality = @floatCast(reflection.quality_score), .background = false } });
     w.print("  [Reflection {d}ms] {s}\n", .{ util_time.nowMillis() - reflect_t0, insights }) catch {};
@@ -5202,6 +5229,30 @@ test "reflection inbox drains, prints, and empties (T3.2 wiring)" {
     const len_after_first = aw.written().len;
     drainReflectionInbox(allocator, &mem, null, &aw.writer);
     try std.testing.expectEqual(len_after_first, aw.written().len); // drained dry
+
+    // P6 near-duplicate gate: the SAME insight again must NOT add a row
+    // (and still prints — the print is not gated).
+    const dup = try allocator.dupe(u8, "insight text from the background llm");
+    const out2 = try allocator.create(ReflectOutcome);
+    out2.* = .{ .insights = dup, .trigger_name = "on_query_complete", .quality = 0.5, .elapsed_ms = 10 };
+    try std.testing.expect(reflect_inbox.push(out2));
+    drainReflectionInbox(allocator, &mem, null, &aw.writer);
+    {
+        const ents = try mem.episodic_mem.retrieveRecent(10);
+        defer mem.episodic_mem.freeEntries(ents);
+        try std.testing.expectEqual(@as(usize, 1), ents.len);
+    }
+    // A genuinely different insight still stores.
+    const other = try allocator.dupe(u8, "completely different insight about caching strategy tradeoffs");
+    const out3 = try allocator.create(ReflectOutcome);
+    out3.* = .{ .insights = other, .trigger_name = "on_query_complete", .quality = 0.5, .elapsed_ms = 10 };
+    try std.testing.expect(reflect_inbox.push(out3));
+    drainReflectionInbox(allocator, &mem, null, &aw.writer);
+    {
+        const ents = try mem.episodic_mem.retrieveRecent(10);
+        defer mem.episodic_mem.freeEntries(ents);
+        try std.testing.expectEqual(@as(usize, 2), ents.len);
+    }
 }
 
 test "mergeInputHistory unions concurrent windows and caps the tail" {

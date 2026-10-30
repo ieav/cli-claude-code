@@ -32,7 +32,7 @@ pub const CronScheduler = struct {
     const Self = @This();
 
     // π/φ/e-based intervals (in ms)
-    pub const REFLECTION_INTERVAL: u64 = @intFromFloat(math.constants.PI * 10.0 * 60.0 * 1000.0); // ~31.4 min
+    pub const REFLECTION_INTERVAL: u64 = @intFromFloat(math.constants.PI * 24.0 * 60.0 * 60.0 * 1000.0); // π×24h ≈ 3.14 d
     pub const KNOWLEDGE_UPDATE_INTERVAL: u64 = @intFromFloat(math.constants.PHI * 60.0 * 60.0 * 1000.0); // ~37.1 min
     pub const MEMORY_DECAY_INTERVAL: u64 = @intFromFloat(math.constants.E * 30.0 * 60.0 * 1000.0); // ~81.5 min
     pub const HEALTH_CHECK_INTERVAL: u64 = 60 * 1000; // 60s
@@ -106,8 +106,8 @@ pub const CronScheduler = struct {
 
 test "CronScheduler intervals" {
     // Verify π/φ/e-based intervals are reasonable
-    try std.testing.expect(CronScheduler.REFLECTION_INTERVAL > 30 * 60 * 1000); // > 30 min
-    try std.testing.expect(CronScheduler.REFLECTION_INTERVAL < 35 * 60 * 1000); // < 35 min
+    try std.testing.expect(CronScheduler.REFLECTION_INTERVAL > 3 * 24 * 60 * 60 * 1000); // > 3 days
+    try std.testing.expect(CronScheduler.REFLECTION_INTERVAL < 4 * 24 * 60 * 60 * 1000); // < 4 days
     try std.testing.expect(CronScheduler.KNOWLEDGE_UPDATE_INTERVAL > 35 * 60 * 1000);
     try std.testing.expect(CronScheduler.MEMORY_DECAY_INTERVAL > 80 * 60 * 1000);
 }

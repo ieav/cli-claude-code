@@ -62,10 +62,12 @@ pub const ReflectionEngine = struct {
         const count = self.query_count.fetchAdd(1, .monotonic) + 1;
         if (count % REFLECT_EVERY_N == 0) return true;
 
-        // Also check time-based trigger (π × 10min)
+        // Also check time-based trigger (π × 24h ≈ 3.14 days — raised from
+        // π×10min: at ~31min it fired constantly in tool-heavy sessions;
+        // the every-N-queries trigger covers in-session reflection).
         const now = time_mod.nowMillis();
         const last = self.last_reflection_at.load(.monotonic);
-        const pi_interval: i64 = @intFromFloat(math.constants.PI * 10.0 * 60.0 * 1000.0);
+        const pi_interval: i64 = @intFromFloat(math.constants.PI * 24.0 * 60.0 * 60.0 * 1000.0);
         if (last > 0 and (now - last) > pi_interval) return true;
 
         return false;

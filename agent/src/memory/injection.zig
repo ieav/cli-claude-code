@@ -114,6 +114,13 @@ pub fn buildMemoryBlockAnchored(allocator: std.mem.Allocator, entries: []const t
     var line_buf: [max_name + max_content + 64]u8 = undefined;
     var used: u32 = 8; // header cost
     var included: usize = 0;
+    // Reflection-type commentary (rows named "reflection*") is capped at
+    // 25% of the budget: repeated self-commentary ranked high on freshness
+    // used to crowd out the user/project knowledge the injection exists
+    // for. Capped entries are SKIPPED, not truncated — later real-knowledge
+    // rows still get the budget.
+    var reflection_used: u32 = 0;
+    const reflection_cap: u32 = budget_tokens / 4;
 
     try writer.writeAll("Relevant memories from previous sessions:\n");
     for (ranks) |r| {
@@ -127,10 +134,13 @@ pub fn buildMemoryBlockAnchored(allocator: std.mem.Allocator, entries: []const t
         }) catch continue;
 
         const cost = tokens.estimateTokens(line);
+        const is_reflection = std.mem.startsWith(u8, e.name, "reflection");
+        if (is_reflection and reflection_used + cost > reflection_cap) continue;
         if (used + cost > budget_tokens and included > 0) break;
         try writer.writeAll(line);
         used += cost;
         included += 1;
+        if (is_reflection) reflection_used += cost;
     }
 
     if (included == 0) return null;
@@ -303,4 +313,42 @@ test "end-to-end: store via EpisodicStore, reload, inject" {
     defer std.testing.allocator.free(block.text);
 
     try std.testing.expect(std.mem.indexOf(u8, block.text, "E2E_MARKER") != null);
+}
+
+test "reflection-type rows capped at 25% of the injection budget" {
+    const now = time_mod.nowMillis();
+    // 6 FRESH reflection rows (rank high on decay) + 2 older project rows.
+    // Cap = 200/4 = 50 tokens; each line costs ~30+ tokens, so at most
+    // 1-2 reflection lines may enter — the rest of the budget must go to
+    // the project rows instead of self-commentary.
+    var entries: [8]types.MemoryEntry = undefined;
+    for (&entries, 0..) |*e, i| {
+        const is_refl = i < 6;
+        e.* = .{
+            .id = @splat(@intCast(i + 1)),
+            .mem_type = if (is_refl) .feedback else .project,
+            .name = if (is_refl) "reflection q=1 tools=9" else "project-conventions",
+            .description = "",
+            .content = if (is_refl)
+                "tool calls are frequent consider optimizing the prompts to reduce unnecessary tool usage"
+            else
+                "always run zig build test before committing changes to this repository",
+            .access_count = 0,
+            .created_at = 0,
+            .updated_at = if (is_refl) now else now - 3600 * 1000,
+        };
+    }
+    const block = (try buildMemoryBlockAnchored(std.testing.allocator, &entries, 200, null)).?;
+    defer std.testing.allocator.free(block.text);
+
+    var refl_lines: usize = 0;
+    var proj_lines: usize = 0;
+    var it = std.mem.splitScalar(u8, block.text, '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        if (std.mem.indexOf(u8, ln, "reflection") != null) refl_lines += 1;
+        if (std.mem.indexOf(u8, ln, "project-conventions") != null) proj_lines += 1;
+    }
+    try std.testing.expect(refl_lines <= 2); // the cap holds
+    try std.testing.expect(proj_lines >= 1); // real knowledge still gets budget
 }
