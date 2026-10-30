@@ -45,6 +45,10 @@ pub const SubagentResult = struct {
     summary: []u8,
     turns_used: usize,
     tool_calls: usize,
+    /// Cumulative LLM usage across all turns (T6.6 metering — the merge
+    /// report surfaces these so a fan-out's cost is visible, not felt).
+    tokens_in: u32 = 0,
+    tokens_out: u32 = 0,
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.summary);
@@ -108,11 +112,15 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
 
     var turn: usize = 0;
     var tool_calls: usize = 0;
+    var tokens_in: u32 = 0;
+    var tokens_out: u32 = 0;
     while (turn < cfg.max_turns) : (turn += 1) {
         const resp = try cfg.provider.complete(history.items, .{
             .max_tokens = 2048,
             .tools = specs.items,
         });
+        tokens_in += resp.usage.input_tokens;
+        tokens_out += resp.usage.output_tokens;
         // The response (and its DOM arena) is NEVER freed inside the loop:
         // tool_use.input slices live in it and outlive this turn inside
         // history. The process-level leak is bounded by max_turns and is
@@ -132,7 +140,7 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
 
         if (tool_uses.items.len == 0) {
             const summary = final_text orelse try alloc.dupe(u8, "(no output)");
-            return .{ .summary = summary, .turns_used = turn + 1, .tool_calls = tool_calls };
+            return .{ .summary = summary, .turns_used = turn + 1, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };
         }
 
         // Append the assistant turn (tool_use blocks), then results.
@@ -152,10 +160,10 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
             try history.append(alloc, .{ .role = .user, .content = rb, .timestamp = 0 });
         }
     }
-    return .{ .summary = try alloc.dupe(u8, "(turn limit reached)"), .turns_used = cfg.max_turns, .tool_calls = tool_calls };
+    return .{ .summary = try alloc.dupe(u8, "(turn limit reached)"), .turns_used = cfg.max_turns, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };
 }
 
-/// Whitelist + Default-mode permission gate, then execute.
+/// Deny-list + the CENTRAL permission pipeline (T6.2), then execute.
 fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 {
     const alloc = cfg.alloc;
     if (!toolAllowed(tu.name)) {
@@ -165,8 +173,13 @@ fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 
         return alloc.dupe(u8, "unknown tool");
     };
 
-    // Default-mode semantics with EMPTY rules: read-only passes, anything
-    // that would ask a user is denied — a headless worker must never block.
+    // The gate must be the CENTRAL pipeline (auth.checkToolPermission):
+    // the registry's per-tool checkPermissions hook is registered by no
+    // tool and defaults to .allow, so gating on it (v0.6.0) was a no-op —
+    // Bash and every write tool ran unchecked. Default mode with EMPTY
+    // rules gives exactly the headless semantics: read-only passes,
+    // writes and protected paths fall through to ask — and ask is denied
+    // here, because a headless worker must never block on a user.
     const perm_ctx = registry.PermissionContext{
         .mode = .default,
         .allow_rules = &.{},
@@ -177,12 +190,11 @@ fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 
         .model_name = "",
     };
     const input = jsonFromToolUse(alloc, tu) catch return error.OutOfMemory;
-    const decision = def.checkPermissions(input, &perm_ctx);
+    const decision = auth.checkToolPermission(def, input, &perm_ctx);
     switch (decision) {
         .allow => {},
-        else => {
-            return std.fmt.allocPrint(alloc, "permission denied (subagents are read-only)", .{});
-        },
+        .ask => |a| return std.fmt.allocPrint(alloc, "permission denied (subagents are read-only): {s}", .{a.message}),
+        .deny => |d| return std.fmt.allocPrint(alloc, "permission denied: {s}", .{d.message}),
     }
     const tr = try def.execute(alloc, input, cfg.io);
     return alloc.dupe(u8, tr.output) catch error.OutOfMemory;
@@ -238,4 +250,29 @@ test "toolAllowed whitelist (T6.2)" {
     try std.testing.expect(toolAllowed("FileRead"));
     try std.testing.expect(toolAllowed("Bash"));
     try std.testing.expect(!toolAllowed("agent")); // no recursive fan-out
+}
+
+test "subagent permission gate runs the CENTRAL pipeline (T6.2 wiring fix)" {
+    // v0.6.0 regression this pins: gating on registry checkPermissions —
+    // a hook no tool registers, defaulting to .allow — let write tools and
+    // Bash through unchecked. The subagent ctx is Default mode + EMPTY
+    // rules through auth.checkToolPermission: writes must land on ask
+    // (= denied for a headless worker), reads on allow.
+    const ctx = registry.PermissionContext{
+        .mode = .default,
+        .allow_rules = &.{},
+        .deny_rules = &.{},
+        .ask_rules = &.{},
+        .provider = null,
+        .allocator = null,
+        .model_name = "",
+    };
+    const d_write = auth.checkToolPermission(&registry.file_write_tool, .null, &ctx);
+    try std.testing.expect(d_write == .ask); // → "subagents are read-only"
+    const d_read = auth.checkToolPermission(&registry.file_read_tool, .null, &ctx);
+    try std.testing.expect(d_read == .allow);
+    // Bash with no parsable command is NOT read-only (bashIsReadOnly
+    // returns false on null input) → ask → denied for a subagent.
+    const d_bash = auth.checkToolPermission(&registry.bash_tool, .null, &ctx);
+    try std.testing.expect(d_bash != .allow);
 }

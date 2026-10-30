@@ -422,6 +422,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // the first successful reflection, so short sessions (<10 queries)
     // never got a time-based trigger.
     reflector.last_reflection_at.store(util_time.nowMillis(), .monotonic);
+    // T3.2 wiring: arm the insight inbox — background workers push here,
+    // the main loop drains it before each prompt. v0.6.0 shipped with
+    // this init (and the drain call) missing, so every background insight
+    // was silently discarded: the LLM round trip ran, the store never did.
+    reflect_inbox = .init();
+    reflect_inbox_init = true;
     var window_queries: std.ArrayList([]u8) = .empty;
     defer {
         for (window_queries.items) |q| allocator.free(q);
@@ -552,6 +558,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // also covers the very first prompt — the file may predate us).
         refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
 
+        // T3.2: land any background-reflection insights that completed
+        // since the last prompt (SQLite writes and printing stay on this
+        // thread — the worker only pushed into the inbox).
+        drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
+
         // Prompt with mode indicator + model + context usage
         const mode_str = switch (current_mode) {
             .default => "ziv",
@@ -591,6 +602,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
             if (mem_sys != null and window_queries.items.len > 0) {
                 runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                // Best-effort drain: an insight that already landed in the
+                // inbox is stored now; one still in flight dies with the
+                // process (the heuristic reflection was stored synchronously
+                // above — nothing of value blocks on a detached thread).
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
             }
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
@@ -623,6 +639,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                // Best-effort drain: an insight that already landed in the
+                // inbox is stored now; one still in flight dies with the
+                // process (the heuristic reflection was stored synchronously
+                // above — nothing of value blocks on a detached thread).
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -871,6 +892,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null); // exit path: heuristic-only, no background dispatch
+                // Best-effort drain: an insight that already landed in the
+                // inbox is stored now; one still in flight dies with the
+                // process (the heuristic reflection was stored synchronously
+                // above — nothing of value blocks on a detached thread).
+                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, w);
                 }
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -1789,7 +1815,13 @@ fn dispatchBackgroundReflection(
     };
     var filled: usize = 0;
     for (queries) |q| {
-        qs[filled] = (alloc.dupe(u8, q) catch break)[0..q.len :0];
+        // 0.17 has no dupeZ, and dupe(..)[0..len:0] PANICS at runtime —
+        // the sentinel check reads past the slice (crashed the 10th-turn
+        // reflection dispatch). Allocate len+1, copy, NUL-terminate.
+        const buf = alloc.alloc(u8, q.len + 1) catch break;
+        @memcpy(buf[0..q.len], q);
+        buf[q.len] = 0;
+        qs[filled] = buf[0..q.len :0];
         filled += 1;
     }
     if (filled < queries.len) {
@@ -4861,6 +4893,36 @@ test "swapMemoryBlockText replaces by identity, preserves siblings" {
     // consumed — caller keeps ownership).
     try std.testing.expect(!swapMemoryBlockText(&history, alloc, "OLD-MEMORY", new_text));
     try std.testing.expectEqualStrings("NEW-MEMORY", history.items[0].content[1].text);
+}
+
+test "reflection inbox drains, prints, and empties (T3.2 wiring)" {
+    // v0.6.0 shipped the inbox uninit and drain uncalled — every
+    // background insight was generated then silently discarded. This pins
+    // the full last mile: push → drain stores a .feedback row, prints the
+    // arrival, and a second drain is a no-op.
+    var tmp: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_reflect_drain_{d}.db", .{util_time.nowMillis()}) catch return;
+    defer _ = fs_ops.deleteFile(path);
+    var db = try database_mod.Database.init(allocator, path);
+    defer db.deinit();
+    try db.runMigrations();
+    var mem = memory_mod.MemorySystem.init(allocator, &db);
+    defer mem.deinit();
+
+    reflect_inbox = .init();
+    reflect_inbox_init = true;
+    defer reflect_inbox_init = false;
+    const owned = try allocator.dupe(u8, "insight text from the background llm");
+    const out = try allocator.create(ReflectOutcome);
+    out.* = .{ .insights = owned, .trigger_name = "on_query_complete", .quality = 0.5, .elapsed_ms = 42 };
+    try std.testing.expect(reflect_inbox.push(out));
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    drainReflectionInbox(allocator, &mem, &aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "insight text from the background llm") != null);
+    const len_after_first = aw.written().len;
+    drainReflectionInbox(allocator, &mem, &aw.writer);
+    try std.testing.expectEqual(len_after_first, aw.written().len); // drained dry
 }
 
 test "mergeInputHistory unions concurrent windows and caps the tail" {

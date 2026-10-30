@@ -122,7 +122,7 @@ fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]
         try w.print("## 子任务 {d}\n", .{i + 1});
         if (jobs[i].result) |r| {
             const cut = subagent.utf8TokenCut(r.summary, SUMMARY_TOKEN_CAP);
-            try w.print("{s}\n(轮次 {d} · 工具调用 {d})\n", .{ cut, r.turns_used, r.tool_calls });
+            try w.print("{s}\n(轮次 {d} · 工具调用 {d} · tokens {d}/{d})\n", .{ cut, r.turns_used, r.tool_calls, r.tokens_in, r.tokens_out });
             if (cut.len < r.summary.len) try w.writeAll("(截断)\n");
         } else if (jobs[i].failed) {
             try w.writeAll("(子代理执行失败)\n");
