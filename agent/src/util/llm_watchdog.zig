@@ -20,7 +20,7 @@ const logger = @import("log.zig");
 pub const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 const POLL_MS: u64 = 250;
 /// SHUT_RDWR — same value (2) on macOS and Linux.
-const SHUT_RDWR: c_int = 2;
+pub const SHUT_RDWR: c_int = 2;
 
 /// Per-request state, owned EXCLUSIVELY by the watchdog thread after arm:
 /// it frees the struct on exit. `Guard.finish()` only flips the flag and
@@ -29,7 +29,27 @@ const State = struct {
     fd: std.c.fd_t,
     done: std.atomic.Value(bool),
     timeout_ms: u64,
+    /// TTFT sub-deadline: when the whole request (headers included — the
+    /// gateway's accept-but-never-answer hang blocks receiveHead BEFORE
+    /// any body read loop exists) produced no first byte by this mark,
+    /// kill early so the caller can auto-retry. Cleared by firstByte().
+    ttft_ms: u64,
+    first_byte: std.atomic.Value(bool),
 };
+
+/// TTFT kills since the last consume — lets a provider map a generic
+/// transport error to error.FirstByteTimeout after the watchdog killed
+/// a request that never produced its first byte.
+var ttft_kills: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+pub fn consumeTtftKill() bool {
+    while (true) {
+        const cur = ttft_kills.load(.acquire);
+        if (cur == 0) return false;
+        if (ttft_kills.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire) != null) continue;
+        return true;
+    }
+}
 
 pub const Guard = struct {
     state: ?*State,
@@ -37,6 +57,12 @@ pub const Guard = struct {
     /// Disarm at request end. Idempotent; never frees (thread owns that).
     pub fn finish(self: Guard) void {
         if (self.state) |s| s.done.store(true, .release);
+    }
+
+    /// First body byte observed — lift the TTFT sub-deadline (the total
+    /// timeout still applies).
+    pub fn firstByte(self: Guard) void {
+        if (self.state) |s| s.first_byte.store(true, .release);
     }
 };
 
@@ -51,6 +77,8 @@ pub fn arm(req: *std.http.Client.Request) Guard {
         .fd = conn.stream_reader.stream.socket.handle,
         .done = std.atomic.Value(bool).init(false),
         .timeout_ms = currentTimeoutMs(),
+        .ttft_ms = currentTtftMs(),
+        .first_byte = std.atomic.Value(bool).init(false),
     };
     const t = std.Thread.spawn(.{}, watchdogThread, .{s}) catch {
         std.heap.smp_allocator.destroy(s);
@@ -64,6 +92,20 @@ fn watchdogThread(s: *State) void {
     const start = time_mod.nowMillis();
     while (!s.done.load(.acquire)) {
         const elapsed: u64 = @intCast(time_mod.nowMillis() - start);
+        // TTFT sub-deadline: nothing at all arrived (headers included) —
+        // a dead request. Kill early and flag it so the provider maps the
+        // resulting error to FirstByteTimeout and auto-retries.
+        if (!s.first_byte.load(.acquire) and s.ttft_ms < s.timeout_ms and elapsed >= s.ttft_ms) {
+            if (s.done.load(.acquire)) {
+                std.heap.smp_allocator.destroy(s);
+                return;
+            }
+            _ = std.c.shutdown(s.fd, SHUT_RDWR);
+            _ = ttft_kills.fetchAdd(1, .release);
+            logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{s.ttft_ms});
+            std.heap.smp_allocator.destroy(s);
+            return;
+        }
         if (elapsed >= s.timeout_ms) {
             // Race guard: a request that completed in the poll window may
             // have already returned its connection to the pool (fd reused).
@@ -99,6 +141,22 @@ pub fn currentTimeoutMs() u64 {
         } else |_| {}
     }
     return DEFAULT_TIMEOUT_MS;
+}
+
+/// Time-to-first-byte budget for INTERACTIVE streams: a gateway that
+/// accepted the request but produced nothing yet is almost certainly a
+/// dead request — the interactive loop kills it at this deadline and
+/// auto-retries instead of sitting on the 180s total watchdog ("发了
+/// 消息模型一直没响应" self-heals within ~30s).
+pub const DEFAULT_TTFT_TIMEOUT_MS: u64 = 30_000;
+
+pub fn currentTtftMs() u64 {
+    if (env.get("ZIV_TTFT_TIMEOUT_MS")) |v| {
+        if (std.fmt.parseInt(u64, v, 10)) |parsed| {
+            return @max(parsed, 5_000);
+        } else |_| {}
+    }
+    return DEFAULT_TTFT_TIMEOUT_MS;
 }
 
 test "timeout config: default, env parse, and 1s floor" {

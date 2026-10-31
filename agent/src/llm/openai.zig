@@ -3,6 +3,8 @@
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
+const logger = @import("../util/log.zig");
+const stream_interrupt = @import("../util/stream_interrupt.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
@@ -92,13 +94,25 @@ pub const OpenAIProvider = struct {
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            // A TTFT kill (gateway never sent even the headers) surfaces
+            // here as a transport error — map it so the caller retries.
+            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            return e;
+        };
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "OpenAI stream", &response);
         }
 
-        // Stream: read chunks and parse SSE events incrementally
+        // Stream: read chunks and parse SSE events incrementally.
+        // TTFT budget: an interactive request with zero body bytes after
+        // currentTtftMs() is treated as dead (the gateway's known
+        // accept-but-never-answer behavior) — kill it here; the REPL
+        // auto-retries instead of waiting out the 180s total watchdog.
+        const ttft_budget_ms: i64 = @intCast(llm_watchdog.currentTtftMs());
+        var ttft_wait_ms: i64 = 0;
+        var first_byte_seen = false;
         var resp_read_buf: [8192]u8 = undefined;
         const resp_reader = response.reader(&resp_read_buf);
         var chunk_buf: [4096]u8 = undefined;
@@ -107,6 +121,44 @@ pub const OpenAIProvider = struct {
 
         var read_err: ?anyerror = null;
         while (true) {
+            // Interruptible idle wait: rather than blocking in peekGreedy,
+            // poll the socket (and stdin past the silence threshold) when
+            // nothing is buffered. Esc/Ctrl-C during a gateway stall then
+            // surfaces as EscCancelled — the same cancel/recall path an
+            // in-stream Esc takes — instead of a dead terminal until the
+            // 180s watchdog. Interactive streams only (opts.esc_interrupt).
+            if (opts.esc_interrupt and resp_reader.bufferedLen() == 0) {
+                if (req.connection) |conn| {
+                    var idle_ms: i32 = 0;
+                    wait: while (true) {
+                        const watch = idle_ms >= stream_interrupt.SILENCE_BEFORE_WATCH_MS;
+                        switch (stream_interrupt.waitSlice(conn.stream_reader.stream.socket.handle, watch)) {
+                            .ready => break :wait,
+                            .tick => {
+                                idle_ms += stream_interrupt.POLL_SLICE_MS;
+                                if (!first_byte_seen) {
+                                    ttft_wait_ms += stream_interrupt.POLL_SLICE_MS;
+                                    if (ttft_wait_ms >= ttft_budget_ms) {
+                                        _ = std.c.shutdown(conn.stream_reader.stream.socket.handle, llm_watchdog.SHUT_RDWR);
+                                        logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{ttft_wait_ms});
+                                        return error.FirstByteTimeout;
+                                    }
+                                }
+                                try cb(ctx, .tick);
+                            },
+                            .cancelled => return error.EscCancelled,
+                            // Echo the keystroke through the stream callback
+                            // so the REPL (which owns the screen) renders it.
+                            .input => |b| {
+                                idle_ms = 0;
+                                try cb(ctx, .{ .live_input = b });
+                            },
+                        }
+                    }
+                }
+            }
+            first_byte_seen = true; // buffered or just-read data exists
+            wd.firstByte(); // lift the watchdog's TTFT sub-deadline
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
@@ -147,6 +199,7 @@ pub const OpenAIProvider = struct {
         }
         try agg.finalize(ctx, cb);
         if (read_err) |e| {
+            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
             try cb(ctx, .{ .error_occurred = mapStreamError(e) });
             return;
         }
@@ -344,7 +397,12 @@ pub const OpenAIProvider = struct {
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            // A TTFT kill (gateway never sent even the headers) surfaces
+            // here as a transport error — map it so the caller retries.
+            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            return e;
+        };
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "OpenAI API", &response);

@@ -45,6 +45,7 @@ const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
 const format_mod = @import("util/format.zig");
 const diff_util = @import("util/diff.zig");
+const llm_watchdog = @import("util/llm_watchdog.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
 const runtime_monitor = @import("runtime/monitor.zig");
@@ -653,7 +654,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             from_auto_queue = true;
             auto_submit = null;
             maybe_line = a;
-            lineinput.pendingSealLine(w);
+            lineinput.regionEnd(w);
             std.Io.Writer.print(w, "  ↳ 自动发送排队消息\n", .{}) catch {};
         } else {
             maybe_line = lineinput.readLine(w, r, &file_writer, prompt, &input_history, allocator) catch |err| {
@@ -1283,6 +1284,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         // Agent loop
         var agent_iterations: usize = 0;
+        // TTFT auto-retries left this turn: a gateway that accepted the
+        // request but sent no first byte gets killed at the TTFT deadline
+        // (provider-side) and transparently retried — "发了消息模型一直
+        // 没响应" self-heals instead of idling on the 180s watchdog.
+        var ttft_retries: u8 = 0;
         var result_blocks = std.ArrayList(llm.ContentBlock).empty;
         defer result_blocks.deinit(allocator);
         // One emergency compaction per turn on ContextOverflow — a second
@@ -1326,6 +1332,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 .temperature = 0.7,
                 // Declare the tools so the model can actually call them.
                 .tools = reg.toolSpecs(),
+                // Interactive stream: Esc/Ctrl-C must work even when the
+                // gateway stalls silently (no events → the in-stream esc
+                // probe never runs; this flag makes the idle socket wait
+                // itself interruptible).
+                .esc_interrupt = true,
             }, r, w, &file_writer, allocator) catch |err| {
                 if (err == error.EscCancelled) {
                     // Esc: abort this exchange and pull the input back into
@@ -1334,6 +1345,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.Writer.print(w, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
                     lineinput.recall_prefill = true;
+                    try std.Io.File.Writer.flush(&file_writer);
+                    break;
+                }
+                if (err == error.FirstByteTimeout) {
+                    // Gateway accepted the request but produced nothing
+                    // within the TTFT budget. Nothing was shown or stored
+                    // yet, so a retry is invisible-safe: re-run this
+                    // generation from the same history.
+                    if (ttft_retries < 2) {
+                        ttft_retries += 1;
+                        try std.Io.Writer.print(w, "\x1b[2m  [网关 {d}s 无响应 — 自动重试 {d}/2…]\x1b[0m\n", .{ @divTrunc(llm_watchdog.currentTtftMs(), 1000), ttft_retries });
+                        try std.Io.File.Writer.flush(&file_writer);
+                        continue;
+                    }
+                    try std.Io.Writer.print(w, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合。Esc 可中断，请检查网关或稍后重发]\x1b[0m\n\n", .{});
                     try std.Io.File.Writer.flush(&file_writer);
                     break;
                 }
@@ -1647,8 +1673,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     window_queries.append(allocator, wq) catch allocator.free(wq);
                 } else |_| {}
                 evbus.emit(.{ .user_query_start = {} });
-                lineinput.pendingSealLine(w);
-                std.Io.Writer.print(w, "  ↳ 补充已进入本轮对话: {s}\n", .{q[0..@min(q.len, 60)]}) catch {};
+                var ib: [128]u8 = undefined;
+                const iline = std.fmt.bufPrint(&ib, "  ↳ 补充已进入本轮对话: {s}\n", .{q[0..@min(q.len, 60)]}) catch "";
+                lineinput.regionPrintLine(w, iline);
                 std.Io.File.Writer.flush(&file_writer) catch {};
             }
 
@@ -2759,7 +2786,15 @@ const StreamAgg = struct {
     /// reasoning_content / Claude thinking) used to render as dead silence
     /// for seconds, reading like a hang.
     thinking_shown: bool = false,
-    thinking_newline_needed: bool = false,
+    /// Line-buffered display: complete lines flush above the live region
+    /// (flushLine); a partial tail waits for its newline or turn end.
+    /// Seeded with the one-space response margin. line_cols is the
+    /// buffered content's display width — reaching the terminal width is
+    /// a SOFT-WRAP flush point (single-line responses must stream, not
+    /// sit invisible in the buffer until the turn ends).
+    line_buf: std.ArrayList(u8) = .empty,
+    line_cols: usize = 0,
+    tick_n: usize = 0,
     /// Response left margin: every displayed response line opens with one
     /// space (user preference); the flag survives across delta chunks so a
     /// line broken between chunks still gets its margin.
@@ -2768,11 +2803,26 @@ const StreamAgg = struct {
     /// cancels generation and recalls the input for editing.
     esc_probe_r: ?*std.Io.Reader = null,
     last_esc_check: i64 = 0,
+    /// Live-region timing: request start (elapsed "等待响应 Ns") and the
+    /// last stream event (silence gates when the region appears).
+    req_t0: i64 = 0,
+    last_event_ms: i64 = 0,
 
     fn deinit(self: *StreamAgg) void {
+        self.line_buf.deinit(self.alloc);
         self.text.deinit(self.alloc);
         // Tool strings are session-lifetime (freed with history); just drop the list.
         self.tools.deinit(self.alloc);
+    }
+
+    /// Flush one buffered output line above the live region. The buffer is
+    /// seeded with the one-space response margin, so items ARE the line.
+    fn flushLine(self: *StreamAgg) void {
+        lineinput.regionPrintLine(self.w, self.line_buf.items);
+        self.line_buf.clearRetainingCapacity();
+        self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
+        self.line_cols = 0;
+        std.Io.File.Writer.flush(self.file_writer) catch {};
     }
 };
 
@@ -2838,7 +2888,12 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
     const self: *StreamAgg = @ptrCast(@alignCast(ctx_opaque.?));
     // Esc interrupts generation (Claude-Code style): poll stdin at most
     // every 50 ms — an error return here aborts the provider stream.
-    if (self.esc_probe_r != null) {
+    // Skipped for .live_input: that byte came from the provider's
+    // silent-stall wait, and probing here would drain a same-burst
+    // remainder BEFORE the event's own byte is fed (reordering
+    // "hello…" into "ello…h"). The interrupt path handles ALL silent-
+    // stall input, Esc included.
+    if (self.esc_probe_r != null and event != .live_input and event != .done and event != .error_occurred) {
         const now = util_time.nowMillis();
         if (now - self.last_esc_check >= 50) {
             self.last_esc_check = now;
@@ -2851,37 +2906,59 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             }
         }
     }
+    if (event != .tick) self.last_event_ms = util_time.nowMillis();
     switch (event) {
         .content_delta => |d| {
-            // P4: freeze the live pending-input echo line so output flows
-            // below it (the pending buffer survives, redraws on next key).
-            lineinput.pendingSealLine(self.w);
-            // Close the "(thinking…)" marker line before the first real text.
-            if (self.thinking_newline_needed) {
-                self.thinking_newline_needed = false;
-                try std.Io.Writer.writeAll(self.w, "\n");
-            }
-            // Live print with the one-space response margin (display only —
-            // self.text keeps the raw text for history).
-            try writeMarginLines(self.w, d, " ", &self.at_line_start);
-            std.Io.File.Writer.flush(self.file_writer) catch {};
+            // History keeps the raw text; the display is LINE-BUFFERED:
+            // whole lines print above the live region (regionPrintLine),
+            // a trailing partial line waits for its newline or turn end.
+            // Line-atomicity is what lets the input region stay visible
+            // while text flows — no mid-line text ever crosses it.
             try self.text.appendSlice(self.alloc, d);
+            self.tick_n = 0; // data flows — silence-flush cadence restarts
+            for (d) |ch| {
+                // Continuation bytes belong to the char already counted —
+                // they can never be a flush point (a flush mid-char split
+                // UTF-8 and printed mojibake at the wrap boundary).
+                if (ch >= 0x80 and ch < 0xC0) {
+                    try self.line_buf.append(self.alloc, ch);
+                    continue;
+                }
+                // A new char begins: flush FIRST if the buffered content
+                // already reached the terminal width — the soft-wrap
+                // point the terminal would take anyway, so single-line
+                // responses stream visibly below… above the region.
+                if (self.line_cols + 1 >= lineinput.currentTermWidth()) {
+                    self.flushLine();
+                }
+                try self.line_buf.append(self.alloc, ch);
+                if (ch == '\n') {
+                    self.flushLine();
+                    continue;
+                }
+                // Display width (UTF-8 lead bytes count — mirrors
+                // lineinput.charWidth).
+                if (ch >= 0xE0) {
+                    self.line_cols += 2;
+                } else if (ch >= 0x20) {
+                    self.line_cols += 1;
+                }
+            }
         },
         .thinking_delta => {
-            lineinput.pendingSealLine(self.w);
             if (!self.thinking_shown) {
                 self.thinking_shown = true;
-                self.thinking_newline_needed = true;
-                try std.Io.Writer.writeAll(self.w, "\x1b[2m(thinking…)\x1b[0m");
+                lineinput.regionPrintLine(self.w, "\x1b[2m(thinking…)\x1b[0m\n");
                 std.Io.File.Writer.flush(self.file_writer) catch {};
             }
         },
         .tool_call => |tu| {
-            lineinput.pendingSealLine(self.w);
             // Per-event arena: the summary strings are print-and-done.
             var sum_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer sum_arena.deinit();
-            try self.w.print("\n  ⏺ \x1b[1m{s}\x1b[0m{s}\n", .{ tu.name, toolArgSummary(sum_arena.allocator(), tu.name, tu.input) });
+            var tb: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&tb, "  ⏺ \x1b[1m{s}\x1b[0m{s}\n", .{ tu.name, toolArgSummary(sum_arena.allocator(), tu.name, tu.input) }) catch "";
+            lineinput.regionPrintLine(self.w, line);
             std.Io.File.Writer.flush(self.file_writer) catch {};
             try self.tools.append(self.alloc, .{
                 .id = try self.alloc.dupe(u8, tu.id),
@@ -2894,8 +2971,53 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             if (u) |uu| self.usage = uu;
         },
         .error_occurred => |e| self.saw_error = e,
+        .live_input => |b| {
+            // Keystroke reported by the provider's silent-stall wait: the
+            // region's input row must echo it even while the gateway
+            // produces nothing. The cursor is parked on the region's input
+            // row by every region operation — redraw is position-safe.
+            lineinput.feedLiveByte(b, self.w);
+            std.Io.File.Writer.flush(self.file_writer) catch {};
+        },
+        .tick => {
+            // ~100ms of socket silence. After 1.5s of CONTINUOUS silence
+            // (15 ticks — content arrival resets the count) flush any
+            // buffered partial line so a trickling single-line response
+            // still becomes visible; newline and soft-wrap stay the clean
+            // flush points during normal flow, keeping text from
+            // shattering into fragments. Then refresh the status row.
+            self.tick_n += 1;
+            if (self.tick_n % 15 == 0 and self.line_cols > 0) {
+                self.flushLine();
+            }
+            const now = util_time.nowMillis();
+            const elapsed = now - self.req_t0;
+            const queued = lineinput.queuedCount();
+            var sb: [96]u8 = undefined;
+            const st = if (queued > 0)
+                std.fmt.bufPrint(&sb, "⏳ 等待响应 {d}.{d}s · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
+                    @divTrunc(elapsed, 1000),
+                    @mod(@divTrunc(elapsed, 100), 10),
+                    queued,
+                }) catch ""
+            else
+                std.fmt.bufPrint(&sb, "⏳ 等待响应 {d}.{d}s · Esc 中断 · Enter 排队", .{
+                    @divTrunc(elapsed, 1000),
+                    @mod(@divTrunc(elapsed, 100), 10),
+                }) catch "";
+            lineinput.regionStatus(self.w, st);
+            std.Io.File.Writer.flush(self.file_writer) catch {};
+        },
     }
 }
+
+fn flushLine(self: *StreamAgg) void {
+        lineinput.regionPrintLine(self.w, self.line_buf.items);
+        self.line_buf.clearRetainingCapacity();
+        self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
+        std.Io.File.Writer.flush(self.file_writer) catch {};
+    }
+
 
 /// Stream the completion, printing deltas live; returns REPL-owned blocks.
 fn streamComplete(
@@ -2907,8 +3029,30 @@ fn streamComplete(
     file_writer: *std.Io.File.Writer,
     alloc: std.mem.Allocator,
 ) !llm.provider.CompleteResponse {
-    var agg = StreamAgg{ .alloc = alloc, .w = w, .file_writer = file_writer, .esc_probe_r = r };
+    var agg = StreamAgg{
+        .alloc = alloc,
+        .w = w,
+        .file_writer = file_writer,
+        .esc_probe_r = r,
+        .req_t0 = util_time.nowMillis(),
+        .last_event_ms = util_time.nowMillis(),
+    };
     defer agg.deinit();
+    agg.line_buf.append(alloc, ' ') catch {}; // response margin seed
+
+    // Live input region: visible for the WHOLE generation — the input
+    // area must not disappear the moment a message is sent. Dropped on
+    // every exit path (defer); the tool phase re-begins it.
+    lineinput.regionBegin(w, "\x1b[2m⏳ 等待响应 0.0s · Esc 中断 · Enter 排队\x1b[0m");
+    defer {
+        // Flush a trailing partial line, then drop the region. Typed text
+        // merges into the next prompt — never frozen into the transcript.
+        if (agg.line_buf.items.len > 1) {
+            agg.line_buf.append(alloc, '\n') catch {};
+            agg.flushLine();
+        }
+        lineinput.regionEnd(w);
+    }
 
     // Keep the terminal RAW for the whole generation: readLine restores
     // cooked mode when it returns, and under cooked input discipline the
@@ -2962,6 +3106,16 @@ fn streamComplete(
         try blocks.append(alloc, .{ .tool_use = tu });
     }
 
+    // Explicit teardown in the success path — the tail newline MUST come
+    // AFTER the region is dropped, or it moves the cursor below the
+    // region first and the deferred clear wipes the wrong rows (the
+    // typed ⌨ row survived into the transcript exactly this way). The
+    // defer above still covers every error path.
+    if (agg.line_buf.items.len > 1) {
+        agg.line_buf.append(alloc, '\n') catch {};
+        agg.flushLine();
+    }
+    lineinput.regionEnd(w);
     try std.Io.Writer.writeAll(w, "\n");
     return .{
         .content = try blocks.toOwnedSlice(alloc),
@@ -3201,6 +3355,10 @@ fn finishToolCall(
 ) !bool {
     logger.info("Tool execute: {s}", .{p.call.tool_name});
 
+    // Keep the live region up through the tool phase (between generations
+    // nothing else owns the bottom rows).
+    lineinput.regionBegin(w, "\x1b[2m⚙ 执行工具 · Esc 中断\x1b[0m");
+
     // Colorized code-change preview (TUI-only, shown only on success).
     // Tool output itself stays compact — it feeds LLM history; the diff
     // never does. Render failures must not break tool flow.
@@ -3215,15 +3373,22 @@ fn finishToolCall(
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    // Preview with a 2-space left margin on continuation lines (raw output
-    // often embeds newlines; those lines used to slam into column 0).
-    try std.Io.Writer.print(w, "  [{s}: ", .{p.call.tool_name});
-    var at_ls = false;
-    try writeMarginLines(w, if (raw.len > 200) raw[0..200] else raw, "  ", &at_ls);
-    try std.Io.Writer.writeAll(w, "]\n");
+    // Result line above the live region (raw output capped at 200 chars,
+    // always at a UTF-8 boundary; embedded newlines are fine —
+    // regionPrintLine is multi-line safe).
+    var disp_cut: usize = @min(raw.len, 200);
+    while (disp_cut > 0 and disp_cut < raw.len and (raw[disp_cut] & 0xC0) == 0x80) disp_cut -= 1;
+    regionPrintF(w, "  [{s}: {s}]\n", .{ p.call.tool_name, raw[0..disp_cut] });
 
+    // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
+    // char boundary. A mid-char cut used to poison every later request:
+    // the gateway's JSON parser rejected the whole session with
+    // "Invalid UTF-8 middle byte" (tool outputs full of CJK comments hit
+    // the 4096th byte mid-汉字 all the time).
+    var hist_cut: usize = max_result;
+    while (hist_cut > 0 and hist_cut < raw.len and (raw[hist_cut] & 0xC0) == 0x80) hist_cut -= 1;
     const content_for_history: []const u8 = if (truncated)
-        try alloc.dupe(u8, raw[0..max_result])
+        try alloc.dupe(u8, raw[0..hist_cut])
     else
         raw; // ownership transfers, no dupe needed
 
@@ -3247,6 +3412,15 @@ fn finishToolCall(
 }
 
 // ──── Code-change diff preview ────
+
+/// Format one line and print it ABOVE the live region (see
+/// lineinput.regionPrintLine). Oversized formats are skipped — every
+/// caller's line is width-capped upstream.
+fn regionPrintF(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    lineinput.regionPrintLine(w, line);
+}
 
 /// Render a colorized preview of what a file-modifying tool actually
 /// changed: removed lines in red, added in green, dim overflow note —
@@ -3284,7 +3458,7 @@ fn renderCodeDiff(
         const old_rows = std.mem.count(u8, ot, "\n") + 1;
         const new_rows = std.mem.count(u8, new_text, "\n") + 1;
         if (old_rows > DIFF_MAX_DIFFABLE_LINES or new_rows > DIFF_MAX_DIFFABLE_LINES) {
-            try std.Io.Writer.print(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
+            regionPrintF(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
             return;
         }
         const d = try diff_util.computeDiff(alloc, ot, new_text);
@@ -3301,18 +3475,18 @@ fn renderCodeDiff(
     while (i < lines.items.len and i < DIFF_MAX_LINES) : (i += 1) {
         const trunc = try diffTruncLine(alloc, lines.items[i].content, DIFF_MAX_COLS);
         switch (lines.items[i].kind) {
-            .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
-            .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
+            .removed => regionPrintF(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
+            .added => regionPrintF(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
             .equal => {},
         }
     }
     if (i < lines.items.len) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
+        regionPrintF(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
     } else if (old_text == null and lines.items.len > 0) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
+        regionPrintF(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
     }
     if (replace_all) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
+        regionPrintF(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
     }
 }
 

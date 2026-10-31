@@ -50,6 +50,13 @@ pub const CompleteOptions = struct {
     stop_sequences: ?[]const []const u8 = null,
     /// Tool declarations the model may call. null = plain chat (no tools).
     tools: ?[]const ToolSpec = null,
+    /// Interactive REPL streams only: make the idle socket wait
+    /// interruptible by Esc/Ctrl-C on stdin (util/stream_interrupt.zig).
+    /// A gateway that never answers then cancels on the spot instead of
+    /// sitting dead until the stall watchdog. Background callers
+    /// (subagents, reflection) MUST leave this false — stdin belongs to
+    /// the REPL thread.
+    esc_interrupt: bool = false,
 };
 
 pub const CompleteResponse = struct {
@@ -100,6 +107,15 @@ pub const StreamEvent = union(enum) {
     tool_call: ToolUseBlock,
     done: ?Usage,
     error_occurred: ProviderError,
+    /// A keystroke that arrived while the socket was silent (gateway
+    /// stall). Delivered up from the provider's interruptible wait so the
+    /// REPL — which owns the screen — can echo/edit it live. Without this
+    /// the byte was stashed invisibly and the user typed into a void.
+    live_input: u8,
+    /// ~100ms passed with no socket data. The REPL renders the elapsed-
+    /// time status row from it — a stalled gateway must be VISIBLE
+    /// ("等待响应 12.4s…"), not a dead screen.
+    tick,
 };
 
 pub const ProviderError = error{

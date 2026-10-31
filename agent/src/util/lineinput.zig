@@ -84,6 +84,12 @@ fn renderCommitted(w: *std.Io.Writer, prompt: []const u8, line: []const u8) !voi
     try w.writeAll("\n");
 }
 
+/// Terminal width for callers outside the editor (the stream line
+/// buffer's soft-wrap flush points).
+pub fn currentTermWidth() usize {
+    return @max(effWidth(), 8);
+}
+
 /// Terminal column count via TIOCGWINSZ; 80 as the conservative fallback.
 fn termWidth() usize {
     var ws: std.c.winsize = undefined;
@@ -497,6 +503,22 @@ pub var pending_buf: [2048]u8 = undefined;
 pub var pending_len: usize = 0;
 /// The dim echo line is currently drawn at the cursor (no \n yet).
 pub var pending_shown: bool = false;
+/// Status row under the pending input row (elapsed wait / queue info).
+/// Written by the REPL's tick handler; both rows form the generation-
+/// period live region. Empty = no status row.
+pub var pending_status_buf: [96]u8 = undefined;
+pub var pending_status_len: usize = 0;
+
+pub fn pendingStatusSet(s: []const u8) void {
+    const n = @min(s.len, pending_status_buf.len);
+    @memcpy(pending_status_buf[0..n], s[0..n]);
+    pending_status_len = n;
+}
+
+pub fn queuedCount() usize {
+    return queued_count - queued_read;
+}
+
 /// Stream-side cursor state: the stream callback syncs its at_line_start
 /// here BEFORE the esc probe, so the pending echo knows whether the cursor
 /// sits mid-output-line — redrawing with \r\x1b[2K there would EAT the
@@ -551,43 +573,94 @@ fn pendingDisplay() []const u8 {
     return s[i..];
 }
 
-/// (Re)draw the dim pending-input echo line at the cursor. Single line,
-/// display-capped — safe for \r + clear-line redraw. When the stream
-/// cursor is mid-output-line, first drop below it (\n) instead of wiping.
+/// (Re)draw the generation-period live region at the cursor: input row
+/// (`⌨ …`, display-capped) plus a dim status row below it. CUD/CUU move
+/// between the rows (never \n downward — the region usually sits on the
+/// last screen rows and \n would scroll). Cursor parks on the input row.
+/// When the stream cursor is mid-output-line, first drop below it.
 pub fn renderPendingLine(w: *std.Io.Writer) void {
-    if (pending_len == 0) {
-        if (pending_shown) {
-            std.Io.Writer.writeAll(w, "\r\x1b[2K") catch {};
-        }
-        pending_shown = false;
+    if (pending_len == 0 and pending_status_len == 0) {
+        if (pending_shown) clearPendingRegion(w);
         return;
     }
     if (!stream_at_line_start) {
         std.Io.Writer.writeAll(w, "\n") catch {};
         stream_at_line_start = true;
     }
-    std.Io.Writer.print(w, "\r\x1b[2K\x1b[2m⌨ {s}\x1b[0m", .{pendingDisplay()}) catch {};
+    std.Io.Writer.writeAll(w, "\r\x1b[2K") catch {};
+    if (pending_len > 0) {
+        std.Io.Writer.print(w, "\x1b[2m⌨ {s}\x1b[0m", .{pendingDisplay()}) catch {};
+    }
+    if (pending_status_len > 0) {
+        std.Io.Writer.writeAll(w, "\x1b[B\r\x1b[2K") catch {};
+        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
+        std.Io.Writer.writeAll(w, "\r\x1b[A") catch {};
+    }
     pending_shown = true;
 }
 
-/// Seal the echo line before stream output prints: freeze it into
-/// scrollback with a newline so output flows BELOW it (chat-app style).
-/// The pending buffer itself survives and redraws on the next keystroke.
-pub fn pendingSealLine(w: *std.Io.Writer) void {
-    if (pending_shown) {
-        std.Io.Writer.writeAll(w, "\n") catch {};
-        pending_shown = false;
-    }
+/// Erase the two-row region; cursor returns to the (former) input row.
+fn clearPendingRegion(w: *std.Io.Writer) void {
+    std.Io.Writer.writeAll(w, "\r\x1b[2K\x1b[B\r\x1b[2K\r\x1b[A") catch {};
 }
 
-fn pendingAppend(c: u8, w: ?*std.Io.Writer) void {
+/// ── Turn-scoped live region lifecycle ──────────────────────────────
+/// The region (input row + status row) stays visible for the WHOLE turn:
+/// begun at generation start, every output line prints ABOVE it via
+/// regionPrintLine (line-atomic — text never flows mid-line across the
+/// region boundary), ended at turn end. This is what keeps the input
+/// area on screen while the model streams.
+
+/// Show the region at the cursor with the given status. Idempotent.
+pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
+    pendingStatusSet(status);
+    if (!stream_at_line_start) {
+        std.Io.Writer.writeAll(w, "\n") catch {};
+        stream_at_line_start = true;
+    }
+    pending_shown = true; // draw even with an empty input row
+    renderPendingLine(w);
+}
+
+/// Print one complete output line ABOVE the region: clear the two region
+/// rows, write the line (newline appended when missing), redraw the
+/// region at the new bottom. The cursor parks on the region's input row.
+pub fn regionPrintLine(w: *std.Io.Writer, line: []const u8) void {
+    if (pending_shown) clearPendingRegion(w);
+    std.Io.Writer.writeAll(w, line) catch {};
+    if (line.len == 0 or line[line.len - 1] != '\n') {
+        std.Io.Writer.writeAll(w, "\n") catch {};
+    }
+    if (pending_status_len > 0 or pending_len > 0) {
+        renderPendingLine(w);
+    } else {
+        pending_shown = false;
+    }
+    stream_at_line_start = true;
+}
+
+/// End of turn: drop the region. Typed pending text is NOT frozen into
+/// the transcript — it merges into the next prompt (typeahead path).
+pub fn regionEnd(w: *std.Io.Writer) void {
+    if (pending_shown) clearPendingRegion(w);
+    pending_shown = false;
+    pendingStatusSet("");
+}
+
+/// Refresh the status row only (tick path); the region stays put.
+pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
+    pendingStatusSet(status);
+    if (pending_shown) renderPendingLine(w);
+}
+
+pub fn pendingAppend(c: u8, w: ?*std.Io.Writer) void {
     if (pending_len >= pending_buf.len) return; // hard cap, drop silently
     pending_buf[pending_len] = c;
     pending_len += 1;
     if (w) |ww| renderPendingLine(ww);
 }
 
-fn pendingBackspace(w: ?*std.Io.Writer) void {
+pub fn pendingBackspace(w: ?*std.Io.Writer) void {
     if (pending_len == 0) return;
     pending_len -= 1;
     while (pending_len > 0 and (pending_buf[pending_len] & 0xC0) == 0x80) pending_len -= 1;
@@ -597,7 +670,7 @@ fn pendingBackspace(w: ?*std.Io.Writer) void {
 /// Enter pressed during generation: queue the pending text as a message
 /// (mid-turn injection / auto-send at turn end). Returns true when a
 /// message was queued.
-fn pendingSubmit(w: ?*std.Io.Writer) bool {
+pub fn pendingSubmit(w: ?*std.Io.Writer) bool {
     if (pending_len == 0) return false;
     if (queued_count >= QUEUED_MAX) return false;
     @memcpy(queued_msgs[queued_count][0..pending_len], pending_buf[0..pending_len]);
@@ -605,12 +678,7 @@ fn pendingSubmit(w: ?*std.Io.Writer) bool {
     queued_count += 1;
     pending_len = 0;
     if (w) |ww| {
-        if (!stream_at_line_start) {
-            std.Io.Writer.writeAll(ww, "\n") catch {};
-            stream_at_line_start = true;
-        }
-        pendingSealLine(ww);
-        std.Io.Writer.writeAll(ww, "  \x1b[2m↳ 已排队（本轮生效或回合后自动发送）\x1b[0m\n") catch {};
+        regionPrintLine(ww, "  \x1b[2m↳ 已排队（本轮生效或回合后自动发送）\x1b[0m\n");
     }
     return true;
 }
@@ -692,6 +760,22 @@ fn captureEscSeq(r: *std.Io.Reader) [8]u8 {
     return seq;
 }
 
+/// Feed one non-Esc keystroke into the generation-period input line and
+/// (when `w` is given) echo it live: printable/Backspace edit the dim
+/// pending line, Enter queues the message. Shared by the esc probe
+/// (in-stream) and the provider's stream-interrupt wait (silent stall) —
+/// the latter used to stash bytes with no echo, so typing during a
+/// gateway stall was invisible.
+pub fn feedLiveByte(c: u8, w: ?*std.Io.Writer) void {
+    if (c == '\r') {
+        _ = pendingSubmit(w);
+    } else if (c == 0x7f) {
+        pendingBackspace(w);
+    } else if (c >= 0x20 or c == '\n') {
+        pendingAppend(c, w);
+    }
+}
+
 fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
     const c = r.takeByte() catch return false;
     if (paste_active) {
@@ -732,13 +816,7 @@ fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
         return true;
     }
     if (c != 0x1b) {
-        if (c == '\r') {
-            _ = pendingSubmit(w);
-        } else if (c == 0x7f) {
-            pendingBackspace(w);
-        } else if (c >= 0x20 or c == '\n') {
-            pendingAppend(c, w);
-        }
+        feedLiveByte(c, w);
         return false;
     }
     // ESC: classify the sequence. Paste markers feed pending; anything
