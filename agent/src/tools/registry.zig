@@ -235,6 +235,10 @@ pub fn ToolRegistry(comptime tools: []const ToolDefinition) type {
 pub fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {
     if (input != .object) return null;
     const obj = input.object.get(key) orelse return null;
+    // Wrong-typed field used to hit `.string` on an inactive union field —
+    // panic in Debug, UB in ReleaseFast. Degrade to null (callers report
+    // "missing field") instead of crashing the tool loop.
+    if (obj != .string) return null;
     return obj.string;
 }
 
@@ -588,4 +592,19 @@ test "ToolDefinition concurrency safety" {
 test "ToolDefinition destructive detection" {
     const input = std.json.Value{ .object = .{} };
     try std.testing.expect(!bash_tool.isDestructive(input));
+}
+
+test "getStringField degrades wrong-typed field to null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        "{\"path\": 123, \"name\": \"ok\"}", .{});
+    // Wrong-typed field: null, not a union-field panic.
+    try std.testing.expect(getStringField(parsed, "path") == null);
+    try std.testing.expectEqualStrings("ok", getStringField(parsed, "name").?);
+    // Missing key / non-object input.
+    try std.testing.expect(getStringField(parsed, "nope") == null);
+    try std.testing.expect(getStringField(std.json.Value{ .integer = 1 }, "path") == null);
 }

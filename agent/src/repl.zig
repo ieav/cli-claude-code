@@ -44,6 +44,7 @@ const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
 const format_mod = @import("util/format.zig");
+const diff_util = @import("util/diff.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
 const runtime_monitor = @import("runtime/monitor.zig");
@@ -53,6 +54,14 @@ const allocator = std.heap.smp_allocator;
 
 const MAX_AGENT_ITERATIONS: usize = 50;
 const MAX_CONTEXT_TOKENS: u32 = 128_000;
+
+/// Code-change diff preview (TUI) — see renderCodeDiff. Cap one edit's
+/// block at 15 rows × 110 display columns so a big rewrite can't flood
+/// the screen; oversized files skip the preview instead of diffing them.
+const DIFF_MAX_LINES: usize = 15;
+const DIFF_MAX_COLS: usize = 110;
+const DIFF_MAX_DIFFABLE_LINES: usize = 800;
+const DIFF_READ_CAP: usize = 1024 * 1024;
 
 /// Baseline fingerprint of all settings files, refreshed by (a) startup,
 /// (b) every own-save (autoSaveSettings, /mode, model picker). When a prompt
@@ -1455,7 +1464,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // every tool_use; approved calls are collected for phase 2.
             var prepared = std.ArrayList(PreparedCall).empty;
             var total_calls: u32 = 0;
-            defer prepared.deinit(allocator);
+            defer {
+                for (prepared.items) |pc| {
+                    if (pc.old_content) |oc| allocator.free(oc);
+                }
+                prepared.deinit(allocator);
+            }
 
             // Iterate the owned copy in history — the response was freed above.
             const last_assistant = history.items[history.items.len - 1].content;
@@ -1509,9 +1523,39 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         continue;
                     }
 
+                    // Capture pre-write bytes for the diff preview.
+                    // renderCodeDiff runs post-execution (finishToolCall),
+                    // when the old content is already gone.
+                    var old_content: ?[]u8 = null;
+                    var old_unavailable = false;
+                    if (isFileModifyingTool(tc.name) and
+                        registry.getStringField(tc.input, "old_string") == null and
+                        registry.getStringField(tc.input, "content") != null)
+                    {
+                        if (registry.getStringField(tc.input, "path")) |fp| {
+                            if (std.Io.Dir.cwd().statFile(io, fp, .{})) |st| {
+                                if (st.size > DIFF_READ_CAP) {
+                                    old_unavailable = true;
+                                } else if (std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, fp, allocator, std.Io.Limit.limited(DIFF_READ_CAP))) |oc| {
+                                    old_content = oc;
+                                } else |read_err| {
+                                    // FileNotFound → genuinely new file (all-green);
+                                    // anything else → skip the preview rather than
+                                    // mislabel the overwrite as a new file.
+                                    if (read_err != error.FileNotFound) old_unavailable = true;
+                                }
+                            } else |stat_err| {
+                                if (stat_err != error.FileNotFound) old_unavailable = true;
+                            }
+                        }
+                    }
+                    errdefer if (old_content) |oc| allocator.free(oc);
+
                     try prepared.append(allocator, .{
                         .call = .{ .tool_name = tc.name, .input = tc.input, .tool_use_id = tc.id },
                         .snap_id = snap_id,
+                        .old_content = old_content,
+                        .old_unavailable = old_unavailable,
                     });
                 }
             }
@@ -3135,6 +3179,12 @@ fn isFileModifyingTool(tool_name: []const u8) bool {
 const PreparedCall = struct {
     call: orchestration_mod.ToolCall,
     snap_id: ?[16]u8,
+    /// File bytes captured BEFORE a write-style tool runs — the diff
+    /// preview is rendered after execution, when it's too late to read.
+    old_content: ?[]u8 = null,
+    /// Prior content exists but can't be shown (oversized / unreadable) —
+    /// skip the preview rather than mislabel the overwrite as a new file.
+    old_unavailable: bool = false,
 };
 
 /// Phase 2 tail: print the outcome, truncate oversized output, record in the
@@ -3150,6 +3200,15 @@ fn finishToolCall(
     history_len: usize,
 ) !bool {
     logger.info("Tool execute: {s}", .{p.call.tool_name});
+
+    // Colorized code-change preview (TUI-only, shown only on success).
+    // Tool output itself stays compact — it feeds LLM history; the diff
+    // never does. Render failures must not break tool flow.
+    if (!result.is_error and isFileModifyingTool(p.call.tool_name) and !p.old_unavailable) {
+        var diff_arena = std.heap.ArenaAllocator.init(allocator);
+        defer diff_arena.deinit();
+        renderCodeDiff(w, diff_arena.allocator(), p.call.input, p.old_content) catch {};
+    }
 
     // Truncate large outputs for history — must dupe before freeing
     const max_result = 4096;
@@ -3185,6 +3244,126 @@ fn finishToolCall(
     // If not truncated, content_for_history == result.output; ownership moved into history
     try std.Io.File.Writer.flush(file_writer);
     return result.is_error;
+}
+
+// ──── Code-change diff preview ────
+
+/// Render a colorized preview of what a file-modifying tool actually
+/// changed: removed lines in red, added in green, dim overflow note —
+/// visually distinct from every other TUI line so edits scan fast.
+/// edit-style tools (old_string/new_string) diff those strings directly;
+/// write-style tools (content) diff the captured pre-write bytes.
+/// `alloc` is a per-call scratch arena — nothing here outlives the print.
+fn renderCodeDiff(
+    w: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    input: std.json.Value,
+    old_content: ?[]const u8,
+) !void {
+    const red = "\x1b[31m";
+    const green = "\x1b[32m";
+    const dim = "\x1b[2m";
+    const reset = "\x1b[0m";
+
+    var old_text: ?[]const u8 = null; // null → brand-new content
+    var new_text: []const u8 = "";
+    var replace_all = false;
+    if (registry.getStringField(input, "old_string")) |old_s| {
+        old_text = old_s;
+        new_text = registry.getStringField(input, "new_string") orelse "";
+        replace_all = registry.getBool(input, "replaceAll") orelse false;
+    } else if (registry.getStringField(input, "content")) |content| {
+        new_text = content;
+        if (old_content) |oc| old_text = oc;
+    } else return; // nothing diffable on this input
+
+    var lines: std.ArrayList(diff_util.DiffLine) = .empty;
+    if (old_text) |ot| {
+        // computeDiff hides lines common to both sides — an old_string
+        // that carries surrounding context would otherwise echo it twice.
+        const old_rows = std.mem.count(u8, ot, "\n") + 1;
+        const new_rows = std.mem.count(u8, new_text, "\n") + 1;
+        if (old_rows > DIFF_MAX_DIFFABLE_LINES or new_rows > DIFF_MAX_DIFFABLE_LINES) {
+            try std.Io.Writer.print(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
+            return;
+        }
+        const d = try diff_util.computeDiff(alloc, ot, new_text);
+        for (d) |dl| {
+            if (dl.kind != .equal) try lines.append(alloc, dl);
+        }
+    } else {
+        for (try diffSplitLines(alloc, new_text)) |l| {
+            try lines.append(alloc, .{ .kind = .added, .content = l });
+        }
+    }
+
+    var i: usize = 0;
+    while (i < lines.items.len and i < DIFF_MAX_LINES) : (i += 1) {
+        const trunc = try diffTruncLine(alloc, lines.items[i].content, DIFF_MAX_COLS);
+        switch (lines.items[i].kind) {
+            .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
+            .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
+            .equal => {},
+        }
+    }
+    if (i < lines.items.len) {
+        try std.Io.Writer.print(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
+    } else if (old_text == null and lines.items.len > 0) {
+        try std.Io.Writer.print(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
+    }
+    if (replace_all) {
+        try std.Io.Writer.print(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
+    }
+}
+
+/// Split text into lines for diff display. splitSequence yields one
+/// artifact empty element for a trailing "\n" — drop it (it would render
+/// a dangling "+ "/"- " row after every normal file edit).
+fn diffSplitLines(alloc: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitSequence(u8, text, "\n");
+    while (it.next()) |line| try lines.append(alloc, line);
+    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+        _ = lines.pop();
+    }
+    return lines.toOwnedSlice(alloc);
+}
+
+/// Truncate one diff line to `max_cols` DISPLAY columns (CJK counts 2),
+/// never cutting mid-UTF-8; tabs expand to 4 spaces so code indent stays
+/// readable; other control bytes are stripped. Append "…" when cut.
+fn diffTruncLine(alloc: std.mem.Allocator, s: []const u8, max_cols: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var col: usize = 0;
+    var i: usize = 0;
+    var cut = false;
+    while (i < s.len) {
+        const c = s[i];
+        var piece: []const u8 = undefined;
+        var cw: usize = undefined;
+        if (c == '\t') {
+            piece = "    ";
+            cw = 4;
+            i += 1;
+        } else if (c < 0x20) {
+            i += 1;
+            continue;
+        } else {
+            var j = i + 1;
+            while (j < s.len and (s[j] & 0xC0) == 0x80) j += 1;
+            piece = s[i..j];
+            cw = if (c >= 0xE0) 2 else 1;
+            i = j;
+        }
+        if (col + cw > max_cols - 1) { // keep one column for the ellipsis
+            cut = true;
+            break;
+        }
+        try out.appendSlice(alloc, piece);
+        col += cw;
+    }
+    if (cut) try out.appendSlice(alloc, "…");
+    return out.toOwnedSlice(alloc);
 }
 
 // ──── Conversation management helpers ────
@@ -5035,6 +5214,92 @@ test "writeMarginLines keeps the margin across chunk splits" {
     var ls3 = false;
     try writeMarginLines(w, "x\n", "  ", &ls3);
     try std.testing.expectEqualStrings("x\n", aw.written());
+}
+
+test "diffSplitLines drops only the artifact trailing empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const two = try diffSplitLines(a, "a\nb\n");
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqualStrings("b", two[1]);
+
+    const no_nl = try diffSplitLines(a, "x");
+    try std.testing.expectEqual(@as(usize, 1), no_nl.len);
+
+    // "a\n\n" has a REAL blank line — only the split artifact goes.
+    const blank = try diffSplitLines(a, "a\n\n");
+    try std.testing.expectEqual(@as(usize, 2), blank.len);
+    try std.testing.expectEqualStrings("", blank[1]);
+
+    const empty = try diffSplitLines(a, "");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "diffTruncLine caps display width CJK-aware, expands tabs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const short = try diffTruncLine(a, "const x = 1;", DIFF_MAX_COLS);
+    try std.testing.expectEqualStrings("const x = 1;", short);
+
+    // CJK chars are 2 columns: cap 6 → 2 chars + ellipsis.
+    const cjk = try diffTruncLine(a, "中文注释内容", 6);
+    try std.testing.expectEqualStrings("中文…", cjk);
+
+    // Never cuts mid-UTF-8: "中" needs 2 cols but only 1 is left.
+    const boundary = try diffTruncLine(a, "ab中", 3);
+    try std.testing.expectEqualStrings("ab…", boundary);
+
+    const tab = try diffTruncLine(a, "\tfoo", DIFF_MAX_COLS);
+    try std.testing.expectEqualStrings("    foo", tab);
+}
+
+test "renderCodeDiff colors edits and hides unchanged context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    // old_string carries surrounding context ("a"/"c") that appears on
+    // both sides — it must not be echoed as a -/+ pair.
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        "{\"path\":\"f.zig\",\"old_string\":\"a\\nb\\nc\",\"new_string\":\"a\\nX\\nc\"}", .{});
+    try renderCodeDiff(&aw.writer, a, input, null);
+
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[31m- b\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[32m+ X\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- c") == null);
+
+    // Write-style with no prior content → all green + new-file footer.
+    aw.writer.end = 0;
+    const wr = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        "{\"path\":\"new.zig\",\"content\":\"line1\\nline2\"}", .{});
+    try renderCodeDiff(&aw.writer, a, wr, null);
+    const out2 = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\x1b[32m+ line1\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "新文件 · 2 行") != null);
+
+    // Oversized input: summary line only, no per-line diff.
+    aw.writer.end = 0;
+    var big_old: std.ArrayList(u8) = .empty;
+    var big_new: std.ArrayList(u8) = .empty;
+    for (0..DIFF_MAX_DIFFABLE_LINES + 1) |_| {
+        try big_old.appendSlice(a, "old line\n");
+        try big_new.appendSlice(a, "new line\n");
+    }
+    var big_obj: std.json.ObjectMap = .empty;
+    try big_obj.put(a, "old_string", .{ .string = big_old.items });
+    try big_obj.put(a, "new_string", .{ .string = big_new.items });
+    try renderCodeDiff(&aw.writer, a, .{ .object = big_obj }, null);
+    const out3 = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out3, "改动过大不展开 diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "\x1b[31m- old line") == null);
 }
 
 test "plan summary, append and remove system blocks (T8)" {
