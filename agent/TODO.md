@@ -440,3 +440,18 @@
   - **π 索引消费**：反思 prompt 注入事件环 π 采样行（"[earlier] ..."），突破近因视野
   - 子代理 prompt 引导：权限被拒不重试同类操作（实测：被拒后如实报告而非撞满 10 轮）
 - **E2E 全绿**：φ 清扫 6→4（fresh 保留）+ Ctrl-C 取消 + 取消后应答 + 优先级标记 + 干净退出。283 测试（278 pass/5 skip/0 fail）。USAGE.md 补 env/config 说明。
+
+## P39（2026-10-31）v0.6.1 稳定性收尾 + 反思卫生 + 全量文档对账
+
+**背景**：c8004f6（P3）之后 7 个提交未记账（发版/看护狗加固/P4/P5/评审修复/粘贴/反思卫生），文档四件套（USAGE / DESIGN §14 / upgrade-plan / TODO）口径滞后，本日一次扫清。
+
+- **v0.6.1 发版（efd7fa4，2026-10-31 00:00:49）**：LLM 请求看护狗（网关停摆不再永久挂死——"agent 工具间歇挂死"的根因修复）；agent 工具注册悬垂（ctx 指向循环体死栈槽，T6.3 接线漏花括号所致，E2E 曾纯靠栈运气通过）；后台反思最后一公里（v0.6.0 生成洞察后全部静默丢弃）；子代理权限门接中央管道（v0.6.0 门是空操作，headless Bash/写 unchecked）；并发恢复 1-8 可配 + 优先级申领 + 协作取消 + 快速失败重试；任务系统通电（类型化事件总线/主线程 cron/TaskPriority/π 采样反思）。四 target 重打，ReleaseFast aarch64-macos 看护狗 E2E 验证。283 测试
+- **看护狗自审加固（ec08e71）**：deadline 轮询窗口内恰好完成的请求可能被误 shutdown 已重池化 fd（finish-store vs poll-load 交错）——shutdown 前二次确认收窄到几条指令窗口；cached_timeout 全局量被主线程/子代理 worker/反思 worker 多线程武装（良性但真实的数据竞争）移除，改为每请求一次 getenv
+- **P4 生成中实时输入 + 中途注入（d74c43a）**：模型思考不再锁键盘——escProbe 的 stdin 轮询从静默 256B 缓冲改为暗色实时回显行 + 消息队列；回车=排队，agent loop 在工具轮间注入（模型同轮可见，E2E 实证补充可改变最终答案）；流结束仍存活的排队自动作为下一轮发送；未提交文本回填编辑器。顺带三修：queuedTake 惰性读游标（急移位覆盖返回中切片）、escProbe 每次排空全部就绪字节（原每 50ms 窗口一字节 ≈ 20B/s 上限）、退格可编辑。286 测试
+- **P5 monitor 误报治理（1d306a7）**：用户侧复现"写算法文件回合跑满 50 轮留 62 个 checkpoint + monitor 重复告警刷屏"。三因三修：上下文判定误用 max_tokens（响应上限 4096）→ 改按当前模型 contextEstimate（glm-5.3=131072）；同签名告警去重打印（事件仍入 π 环）；每轮写上限 15 次（FileWrite/FileEdit），写马拉松显式收束——Bash 批量创建按设计不设上限（其上下文成本是一条命令而非 N 个文件体）。TUI：usage 行紧凑暗色 `[model · in N → out M · X.Xs]`
+- **评审双修（264faf2）**：中途注入的 dupe 指针同时进 history 与 window_queries，compact/clearHistory 后 double free——window 自持副本（与常规查询路径契约一致）；pending 回显无视光标位置用 `\r\x1b[2K` 重绘会抹掉流式半行——先同步 at_line_start 再在半行下方落行
+- **粘贴进 pending（b71d371）**：生成中 bracketed paste 不再中断——ESC 序列捕获分类（[200~ 起始/[201~ 终止/其余照旧取消），粘贴字节追加进 live pending 行（CR 归一，多段仍一条消息）。顺带三 bug：定长零填充 [8]u8 比较（永不匹配，粘贴实际仍全部取消）、captureEscSeq 不查 reader 自身缓冲（突发误读为裸 Esc）、harness 需分块输入。typeahead 256→2048 对齐 pending。288 测试；真网关 E2E：粘贴→实时回显→中途注入→4242 标记进最终答案
+- **反思卫生三件套（11f0632）**：反思入库（启发式+后台 LLM）走提取路径同款 jaccard>0.8 近重门——重复洞察不再无限堆积，同文不再自刷 updated_at（e 衰减终于能老死它）；注入预算对 reflection 类行设 25% 上限（跳过不截断，真实用户/项目知识补满其余）；π 定时器 10min→24h（工具密集会话每 31 分钟空转触发），每 10 查询触发保留。289 测试
+- **文档对账（本日）**：① 两处过时注释统一改口——repl.zig T6.4 注释与 upgrade-plan 进度注记从"挂死未定位需 root 级工具"改为"已破案（网关停摆）+ 看护狗兜底 + 默认保守关（default-on E2E 复验后决策）"；② /help 补 /plan、/terminal-setup、/models 别名；③ USAGE：/agent 移出命令表改为表后说明（代码无该命令分支，agent 是动态注册的 LLM 工具）、命令表补 /plan 行、补 P4 生成中打字/粘贴行为、§5.9 对账（8→7 条，删已废弃"决策质量"行，补 P5 误报治理说明）；④ DESIGN 14.1 监控行更新为 P38 通电口径、14.2 任务系统两行闭环（cancel/retry/priority 已接线，残留仅 progress 字段）、14.4 基线 241→289；⑤ upgrade-plan T1~T8 共 23 行逐项勾选（T3.1/T3.3/T7.2 变体口径在进度注记）
+- **登记（沿袭，无变化）**：agent 默认开启复验待做；skill when_to_use 语义触发（$ARGUMENTS 基建已有）；monitor auto_fix 半环；knowledge_conflict 数据源；研究 Step1 本地预检/Step5 交互；alternatives 恒空；RoPE/φ 降维/黄金分割/ε 衰减；Windows 仅分析文档；Linux musl 实机待验；SIGSEGV 兜底（异步信号安全原因，接受）
+- **结果**：289 测试（284 pass / 5 skip / 0 fail）实测复核

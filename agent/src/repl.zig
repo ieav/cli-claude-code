@@ -524,13 +524,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
     };
-    // T6.4 status: the subagent dispatch tool is DISABLED by default —
-    // after an agent-tool turn, the next prompt submit intermittently
-    // blocks in an uninterruptible stdio wait (SIGTERM-unreachable, 0% CPU;
-    // memory safety was ruled out with a DebugAllocator build; a pure
-    // single-thread skeleton with no LLM reproduced it, so the trigger is
-    // the dynamic-tool path interacting with something in std — needs
-    // root-level tooling to pin). Opt back in with ZIV_AGENT_TOOL=1.
+    // T6.4 status: the subagent dispatch tool is conservatively DISABLED
+    // by default. The old "intermittent hang after an agent-tool turn" was
+    // root-caused on 2026-10-30 (TODO P38): the gateway occasionally
+    // accepts a request and then never answers, and the provider layer had
+    // no timeout — the dynamic-tool path itself was exonerated. Every LLM
+    // request is now guarded by the stall watchdog (util/llm_watchdog.zig,
+    // default 180s, ZIV_LLM_TIMEOUT_MS), so the default could flip back on
+    // after a default-on E2E re-validation; until then opt in with
+    // ZIV_AGENT_TOOL=1.
     const agent_tool_enabled = blk: {
         const v = env.get("ZIV_AGENT_TOOL") orelse break :blk false;
         break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
@@ -4733,9 +4735,10 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /stats            Show session statistics and token usage
         \\  /tools            List registered tools (12 tools)
         \\  /run <t> <json>   Execute a tool directly
+        \\  /terminal-setup   Show Shift+Enter setup guide for this terminal
         \\
         \\Model & Config:
-        \\  /model            Show current model and available models
+        \\  /model, /models   Show current model and available models
         \\  /model <name>     Switch to a different model
         \\  /mode             Cycle permission mode
         \\  /config           Interactive configuration menu
@@ -4748,6 +4751,8 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
         \\  /rewind           Rewind files AND conversation to a checkpoint
+        \\  /plan <goal>      Create a plan file anchored into the system
+        \\                    prompt; /plan shows it, /plan off ends it
         \\  /memory           Show injected and stored memories
         \\  /research <topic> Web research with phi-curated solutions
         \\  /diagnose <q>     Self-diagnose a weak answer vs your concern

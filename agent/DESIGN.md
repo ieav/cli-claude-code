@@ -2117,13 +2117,13 @@ src/
 | 十、自主优化研究 | `/research <topic>`：φ 生成 3 组查询 → **并发搜索**（每查询一线程）→ φ 精选 → ★ 推荐 + 理由（真实候选数）；推荐结果以记忆 + 图谱节点落库 |
 | 九、自诊断 | `/diagnose <concern>`：优先读 live 决策链（每查询 7 类埋点：memory_retrieval / context_assembly / llm_generation / response_postprocess / tool_selection / tool_execution / reflection_trigger，含真实耗时）→ 逐步 ✓/⚠ 走查 → confidence < φ 定位 root cause → 诊断结论以 `.feedback` 入库 |
 | 八、权限系统 | 6 模式 + 6 步管道；**规则模式匹配已实现**（glob 匹配 command/path，带 pattern 的规则精确命中才生效）；Default 模式只读免确认、dont_ask 只拒"需确认项"；连续拒绝看护（denial_tracker 接线） |
-| 三、运行时检测/监控 | **组件就绪、未接线**：builtin_rules 7 条 + monitor 循环（nanosleep）已实现，但 REPL 不启动 monitor/cron/event_bus（见 14.2） |
+| 三、运行时检测/监控 | P38 通电：cron 主线程执行（MEMORY_DECAY φ 清扫 + HEALTH_CHECK runChecks，上下文口径按当前模型 `contextEstimate`）；EventBus 类型化 + REPL 六类 emit 点；monitor 告警去重（P5） |
 | 操作记录与回滚 | `/rewind` 支持 `[0] 会话初始态` 哨兵（撤销全部文件改动），preview→confirm→restore→日志收缩全链实测 |
 
 ### 14.2 与设计的偏差
 
 > 2026-10-29 设计符合性审计后对账：下列前五行为此前登记、现已闭环（移入 14.1）；
-> 其后为**现行**偏差清单。
+> 2026-10-31 再对账：任务系统两行随 P38 通电闭环（明细 TODO P39），其后为**现行**偏差清单。
 
 | 设计 | 实际 | 原因/计划 |
 |------|------|----------|
@@ -2132,8 +2132,8 @@ src/
 | ~~编排 REPL 未接入~~ | ✅ agent 循环 phase1 串行预检 + phase2 `executeBatches` 真并行（e 上限随负载数自适应） | — |
 | ~~注入按 e 衰减非相似度~~ | ✅ 0.5×e 衰减 + 0.5×余弦混合排序（64 维 hash 词袋），候选池 200 | — |
 | ~~反思不调 LLM~~ | ✅ provider 可达且窗口 ≥3 条时 LLM 增强总结，启发式兜底 | — |
-| 二、任务系统运行时接线 | ThreadPool/CronScheduler/EventBus 已实现但 REPL 零实例化；反思/记忆提取在主循环内联 | 接线另立任务（TODO P29 遗留） |
-| Task 生命周期（cancel/progress/retry） | cancel() 桩、progress/max_retries 字段无读写、TaskContext 不存在；submit 不读 priority（队列纯 FIFO）；Event payload 退化为字符串（设计的结构化 task_completed/user_query_end 无发射者） | 随任务系统接线一并设计 |
+| ~~二、任务系统运行时接线~~ | ✅ P38 通电：cron 主线程执行（BoundedMPSC 投递到期索引，SQLite 铁律）、EventBus 类型化（EventData union）+ REPL 六类 emit 点、π 采样事件环注入反思；ThreadPool 按需消费（编排/任务工具），REPL 零消费者池移除 | — |
+| ~~Task 生命周期（cancel/progress/retry）~~ | ✅ cancel=子代理协作取消（SIGINT→原子标志→每轮/每工具检查）、retry=快速失败 job 1s 退避重试 1 次、priority=TaskCreate 1-5 + 列表排序 + 派发优先级申领；Event payload 已类型化。残留：用户侧 Task 无 progress 字段 | progress 展示随任务 UI 另议 |
 | monitor 自动修复半环 | RuntimeRule 无 auto_fix_fn 字段，runChecks 无修复尝试 | 待 monitor 接线时补 |
 | 检测规则集与设计差异 | knowledge_conflict 未实现（缺 recent_conflicts 数据源）；decision_quality 因与 context_overflow 同指标且阈值更高（永不可达）已删除 | knowledge_conflict 需先定义冲突数据源 |
 | 第一章数学场景部分未落地 | RoPE π-旋转、φ 嵌入降维、黄金分割超参搜索、ε 探索衰减均未实现且此前未登记；知识检索相关度为名次线性（非 e-时间衰减）；π 分散索引（pi_ring getByPiIndex/piIterator）能力就绪但生产零消费（EventBus 读路径走 FIFO） | 已补登记（TODO P37） |
@@ -2149,3 +2149,4 @@ src/
 
 - v0.4.0：Zig 0.17.0 / 179 测试全绿 / 记忆-反思飞轮运转。已知债已清偿（allocPrint、DOM 泄漏、facade 吞错，P20）；剩余低优先项见 USAGE §8
 - 2026-10-29 增量：**241 测试（236 pass / 5 skip / 0 fail）**；两轮多 agent 审计（逻辑闭环 + 设计符合性）修复 40+ 项并完成 14.1/14.2 对账（明细 TODO P37）
+- 2026-10-31 增量：**289 测试（284 pass / 5 skip / 0 fail）**；v0.6.1 稳定性发版（看护狗/注册悬垂/反思落库/子代理权限门）、P38 任务系统通电后 14.1/14.2 再对账、P4 生成中实时输入、P5 monitor 误报治理、反思卫生三件套（明细 TODO P39）
