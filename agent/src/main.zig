@@ -49,7 +49,6 @@ test {
     _ = @import("runtime/self_diagnostic.zig");
     _ = @import("storage/database.zig");
     _ = @import("storage/vector.zig");
-    _ = @import("util/stream_interrupt.zig");
     _ = @import("task/cron.zig");
     _ = @import("task/event_bus.zig");
     _ = @import("task/mpsc_queue.zig");
