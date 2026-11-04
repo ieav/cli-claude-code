@@ -35,6 +35,7 @@
 - **卡死根因修复**（2026-11-01 晚，keep-alive mock 复现定位）：**P2 的空闲轮询在 headers+body 同 TCP 段到达时饿死**——body 已进连接级缓冲，`resp_reader.bufferedLen()==0`（只看外层 buffer）→ poll 内核 socket（空）→ tick 到 180s 看门狗 = 用户"两分多钟"。真网关秒回必同段，必现。**修法（架构正确化）**：pump 线程回归**阻塞读**（`peekGreedy`，缓冲语义天然正确），取消改为 UI 循环 `shutdown(2)` 已发布的连接 fd（`CompleteOptions.cancel_fd`，看门狗同款技术）；pump 不再需要任何轮询；`stream_interrupt.zig` 整个删除；TTFT 由看门狗子期限覆盖（headers 30s 杀→FirstByteTimeout 重试），Esc 取消映射在 job.err 与 saw_error 两路补齐。
 - **排队可见性修复**（同日）：排队消息在**入队瞬间**以品红提交样式 + 暗色 `↳ 已排队` 标记滚入转写（`liveQueueSubmit`）；`queued_echoed`/`last_take_echoed` 标记防注入/自动发送时二次回显。
 - **工具批次可取消**（2026-11-04）：P4 的"工具期 Esc 无效果"是最后一条卡死路径——`timeout: 0` 无限 Bash × 不可取消批次 = 回合永久卡住。修法三层：① `util/cancel.tool_batch_cancel` 会话级取消槽（UI 循环 Esc/Ctrl-C 置位，批次前重置）；② bash 看门狗常驻轮询取消（原 `deadline=0` 直接不启看门狗），取消即击杀整进程组，返回"cancelled by user"；③ `orchestration.executeToolCall` 执行前查槽——未启动调用短路为 "cancelled (not run)"，**每个 tool_use 仍有一一对应的 tool_result**（历史 API 合法性不变量），取消/部分结果入历史后回合优雅终止。顺带修复 worker 失败路径 `return e` 留下悬空 tool_use（严格 API 下次请求必 400）→ 补失败结果 + 优雅收回合。`agent` 派发桥接同一取消槽（workerMain 把 tool_batch_cancel 并入协作标志，在飞子代理下轮即停）。
+- **T6.4 agent 工具默认开启**（2026-11-04）：P38 停摆复验以可执行 E2E 落地（`tests/agent_e2e.zig`，真 HTTP mock 网关 127.0.0.1）：happy 扇出（2 任务并发、2 round trip、合并报告完整）+ P38 停摆（网关收下请求永不答 → `ZIV_LLM_TIMEOUT_MS=1500` 短看护狗杀连接 → 快速失败重试再失败 → **派发仍限时返回合并报告**）。双绿后默认翻转为 ON（`ZIV_AGENT_TOOL=0` 退出）。
 - **验证**：真 pty + HTTP/1.1 keep-alive 同段 mock + ReleaseFast：第一条回复 ✓、✓完成 ✓、排队消息转写可见 ✓、排队计数 ✓、第二请求全链路（5027B→5123B 两轮 REQ/RESP）✓；299/304 单测绿。
 
 ## 0. 三条原则 → ziv 的差距（现状锚点）

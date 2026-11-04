@@ -54,6 +54,7 @@ test {
     _ = @import("task/mpsc_queue.zig");
     _ = @import("task/thread_pool.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/agent_e2e.zig");
     _ = @import("tools/auth_mode.zig");
     _ = @import("tools/classifier.zig");
     _ = @import("tools/denial_tracker.zig");

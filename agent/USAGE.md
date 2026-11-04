@@ -206,7 +206,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/skills` | 列出已安装 Skill（详见下文 v0.5.1 节） |
 | `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见下文 v0.5.1 节） |
 
-> **`agent` 并行子代理（实验，非斜杠命令）**：子代理派发是注册给模型的动态工具，**默认关闭**（设 `ZIV_AGENT_TOOL=1` 启用），由 LLM 在对话中自主调用，也可 `/run agent {"tasks":["…","…"]}` 手动触发——直接输入 `/agent` 不会执行任何命令。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整；派发期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死。
+> **`agent` 并行子代理（非斜杠命令）**：子代理派发是注册给模型的动态工具，**默认开启**（设 `ZIV_AGENT_TOOL=0` 关闭），由 LLM 在对话中自主调用，也可 `/run agent {"tasks":["…","…"]}` 手动触发——直接输入 `/agent` 不会执行任何命令。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整；派发期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死（E2E 已锁：tests/agent_e2e.zig）。
 
 ### 权限模式 (Permission Modes)
 

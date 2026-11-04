@@ -552,18 +552,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
     };
-    // T6.4 status: the subagent dispatch tool is conservatively DISABLED
-    // by default. The old "intermittent hang after an agent-tool turn" was
-    // root-caused on 2026-10-30 (TODO P38): the gateway occasionally
+    // T6.4 status: the subagent dispatch tool is ENABLED by default
+    // (2026-11-04). The old "intermittent hang after an agent-tool turn"
+    // was root-caused on 2026-10-30 (TODO P38): the gateway occasionally
     // accepts a request and then never answers, and the provider layer had
     // no timeout — the dynamic-tool path itself was exonerated. Every LLM
     // request is now guarded by the stall watchdog (util/llm_watchdog.zig,
-    // default 180s, ZIV_LLM_TIMEOUT_MS), so the default could flip back on
-    // after a default-on E2E re-validation; until then opt in with
-    // ZIV_AGENT_TOOL=1.
+    // default 180s, ZIV_LLM_TIMEOUT_MS), and the default-on E2E
+    // re-validation ran both shapes against a real mock gateway
+    // (tests/agent_e2e.zig): happy fan-out AND the P38 stall (gateway
+    // accepts, never answers → watchdog kills → fail-fast retry fails →
+    // dispatch still returns merged output, bounded). Opt OUT with
+    // ZIV_AGENT_TOOL=0 / false.
     const agent_tool_enabled = blk: {
-        const v = env.get("ZIV_AGENT_TOOL") orelse break :blk false;
-        break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        const v = env.get("ZIV_AGENT_TOOL") orelse break :blk true;
+        break :blk !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
     };
     if (agent_tool_enabled) reg.registerDynamic(
         "agent",
