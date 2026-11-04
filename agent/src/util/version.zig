@@ -2,7 +2,7 @@
 /// REPL /version command, `ziv --version`, and release.sh all read this
 /// constant — release.sh extracts it with a regex, so keep the exact form:
 ///   pub const version = "X.Y.Z";
-pub const version = "0.6.3";
+pub const version = "0.7.9";
 
 const std = @import("std");
 
