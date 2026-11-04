@@ -45,6 +45,7 @@ const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
 const format_mod = @import("util/format.zig");
 const diff_util = @import("util/diff.zig");
+const cancel_mod = @import("util/cancel.zig");
 const llm_watchdog = @import("util/llm_watchdog.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
@@ -328,7 +329,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // Semantic tier: the knowledge graph shares the memory database.
     var kgraph: ?knowledge_graph.KnowledgeGraph = if (mem_db != null)
         knowledge_graph.KnowledgeGraph.init(allocator, &mem_db.?)
-    else null;
+    else
+        null;
     defer if (kgraph) |*g| g.deinit(); // finalize cached stmts before db close
 
     // ──── P3: runtime layer — typed event bus + cron (main-thread exec) ────
@@ -1637,6 +1639,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             result_blocks.clearRetainingCapacity();
 
             var has_tool_use = false;
+            // Esc-cancel / worker-failure markers, hoisted to iteration
+            // scope: the turn-break after the tool-result history append
+            // (below) reads them from outside the `prepared` block.
+            // batch_aborted = end the turn after this batch (Esc OR worker
+            // failure); worker_failed = additionally skip finishToolCall
+            // (no results exist — manual failure results were appended).
+            // A user Esc does NOT skip finishToolCall: the cancelled batch
+            // still yields one result per tool_use id, and those results
+            // are exactly what the model must see on the next turn.
+            var batch_aborted = false;
+            var user_cancelled = false;
+            var worker_failed = false;
             // Phase 1 (serial): permission gate + pre-execution backup for
             // every tool_use; approved calls are collected for phase 2.
             var prepared = std.ArrayList(PreparedCall).empty;
@@ -1808,6 +1822,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 };
                 var tool_job = ToolJob{};
                 var tool_results: []orchestration_mod.BatchResult = undefined;
+                // batch_aborted/user_cancelled live at iteration scope (see
+                // their declaration above); set by the UI loop (Esc) or the
+                // worker-failure path below. Tool results are still appended
+                // to history so every tool_use id keeps a tool_result.
                 // Interactive tools (AskUserQuestion) read stdin COOKED on
                 // the calling thread — running them inside the worker would
                 // race the UI loop for fd 0. Any batch containing one runs
@@ -1817,6 +1835,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 for (prepared.items) |p| {
                     if (std.mem.eql(u8, p.call.tool_name, "AskUserQuestion")) has_interactive = true;
                 }
+                // Fresh cancel slot per batch — a stale `true` from a
+                // previous Esc would silently no-op every tool in this one.
+                cancel_mod.toolBatchReset();
                 const th = if (has_interactive) null else std.Thread.spawn(.{}, ToolJob.run, .{ &tool_job, batches, allocator, io, reg.definitions() }) catch null;
                 {
                     if (th) |t| {
@@ -1827,9 +1848,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
                             const n = std.c.poll(&pfd, 1, 100);
                             if (n == 1 and (pfd[0].revents & std.c.POLL.IN) != 0) {
-                                // Esc/Ctrl-C consumed (true), no effect on tools.
-                                _ = lineinput.editorLiveKey(r, w);
-                            } else if (n == 0) {
+                                if (lineinput.editorLiveKey(r, w) and !user_cancelled) {
+                                    // Esc/Ctrl-C during tools: cancel the
+                                    // batch. An in-flight Bash is group-
+                                    // killed by its watchdog (this is the
+                                    // only escape from `timeout: 0`); not-
+                                    // yet-started calls short-circuit to
+                                    // "cancelled (not run)". The batch still
+                                    // yields one result per tool_use id.
+                                    user_cancelled = true;
+                                    batch_aborted = true;
+                                    cancel_mod.toolBatchCancel();
+                                    lineinput.regionStatus(w, "⏳ 正在取消工具批次…");
+                                    std.Io.File.Writer.flush(&file_writer) catch {};
+                                }
+                            } else if (n == 0 and !user_cancelled) {
                                 const now = util_time.nowMillis();
                                 if (now - last_status >= 500) {
                                     last_status = now;
@@ -1839,36 +1872,63 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                 }
                             }
                         }
-                        tool_results = tool_job.results orelse {
-                            // surface the worker's error through the loop's try
-                            if (tool_job.err) |e| return e;
-                            return error.ToolBatchFailed;
-                        };
+                        // The slot must not leak a `true` into later batches
+                        // (subagent tool runs its own inner batches).
+                        cancel_mod.toolBatchReset();
+                        if (tool_job.results) |res| {
+                            tool_results = res;
+                        } else {
+                            // The worker failed (alloc etc.). Returning here
+                            // would strand every tool_use id without a
+                            // tool_result — invalid history for strict APIs
+                            // on the next request. Record failure results
+                            // and end the turn gracefully instead.
+                            // tool_results stays undefined — every use below
+                            // is guarded by !worker_failed.
+                            if (tool_job.err) |e| logger.err("tool batch worker failed: {}", .{e});
+                            batch_aborted = true;
+                            worker_failed = true;
+                            for (prepared.items) |p| {
+                                try result_blocks.append(allocator, .{ .tool_result = .{
+                                    .tool_use_id = try allocator.dupe(u8, p.call.tool_use_id),
+                                    .content = try allocator.dupe(u8, "tool batch failed (internal error); not executed"),
+                                    .is_error = true,
+                                } });
+                            }
+                            std.Io.Writer.print(ow, "  [工具批次内部错误 — 本回合结束，结果已按失败记录]\n", .{}) catch {};
+                            try std.Io.File.Writer.flush(&file_writer);
+                        }
                     } else {
                         // No thread: synchronous fallback (pre-P4 shape).
                         tool_results = try orchestration_mod.executeBatches(batches, allocator, io, reg.definitions());
                     }
                 }
-                const results = tool_results;
-                defer allocator.free(results);
 
-                var batch_errors: u32 = 0;
-                for (prepared.items, 0..) |p, i| {
-                    window_tools += 1;
-                    const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len);
-                    if (errored) {
-                        window_errors += 1;
-                        batch_errors += 1;
-                        evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                // Worker failure is the ONLY path that skips finishToolCall
+                // (results don't exist). A user cancel runs it normally —
+                // the cancelled/partial results must land in history.
+                if (!worker_failed) {
+                    const results = tool_results;
+                    defer allocator.free(results);
+
+                    var batch_errors: u32 = 0;
+                    for (prepared.items, 0..) |p, i| {
+                        window_tools += 1;
+                        const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len);
+                        if (errored) {
+                            window_errors += 1;
+                            batch_errors += 1;
+                            evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                        }
                     }
-                }
 
-                // Live decision trace: execution step for this batch.
-                if (live_trace) |*t| {
-                    const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
-                    var step_buf: [96]u8 = undefined;
-                    const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
-                    traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", @intCast(util_time.nowMillis() - batch_t0), allocator) catch {};
+                    // Live decision trace: execution step for this batch.
+                    if (live_trace) |*t| {
+                        const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
+                        var step_buf: [96]u8 = undefined;
+                        const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
+                        traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", @intCast(util_time.nowMillis() - batch_t0), allocator) catch {};
+                    }
                 }
             }
 
@@ -1882,6 +1942,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .content = result_slice,
                     .timestamp = util_time.nowMillis(),
                 });
+            }
+
+            // Esc-cancelled or internally-failed batch: the turn stops
+            // HERE, with valid history — the tool results (cancelled /
+            // partial / failure) are already appended, so the model sees
+            // exactly what happened when the conversation resumes.
+            if (batch_aborted) {
+                lineinput.regionEnd(w);
+                if (user_cancelled) {
+                    std.Io.Writer.print(ow, "\n  [Esc — 工具批次已取消，回合结束。取消/部分结果已记录，可直接继续对话]\n\n", .{}) catch {};
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                break;
             }
 
             // P4 mid-turn injection: messages the user typed + Enter'd

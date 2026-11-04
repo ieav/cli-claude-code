@@ -8,6 +8,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const util_time = @import("../util/time.zig");
+const cancel = @import("../util/cancel.zig");
 
 /// Hard ceiling for one command; explicit timeouts clamp to this.
 const MAX_TIMEOUT_S: i64 = 300;
@@ -21,6 +22,13 @@ const OUTPUT_LIMIT: usize = 256 * 1024;
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const command = getStringField(input, "command") orelse
         return registry.ToolResult{ .output = "Error: 'command' field is required", .is_error = true };
+
+    // Batch already cancelled (Esc) — don't even spawn. Ownership rule:
+    // output transfers to history which FREES it — must be allocated,
+    // never a literal (freeContentBlocks would free static memory).
+    if (cancel.toolBatchCancelled()) {
+        return registry.ToolResult{ .output = try alloc.dupe(u8, "cancelled by user (not run)"), .is_error = true };
+    }
 
     // timeout in seconds; 0 = unlimited, negative treated as 0.
     const timeout_s: i64 = @min(@max(getIntField(input, "timeout") orelse DEFAULT_TIMEOUT_S, 0), MAX_TIMEOUT_S);
@@ -58,10 +66,12 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     if (err_thread == null) err_reader.run();
 
     var timed_out = std.atomic.Value(bool).init(false);
+    var user_cancelled = std.atomic.Value(bool).init(false);
     var watch = Watchdog{
         .pid = pid,
         .deadline_ms = if (timeout_s == 0) 0 else util_time.nowMillis() + timeout_s * 1000, // 0 = no deadline
         .timed_out = &timed_out,
+        .user_cancelled = &user_cancelled,
         .done = std.atomic.Value(bool).init(false),
     };
     const watch_thread = std.Thread.spawn(.{}, Watchdog.run, .{&watch}) catch null;
@@ -82,6 +92,12 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     if (timed_out.load(.acquire)) {
         return registry.ToolResult{
             .output = try alloc.print("Command timed out after {d}s and was killed: {s}", .{ timeout_s, command }),
+            .is_error = true,
+        };
+    }
+    if (user_cancelled.load(.acquire)) {
+        return registry.ToolResult{
+            .output = try alloc.print("Command cancelled by user (Esc) and was killed: {s}", .{command}),
             .is_error = true,
         };
     }
@@ -139,27 +155,42 @@ const PipeReader = struct {
     }
 };
 
-/// Sleeps until the deadline, then kills the child's whole process group
-/// (the group id equals the child pid — setpgid(0,0) at spawn). The blocked
-/// waitpid in the main thread returns as soon as the leader dies.
+/// Polls until the child exits, the deadline passes, or the user cancels
+/// the tool batch — whichever comes first — then, on the latter two, kills
+/// the child's whole process group (the group id equals the child pid —
+/// setpgid(0,0) at spawn). The blocked waitpid in the main thread returns
+/// as soon as the leader dies. The watchdog runs even for unlimited
+/// commands (deadline 0): a user cancel must be able to unbind a
+/// `timeout: 0` hang, which was previously uncancellable forever.
 const Watchdog = struct {
     pid: i32,
     deadline_ms: i64, // 0 = no deadline (unlimited)
     timed_out: *std.atomic.Value(bool),
+    user_cancelled: *std.atomic.Value(bool),
     done: std.atomic.Value(bool),
 
     fn run(self: *Watchdog) void {
-        if (self.deadline_ms == 0) return;
-        while (util_time.nowMillis() < self.deadline_ms) {
+        while (true) {
             if (self.done.load(.acquire)) return;
+            if (cancel.toolBatchCancelled()) {
+                self.killGroup();
+                self.user_cancelled.store(true, .release);
+                return;
+            }
+            if (self.deadline_ms != 0 and util_time.nowMillis() >= self.deadline_ms) {
+                self.killGroup();
+                self.timed_out.store(true, .release);
+                return;
+            }
             sleepMs(25);
         }
-        if (self.done.load(.acquire)) return;
-        // Kill the group, then the leader directly in case setpgid lost a
-        // race we cannot observe. Both errors (ESRCH) are harmless.
+    }
+
+    /// Kill the group, then the leader directly in case setpgid lost a
+    /// race we cannot observe. Both errors (ESRCH) are harmless.
+    fn killGroup(self: *Watchdog) void {
         _ = std.c.kill(-self.pid, .KILL);
         _ = std.c.kill(self.pid, .KILL);
-        self.timed_out.store(true, .release);
     }
 };
 
@@ -248,4 +279,51 @@ test "bash working_directory is honored" {
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("tmp", std.mem.trim(u8, result.output, " \n"));
+}
+
+/// Helper: fire the batch-cancel flag after `delay_ms` (detached thread).
+fn cancelAfter(delay_ms: u32) void {
+    const t = std.Thread.spawn(.{}, struct {
+        fn run(d: u32) void {
+            sleepMs(d);
+            cancel.toolBatchCancel();
+        }
+    }.run, .{delay_ms}) catch return;
+    t.detach();
+}
+
+test "bash cancel kills an unlimited hung command" {
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    defer cancel.toolBatchReset(); // never leak a `true` into other tests
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    // timeout 0 = unlimited — previously uncancellable FOREVER; the only
+    // escape is the batch-cancel watchdog path this test locks.
+    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30" });
+    try obj.put(std.testing.allocator, "timeout", .{ .integer = 0 });
+    cancelAfter(300);
+    const t0 = util_time.nowMillis();
+    const result = try execute(std.testing.allocator, .{ .object = obj }, io_state.io());
+    defer std.testing.allocator.free(result.output);
+    const elapsed = util_time.nowMillis() - t0;
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "cancelled by user") != null);
+    // Killed at ~300ms, not 30s (generous scheduling slack).
+    try std.testing.expect(elapsed < 10_000);
+}
+
+test "bash pre-cancelled batch never spawns" {
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    defer cancel.toolBatchReset();
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    // If the command ran at all, its stdout would contain X.
+    try obj.put(std.testing.allocator, "command", .{ .string = "printf X_CANCEL_PROBE" });
+    cancel.toolBatchCancel();
+    const result = try execute(std.testing.allocator, .{ .object = obj }, io_state.io());
+    defer std.testing.allocator.free(result.output); // allocated: the ownership rule for history
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("cancelled by user (not run)", result.output);
 }

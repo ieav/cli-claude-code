@@ -14,6 +14,7 @@ const llm = @import("../llm/mod.zig");
 const subagent = @import("../agent/subagent.zig");
 const tokens = @import("../util/tokens.zig");
 const event_bus = @import("../task/event_bus.zig");
+const cancel_mod = @import("../util/cancel.zig");
 const openai = @import("../llm/openai.zig");
 const claude = @import("../llm/claude.zig");
 const ollama = @import("../llm/ollama.zig");
@@ -191,6 +192,11 @@ fn workerMain(w: *WorkerCtx) void {
     const provider = makeProviderInto(w.ctx, wio, &storage);
     defer provider.deinit();
     while (true) {
+        // Esc-during-tools cancels the batch (util/cancel.tool_batch_cancel):
+        // bridge it into THIS dispatch's cooperative flag so in-flight
+        // subagents (which poll it every turn/tool) stop too, not just the
+        // not-yet-claimed jobs.
+        if (cancel_mod.toolBatchCancelled()) w.cancel.store(true, .release);
         if (w.cancel.load(.acquire)) break;
         const c = w.next.fetchAdd(1, .monotonic);
         if (c >= w.order_len) break;
@@ -249,7 +255,7 @@ fn mergeJobs(alloc: std.mem.Allocator, ctx: *DispatchCtx, jobs: *[MAX_SUBAGENTS]
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     const w = &aw.writer;
-    if (canceled) try w.writeAll("(已按 Ctrl-C 取消：未完成的子任务被中断)\n");
+    if (canceled) try w.writeAll("(已按用户中断取消：未完成的子任务被中断)\n");
     var i: usize = 0;
     while (i < n) : (i += 1) {
         defer if (jobs[i].result) |r| r.deinit(ctx.alloc);
