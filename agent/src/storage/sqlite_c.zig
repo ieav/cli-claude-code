@@ -32,6 +32,10 @@ pub extern fn sqlite3_prepare_v2(
 ) c_int;
 pub extern fn sqlite3_finalize(stmt: ?*sqlite3_stmt) c_int;
 pub extern fn sqlite3_step(stmt: ?*sqlite3_stmt) c_int;
+/// Rewind a stepped statement for re-binding; also clears the error state
+/// so a cached statement is reusable. Pairs with sqlite3_clear_bindings.
+pub extern fn sqlite3_reset(stmt: ?*sqlite3_stmt) c_int;
+pub extern fn sqlite3_clear_bindings(stmt: ?*sqlite3_stmt) c_int;
 pub extern fn sqlite3_column_text(stmt: ?*sqlite3_stmt, i_col: c_int) ?[*:0]const u8;
 
 // Destructor callback for bound values.

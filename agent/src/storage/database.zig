@@ -307,6 +307,39 @@ pub const Statement = struct {
     pub fn finalize(self: Self) void {
         _ = c.sqlite3_finalize(self.stmt);
     }
+
+    /// Rewind for a fresh bind/step cycle on a cached statement. Bindings
+    /// are cleared too: a parameter left unbound on reuse would silently
+    /// carry the PREVIOUS call's value.
+    pub fn reset(self: Self) void {
+        _ = c.sqlite3_reset(self.stmt);
+        _ = c.sqlite3_clear_bindings(self.stmt);
+    }
+};
+
+/// A statement prepared on first use and rebound every use after — the
+/// memory pipeline runs the same SELECT/INSERT texts every prompt, and
+/// re-preparing the SQL each call was pure parse overhead. deinit() must
+/// run before the Database closes. NOT thread-safe: keep one cache per
+/// store and use it from that store's owning thread.
+pub const CachedStatement = struct {
+    sql: []const u8,
+    inner: ?Statement = null,
+
+    const Self = @This();
+
+    /// Prepared-once, reset-per-use. The returned Statement is a borrowed
+    /// handle owned by this cache — do NOT finalize it.
+    pub fn acquire(self: *Self, allocator: std.mem.Allocator, db: *Database) !Statement {
+        if (self.inner == null) self.inner = try Statement.prepare(allocator, db, self.sql);
+        self.inner.?.reset();
+        return self.inner.?;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.inner) |s| s.finalize();
+        self.inner = null;
+    }
 };
 
 test "Database init and migration" {
