@@ -50,13 +50,20 @@ pub const CompleteOptions = struct {
     stop_sequences: ?[]const []const u8 = null,
     /// Tool declarations the model may call. null = plain chat (no tools).
     tools: ?[]const ToolSpec = null,
-    /// Interactive REPL streams only: make the idle socket wait
-    /// interruptible by Esc/Ctrl-C on stdin (util/stream_interrupt.zig).
-    /// A gateway that never answers then cancels on the spot instead of
-    /// sitting dead until the stall watchdog. Background callers
-    /// (subagents, reflection) MUST leave this false — stdin belongs to
-    /// the REPL thread.
-    esc_interrupt: bool = false,
+    /// Interactive REPL streams only: cancellation plumbing owned by the
+    /// UI loop (see repl.StreamJob). The provider publishes the
+    /// connection's socket fd into `cancel_fd` once connected; the UI,
+    /// on Esc/Ctrl-C, sets the flag AND shutdown(2)s the fd — the pump
+    /// thread's BLOCKING read fails immediately, the stream unwinds, and
+    /// the killed-connection error maps to error.EscCancelled. The pump
+    /// never needs to poll anything; buffered body data is consumed with
+    /// correct reader semantics (the idle-poll design starved when
+    /// headers+body arrived in one TCP segment — the body sat in the
+    /// connection buffer while the poll watched an empty kernel socket
+    /// for 180s). Background callers (subagents, reflection) MUST leave
+    /// these null — there is no UI to cancel them.
+    cancel_flag: ?*std.atomic.Value(bool) = null,
+    cancel_fd: ?*std.atomic.Value(i32) = null,
 };
 
 pub const CompleteResponse = struct {
@@ -101,17 +108,23 @@ pub const Usage = struct {
 /// OpenAI/Claude keep them until the stream state deinits — never rely on
 /// that longer lifetime). Consumers must dupe synchronously anything they
 /// keep.
+/// Payload of the terminal `.done` stream event. `usage` stays optional
+/// (some gateways never send token counts). `stop_reason` is the wire's
+/// own verdict: the streaming path used to drop finish_reason entirely,
+/// so a `length`-capped truncation — a reasoning model burning the whole
+/// output budget on thinking — was misreported as `end_turn` and the
+/// REPL's advice ("resend") reproduced the failure identically.
+pub const DoneInfo = struct {
+    usage: ?Usage = null,
+    stop_reason: ?CompleteResponse.StopReason = null,
+};
+
 pub const StreamEvent = union(enum) {
     content_delta: []const u8,
     thinking_delta: []const u8,
     tool_call: ToolUseBlock,
-    done: ?Usage,
+    done: DoneInfo,
     error_occurred: ProviderError,
-    /// A keystroke that arrived while the socket was silent (gateway
-    /// stall). Delivered up from the provider's interruptible wait so the
-    /// REPL — which owns the screen — can echo/edit it live. Without this
-    /// the byte was stashed invisibly and the user typed into a void.
-    live_input: u8,
     /// ~100ms passed with no socket data. The REPL renders the elapsed-
     /// time status row from it — a stalled gateway must be VISIBLE
     /// ("等待响应 12.4s…"), not a dead screen.
@@ -144,6 +157,132 @@ pub fn readErrorBody(alloc: std.mem.Allocator, response: anytype) []const u8 {
 /// status to a ProviderError. Every backend funnels its non-2xx responses
 /// through here so a 400 always carries its actual reason into the log
 /// instead of a bare `status=400`.
+/// Human-readable reason for the most recent provider failure (gateway
+/// status + body excerpt). The error union carries only a TAG; this
+/// side-channel carries the WHY so the TUI can show the gateway's own
+/// message instead of leaning on a raw stderr log line.
+var detail_buf: [512]u8 = undefined;
+var detail_len: usize = 0;
+/// Tiny spin lock (std.Thread.Mutex is gone in 0.17): critical sections
+/// are a bufPrint and a slice copy — nanoseconds under lock.
+var detail_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn detailLock() void {
+    while (detail_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+
+fn detailUnlock() void {
+    detail_lock.store(false, .release);
+}
+
+pub fn setErrorDetail(comptime fmt: []const u8, args: anytype) void {
+    detailLock();
+    defer detailUnlock();
+    const s = std.fmt.bufPrint(&detail_buf, fmt, args) catch detail_buf[0..0];
+    detail_len = s.len;
+}
+
+pub fn lastErrorDetail() []const u8 {
+    detailLock();
+    defer detailUnlock();
+    return detail_buf[0..detail_len];
+}
+
+/// Reset the side channel at request start. Without this, an error that
+/// never passes through failRequest (connection refused, socket timeout,
+/// TTFT kill, mid-stream transport failure) would leave the PREVIOUS
+/// request's gateway reason in place — and the REPL would pin that stale
+/// reason on this request's failure. Both Provider entry points call it,
+/// so every backend and every caller is covered.
+pub fn clearErrorDetail() void {
+    detailLock();
+    defer detailUnlock();
+    detail_len = 0;
+}
+
+/// Write a detail only when none is set for this request. Mid-stream
+/// transport failures use this: if an in-band error payload already
+/// recorded the gateway's own message, that reason wins over a generic
+/// "transport error: X".
+pub fn setErrorDetailIfEmpty(comptime fmt: []const u8, args: anytype) void {
+    detailLock();
+    const empty = detail_len == 0;
+    detailUnlock();
+    if (empty) setErrorDetail(fmt, args);
+}
+
+/// Record the reason carried by an in-band error payload — HTTP 200, then
+/// {"error":{"message":"…"}} in a data chunk (OpenAI/Ollama) or an SSE
+/// "error" event (Claude). The mapped tag (ServerError) says nothing; the
+/// gateway's own message is the diagnosable reason. Newlines are flattened
+/// and capped like failRequest so the [网关返回: …] line stays one line.
+pub fn noteInBandError(backend: []const u8, parsed: std.json.Value) void {
+    const e = parsed.object.get("error") orelse return;
+    var msg: []const u8 = "";
+    if (e == .object) {
+        if (e.object.get("message")) |m| {
+            if (m == .string) msg = m.string;
+        }
+    } else if (e == .string) msg = e.string;
+    var flat: [300]u8 = undefined;
+    var n: usize = 0;
+    for (msg) |c| {
+        if (n >= flat.len) break;
+        flat[n] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
+        n += 1;
+    }
+    if (n == 0) {
+        setErrorDetail("{s}: in-band error (no message field)", .{backend});
+    } else {
+        setErrorDetail("{s}: in-band error: {s}", .{ backend, flat[0..n] });
+    }
+}
+
+test "error-detail side channel lifecycle" {
+    clearErrorDetail();
+    try std.testing.expectEqual(@as(usize, 0), lastErrorDetail().len);
+    setErrorDetail("openai: status=429 rate limited", .{});
+    // IfEmpty must NOT clobber an existing reason.
+    setErrorDetailIfEmpty("openai stream: transport error: X", .{});
+    try std.testing.expectEqualStrings("openai: status=429 rate limited", lastErrorDetail());
+    // Clear + IfEmpty writes the fallback when nothing better exists.
+    clearErrorDetail();
+    setErrorDetailIfEmpty("openai stream: transport error: {s}", .{"ConnectionResetByPeer"});
+    try std.testing.expectEqualStrings("openai stream: transport error: ConnectionResetByPeer", lastErrorDetail());
+    clearErrorDetail();
+}
+
+test "noteInBandError extracts the gateway's message" {
+    clearErrorDetail();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed_op = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"error":{"message":"model `foo` not found"}}
+    , .{});
+    noteInBandError("ollama", parsed_op);
+    try std.testing.expectEqualStrings("ollama: in-band error: model `foo` not found", lastErrorDetail());
+    // Claude shape: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+    const parsed_cl = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+    , .{});
+    noteInBandError("claude", parsed_cl);
+    try std.testing.expectEqualStrings("claude: in-band error: Overloaded", lastErrorDetail());
+    // No message field → placeholder, not silence.
+    const parsed_bare = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"error":true}
+    , .{});
+    noteInBandError("openai", parsed_bare);
+    try std.testing.expectEqualStrings("openai: in-band error (no message field)", lastErrorDetail());
+    // Multi-line message collapses to one line.
+    const parsed_ml = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"error":{"message":"line1\nline2"}}
+    , .{});
+    noteInBandError("openai", parsed_ml);
+    try std.testing.expectEqualStrings("openai: in-band error: line1 line2", lastErrorDetail());
+    clearErrorDetail();
+}
+
 pub fn failRequest(alloc: std.mem.Allocator, tag: []const u8, response: anytype) ProviderError {
     const status: u16 = @backingInt(response.head.status);
     const body = readErrorBody(alloc, response);
@@ -151,6 +290,7 @@ pub fn failRequest(alloc: std.mem.Allocator, tag: []const u8, response: anytype)
 
     if (body.len == 0) {
         logger.err("{s} error: status={d} (no error body)", .{ tag, status });
+        setErrorDetail("{s}: status={d} (no error body)", .{ tag, status });
     } else {
         // Collapse newlines and cap at 300 chars so the [ERR] log stays a
         // single greppable line.
@@ -162,6 +302,7 @@ pub fn failRequest(alloc: std.mem.Allocator, tag: []const u8, response: anytype)
             n += 1;
         }
         logger.err("{s} error: status={d} body={s}", .{ tag, status, flat[0..n] });
+        setErrorDetail("{s}: status={d} {s}", .{ tag, status, flat[0..n] });
     }
 
     if (status == 400 and isContextOverflowBody(body)) return error.ContextOverflow;
@@ -197,7 +338,6 @@ pub fn contextEstimate(model: []const u8, backend: anytype) u32 {
     return 32_768;
 }
 
-
 /// Model capability tier (T2.1): gates the memory flywheel's auxiliary
 /// LLM calls — weak/local models produce noise insights that poison the
 /// next session's injected memories (defect ⑧).
@@ -221,8 +361,9 @@ pub fn capabilityTier(model: []const u8, backend: anytype) CapabilityTier {
 
 fn isContextOverflowBody(body: []const u8) bool {
     const markers = [_][]const u8{
-        "context length", "context window", "maximum context", "too long",
-        "too many tokens", "token limit",    "input length",  "最大",
+        "context length",  "context window", "maximum context", "too long",
+        "too many tokens", "token limit",    "input length",
+        "最大",
     };
     for (markers) |m| {
         if (containsIgnoreCase(body, m)) return true;
@@ -268,10 +409,14 @@ pub const Provider = struct {
     vtable: *const ProviderVTable,
 
     pub fn complete(self: Provider, messages: []const Message, opts: CompleteOptions) anyerror!CompleteResponse {
+        // Fresh error-detail per request: an error that sets no detail of
+        // its own must surface "no reason" — never the previous request's.
+        clearErrorDetail();
         return self.vtable.complete_fn(self.ptr, messages, opts);
     }
 
     pub fn stream(self: Provider, messages: []const Message, opts: CompleteOptions, ctx: ?*anyopaque, cb: *const StreamCallback) anyerror!void {
+        clearErrorDetail();
         return self.vtable.stream_fn(self.ptr, messages, opts, ctx, cb);
     }
 
@@ -279,8 +424,8 @@ pub const Provider = struct {
         if (self.vtable.count_tokens_fn) |fn_ptr| {
             return fn_ptr(self.ptr, text);
         }
-        // Estimate: ~4 chars per token
-        return @intCast(text.len / 4);
+        // Char-class-aware estimate (CJK-aware) — see util/tokens.zig.
+        return @import("../util/tokens.zig").estimateTokens(text);
     }
 
     pub fn supportsToolUse(self: Provider) bool {

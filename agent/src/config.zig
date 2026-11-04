@@ -29,7 +29,12 @@ pub const Settings = struct {
     /// beats name-based detection, so custom model names (glm-4.6, deepseek-…)
     /// can be routed through a configured compatible gateway.
     default_backend: ?[]const u8 = null,
-    max_tokens: u32 = 4096,
+    /// Response budget. 16384, not 4096: reasoning models stream their
+    /// thinking as output tokens (GLM reasoning_content, Claude thinking),
+    /// and a heavy turn can burn 4K+ before writing a word of the actual
+    /// answer — at 4096 the model literally ran out of room mid-thought
+    /// (the "out=4096, zero content" empty-response pathology).
+    max_tokens: u32 = 16384,
     /// Cross-session memory injection budget (tokens): how much of the
     /// system prompt the memory block may occupy. Manual knob (T1.1);
     /// adaptive per-model scaling arrives with T1.2. 1200 default — 800

@@ -4,10 +4,11 @@
 const std = @import("std");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
 const logger = @import("../util/log.zig");
-const stream_interrupt = @import("../util/stream_interrupt.zig");
+const time_mod = @import("../util/time.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
+const tokens_mod = @import("../util/tokens.zig");
 
 pub const OpenAIConfig = struct {
     api_key: []const u8,
@@ -66,6 +67,10 @@ pub const OpenAIProvider = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
+        // Transport-failure forensics: how long did the request live, and
+        // (mid-stream) how much arrived before the socket died. Without
+        // these the [网关返回] line is just an error enum name.
+        const stream_t0 = time_mod.nowMillis();
 
         var sse_parser = streaming_mod.SSEParser.init(self.allocator);
         defer sse_parser.deinit();
@@ -88,31 +93,46 @@ pub const OpenAIProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var ttft_killed = std.atomic.Value(bool).init(false);
+        const wd = llm_watchdog.arm(&req, &ttft_killed);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
+        // P2 cancellation plumbing: publish the connection fd for the UI
+        // loop; Esc/Ctrl-C shutdown(2)s it, failing the BLOCKING reads
+        // below (the pump thread never polls — see CompleteOptions docs).
+        if (opts.cancel_fd) |pfd| {
+            if (req.connection) |conn| {
+                pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+            }
+        }
+        defer if (opts.cancel_fd) |pfd| pfd.store(-1, .release);
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |e| {
             // A TTFT kill (gateway never sent even the headers) surfaces
             // here as a transport error — map it so the caller retries.
-            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            if (wd.ttftKilled()) return error.FirstByteTimeout;
+            const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
+            provider.setErrorDetailIfEmpty("openai: request failed: {s} (no headers, {d:.1}s, model {s})", .{ @errorName(e), elapsed, self.config.model });
+            logger.err("openai: request failed: {s} after {d:.1}s (model {s})", .{ @errorName(e), elapsed, self.config.model });
             return e;
         };
+        // Headers arrived — the gateway is alive. Lift the TTFT sub-deadline
+        // at header time (the body-byte lift further down stays as a second
+        // belt): a slow-but-healthy stream must not be killed at 30s.
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "OpenAI stream", &response);
         }
 
-        // Stream: read chunks and parse SSE events incrementally.
-        // TTFT budget: an interactive request with zero body bytes after
-        // currentTtftMs() is treated as dead (the gateway's known
-        // accept-but-never-answer behavior) — kill it here; the REPL
-        // auto-retries instead of waiting out the 180s total watchdog.
-        const ttft_budget_ms: i64 = @intCast(llm_watchdog.currentTtftMs());
-        var ttft_wait_ms: i64 = 0;
+        // Stream: read chunks and parse SSE events incrementally. The
+        // watchdog's TTFT sub-deadline covers never-any-headers (killed at
+        // receiveHead → FirstByteTimeout); body silence is bounded by the
+        // 180s total watchdog.
         var first_byte_seen = false;
+        var received_bytes: u64 = 0;
         var resp_read_buf: [8192]u8 = undefined;
         const resp_reader = response.reader(&resp_read_buf);
         var chunk_buf: [4096]u8 = undefined;
@@ -127,36 +147,6 @@ pub const OpenAIProvider = struct {
             // surfaces as EscCancelled — the same cancel/recall path an
             // in-stream Esc takes — instead of a dead terminal until the
             // 180s watchdog. Interactive streams only (opts.esc_interrupt).
-            if (opts.esc_interrupt and resp_reader.bufferedLen() == 0) {
-                if (req.connection) |conn| {
-                    var idle_ms: i32 = 0;
-                    wait: while (true) {
-                        const watch = idle_ms >= stream_interrupt.SILENCE_BEFORE_WATCH_MS;
-                        switch (stream_interrupt.waitSlice(conn.stream_reader.stream.socket.handle, watch)) {
-                            .ready => break :wait,
-                            .tick => {
-                                idle_ms += stream_interrupt.POLL_SLICE_MS;
-                                if (!first_byte_seen) {
-                                    ttft_wait_ms += stream_interrupt.POLL_SLICE_MS;
-                                    if (ttft_wait_ms >= ttft_budget_ms) {
-                                        _ = std.c.shutdown(conn.stream_reader.stream.socket.handle, llm_watchdog.SHUT_RDWR);
-                                        logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{ttft_wait_ms});
-                                        return error.FirstByteTimeout;
-                                    }
-                                }
-                                try cb(ctx, .tick);
-                            },
-                            .cancelled => return error.EscCancelled,
-                            // Echo the keystroke through the stream callback
-                            // so the REPL (which owns the screen) renders it.
-                            .input => |b| {
-                                idle_ms = 0;
-                                try cb(ctx, .{ .live_input = b });
-                            },
-                        }
-                    }
-                }
-            }
             first_byte_seen = true; // buffered or just-read data exists
             wd.firstByte(); // lift the watchdog's TTFT sub-deadline
             // Incremental read: take whatever is buffered right now (at least
@@ -174,6 +164,7 @@ pub const OpenAIProvider = struct {
             const n = @min(avail.len, chunk_buf.len);
             @memcpy(chunk_buf[0..n], avail[0..n]);
             resp_reader.toss(n);
+            received_bytes += n;
 
             _ = try sse_parser.feed(chunk_buf[0..n]);
             const events = sse_parser.drain();
@@ -190,7 +181,7 @@ pub const OpenAIProvider = struct {
                 if (evt.data) |data| {
                     if (std.mem.eql(u8, data, "[DONE]")) {
                         try agg.finalize(ctx, cb);
-                        try cb(ctx, .{ .done = agg.usage });
+                        try cb(ctx, .{ .done = .{ .usage = agg.usage, .stop_reason = agg.stop_reason } });
                         return;
                     }
                     try agg.feed(data, ctx, cb);
@@ -199,11 +190,26 @@ pub const OpenAIProvider = struct {
         }
         try agg.finalize(ctx, cb);
         if (read_err) |e| {
-            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            if (wd.ttftKilled()) return error.FirstByteTimeout;
+            // The tag (ServerError/NetworkTimeout) says nothing about WHY;
+            // without this the [网关返回] line was absent (or, before the
+            // per-request clear, showed the previous request's reason).
+            // Forensics: bytes received / elapsed / HTTP status tell a
+            // mid-stream gateway drop (got 200 then RST) apart from a
+            // request that never really started.
+            const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
+            const detail = std.fmt.allocPrint(self.allocator, "openai stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model }) catch null;
+            if (detail) |d| {
+                provider.setErrorDetailIfEmpty("{s}", .{d});
+                self.allocator.free(d);
+            } else {
+                provider.setErrorDetailIfEmpty("openai stream: transport error: {s}", .{@errorName(e)});
+            }
+            logger.err("{s}", .{provider.lastErrorDetail()});
             try cb(ctx, .{ .error_occurred = mapStreamError(e) });
             return;
         }
-        try cb(ctx, .{ .done = agg.usage });
+        try cb(ctx, .{ .done = .{ .usage = agg.usage, .stop_reason = agg.stop_reason } });
     }
 
     fn mapStreamError(err: anyerror) provider.ProviderError {
@@ -215,7 +221,7 @@ pub const OpenAIProvider = struct {
 
     fn countTokens(ptr: *anyopaque, text: []const u8) anyerror!u32 {
         _ = ptr;
-        return @intCast(text.len / 4);
+        return tokens_mod.estimateTokens(text);
     }
 
     fn supportsToolUse(ptr: *anyopaque) bool {
@@ -391,7 +397,8 @@ pub const OpenAIProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var ttft_killed = std.atomic.Value(bool).init(false);
+        const wd = llm_watchdog.arm(&req, &ttft_killed);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -400,9 +407,13 @@ pub const OpenAIProvider = struct {
         var response = req.receiveHead(&redirect_buf) catch |e| {
             // A TTFT kill (gateway never sent even the headers) surfaces
             // here as a transport error — map it so the caller retries.
-            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            if (wd.ttftKilled()) return error.FirstByteTimeout;
+            provider.setErrorDetailIfEmpty("openai: request failed: {s}", .{@errorName(e)});
             return e;
         };
+        // Headers arrived — alive; lift the TTFT sub-deadline (a long
+        // non-stream completion must not be killed at 30s mid-body-read).
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "OpenAI API", &response);
@@ -531,6 +542,10 @@ pub const OpenAIProvider = struct {
         arena: std.heap.ArenaAllocator,
         calls: std.ArrayList(?*ToolCallAcc) = .empty,
         usage: ?provider.Usage = null,
+        /// Wire finish_reason, mapped. `"length"` used to be dropped on the
+        /// floor here — a reasoning model that spent the whole output budget
+        /// thinking then looked like a clean `end_turn` to the REPL.
+        stop_reason: ?provider.CompleteResponse.StopReason = null,
         finalized: bool = false,
 
         const ToolCallAcc = struct {
@@ -583,6 +598,7 @@ pub const OpenAIProvider = struct {
             // stream): without this the chunk is dropped, the stream ends
             // at EOF, and the truncated response completes "successfully".
             if (parsed.object.get("error") != null) {
+                provider.noteInBandError("openai", parsed);
                 try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
                 return;
             }
@@ -631,8 +647,15 @@ pub const OpenAIProvider = struct {
             }
 
             if (choice.object.get("finish_reason")) |fr| {
-                if (fr == .string and std.mem.eql(u8, fr.string, "tool_calls")) {
-                    try self.finalize(ctx, cb);
+                if (fr == .string) {
+                    if (std.mem.eql(u8, fr.string, "tool_calls")) {
+                        self.stop_reason = .tool_use;
+                        try self.finalize(ctx, cb);
+                    } else if (std.mem.eql(u8, fr.string, "length")) {
+                        self.stop_reason = .max_tokens;
+                    } else if (std.mem.eql(u8, fr.string, "stop")) {
+                        self.stop_reason = .end_turn;
+                    }
                 }
             }
         }
@@ -771,6 +794,7 @@ const TestSink = struct {
     deltas: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(provider.ToolUseBlock) = .empty,
     done_usage: ?provider.Usage = null,
+    done_stop: ?provider.CompleteResponse.StopReason = null,
 
     fn cb(ctx_opaque: ?*anyopaque, event: provider.StreamEvent) anyerror!void {
         const self: *TestSink = @ptrCast(@alignCast(ctx_opaque.?));
@@ -782,7 +806,8 @@ const TestSink = struct {
                 .input = tu.input,
             }),
             .done => |u| {
-                if (u != null) self.done_usage = u;
+                if (u.usage) |usage| self.done_usage = usage;
+                if (u.stop_reason) |sr| self.done_stop = sr;
             },
             else => {},
         }
@@ -848,6 +873,29 @@ test "OpenAI stream state synthesizes missing id and captures usage" {
     try std.testing.expect(state.usage != null);
     try std.testing.expectEqual(@as(u32, 11), state.usage.?.input_tokens);
     try std.testing.expectEqual(@as(u32, 7), state.usage.?.output_tokens);
+}
+
+test "OpenAI stream state maps finish_reason to stop_reason" {
+    var sink: TestSink = .{ .alloc = std.testing.allocator };
+    defer sink.deinit();
+    var state = OpenAIProvider.OpenAIStreamState.init(std.testing.allocator);
+    defer state.deinit();
+
+    // "length" — the reasoning-burn truncation that used to vanish.
+    try state.feed(
+        \\{"choices":[{"index":0,"delta":{"reasoning_content":"deep thought"},"finish_reason":null}]}
+    , @ptrCast(&sink), TestSink.cb);
+    try state.feed(
+        \\{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+    , @ptrCast(&sink), TestSink.cb);
+    try std.testing.expectEqual(provider.CompleteResponse.StopReason.max_tokens, state.stop_reason.?);
+
+    var state2 = OpenAIProvider.OpenAIStreamState.init(std.testing.allocator);
+    defer state2.deinit();
+    try state2.feed(
+        \\{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+    , @ptrCast(&sink), TestSink.cb);
+    try std.testing.expectEqual(provider.CompleteResponse.StopReason.end_turn, state2.stop_reason.?);
 }
 
 test "OpenAI stream state emits content deltas live" {

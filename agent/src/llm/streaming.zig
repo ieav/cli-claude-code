@@ -135,6 +135,10 @@ pub const ClaudeStreamState = struct {
     input_tokens: u32 = 0,
     output_tokens: u32 = 0,
     saw_usage: bool = false,
+    /// Wire stop_reason from message_delta (null = never reported). The
+    /// REPL surfaces a `max_tokens` cap honestly instead of defaulting to
+    /// end_turn — see provider.DoneInfo.
+    stop_reason: ?provider.CompleteResponse.StopReason = null,
 
     const ToolAcc = struct {
         index: usize,
@@ -230,6 +234,18 @@ pub const ClaudeStreamState = struct {
                 }
             }
         } else if (std.mem.eql(u8, t, "message_delta")) {
+            if (parsed.object.get("delta")) |d| {
+                if (d == .object) {
+                    if (d.object.get("stop_reason")) |sr| {
+                        if (sr == .string) {
+                            if (std.mem.eql(u8, sr.string, "end_turn")) self.stop_reason = .end_turn;
+                            if (std.mem.eql(u8, sr.string, "max_tokens")) self.stop_reason = .max_tokens;
+                            if (std.mem.eql(u8, sr.string, "stop_sequence")) self.stop_reason = .stop_sequence;
+                            if (std.mem.eql(u8, sr.string, "tool_use")) self.stop_reason = .tool_use;
+                        }
+                    }
+                }
+            }
             if (parsed.object.get("usage")) |u| {
                 if (u == .object) {
                     if (u.object.get("output_tokens")) |ov| {
@@ -243,6 +259,10 @@ pub const ClaudeStreamState = struct {
         } else if (std.mem.eql(u8, t, "message_stop")) {
             return true;
         } else if (std.mem.eql(u8, t, "error")) {
+            // The event body carries the gateway's own reason
+            // ({"error":{"type":"overloaded_error","message":"…"}}) —
+            // record it so the REPL's [网关返回] line shows it.
+            provider.noteInBandError("claude", parsed);
             try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
             // Terminal: an error event ends the conversation — returning
             // false let the loop run to EOF and emit a trailing .done,
@@ -257,6 +277,12 @@ pub const ClaudeStreamState = struct {
     pub fn usageValue(self: *const Self) ?provider.Usage {
         if (!self.saw_usage) return null;
         return .{ .input_tokens = self.input_tokens, .output_tokens = self.output_tokens };
+    }
+
+    /// The wire's stop_reason (message_delta), or null when no
+    /// message_delta carried one.
+    pub fn stopReasonValue(self: *const Self) ?provider.CompleteResponse.StopReason {
+        return self.stop_reason;
     }
 
     fn accFor(self: *Self, index: usize) ?*ToolAcc {
@@ -310,6 +336,7 @@ const StreamSink = struct {
     thinking: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(provider.ToolUseBlock) = .empty,
     done_usage: ?provider.Usage = null,
+    done_stop: ?provider.CompleteResponse.StopReason = null,
 
     fn cb(ctx_opaque: ?*anyopaque, event: provider.StreamEvent) anyerror!void {
         const self: *StreamSink = @ptrCast(@alignCast(ctx_opaque.?));
@@ -322,7 +349,8 @@ const StreamSink = struct {
                 .input = tu.input,
             }),
             .done => |u| {
-                if (u != null) self.done_usage = u;
+                if (u.usage) |usage| self.done_usage = usage;
+                if (u.stop_reason) |sr| self.done_stop = sr;
             },
             else => {},
         }
@@ -392,6 +420,22 @@ test "ClaudeStreamState reassembles tool_use and merges usage" {
     const usage = state.usageValue().?;
     try std.testing.expectEqual(@as(u32, 25), usage.input_tokens);
     try std.testing.expectEqual(@as(u32, 42), usage.output_tokens);
+    try std.testing.expectEqual(provider.CompleteResponse.StopReason.tool_use, state.stopReasonValue().?);
+}
+
+test "ClaudeStreamState captures max_tokens stop_reason" {
+    var sink: StreamSink = .{ .alloc = std.testing.allocator };
+    defer sink.deinit();
+    var state = ClaudeStreamState.init(std.testing.allocator);
+    defer state.deinit();
+
+    // Reasoning burn: the stream ends capped with zero visible content.
+    _ = try state.feed("{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30759}}}", @ptrCast(&sink), StreamSink.cb);
+    _ = try state.feed("{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"...\"}}", @ptrCast(&sink), StreamSink.cb);
+    _ = try state.feed("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4096}}", @ptrCast(&sink), StreamSink.cb);
+
+    try std.testing.expectEqual(provider.CompleteResponse.StopReason.max_tokens, state.stopReasonValue().?);
+    try std.testing.expectEqualStrings("...", sink.thinking.items);
 }
 
 test "ClaudeStreamState passes thinking deltas through" {
