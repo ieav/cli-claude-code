@@ -1334,6 +1334,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         const turn_t0 = util_time.nowMillis();
         var turn_in: u64 = 0;
         var turn_out: u64 = 0;
+        // ① Turn timing — same clock (util_time.nowMillis) and same
+        // boundaries everywhere downstream: LLM = per generation
+        // (llm_t0 → accepted response), tools = per batch (batch_t0 →
+        // all results collected), turn = turn_t0 → teardown. Surfaced in
+        // the frozen turn-end status row + ziv.log + .ziv/traces/*.jsonl.
+        var turn_llm_ms: i64 = 0;
+        var turn_llm_calls: u32 = 0;
+        var turn_tool_ms: i64 = 0;
+        var turn_tool_calls: u32 = 0;
 
         // The live region (status row + prompt-identical input row) now
         // spans the WHOLE turn: begun once here, ended once after the
@@ -1565,6 +1574,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             total_output_tokens += response.usage.output_tokens;
             turn_in += response.usage.input_tokens;
             turn_out += response.usage.output_tokens;
+            // Timing 口径: one window per generation, llm_t0 → accepted
+            // response. The rare budget-escalation retry keeps the same
+            // llm_t0, folding the discarded attempt into this window — a
+            // bounded overcount, simpler than threading a second t0
+            // through the escalation loop.
+            turn_llm_calls += 1;
+            turn_llm_ms += util_time.nowMillis() - llm_t0;
 
             // Live decision trace: generation step.
             if (live_trace) |*t| {
@@ -1918,7 +1934,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     var batch_errors: u32 = 0;
                     for (prepared.items, 0..) |p, i| {
                         window_tools += 1;
-                        const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len);
+                        const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
                         if (errored) {
                             window_errors += 1;
                             batch_errors += 1;
@@ -1926,6 +1942,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         }
                     }
 
+                    // Timing 口径: one window per batch, dispatch
+                    // (batch_t0) → all results collected; tools counted
+                    // per call — a parallel batch folds each tool's time
+                    // into the batch window (wall time, not exclusive).
+                    turn_tool_ms += util_time.nowMillis() - batch_t0;
+                    turn_tool_calls += @intCast(prepared.items.len);
                     // Live decision trace: execution step for this batch.
                     if (live_trace) |*t| {
                         const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
@@ -2003,17 +2025,36 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             region_wr.flushTableBlock();
             if (turn_in + turn_out > 0) {
                 const turn_s = @as(f64, @floatFromInt(util_time.nowMillis() - turn_t0)) / 1000.0;
-                var sb: [96]u8 = undefined;
+                var sb: [160]u8 = undefined;
                 // Non-empty fallback: regionStatus("") would erase the
                 // region rows instead of freezing a summary.
-                const summary = std.fmt.bufPrint(&sb, "✓ 完成 · in {d} → out {d} · {d:.1}s", .{ turn_in, turn_out, turn_s }) catch "✓ 完成";
+                const summary = std.fmt.bufPrint(&sb, "✓ 完成 · in {d} → out {d} · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 总 {d:.1}s", .{ turn_in, turn_out, turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, turn_s }) catch "✓ 完成";
                 lineinput.regionStatus(w, summary);
                 lineinput.regionFreeze(w);
+                // Same numbers into the persistent log — the frozen row
+                // scrolls away; ziv.log is where post-mortems read.
+                logger.info("turn: llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
             } else {
                 lineinput.regionEnd(w);
                 try std.Io.Writer.writeAll(w, "\n");
             }
             try std.Io.File.Writer.flush(&file_writer);
+        }
+
+        // ③ Turn telemetry: persist the decision trace (per-step
+        // durations, JSONL) before the next query re-inits it. Default
+        // ON; ZIV_TRACE=0/false opts out. A failed write is a warning —
+        // telemetry must never break a turn.
+        if (live_trace) |*t| {
+            const trace_off = blk: {
+                const v = env.get("ZIV_TRACE") orelse break :blk false;
+                break :blk std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            };
+            if (!trace_off and t.getSteps().len > 0) {
+                t.complete();
+                t.writeJsonlFile(io, ".ziv/traces", allocator) catch |e|
+                    logger.warning("trace persist failed: {}", .{e});
+            }
         }
 
         if (agent_iterations >= MAX_AGENT_ITERATIONS) {
@@ -4071,8 +4112,12 @@ fn finishToolCall(
     ow: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     history_len: usize,
+    elapsed_ms: i64,
 ) !bool {
-    logger.info("Tool execute: {s}", .{p.call.tool_name});
+    // Wall time from batch dispatch — for a parallel batch this includes
+    // queue wait and overlaps siblings; per-tool exclusive time would
+    // need per-future t0 plumbing the pool doesn't expose.
+    logger.info("Tool execute: {s} ({d}ms)", .{ p.call.tool_name, elapsed_ms });
 
     // Tool phase: the region is already up (turn-scoped) — just swap the
     // STATUS text; the input row never flickers between phases anymore.
