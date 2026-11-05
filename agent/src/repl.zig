@@ -1043,6 +1043,40 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try showContext(&history, total_input_tokens, total_output_tokens, w);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
+            } else if (std.mem.eql(u8, input, "/trace")) {
+                // P2: per-step timing of the last turn, read straight from
+                // the .ziv/traces/*.jsonl the turn-end telemetry wrote —
+                // the data has existed since 2026-11-05, this is its
+                // in-TUI window.
+                if (last_trace_path_len == 0) {
+                    try std.Io.Writer.print(w, "  本会话尚无 trace（任一回合结束后生成；ZIV_TRACE=0 可关闭落盘）\n\n", .{});
+                } else {
+                    const tpath = last_trace_path_buf[0..last_trace_path_len];
+                    var fbuf: [131072]u8 = undefined;
+                    if (std.Io.Dir.cwd().readFile(io, tpath, &fbuf)) |data| {
+                        var lines_it = std.mem.splitScalar(u8, data, '\n');
+                        const header = lines_it.next() orelse "";
+                        var qb: [96]u8 = undefined;
+                        const qtxt = traceHeaderSummary(header, &qb) catch "（表头解析失败）";
+                        try std.Io.Writer.print(w, "  ⏱ 上一回合 {s}\n", .{qtxt});
+                        var step_no: usize = 0;
+                        while (lines_it.next()) |ln| {
+                            if (ln.len == 0) continue;
+                            step_no += 1;
+                            if (step_no > 80) break;
+                            var sb: [96]u8 = undefined;
+                            if (traceStepSummary(ln, &sb)) |s| {
+                                try std.Io.Writer.print(w, "    {d:>3}. {s}\n", .{ step_no, s });
+                            }
+                        }
+                        if (step_no > 80) try std.Io.Writer.print(w, "    …（超 80 步截断；全量见文件）\n", .{});
+                        try std.Io.Writer.print(w, "  文件: {s}\n\n", .{tpath});
+                    } else |_| {
+                        try std.Io.Writer.print(w, "  读取 trace 失败（文件可能已被移动）: {s}\n\n", .{tpath});
+                    }
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
             } else if (std.mem.eql(u8, input, "/memory")) {
                 try printMemoryStatus(if (mem_sys) |*ms| ms else null, injected_count, w);
                 try std.Io.File.Writer.flush(&file_writer);
@@ -1352,6 +1386,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // Transcript prints inside the loop go through `ow` (region-aware);
         // only the region lifecycle calls below keep `w`.
         live_turn_t0 = turn_t0;
+        live_llm_rounds = 0;
         lineinput.regionBegin(w, "⏳ 本轮 0.0s · 累计 0.0s · Esc 中断 · Enter 排队");
         // v0.7.7: context low-water WARNING (Claude-Code parity) — one dim
         // transcript line at >=80% of the model's ceiling, before the φ
@@ -1445,7 +1480,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         continue;
                     }
                     lineinput.regionEnd(w);
-                    try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合。Esc 可中断，请检查网关或稍后重发]\x1b[0m\n\n", .{});
+                    try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合]\x1b[0m\n", .{});
+                    // P3 recoverable give-up: prefill 「继续」 — one Enter
+                    // resumes the task as a fresh turn (proven 2026-11-05:
+                    // a "继续" turn picked the task up cleanly and history
+                    // pairs stay legal — see trace 1793893733712).
+                    try std.Io.Writer.print(ow, "\x1b[2m  [输入区已预填「继续」：网关恢复后 Enter 即接续任务；也可直接改成其他输入]\x1b[0m\n\n", .{});
+                    lineinput.recall_text = "继续";
+                    lineinput.recall_prefill = true;
                     try std.Io.File.Writer.flush(&file_writer);
                     break;
                 }
@@ -1580,6 +1622,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // bounded overcount, simpler than threading a second t0
             // through the escalation loop.
             turn_llm_calls += 1;
+            live_llm_rounds = turn_llm_calls; // StreamJob ticker mirror
             turn_llm_ms += util_time.nowMillis() - llm_t0;
 
             // Live decision trace: generation step.
@@ -1832,12 +1875,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         self.done.store(true, .release);
                     }
                     /// Status text with the LIVE turn clock (UI loop side).
-                    fn statusText(t0: i64, n_calls: usize, first_tool: []const u8, buf: []u8) []const u8 {
+                    fn statusText(t0: i64, llm_rounds: u32, n_calls: usize, first_tool: []const u8, buf: []u8) []const u8 {
                         const tsum = @as(f64, @floatFromInt(util_time.nowMillis() - t0)) / 1000.0;
                         return if (n_calls == 1)
-                            std.fmt.bufPrint(buf, "⚙ 工具 {s} · 回合 {d:.1}s", .{ first_tool, tsum }) catch "⚙ 执行工具"
+                            std.fmt.bufPrint(buf, "⚙ 工具 {s} · LLM {d}轮 · 回合 {d:.1}s", .{ first_tool, llm_rounds, tsum }) catch "⚙ 执行工具"
                         else
-                            std.fmt.bufPrint(buf, "⚙ 执行 {d} 个工具（{s}…） · 回合 {d:.1}s", .{ n_calls, first_tool, tsum }) catch "⚙ 执行工具";
+                            std.fmt.bufPrint(buf, "⚙ 执行 {d} 个工具（{s}…） · LLM {d}轮 · 回合 {d:.1}s", .{ n_calls, first_tool, llm_rounds, tsum }) catch "⚙ 执行工具";
                     }
                 };
                 var tool_job = ToolJob{};
@@ -1887,7 +1930,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                 if (now - last_status >= 500) {
                                     last_status = now;
                                     var sb: [96]u8 = undefined;
-                                    lineinput.regionStatus(w, ToolJob.statusText(turn_t0, prepared.items.len, prepared.items[0].call.tool_name, &sb));
+                                    lineinput.regionStatus(w, ToolJob.statusText(turn_t0, turn_llm_calls, prepared.items.len, prepared.items[0].call.tool_name, &sb));
                                     std.Io.File.Writer.flush(&file_writer) catch {};
                                 }
                             }
@@ -2036,6 +2079,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 logger.info("turn: llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
             } else {
                 lineinput.regionEnd(w);
+                // Aborted/failed exits (Esc, TTFT give-up, transport error)
+                // arrive with the region already down — the frozen-row
+                // summary above never runs, so the turn's cost was silent
+                // (2026-11-05 23:51 incident: 157.9s spent, TUI showed
+                // nothing). Same breakdown, as a transcript line instead.
+                if (turn_llm_calls > 0 or turn_tool_calls > 0) {
+                    const abort_s = @as(f64, @floatFromInt(util_time.nowMillis() - turn_t0)) / 1000.0;
+                    std.Io.Writer.print(ow, "  \x1b[2m⏱ 中断 · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 已进行 {d:.1}s · 逐步耗时见 .ziv/traces/（/trace 直读）\x1b[0m\n", .{ turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, abort_s }) catch {};
+                    logger.info("turn(aborted): llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
+                }
                 try std.Io.Writer.writeAll(w, "\n");
             }
             try std.Io.File.Writer.flush(&file_writer);
@@ -2052,8 +2105,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             };
             if (!trace_off and t.getSteps().len > 0) {
                 t.complete();
-                t.writeJsonlFile(io, ".ziv/traces", allocator) catch |e|
+                if (t.writeJsonlFile(io, ".ziv/traces", allocator)) {
+                    // /trace reads this path back — record it on success only.
+                    if (std.fmt.bufPrint(&last_trace_path_buf, ".ziv/traces/{d}.jsonl", .{t.started_at})) |p| {
+                        last_trace_path_len = p.len;
+                    } else |_| {}
+                } else |e| {
                     logger.warning("trace persist failed: {}", .{e});
+                }
             }
         }
 
@@ -3300,6 +3359,71 @@ fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void
 
 /// Append one step to the live decision trace (all strings duped; the
 /// trace frees them in deinit).
+/// One compact row from a trace JSONL step line: "phase  Nms". Header
+/// lines (query/total — no "phase" key) return null. Field scanning, not
+/// JSON parsing: /trace stays light and the field order is fixed by
+/// decision_trace.toJsonl.
+fn traceStepSummary(line: []const u8, buf: []u8) ?[]const u8 {
+    const phase_key = "\"phase\":\"";
+    const p0 = std.mem.indexOf(u8, line, phase_key) orelse return null;
+    const p1 = p0 + phase_key.len;
+    const p2 = std.mem.indexOfScalarPos(u8, line, p1, '"') orelse return null;
+    const ms_key = "\"ms\":";
+    const m0 = std.mem.indexOf(u8, line, ms_key) orelse return null;
+    const m1 = m0 + ms_key.len;
+    const m2 = std.mem.indexOfScalarPos(u8, line, m1, ',') orelse line.len;
+    return std.fmt.bufPrint(buf, "{s:<18} {s}ms", .{ line[p1..p2], line[m1..m2] }) catch null;
+}
+
+/// Header row of a trace file: "「query」 · N 步 · 总 X.Ys".
+fn traceHeaderSummary(header: []const u8, buf: []u8) ![]const u8 {
+    const qk = "\"query\":\"";
+    const q0 = std.mem.indexOf(u8, header, qk) orelse return error.BadHeader;
+    const q1 = q0 + qk.len;
+    var q_end = std.mem.indexOf(u8, header, "\",\"steps\":") orelse header.len;
+    if (q_end < q1) q_end = header.len;
+    var query = header[q1..q_end];
+    if (query.len > 24) {
+        query = query[0..24];
+        // Back off to a UTF-8 boundary — a mid-CJK cut would mojibake.
+        while (query.len > 0 and (query[query.len - 1] & 0xC0) == 0x80) query = query[0 .. query.len - 1];
+        if (query.len > 0) query = query[0 .. query.len - 1];
+    }
+    const tk = "\"total_ms\":";
+    const t0 = std.mem.indexOf(u8, header, tk) orelse return error.BadHeader;
+    const t1 = t0 + tk.len;
+    const t2 = std.mem.indexOfScalarPos(u8, header, t1, ',') orelse header.len;
+    const total_ms = std.fmt.parseInt(i64, header[t1..t2], 10) catch 0;
+    const sk = "\"steps\":";
+    const s0 = std.mem.indexOf(u8, header, sk) orelse return error.BadHeader;
+    const s1 = s0 + sk.len;
+    const s2 = std.mem.indexOfScalarPos(u8, header, s1, ',') orelse header.len;
+    return std.fmt.bufPrint(buf, "「{s}」 · {s} 步 · 总 {d}.{d}s", .{ query, header[s1..s2], @divTrunc(total_ms, 1000), @divTrunc(@mod(total_ms, 1000), 100) });
+}
+
+test "trace line summary: step rows parsed, header skipped" {
+    var buf: [96]u8 = undefined;
+    const step_line = "{\"step\":3,\"phase\":\"llm_generation\",\"ts\":1793893800607,\"ms\":66895,\"conf\":0.90,\"in\":\"history + system prompt\",\"out\":\"content blocks\",\"why\":\"tool_use\"}";
+    const s = traceStepSummary(step_line, &buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, s, "llm_generation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "66895ms") != null);
+    // Header rows carry no "phase" key — they must yield null, not garbage.
+    const header_line = "{\"query\":\"继续\",\"steps\":9,\"total_ms\":157941,\"started_at\":1793893733712}";
+    try std.testing.expect(traceStepSummary(header_line, &buf) == null);
+}
+
+test "trace header summary: query, steps, total seconds" {
+    var buf: [96]u8 = undefined;
+    const header = "{\"query\":\"继续任务\",\"steps\":9,\"total_ms\":157941,\"started_at\":1793893733712}";
+    const s = try traceHeaderSummary(header, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, s, "继续任务") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "157.9s") != null);
+    // Long CJK queries truncate on a UTF-8 boundary (no mojibake tail).
+    const long_header = "{\"query\":\"一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十\",\"steps\":2,\"total_ms\":1000,\"started_at\":1}";
+    const s2 = try traceHeaderSummary(long_header, &buf);
+    try std.testing.expect(s2.len <= buf.len);
+}
+
 fn traceAddStep(
     t: *decision_trace.DecisionTrace,
     phase: decision_trace.DecisionPhase,
@@ -3332,6 +3456,14 @@ fn traceAddStep(
 /// previous rounds cost. Main-thread only: set by run() right before
 /// regionBegin, read by streamCb's tick on the same thread.
 var live_turn_t0: i64 = 0;
+/// Completed LLM rounds in the live turn (mirrors turn_llm_calls for the
+/// StreamJob ticker thread, which cannot reach the turn loop's locals).
+/// 0 = between turns.
+var live_llm_rounds: u32 = 0;
+/// Path of the most recently persisted decision trace (set at turn end;
+/// /trace reads it). Empty until the first turn of the session writes one.
+var last_trace_path_buf: [160]u8 = undefined;
+var last_trace_path_len: usize = 0;
 
 const StreamAgg = struct {
     alloc: std.mem.Allocator,
@@ -3540,7 +3672,8 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             const queued = lineinput.queuedCount();
             var sb: [96]u8 = undefined;
             const st = if (queued > 0)
-                std.fmt.bufPrint(&sb, "⏳ 本轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
+                    live_llm_rounds + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
@@ -3548,7 +3681,8 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
                     queued,
                 }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队"
             else
-                std.fmt.bufPrint(&sb, "⏳ 本轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队", .{
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队", .{
+                    live_llm_rounds + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
@@ -4143,7 +4277,10 @@ fn finishToolCall(
     // the writer is line-atomic above the region).
     var disp_cut: usize = @min(raw.len, 200);
     while (disp_cut > 0 and disp_cut < raw.len and (raw[disp_cut] & 0xC0) == 0x80) disp_cut -= 1;
-    std.Io.Writer.print(ow, "  [{s}: {s}]\n", .{ p.call.tool_name, raw[0..disp_cut] }) catch {};
+    // Tool line carries its wall time (batch dispatch → collection): in a
+    // long turn the "how long did each step take" question is answered
+    // here, live — no need to dig into .ziv/traces after the fact.
+    std.Io.Writer.print(ow, "  [{s} · {d}.{d}s: {s}]\n", .{ p.call.tool_name, @divTrunc(elapsed_ms, 1000), @divTrunc(@mod(elapsed_ms, 1000), 100), raw[0..disp_cut] }) catch {};
 
     // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
     // char boundary. A mid-char cut used to poison every later request:
@@ -5924,6 +6061,7 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /compact phi      Truncate history to the recent 61.8% (no LLM call)
         \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
         \\  /context          Show current context/token usage
+        \\  /trace            Show the last turn's per-step timing
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
         \\  /rewind           Rewind files AND conversation to a checkpoint
