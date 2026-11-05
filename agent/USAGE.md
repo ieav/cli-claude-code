@@ -206,7 +206,7 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/skills` | 列出已安装 Skill（详见下文 v0.5.1 节） |
 | `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见下文 v0.5.1 节） |
 
-> **`agent` 并行子代理（非斜杠命令）**：子代理派发是注册给模型的动态工具，**默认开启**（设 `ZIV_AGENT_TOOL=0` 关闭），由 LLM 在对话中自主调用，也可 `/run agent {"tasks":["…","…"]}` 手动触发——直接输入 `/agent` 不会执行任何命令。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整；派发期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死（E2E 已锁：tests/agent_e2e.zig）。
+> **`agent` 并行子代理（非斜杠命令）**：子代理派发是注册给模型的动态工具，**默认开启**（设 `ZIV_AGENT_TOOL=0` 关闭），由 LLM 在对话中自主调用，也可 `/run agent {"tasks":["…","…"]}` 手动触发——直接输入 `/agent` 不会执行任何命令。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整；派发期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s 空闲——距上一字节无数据才算超时，持续出数据的长流不会被杀，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死（E2E 已锁：tests/agent_e2e.zig）。
 
 ### 权限模式 (Permission Modes)
 
@@ -744,7 +744,7 @@ Ziv 支持 5 层配置源，后者覆盖前者：
 
 搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
 
-运行时行为环境变量：`ZIV_LLM_TIMEOUT_MS`（LLM 请求看护狗超时，默认 180000，下限 1000——网关接受请求后不响应时按超时报错恢复而不是永久挂死）；`ZIV_CRON_SCALE`（定时任务时间线压缩倍数，仅测试用，如 600 把 81.5 分钟的记忆清扫压缩到 ~8 秒）；`ZIV_LOG`（日志级别 debug|info|warning，默认 notice，`2>ziv.log` 查看）。
+运行时行为环境变量：`ZIV_LLM_TIMEOUT_MS`（LLM 请求**空闲**看护狗超时——距上一字节无数据才算超时，默认 180000，下限 1000；持续出数据的长流不会被杀，网关停摆时按超时报错恢复而不是永久挂死）；`ZIV_CRON_SCALE`（定时任务时间线压缩倍数，仅测试用，如 600 把 81.5 分钟的记忆清扫压缩到 ~8 秒）；`ZIV_LOG`（日志级别 debug|info|warning，默认 notice，`2>ziv.log` 查看）。
 
 ### 6.3 代码中配置
 

@@ -93,8 +93,8 @@ pub const OpenAIProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        var ttft_killed = std.atomic.Value(bool).init(false);
-        const wd = llm_watchdog.arm(&req, &ttft_killed);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -130,7 +130,8 @@ pub const OpenAIProvider = struct {
         // Stream: read chunks and parse SSE events incrementally. The
         // watchdog's TTFT sub-deadline covers never-any-headers (killed at
         // receiveHead → FirstByteTimeout); body silence is bounded by the
-        // 180s total watchdog.
+        // 180s idle watchdog — bumped per chunk below, so a stream that
+        // keeps sending never hits it, however long the turn runs.
         var first_byte_seen = false;
         var received_bytes: u64 = 0;
         var resp_read_buf: [8192]u8 = undefined;
@@ -148,7 +149,7 @@ pub const OpenAIProvider = struct {
             // in-stream Esc takes — instead of a dead terminal until the
             // 180s watchdog. Interactive streams only (opts.esc_interrupt).
             first_byte_seen = true; // buffered or just-read data exists
-            wd.firstByte(); // lift the watchdog's TTFT sub-deadline
+            wd.firstByte(); // data exists: lift TTFT, push the idle deadline
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
@@ -196,9 +197,15 @@ pub const OpenAIProvider = struct {
             // per-request clear, showed the previous request's reason).
             // Forensics: bytes received / elapsed / HTTP status tell a
             // mid-stream gateway drop (got 200 then RST) apart from a
-            // request that never really started.
+            // request that never really started. A kill by OUR idle
+            // watchdog (stream went silent) is attributed to ziv, not the
+            // gateway — the 2026-11-05 "网关断流" reports were exactly
+            // this kill mislabelled.
             const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
-            const detail = std.fmt.allocPrint(self.allocator, "openai stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model }) catch null;
+            const detail = if (wd.idleKilled())
+                std.fmt.allocPrint(self.allocator, "openai stream: killed by ziv idle watchdog — stream went silent past the deadline (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @backingInt(response.head.status), received_bytes, elapsed, self.config.model }) catch null
+            else
+                std.fmt.allocPrint(self.allocator, "openai stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model }) catch null;
             if (detail) |d| {
                 provider.setErrorDetailIfEmpty("{s}", .{d});
                 self.allocator.free(d);
@@ -397,8 +404,8 @@ pub const OpenAIProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        var ttft_killed = std.atomic.Value(bool).init(false);
-        const wd = llm_watchdog.arm(&req, &ttft_killed);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));

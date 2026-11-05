@@ -558,7 +558,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // accepts a request and then never answers, and the provider layer had
     // no timeout — the dynamic-tool path itself was exonerated. Every LLM
     // request is now guarded by the stall watchdog (util/llm_watchdog.zig,
-    // default 180s, ZIV_LLM_TIMEOUT_MS), and the default-on E2E
+    // default 180s idle — pushed forward by every received byte since
+    // 2026-11-05, ZIV_LLM_TIMEOUT_MS), and the default-on E2E
     // re-validation ran both shapes against a real mock gateway
     // (tests/agent_e2e.zig): happy fan-out AND the P38 stall (gateway
     // accepts, never answers → watchdog kills → fail-fast retry fails →

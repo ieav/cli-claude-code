@@ -90,8 +90,8 @@ pub const ClaudeProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        var ttft_killed = std.atomic.Value(bool).init(false);
-        const wd = llm_watchdog.arm(&req, &ttft_killed);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -132,7 +132,8 @@ pub const ClaudeProvider = struct {
         // Stream: read chunks and parse SSE events incrementally. The
         // watchdog's TTFT sub-deadline covers never-any-headers (killed at
         // receiveHead → FirstByteTimeout); body silence is bounded by the
-        // 180s total watchdog.
+        // 180s idle watchdog — bumped per chunk below, so a stream that
+        // keeps sending never hits it, however long the turn runs.
         var first_byte_seen = false;
         var received_bytes: u64 = 0;
         var resp_read_buf: [8192]u8 = undefined;
@@ -148,8 +149,10 @@ pub const ClaudeProvider = struct {
             // headers lives in the connection buffer, which only a real
             // read consumes). Cancellation is the UI loop's shutdown(2)
             // on the published fd; the watchdog's TTFT sub-deadline
-            // (headers) and 180s total deadline bound the block.
+            // (headers) and 180s idle deadline (bumped per chunk here)
+            // bound the block.
             first_byte_seen = true; // reached only when data exists
+            wd.firstByte(); // data exists: lift TTFT, push the idle deadline
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
@@ -194,7 +197,14 @@ pub const ClaudeProvider = struct {
         if (read_err) |e| {
             if (wd.ttftKilled()) return error.FirstByteTimeout;
             const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
-            provider.setErrorDetailIfEmpty("claude stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            // A kill by OUR idle watchdog (stream went silent) is
+            // attributed to ziv, not the gateway — see openai.zig's
+            // 2026-11-05 note.
+            if (wd.idleKilled()) {
+                provider.setErrorDetailIfEmpty("claude stream: killed by ziv idle watchdog — stream went silent past the deadline (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            } else {
+                provider.setErrorDetailIfEmpty("claude stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            }
             logger.err("{s}", .{provider.lastErrorDetail()});
             try cb(ctx, .{ .error_occurred = switch (e) {
                 error.ConnectionResetByPeer, error.BrokenPipe => provider.ProviderError.NetworkTimeout,
@@ -394,8 +404,8 @@ pub const ClaudeProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        var ttft_killed = std.atomic.Value(bool).init(false);
-        const wd = llm_watchdog.arm(&req, &ttft_killed);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
