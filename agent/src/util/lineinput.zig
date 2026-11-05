@@ -618,31 +618,6 @@ fn liveDraft() []const u8 {
     return ed.buf[0..ed.len];
 }
 
-/// Display-capped tail of the live draft, cut at a UTF-8 boundary and
-/// fitting the terminal width minus the prompt prefix (the input row must
-/// stay ONE row — an overflowing echo would wrap over the status row).
-/// Interim single-row view: the P3 renderer gives the editor its full
-/// multi-row block back.
-fn editorTail() []const u8 {
-    const s = liveDraft();
-    const tw = currentTermWidth(); // honors the force_width test hook
-    var budget: usize = if (tw > 40) tw - 40 else 16;
-    const pw = strWidth(pendingPrompt());
-    if (tw > pw + 2) budget = tw - pw - 2;
-    var i = s.len;
-    var cols: usize = 0;
-    while (i > 0) {
-        // walk back one rune
-        var start = i - 1;
-        while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
-        const rune_cols: usize = if (s[start] >= 0xE0) 2 else 1;
-        if (cols + rune_cols > budget) break;
-        cols += rune_cols;
-        i = start;
-    }
-    return s[i..];
-}
-
 /// ── P3: turn-scoped live region (DECSTBM scroll-region protocol) ────
 /// The terminal is split by a scroll region: rows [1, H-2] are the
 /// TRANSCRIPT (scrolls), the bottom TWO rows are PINNED (status above,
@@ -658,6 +633,106 @@ var region_h: usize = 0;
 /// the draft; matches MAX_VIEW_ROWS' spirit, smaller to keep the
 /// transcript area on short terminals).
 const MAX_LIVE_BLOCK_ROWS: usize = 6;
+
+/// Synchronized-Update brackets around full repaints: terminals that
+/// support ?2026 (kitty/iTerm2/WezTerm/foot…) present the whole block as
+/// ONE atomic frame — the up-to-7-row clear+rewrite of a keystroke no
+/// longer flashes. Terminals without support see an unknown private-mode
+/// set/reset, which is a defined no-op.
+fn suBegin(w: *std.Io.Writer) void {
+    std.Io.Writer.writeAll(w, "\x1b[?2026h") catch {};
+}
+fn suEnd(w: *std.Io.Writer) void {
+    std.Io.Writer.writeAll(w, "\x1b[?2026l") catch {};
+}
+
+/// Census of the live editor block: total soft-wrapped display rows, the
+/// cursor's ABSOLUTE display row (0-based), and its display column
+/// (prompt width included on row 0). One walk serves both the painter and
+/// the cursor park — they can never disagree about where the cursor
+/// belongs (the "typing position snapped to the end while editing
+/// mid-draft" bug class).
+const LiveCensus = struct { nrows: usize, cur_row: usize, cur_col: usize };
+
+fn scanLiveBlock(rows_buf: ?*[64][]const u8, pos_override: ?usize) LiveCensus {
+    const pw = strWidth(pendingPrompt());
+    const tw = currentTermWidth();
+    var nrows: usize = 0;
+    var cur_row: usize = 0;
+    var cur_col: usize = pw;
+    var found = false;
+
+    const ed = live_ed;
+    const s: []const u8 = if (ed) |e| e.buf[0..e.len] else "";
+    const pos: usize = if (pos_override) |p| @min(p, s.len) else if (ed) |e| @min(e.pos, e.len) else 0;
+
+    var off: usize = 0; // logical line start (absolute)
+    var first = true;
+    while (off <= s.len) {
+        const nl = std.mem.indexOfScalarPos(u8, s, off, '\n');
+        const le = nl orelse s.len;
+        const logical = s[off..le];
+        const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
+        var col: usize = 0;
+        var i: usize = 0;
+        var row_start: usize = off;
+        while (i <= logical.len) {
+            // Cursor boundary BEFORE consuming — a wrap never re-matches
+            // (a hit returns with the PRE-wrap column, the row-end cell).
+            if (!found and pos == off + i) {
+                found = true;
+                cur_row = nrows;
+                cur_col = if (nrows == 0) pw + col else col;
+            }
+            if (i == logical.len) { // close this display row
+                if (rows_buf) |rb| {
+                    if (nrows < rb.len) {
+                        rb[nrows] = s[row_start .. off + i];
+                        nrows += 1;
+                    }
+                } else if (nrows < 64) nrows += 1;
+                break;
+            }
+            const nx = nextChar(logical, i);
+            const cw = strWidth(logical[i..nx]);
+            if (col > 0 and col + cw > avail) { // wrap: close row, re-scan i
+                if (rows_buf) |rb| {
+                    if (nrows < rb.len) {
+                        rb[nrows] = s[row_start .. off + i];
+                        nrows += 1;
+                    }
+                } else if (nrows < 64) nrows += 1;
+                row_start = off + i;
+                col = 0;
+                continue;
+            }
+            col += cw;
+            i = nx;
+        }
+        if (nl == null) break;
+        off = le + 1;
+        first = false;
+    }
+    if (nrows == 0) nrows = 1; // empty draft: one blank input row
+    return .{ .nrows = nrows, .cur_row = cur_row, .cur_col = cur_col };
+}
+
+/// Park the visible cursor at the editor's ACTUAL editing position within
+/// the painted window: the census row if visible, else the first visible
+/// row (cursor scrolled out of the tail window — rare, up-arrow into a
+/// long draft). Both the block painter and the tick/transcript restore
+/// path land here, so the cursor never visibly "snaps to the end".
+fn parkLiveCursor(w: *std.Io.Writer, c: LiveCensus) void {
+    const split = regionRows();
+    const marker = c.nrows > MAX_LIVE_BLOCK_ROWS;
+    const start = if (marker) c.nrows - MAX_LIVE_BLOCK_ROWS else 0;
+    const top = split + 2 + @as(usize, if (marker) 1 else 0);
+    if (c.cur_row >= start) {
+        std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ top + (c.cur_row - start), c.cur_col + 1 }) catch {};
+    } else {
+        std.Io.Writer.print(w, "\x1b[{d};1H", .{top}) catch {};
+    }
+}
 
 /// The editor block's CURRENT row count (>=1): soft-wrapped display rows
 /// of the persistent draft, prompt sharing row 0, tail-windowed with a
@@ -718,6 +793,7 @@ fn regionApply(w: *std.Io.Writer) void {
     region_h = h;
     const split = regionRows();
     last_block_rows = blockRows();
+    suBegin(w); // whole re-arm is one frame (bounds + status + block)
     if (!pending_shown) {
         // FIRST ARM. The cursor sits at the FLOW position (right after
         // the committed echo) — on an UNKNOWN row R (full-screen shell
@@ -751,7 +827,8 @@ fn regionApply(w: *std.Io.Writer) void {
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     }
-    writeEditorBlock(w);
+    writeEditorBlock(w); // nested SU — spec-legal, one frame either way
+    suEnd(w);
     pending_shown = true;
     pending_status_shown = true;
 }
@@ -759,44 +836,17 @@ fn regionApply(w: *std.Io.Writer) void {
 /// Paint the editor block into its pinned rows (absolute): every soft-
 /// wrapped display row of the draft, prompt sharing row 0, tail-windowed
 /// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
-/// Cursor parks at the end of the LAST row's text — the typing position.
+/// The visible cursor parks at the EDITOR'S editing position (census row
+/// + column), not incidentally at the last write — arrow-key edits are
+/// legible mid-generation. SU-bracketed so supporting terminals render
+/// the whole repaint as one frame.
 fn writeEditorBlock(w: *std.Io.Writer) void {
     const split = regionRows();
-    const tw = currentTermWidth();
-    const pw = strWidth(pendingPrompt());
-
-    // Collect display rows first (tail window decision needs the total).
     var rows_buf: [64][]const u8 = undefined;
-    var nrows: usize = 0;
-    var first_logical = true;
-    var iter = std.mem.splitScalar(u8, liveDraft(), '\n');
-    while (iter.next()) |logical| {
-        const avail: usize = if (first_logical) (if (tw > pw) tw - pw else 1) else tw;
-        var col: usize = 0;
-        var i: usize = 0;
-        var row_start: usize = 0;
-        while (i <= logical.len) {
-            if (i == logical.len or (col > 0 and blk: {
-                const next = nextChar(logical, i);
-                const cw = strWidth(logical[i..next]);
-                break :blk col + cw > avail;
-            })) {
-                if (nrows < rows_buf.len) {
-                    rows_buf[nrows] = logical[row_start..i];
-                    nrows += 1;
-                }
-                row_start = i;
-                col = 0;
-                if (i == logical.len) break;
-            }
-            const next = nextChar(logical, i);
-            col += strWidth(logical[i..next]);
-            i = next;
-        }
-        first_logical = false;
-    }
-    if (nrows == 0) nrows = 1; // empty draft: one blank input row
+    const c = scanLiveBlock(&rows_buf, null);
+    const nrows = c.nrows;
 
+    suBegin(w);
     const hidden = nrows -| MAX_LIVE_BLOCK_ROWS;
     const start = if (nrows > MAX_LIVE_BLOCK_ROWS) hidden else 0;
     var row_idx = split + 2;
@@ -818,6 +868,8 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
         std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
     }
+    parkLiveCursor(w, c);
+    suEnd(w);
 }
 
 /// True while the region is armed — REPL output funnels through
@@ -862,12 +914,14 @@ pub fn regionPrintLine(w: *std.Io.Writer, line: []const u8) void {
     parkCursor(w);
 }
 
-/// Park the cursor at the end of the editor block's last visible row.
+/// Park the cursor at the editor's ACTUAL editing position — the SAME
+/// computation the block painter uses (scanLiveBlock). The 500ms status
+/// tick and every transcript line restore the cursor HERE, so mid-draft
+/// arrow edits are never visually yanked back to the end of the block.
+/// (The old tail-width math also broke on multi-line drafts: a tail cut
+/// across '\n' counted as one row's width and parked past the line end.)
 fn parkCursor(w: *std.Io.Writer) void {
-    const last = editorTail();
-    var cols = strWidth(pendingPrompt());
-    cols += strWidth(last);
-    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ region_h, cols + 1 }) catch {};
+    parkLiveCursor(w, scanLiveBlock(null, null));
 }
 
 /// In-place repaint of the pinned rows (keystroke path): status row only
@@ -936,15 +990,18 @@ pub fn regionFreeze(w: *std.Io.Writer) void {
     regionEnd(w);
 }
 
-/// Paint the status row (absolute) and park the cursor back on the
-/// input row's end. Caller sets pending_status first.
+/// Paint the status row (absolute) and park the cursor back at the
+/// editor's editing position. Caller sets pending_status first.
+/// SU-bracketed: the ticking live clock repaints atomically.
 fn paintStatusRow(w: *std.Io.Writer) void {
     const split = regionRows();
+    suBegin(w);
     std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     }
     parkCursor(w);
+    suEnd(w);
 }
 
 /// Refresh the status row only (tick path); the region stays put.
