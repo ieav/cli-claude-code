@@ -64,6 +64,16 @@ pub const OpenAIProvider = struct {
     }
 
     fn stream(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, ctx: ?*anyopaque, cb: *const provider.StreamCallback) anyerror!void {
+        return streamImpl(ptr, messages, opts, ctx, cb, true);
+    }
+
+    /// Keep-alive race retry (2026-11-06): the pooled idle connection may
+    /// already be server-closed — the first read then fails within ~1s
+    /// with HttpConnectionClosing/ConnectionResetByPeer and THIS
+    /// request's bytes were never consumed. One invisible retry on a
+    /// fresh connection (body fully re-sendable); a second failure falls
+    /// through to the normal error path. Recursion depth ≤ 1.
+    fn streamImpl(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, ctx: ?*anyopaque, cb: *const provider.StreamCallback, retry_ok: bool) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
@@ -114,6 +124,10 @@ pub const OpenAIProvider = struct {
             // here as a transport error — map it so the caller retries.
             if (wd.ttftKilled()) return error.FirstByteTimeout;
             const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
+            if (retry_ok and elapsed < 1.5 and !wd.idleKilled() and (e == error.HttpConnectionClosing or e == error.ConnectionResetByPeer)) {
+                logger.info("openai: pooled conn dead ({s} at {d:.1}s, no headers) — retrying once on a fresh connection", .{ @errorName(e), elapsed });
+                return streamImpl(ptr, messages, opts, ctx, cb, false);
+            }
             provider.setErrorDetailIfEmpty("openai: request failed: {s} (no headers, {d:.1}s, model {s})", .{ @errorName(e), elapsed, self.config.model });
             logger.err("openai: request failed: {s} after {d:.1}s (model {s})", .{ @errorName(e), elapsed, self.config.model });
             return e;
@@ -386,6 +400,12 @@ pub const OpenAIProvider = struct {
     }
 
     fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
+        return sendRequestImpl(self, path, body, true);
+    }
+
+    /// Keep-alive race retry — see streamImpl (same rationale: pooled
+    /// idle conn server-closed; request bytes never consumed).
+    fn sendRequestImpl(self: *Self, path: []const u8, body: []const u8, retry_ok: bool) ![]u8 {
         const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
 
@@ -415,6 +435,10 @@ pub const OpenAIProvider = struct {
             // A TTFT kill (gateway never sent even the headers) surfaces
             // here as a transport error — map it so the caller retries.
             if (wd.ttftKilled()) return error.FirstByteTimeout;
+            if (retry_ok and !wd.ttftKilled() and !wd.idleKilled() and (e == error.HttpConnectionClosing or e == error.ConnectionResetByPeer)) {
+                logger.info("openai: pooled conn dead ({s}, no headers) — retrying once on a fresh connection", .{@errorName(e)});
+                return sendRequestImpl(self, path, body, false);
+            }
             provider.setErrorDetailIfEmpty("openai: request failed: {s}", .{@errorName(e)});
             return e;
         };
