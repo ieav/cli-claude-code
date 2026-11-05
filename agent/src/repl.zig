@@ -43,6 +43,7 @@ const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
+const turn_clock = @import("util/turn_clock.zig");
 const task_store = @import("tools/task_store.zig");
 const format_mod = @import("util/format.zig");
 const diff_util = @import("util/diff.zig");
@@ -1049,10 +1050,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // the .ziv/traces/*.jsonl the turn-end telemetry wrote —
                 // the data has existed since 2026-11-05, this is its
                 // in-TUI window.
-                if (last_trace_path_len == 0) {
+                if (turn_clock.tracePath().len == 0) {
                     try std.Io.Writer.print(w, "  本会话尚无 trace（任一回合结束后生成；ZIV_TRACE=0 可关闭落盘）\n\n", .{});
                 } else {
-                    const tpath = last_trace_path_buf[0..last_trace_path_len];
+                    const tpath = turn_clock.tracePath();
                     var fbuf: [131072]u8 = undefined;
                     if (std.Io.Dir.cwd().readFile(io, tpath, &fbuf)) |data| {
                         var lines_it = std.mem.splitScalar(u8, data, '\n');
@@ -1423,8 +1424,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // begin/end flickered the bottom two rows on every iteration).
         // Transcript prints inside the loop go through `ow` (region-aware);
         // only the region lifecycle calls below keep `w`.
-        live_turn_t0 = turn_t0;
-        live_llm_rounds = 0;
+        turn_clock.turnStart(turn_t0);
         lineinput.regionBegin(w, "⏳ 本轮 0.0s · 累计 0.0s · Esc 中断 · Enter 排队");
         // v0.7.7: context low-water WARNING (Claude-Code parity) — one dim
         // transcript line at >=80% of the model's ceiling, before the φ
@@ -1660,7 +1660,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // bounded overcount, simpler than threading a second t0
             // through the escalation loop.
             turn_llm_calls += 1;
-            live_llm_rounds = turn_llm_calls; // StreamJob ticker mirror
+            turn_clock.roundDone(turn_llm_calls); // StreamJob ticker mirror
             turn_llm_ms += util_time.nowMillis() - llm_t0;
 
             // Live decision trace: generation step.
@@ -2161,8 +2161,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 t.complete();
                 if (t.writeJsonlFile(io, ".ziv/traces", allocator)) {
                     // /trace reads this path back — record it on success only.
-                    if (std.fmt.bufPrint(&last_trace_path_buf, ".ziv/traces/{d}.jsonl", .{t.started_at})) |p| {
-                        last_trace_path_len = p.len;
+                    var path_b: [160]u8 = undefined;
+                    if (std.fmt.bufPrint(&path_b, ".ziv/traces/{d}.jsonl", .{t.started_at})) |p| {
+                        turn_clock.setTracePath(p);
                     } else |_| {}
                 } else |e| {
                     logger.warning("trace persist failed: {}", .{e});
@@ -3509,15 +3510,8 @@ fn traceAddStep(
 /// generation timer reset to 0.0s on every round, hiding what the
 /// previous rounds cost. Main-thread only: set by run() right before
 /// regionBegin, read by streamCb's tick on the same thread.
-var live_turn_t0: i64 = 0;
-/// Completed LLM rounds in the live turn (mirrors turn_llm_calls for the
-/// StreamJob ticker thread, which cannot reach the turn loop's locals).
-/// 0 = between turns.
-var live_llm_rounds: u32 = 0;
-/// Path of the most recently persisted decision trace (set at turn end;
-/// /trace reads it). Empty until the first turn of the session writes one.
-var last_trace_path_buf: [160]u8 = undefined;
-var last_trace_path_len: usize = 0;
+// Turn timing/round/trace-path state lives in util/turn_clock.zig (R2:
+// three loose globals → one atomic namespaced object, single writer).
 
 const StreamAgg = struct {
     alloc: std.mem.Allocator,
@@ -3737,11 +3731,12 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             }
             const now = util_time.nowMillis();
             // P1: BOTH clocks — this round (req_t0) and the whole turn
-            // (live_turn_t0). The old status showed only the round clock,
+            // (turn_clock). The old status showed only the round clock,
             // which reset to 0.0s on every generation and hid what the
             // previous rounds cost.
             const round_ms = now - self.req_t0;
-            const turn_ms = if (live_turn_t0 != 0) now - live_turn_t0 else round_ms;
+            const elapsed = turn_clock.elapsedMs(now);
+            const turn_ms = if (elapsed > 0) elapsed else round_ms;
             const queued = lineinput.queuedCount();
             const ts = task_store.global();
             var task_seg: [40]u8 = undefined;
@@ -3752,7 +3747,7 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             var sb: [128]u8 = undefined;
             const st = if (queued > 0)
                 std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
-                    live_llm_rounds + 1,
+                    turn_clock.roundsDone() + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
@@ -3762,7 +3757,7 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
                 }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队"
             else
                 std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队", .{
-                    live_llm_rounds + 1,
+                    turn_clock.roundsDone() + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
