@@ -3507,6 +3507,27 @@ test "over-wide table clips to terminal width" {
     try std.testing.expect(std.mem.indexOf(u8, out, "tail\n") != null);
 }
 
+test "RegionWriter renders streamed markdown tables, not raw pipes" {
+    // The 2026-11-06 wiring regression this locks: model text streams in
+    // as margin-seeded lines through the RegionWriter — pipe tables must
+    // come out as aligned blocks with a rule line, never raw |---|.
+    // drain() gates the table path on regionUp(); tests have no live
+    // region, so enter one step down at feed() — the exact function the
+    // region-up branch dispatches to. Same-file access keeps the seam
+    // private.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(std.testing.allocator, &out);
+    var rw = RegionWriter{ .real = &aw.writer, .table_alloc = std.testing.allocator };
+    rw.feed(" | 节奏 | 完成时间 |\n|---|---|\n| 每天 1 轮 | ~27 天 |\nplain line\n");
+    out = aw.toArrayList();
+    const s = out.items;
+    try std.testing.expect(std.mem.indexOf(u8, s, "|---|") == null); // raw separator gone
+    try std.testing.expect(std.mem.indexOf(u8, s, "\u{2500}") != null); // rule line rendered
+    try std.testing.expect(std.mem.indexOf(u8, s, "节奏") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "plain line") != null);
+}
+
 // ── Phase 0 lock tests (tui-event-loop plan) ─────────────────────────
 // End-to-end readLine through a REAL Io (Threaded) + /dev/null
 // File.Writer + Reader.fixed input. These lock the behaviors the event-

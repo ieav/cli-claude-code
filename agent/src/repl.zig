@@ -43,6 +43,7 @@ const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
+const task_store = @import("tools/task_store.zig");
 const format_mod = @import("util/format.zig");
 const diff_util = @import("util/diff.zig");
 const cancel_mod = @import("util/cancel.zig");
@@ -1077,6 +1078,43 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
+            } else if (std.mem.eql(u8, input, "/tasks")) {
+                // ②: the task system (TaskCreate/TaskUpdate) had a full
+                // store + render() but no TUI surface at all.
+                const ts = task_store.global();
+                if (ts.count() == 0) {
+                    try std.Io.Writer.print(w, "  任务列表为空（模型用 TaskCreate 建任务后在此查看进度）\n\n", .{});
+                } else {
+                    const rendered = ts.render(allocator) catch {
+                        try std.Io.Writer.print(w, "  任务列表渲染失败\n\n", .{});
+                        try std.Io.File.Writer.flush(&file_writer);
+                        continue;
+                    };
+                    defer allocator.free(rendered);
+                    try std.Io.Writer.print(w, "{s}\n", .{rendered});
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/last") or std.mem.startsWith(u8, input, "/last ")) {
+                // ③: full output of a recent tool — the one-line preview in
+                // the transcript deliberately truncates; this is the
+                // expansion valve (/last = newest, /last 3 = third newest).
+                var n: usize = 1;
+                if (std.mem.startsWith(u8, input, "/last ")) {
+                    const arg = std.mem.trim(u8, input["/last ".len..], " \t");
+                    n = std.fmt.parseInt(usize, arg, 10) catch 1;
+                }
+                if (LastTools.get(n)) |e| {
+                    try std.Io.Writer.print(w, "  ── {s}（最近第 {d} 条，{d} 字节）──\n", .{ e.name, n, e.output.len });
+                    var at_ls = false;
+                    try writeMarginLines(w, e.output, "  ", &at_ls);
+                    if (!at_ls) try std.Io.Writer.writeAll(w, "\n");
+                    try std.Io.Writer.writeAll(w, "\n");
+                } else {
+                    try std.Io.Writer.print(w, "  无记录（/last=最近一条，/last N=第 N 近，最多保留 {d} 条）\n\n", .{LastTools.N});
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
             } else if (std.mem.eql(u8, input, "/memory")) {
                 try printMemoryStatus(if (mem_sys) |*ms| ms else null, injected_count, w);
                 try std.Io.File.Writer.flush(&file_writer);
@@ -1453,7 +1491,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // Interactive stream: the UI loop's cancel flag (P2) —
                 // Esc/Ctrl-C fails the pump's idle wait cross-thread.
                 .cancel_flag = null, // set by streamComplete's StreamJob
-            }, r, w, &file_writer, allocator, &had_thinking) catch |err| {
+            }, r, w, ow, &file_writer, allocator, &had_thinking) catch |err| {
                 // The region stays up through streamComplete's error
                 // returns — turn-ENDING paths drop it before printing,
                 // turn-CONTINUING paths print above it.
@@ -1573,7 +1611,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         .temperature = 0.7,
                         .tools = reg.toolSpecs(),
                         .cancel_flag = null,
-                    }, r, w, &file_writer, allocator, &had_thinking) catch |err2| {
+                    }, r, w, ow, &file_writer, allocator, &had_thinking) catch |err2| {
                         if (err2 == error.EscCancelled) {
                             esc_after_retry = true; // the Esc recall below owns the messaging
                         } else {
@@ -1877,10 +1915,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     /// Status text with the LIVE turn clock (UI loop side).
                     fn statusText(t0: i64, llm_rounds: u32, n_calls: usize, first_tool: []const u8, buf: []u8) []const u8 {
                         const tsum = @as(f64, @floatFromInt(util_time.nowMillis() - t0)) / 1000.0;
-                        return if (n_calls == 1)
-                            std.fmt.bufPrint(buf, "⚙ 工具 {s} · LLM {d}轮 · 回合 {d:.1}s", .{ first_tool, llm_rounds, tsum }) catch "⚙ 执行工具"
+                        // Task progress (②: the task system existed but the
+                        // TUI never surfaced it — "长任务进行到哪" answered
+                        // at a glance). Empty store → segment omitted.
+                        const ts = task_store.global();
+                        var task_seg: [40]u8 = undefined;
+                        const tseg: []const u8 = if (ts.count() > 0)
+                            std.fmt.bufPrint(&task_seg, " · 任务 {d}/{d}", .{ ts.completedCount(), ts.count() }) catch ""
                         else
-                            std.fmt.bufPrint(buf, "⚙ 执行 {d} 个工具（{s}…） · LLM {d}轮 · 回合 {d:.1}s", .{ n_calls, first_tool, llm_rounds, tsum }) catch "⚙ 执行工具";
+                            "";
+                        return if (n_calls == 1)
+                            std.fmt.bufPrint(buf, "⚙ 工具 {s}{s} · LLM {d}轮 · 回合 {d:.1}s", .{ first_tool, tseg, llm_rounds, tsum }) catch "⚙ 执行工具"
+                        else
+                            std.fmt.bufPrint(buf, "⚙ 执行 {d} 个工具（{s}…）{s} · LLM {d}轮 · 回合 {d:.1}s", .{ n_calls, first_tool, tseg, llm_rounds, tsum }) catch "⚙ 执行工具";
                     }
                 };
                 var tool_job = ToolJob{};
@@ -2086,7 +2133,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // nothing). Same breakdown, as a transcript line instead.
                 if (turn_llm_calls > 0 or turn_tool_calls > 0) {
                     const abort_s = @as(f64, @floatFromInt(util_time.nowMillis() - turn_t0)) / 1000.0;
-                    std.Io.Writer.print(ow, "  \x1b[2m⏱ 中断 · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 已进行 {d:.1}s · 逐步耗时见 .ziv/traces/（/trace 直读）\x1b[0m\n", .{ turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, abort_s }) catch {};
+                    const ts = task_store.global();
+                    var tseg_b: [48]u8 = undefined;
+                    const undone = ts.count() -| ts.completedCount();
+                    const tseg: []const u8 = if (undone > 0)
+                        std.fmt.bufPrint(&tseg_b, " · 未完任务 {d}（/tasks 查看）", .{undone}) catch ""
+                    else
+                        "";
+                    std.Io.Writer.print(ow, "  \x1b[2m⏱ 中断 · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 已进行 {d:.1}s{s} · 逐步耗时见 .ziv/traces/（/trace 直读）\x1b[0m\n", .{ turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, abort_s, tseg }) catch {};
                     logger.info("turn(aborted): llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
                 }
                 try std.Io.Writer.writeAll(w, "\n");
@@ -3468,6 +3522,11 @@ var last_trace_path_len: usize = 0;
 const StreamAgg = struct {
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    /// Table-aware transcript writer (the turn loop's RegionWriter). When
+    /// set, whole lines flow through its emitLine — pipe tables buffer and
+    /// render aligned (renderTableBlock) instead of dumping raw markdown.
+    /// Null keeps the legacy raw regionPrintLine path (non-turn callers).
+    tw: ?*std.Io.Writer = null,
     file_writer: *std.Io.File.Writer,
     text: std.ArrayList(u8) = .empty,
     tools: std.ArrayList(llm.provider.ToolUseBlock) = .empty,
@@ -3508,7 +3567,21 @@ const StreamAgg = struct {
     /// Flush one buffered output line above the live region. The buffer is
     /// seeded with the one-space response margin, so items ARE the line.
     fn flushLine(self: *StreamAgg) void {
-        lineinput.regionPrintLine(self.w, self.line_buf.items);
+        if (self.tw) |tw| {
+            // Route whole lines through the RegionWriter so pipe tables
+            // hit isTableRow → renderTableBlock (the 2026-11-06 fix: live
+            // deltas used to regionPrintLine on the RAW writer, so the
+            // table machinery existed but model text never reached it).
+            // A soft-wrapped partial gets a synthetic newline — display-
+            // identical to the terminal's own wrap, and it releases the
+            // RegionWriter's line buffer.
+            if (self.line_buf.items.len > 0 and self.line_buf.items[self.line_buf.items.len - 1] != '\n') {
+                self.line_buf.append(self.alloc, '\n') catch {};
+            }
+            tw.writeAll(self.line_buf.items) catch {};
+        } else {
+            lineinput.regionPrintLine(self.w, self.line_buf.items);
+        }
         self.line_buf.clearRetainingCapacity();
         self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
         self.line_cols = 0;
@@ -3670,35 +3743,36 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             const round_ms = now - self.req_t0;
             const turn_ms = if (live_turn_t0 != 0) now - live_turn_t0 else round_ms;
             const queued = lineinput.queuedCount();
-            var sb: [96]u8 = undefined;
+            const ts = task_store.global();
+            var task_seg: [40]u8 = undefined;
+            const tseg: []const u8 = if (ts.count() > 0)
+                std.fmt.bufPrint(&task_seg, " · 任务 {d}/{d}", .{ ts.completedCount(), ts.count() }) catch ""
+            else
+                "";
+            var sb: [128]u8 = undefined;
             const st = if (queued > 0)
-                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
                     live_llm_rounds + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
                     @mod(@divTrunc(turn_ms, 100), 10),
+                    tseg,
                     queued,
                 }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队"
             else
-                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s · Esc 中断 · Enter 排队", .{
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队", .{
                     live_llm_rounds + 1,
                     @divTrunc(round_ms, 1000),
                     @mod(@divTrunc(round_ms, 100), 10),
                     @divTrunc(turn_ms, 1000),
                     @mod(@divTrunc(turn_ms, 100), 10),
+                    tseg,
                 }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队";
             lineinput.regionStatus(self.w, st);
             std.Io.File.Writer.flush(self.file_writer) catch {};
         },
     }
-}
-
-fn flushLine(self: *StreamAgg) void {
-    lineinput.regionPrintLine(self.w, self.line_buf.items);
-    self.line_buf.clearRetainingCapacity();
-    self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
-    std.Io.File.Writer.flush(self.file_writer) catch {};
 }
 
 // ── P2: stream pump job ──────────────────────────────────────────────
@@ -3823,6 +3897,9 @@ fn streamComplete(
     opts: llm.provider.CompleteOptions,
     r: ?*std.Io.Reader,
     w: *std.Io.Writer,
+    /// Transcript writer for model text: the turn loop's RegionWriter
+    /// (table-aware). Null for non-TUI callers.
+    tw: ?*std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     alloc: std.mem.Allocator,
     had_thinking: *bool,
@@ -3830,6 +3907,7 @@ fn streamComplete(
     var agg = StreamAgg{
         .alloc = alloc,
         .w = w,
+        .tw = tw,
         .file_writer = file_writer,
         .req_t0 = util_time.nowMillis(),
         .last_event_ms = util_time.nowMillis(),
@@ -4234,6 +4312,96 @@ const PreparedCall = struct {
     old_unavailable: bool = false,
 };
 
+/// Ring of recent tool outputs backing /last (③, 2026-11-06): the
+/// transcript shows a one-line preview by design; this answers "它刚才
+/// 到底输出了什么" without re-running anything. 8 slots × 8 KiB.
+const LastTools = struct {
+    const N: usize = 8;
+    const CAP: usize = 8 * 1024;
+    var buf: [N * CAP]u8 = undefined;
+    var lens: [N]usize = @splat(0);
+    var names: [N][32]u8 = undefined;
+    var name_lens: [N]usize = @splat(0);
+    var head: usize = 0; // next write slot; newest lives at (head+N-1)%N
+    var count: usize = 0;
+
+    fn push(name: []const u8, output: []const u8) void {
+        const i = head;
+        lens[i] = @min(output.len, CAP);
+        @memcpy(buf[i * CAP .. i * CAP + lens[i]], output[0..lens[i]]);
+        const nl = @min(name.len, names[i].len);
+        @memcpy(names[i][0..nl], name[0..nl]);
+        name_lens[i] = nl;
+        head = (head + 1) % N;
+        count = @min(count + 1, N);
+    }
+
+    /// n=1 → newest. Null when nothing recorded / out of range.
+    fn get(n: usize) ?struct { name: []const u8, output: []const u8 } {
+        if (n == 0 or n > count) return null;
+        const i = (head + N - n) % N;
+        return .{ .name = names[i][0..name_lens[i]], .output = buf[i * CAP .. i * CAP + lens[i]] };
+    }
+};
+
+const LinePreview = struct { slice: []const u8, clipped: bool };
+
+/// First non-empty line of `s`, width-clipped to ≤80 display cols at a
+/// rune boundary — the /last-aware one-line tool preview (③). Borrowed
+/// slice into `s`; `clipped` flags a width cut.
+fn firstLineClipped(s: []const u8) LinePreview {
+    const max_cols: usize = 80;
+    var rest = s;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = std.mem.trim(u8, rest[0..nl], " \t\r");
+        if (line.len > 0) {
+            var cols: usize = 0;
+            var i: usize = 0;
+            while (i < line.len) {
+                const b = line[i];
+                const w: usize = if (b < 0x80) 1 else if (b >= 0xE0) 2 else if (b >= 0xC0) 1 else 0;
+                if (cols + w > max_cols) return .{ .slice = line[0..i], .clipped = true };
+                cols += w;
+                i += 1;
+            }
+            return .{ .slice = line, .clipped = false };
+        }
+        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+    }
+    return .{ .slice = "", .clipped = false };
+}
+
+test "firstLineClipped: blank-skip, width clip, empty" {
+    const r1 = firstLineClipped("\n\n  line one  \nline two\n");
+    try std.testing.expectEqualStrings("line one", r1.slice);
+    try std.testing.expect(!r1.clipped);
+    var long: [88]u8 = undefined;
+    @memset(&long, 'x');
+    const r2 = firstLineClipped(&long);
+    try std.testing.expectEqual(@as(usize, 80), r2.slice.len);
+    try std.testing.expect(r2.clipped);
+    // Short CJK line passes uncut, at a rune boundary.
+    const r3 = firstLineClipped("节奏表\nsecond");
+    try std.testing.expectEqualStrings("节奏表", r3.slice);
+    const r4 = firstLineClipped("\n \n");
+    try std.testing.expectEqualStrings("", r4.slice);
+}
+
+test "LastTools: ring order and wrap" {
+    LastTools.head = 0;
+    LastTools.count = 0;
+    LastTools.push("bash", "out-1");
+    LastTools.push("read", "out-2");
+    try std.testing.expectEqualStrings("out-2", LastTools.get(1).?.output);
+    try std.testing.expectEqualStrings("out-1", LastTools.get(2).?.output);
+    try std.testing.expect(LastTools.get(3) == null);
+    for (0..10) |_| LastTools.push("t", "x");
+    try std.testing.expectEqual(@as(usize, LastTools.N), LastTools.count);
+    try std.testing.expectEqualStrings("x", LastTools.get(1).?.output);
+    try std.testing.expect(LastTools.get(LastTools.N + 1) == null);
+}
+
 /// Phase 2 tail: print the outcome, truncate oversized output, record in the
 /// operation log, append the tool_result block. Returns true on tool error.
 fn finishToolCall(
@@ -4272,15 +4440,21 @@ fn finishToolCall(
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    // Result line through the region-aware writer (raw output capped at
-    // 200 chars, always at a UTF-8 boundary; embedded newlines are fine —
-    // the writer is line-atomic above the region).
-    var disp_cut: usize = @min(raw.len, 200);
-    while (disp_cut > 0 and disp_cut < raw.len and (raw[disp_cut] & 0xC0) == 0x80) disp_cut -= 1;
-    // Tool line carries its wall time (batch dispatch → collection): in a
-    // long turn the "how long did each step take" question is answered
-    // here, live — no need to dig into .ziv/traces after the fact.
-    std.Io.Writer.print(ow, "  [{s} · {d}.{d}s: {s}]\n", .{ p.call.tool_name, @divTrunc(elapsed_ms, 1000), @divTrunc(@mod(elapsed_ms, 1000), 100), raw[0..disp_cut] }) catch {};
+    // Density fix (③, 2026-11-06): ONE line per tool — first non-empty
+    // line of the output, width-clipped; multi-line dumps used to flood
+    // the transcript. Full output lives in /last. Wall time carried live
+    // (batch dispatch → collection); tool name colored by outcome.
+    LastTools.push(p.call.tool_name, raw);
+    const preview = firstLineClipped(raw);
+    const name_col = if (result.is_error) "\x1b[31m" else "\x1b[36m";
+    std.Io.Writer.print(ow, "  [{s}{s}\x1b[0m · {d}.{d}s: {s}{s}]\n", .{
+        name_col,
+        p.call.tool_name,
+        @divTrunc(elapsed_ms, 1000),
+        @divTrunc(@mod(elapsed_ms, 1000), 100),
+        preview.slice,
+        if (preview.clipped or preview.slice.len < raw.len) " \x1b[2m…（/last 全文）\x1b[0m" else "",
+    }) catch {};
 
     // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
     // char boundary. A mid-char cut used to poison every later request:
@@ -6062,6 +6236,8 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
         \\  /context          Show current context/token usage
         \\  /trace            Show the last turn's per-step timing
+        \\  /tasks            Show the task list and progress
+        \\  /last [N]         Show a recent tool's full output (N=1 newest)
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
         \\  /rewind           Rewind files AND conversation to a checkpoint
