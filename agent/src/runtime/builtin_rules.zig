@@ -29,25 +29,30 @@ pub fn checkMemory(ctx: *rules.RuntimeContext) rules.CheckResult {
 }
 
 // ──── Rule 2: API rate limit ────
+/// Evidence-based (2026-11-06): fires ONLY on real 429 responses seen in
+/// the window. The old heuristic divided a per-"minute" call count by a
+/// fictional 60/min ceiling — but the health check only drains at the
+/// REPL loop top, so a long turn's ENTIRE call volume landed in one
+/// window: any 48+-call debugging marathon read as "approaching rate
+/// limit" right after the turn ended (50 calls / 29 min tripped it).
+/// Real 429s are counted at the agent-loop error site and swapped per
+/// check — a truthful signal with no window semantics to break.
 pub fn checkApiRate(ctx: *rules.RuntimeContext) rules.CheckResult {
-    if (ctx.api_rate_limit == 0) return .pass;
-    const ratio = @as(f64, @floatFromInt(ctx.api_calls_last_minute)) / @as(f64, @floatFromInt(ctx.api_rate_limit));
-    if (ratio > 0.8) {
-        return .{
-            .fail = .{
-                .rule_id = "api_rate_limit",
-                .message = "API 调用接近速率限制",
-                .metric_current = ratio,
-                .metric_threshold = 0.8,
-                .suggested_fixes = &.{
-                    .{ .description = "降低后台任务频率", .action_type = .auto_fixable, .auto_fixable = true },
-                    .{ .description = "切换到本地模型", .action_type = .adjust_parameter, .auto_fixable = false },
-                    .{ .description = "暂停非关键任务", .action_type = .auto_fixable, .auto_fixable = true },
-                },
+    if (ctx.api_rate_limited_count == 0) return .pass;
+    return .{
+        .fail = .{
+            .rule_id = "api_rate_limit",
+            .message = "API 速率受限（窗口内收到 429）",
+            .metric_current = @floatFromInt(ctx.api_rate_limited_count),
+            .metric_threshold = 1,
+            .suggested_fixes = &.{
+                .{ .description = "稍等后重试（网关限额窗口通常按分钟重置）", .action_type = .auto_fixable, .auto_fixable = false },
+                .{ .description = "降低请求频率或切换模型/网关", .action_type = .adjust_parameter, .auto_fixable = false },
             },
-        };
-    }
-    return .pass;
+        },
+    };
+    // Ratio path removed; api_calls_last_minute/api_rate_limit stay in
+    // RuntimeContext for potential future use but no rule consumes them.
 }
 
 // ──── Rule 3: Storage integrity ────
@@ -215,4 +220,48 @@ test "checkContextOverflow passes below φ threshold" {
     // 5000/10000 = 0.5 < φ
     const result = checkContextOverflow(&ctx);
     try std.testing.expect(result == .pass);
+}
+
+test "checkApiRate is evidence-based: no 429s, no warning — call volume alone never trips it" {
+    // The old ratio rule fired here: 50 calls in one (broken) window
+    // against a fictional 60/min ceiling read 83% after a long turn.
+    var ctx = rules.RuntimeContext{
+        .memory_used_bytes = 0,
+        .memory_limit_bytes = 1,
+        .memory_entry_count = 0,
+        .api_calls_last_minute = 50,
+        .api_rate_limit = 60,
+        .api_rate_limited_count = 0,
+        .db_integrity_ok = true,
+        .current_tokens = 0,
+        .max_tokens = 1000,
+        .task_failed_count = 0,
+        .task_total_count = 1,
+        .network_timeout_count = 0,
+        .active_tasks = 0,
+        .max_concurrent_tasks = 0,
+    };
+    try std.testing.expect(checkApiRate(&ctx) == .pass);
+}
+
+test "checkApiRate warns on real 429s" {
+    var ctx = rules.RuntimeContext{
+        .memory_used_bytes = 0,
+        .memory_limit_bytes = 1,
+        .memory_entry_count = 0,
+        .api_calls_last_minute = 1,
+        .api_rate_limit = 60,
+        .api_rate_limited_count = 2,
+        .db_integrity_ok = true,
+        .current_tokens = 0,
+        .max_tokens = 1000,
+        .task_failed_count = 0,
+        .task_total_count = 1,
+        .network_timeout_count = 0,
+        .active_tasks = 0,
+        .max_concurrent_tasks = 0,
+    };
+    const result = checkApiRate(&ctx);
+    try std.testing.expect(result == .fail);
+    try std.testing.expectEqualStrings("api_rate_limit", result.fail.rule_id);
 }

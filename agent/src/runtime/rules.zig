@@ -46,6 +46,10 @@ pub const RuntimeContext = struct {
     memory_entry_count: usize,
     api_calls_last_minute: u32,
     api_rate_limit: u32,
+    /// Real 429 responses seen since the previous check (evidence-based
+    /// rate-limit signal — see checkApiRate). Defaulted so existing
+    /// initializers keep compiling.
+    api_rate_limited_count: u32 = 0,
     db_integrity_ok: bool,
     current_tokens: u32,
     max_tokens: u32,
