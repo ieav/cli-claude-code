@@ -168,7 +168,7 @@ P0(安全网) → P1(结构) → P2(上下文) → P3(恢复) ∥ P4(交互) →
 | Phase | 状态 |
 |---|---|
 | P0 | ✅ 完成（2026-11-06，`scripts/pty_suite.py` 五场景全绿 + 旧二进制红灯验证；用法 `python3 scripts/pty_suite.py zig-out/bin/ziv`） |
-| P1 | ◐ 进行中（2026-11-06）：turn/stream.zig + turn/ask.zig + turn/tools.zig 已抽（repl 7103→5846 行，双判据全绿）；DESIGN v2 对账表已加。**剩余**：history/压缩集群（~450 行）、反思/提取集群（~700 行）、config/菜单集群（~500 行）→ 拆至 src/turn/ 与 src/session/，以及 run() 内联状态机（2041 行）的上下文结构体化——机械模式已验证，按本日两步的脚本化搬移继续 |
+| P1 | ✅ 完成（2026-11-06，`5119177`..`18bbe9b` 共 9 步）：repl.zig 7103 → **1835 行**（验收 ≤2000 达成）。拆出 turn/{stream,ask,tools,history}、session/{memory_ops,model_switcher,input_history}、commands/{config_menu,history_cmds,dispatch}；终局为 ReplCtx（37 字段指针联动 run() 状态）+ dispatchSlash（622 行命令树函数化，四态 outcome 驱动循环）。每步双判据（325 pass / 5 skip 基线一致 + pty 五场景全绿）+ 纯度脚本校验 |
 | P2–P7 | 待开始 |
 
 > P0 红灯基线：修复前二进制（会话 raw 改造前）在 S1/S3 失败——套件对终端
