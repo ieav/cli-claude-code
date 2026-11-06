@@ -17,6 +17,7 @@ const logger = @import("../util/log.zig");
 const json_tree = @import("../util/json_tree.zig");
 const fs_ops = @import("../util/fs_ops.zig");
 const auth = @import("../tools/auth_mode.zig");
+const injection_mod = @import("../memory/injection.zig");
 
 pub const SessionStore = struct {
     db: database_mod.Database,
@@ -142,7 +143,11 @@ pub const SessionStore = struct {
             if (seq == self.firstUserIndex(history)) {
                 for (msg.content) |b| {
                     if (b != .text) continue;
-                    const head = b.text[0..@min(b.text.len, 48)];
+                    // Byte-slicing a CJK headline at 48 splits a UTF-8 rune and stores
+                    // INVALID UTF-8 (caught live: external readers choke on the
+                    // column). Clamp to the nearest boundary first.
+                    const cut = injection_mod.utf8Boundary(b.text, 48);
+                    const head = b.text[0..cut];
                     const qhead = database_mod.Database.quoteString(self.alloc, head) catch break;
                     defer self.alloc.free(qhead);
                     const uq = std.fmt.allocPrint(self.alloc,
