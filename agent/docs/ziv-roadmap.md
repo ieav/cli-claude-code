@@ -173,7 +173,7 @@ P0(安全网) → P1(结构) → P2(上下文) → P3(恢复) ∥ P4(交互) →
 | P3 | ✅ 完成（2026-11-06，`eebf4ea` + 闭环复查 `301a3a5`）：session/session_store.zig 持久化 .ziv/sessions.db（四块型无损往返）；/resume 列表+选择+恢复 history/模型/模式；崩溃检测启动提示；/clear 轮转。复查修掉：双系统消息（三点位 token 实锤）、恢复列表混入活行、空壳行噪音（flush 门+adopt 清删）。验收 S7/S8 |
 | P4 | ✅ 完成（2026-11-06，`057fa7e`）：turn/error_recovery.zig——退避策略（429/网络类 1s/2s×2）+ 四选项交互选择器（重试/压缩后重试/换模型/忽略）+ selectorEligible 排除矩阵；/config 挂 auto_fix 开关。验收 S9：死网关注入 → 退避×2 → 选择器 → 重试真实生效。套件 335 pass / 5 skip + pty 九场景 |
 | P5 | ✅ 完成（2026-11-06，`58c7b58`/`a6bb458`/`152353f`/`693caf5` 四子项）：①嵌入离线对比（RoPE 实现并测试锁定其 cosine 中立性→不翻格式；stem-lite MRR 胜出接线）②经验回放（窗口 20→256 + piSample π 抖动全史采样喂反思与 LLM 提示）③π 图谱扫描（孤立节点/断边检测，cron π 小时 + /knowledge 报告）④洞察质量门（启发式入库前 LLM yes/no 校验，误诊零入库，e2e 双态）。套件 341 pass / 5 skip |
-| P6 | ◐ 进行中（2026-11-06，`a2e9790`）：①② 已落——knowledge/code_index.zig（FTS5 行级索引 + mtime 台账 + 全新鲜才服务）+ FileRead 沉淀钩子 + Grep 字面量双路（正则恒实扫）；S10 场景 + 真库 mtime 单测。**剩余**：③ 上下文注入按当前问题相关性检索代码片段（与记忆注入同管线） |
+| P6 | ✅ 完成（2026-11-06，`a2e9790` + `56f91dc`）：① FTS5 代码索引（.ziv/index.db，mtime 台账，全新鲜才服务）② FileRead 沉淀 + Grep 字面量双路（正则恒实扫，S10）③ 按问题相关性的代码上下文注入（buildContextBlock 关键词→前缀 OR→bm25，逐字节不变不换块保 prompt-cache，S11 + /stats 可观测）。套件 345 pass / 5 skip + pty 十一场景 |
 | P7 | 待开始 |
 
 > P0 红灯基线：修复前二进制（会话 raw 改造前）在 S1/S3 失败——套件对终端
