@@ -25,6 +25,8 @@ test {
     _ = @import("knowledge/search.zig");
     _ = @import("llm/claude.zig");
     _ = @import("llm/compaction.zig");
+    _ = @import("util/json_tree.zig");
+    _ = @import("turn/stream.zig");
     _ = @import("llm/message.zig");
     _ = @import("llm/mod.zig");
     _ = @import("llm/ollama.zig");
