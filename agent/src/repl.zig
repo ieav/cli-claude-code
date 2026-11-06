@@ -3677,19 +3677,10 @@ const StreamAgg = struct {
 /// nothing useful to show.
 fn toolArgSummary(alloc: std.mem.Allocator, tool: []const u8, input: std.json.Value) []const u8 {
     _ = tool;
-    const interesting = [_][]const u8{ "command", "path", "pattern", "query", "topic", "url", "name" };
     var pick: []const u8 = "";
-    for (interesting) |field| {
-        if (input == .object) {
-            if (input.object.get(field)) |v| {
-                if (v == .string and v.string.len > 0) {
-                    pick = v.string;
-                    break;
-                }
-            }
-        }
-    }
-    if (pick.len == 0) {
+    if (toolArgPick(input)) |p| {
+        pick = p;
+    } else {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         std.json.Stringify.value(input, .{}, &aw.writer) catch return "";
         pick = aw.written();
@@ -3697,6 +3688,66 @@ fn toolArgSummary(alloc: std.mem.Allocator, tool: []const u8, input: std.json.Va
     }
     const s = summarize(alloc, pick) catch return "";
     return std.fmt.allocPrint(alloc, "({s})", .{s}) catch "";
+}
+
+/// The "interesting" string arg for a call preview (command/path/pattern/
+/// query/topic/url/name), or null when none exists (the JSON-fallback
+/// case handled by toolArgSummary).
+fn toolArgPick(input: std.json.Value) ?[]const u8 {
+    const interesting = [_][]const u8{ "command", "path", "pattern", "query", "topic", "url", "name" };
+    for (interesting) |field| {
+        if (input == .object) {
+            if (input.object.get(field)) |v| {
+                if (v == .string and v.string.len > 0) return v.string;
+            }
+        }
+    }
+    return null;
+}
+
+/// Full-visibility call preview (2026-11-06): a short single-line arg
+/// stays inline `⏺ Bash(cmd)` — UNTRUNCATED; a long or multi-line arg
+/// prints the WHOLE value as an indented body under the header. The old
+/// 80-col one-line cut reduced long commands to "(cd ~/… && grep …)" —
+/// the user could never see what was about to run. JSON-fallback
+/// previews (no interesting field) keep the summarized one-line shape.
+fn printToolCallPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, name: []const u8, input: std.json.Value) void {
+    if (toolArgPick(input)) |pick| {
+        if (pick.len <= 96 and std.mem.indexOfScalar(u8, pick, '\n') == null) {
+            var tb: [192]u8 = undefined;
+            const line_opt: ?[]const u8 = std.fmt.bufPrint(&tb, "  ⏺ \x1b[1m{s}\x1b[0m({s})\n", .{ name, pick }) catch null;
+            if (line_opt) |line| {
+                lineinput.regionPrintLine(w, line);
+                return;
+            }
+            // Buffer overflow (huge name?) → header+body path below.
+        }
+        var hb: [96]u8 = undefined;
+        const head = std.fmt.bufPrint(&hb, "  ⏺ \x1b[1m{s}\x1b[0m\n", .{name}) catch "";
+        lineinput.regionPrintLine(w, head);
+        var rest = pick;
+        var shown: usize = 0;
+        while (rest.len > 0 and shown < 50) : (shown += 1) {
+            const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+            var tb: [4096]u8 = undefined;
+            const line = std.fmt.bufPrint(&tb, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch
+                std.fmt.bufPrint(&tb, "  …(单行超 4KiB)\n", .{}) catch "";
+            lineinput.regionPrintLine(w, line);
+            rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+        }
+        const total = std.mem.count(u8, pick, "\n") + @intFromBool(pick.len > 0 and pick[pick.len - 1] != '\n');
+        if (shown < total) {
+            var mb: [96]u8 = undefined;
+            const marker: ?[]const u8 = std.fmt.bufPrint(&mb, "  \x1b[2m…参数过长已截断（{d}/{d} 行）\x1b[0m\n", .{ shown, total }) catch null;
+            if (marker) |line| {
+                lineinput.regionPrintLine(w, line);
+            }
+        }
+        return;
+    }
+    var tb: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&tb, "  ⏺ \x1b[1m{s}\x1b[0m{s}\n", .{ name, toolArgSummary(alloc, name, input) }) catch "";
+    lineinput.regionPrintLine(w, line);
 }
 
 /// "(summary)" — first line, display-width-capped (CJK-aware, per CHAR not
@@ -3783,9 +3834,7 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             // Per-event arena: the summary strings are print-and-done.
             var sum_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer sum_arena.deinit();
-            var tb: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&tb, "  ⏺ \x1b[1m{s}\x1b[0m{s}\n", .{ tu.name, toolArgSummary(sum_arena.allocator(), tu.name, tu.input) }) catch "";
-            lineinput.regionPrintLine(self.w, line);
+            printToolCallPreview(self.w, sum_arena.allocator(), tu.name, tu.input);
             std.Io.File.Writer.flush(self.file_writer) catch {};
             try self.tools.append(self.alloc, .{
                 .id = try self.alloc.dupe(u8, tu.id),
@@ -7027,4 +7076,28 @@ test "mergeInputHistory unions concurrent windows and caps the tail" {
     try std.testing.expectEqual(@as(usize, 500), m5.len);
     try std.testing.expectEqualStrings("old-odd", m5[0]); // 5 oldest file lines dropped
     try std.testing.expectEqualStrings("fresh494", m5[499]);
+}
+
+test "printToolCallPreview: short inline untruncated, long becomes header+full body" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // Short: single inline line, the full command visible.
+    var o1: std.json.ObjectMap = .empty;
+    defer o1.deinit(std.testing.allocator);
+    try o1.put(std.testing.allocator, "command", .{ .string = "ls -la" });
+    printToolCallPreview(&aw.writer, std.testing.allocator, "Bash", .{ .object = o1 });
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "⏺") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "(ls -la)") != null);
+
+    // Long (>96): header line, then the FULL command indented — the old
+    // 80-col cut showed "(cd ~/… && grep …)" and nothing more.
+    const long_cmd = "cd ~/temp/chat/algorithms/build/04-ds && grep -rn \"^- \\[ \\]\" README.md TODO.md NOTES.md docs/ 2>/dev/null | head -20";
+    var o2: std.json.ObjectMap = .empty;
+    defer o2.deinit(std.testing.allocator);
+    try o2.put(std.testing.allocator, "command", .{ .string = long_cmd });
+    aw.clearRetainingCapacity();
+    printToolCallPreview(&aw.writer, std.testing.allocator, "Bash", .{ .object = o2 });
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "| head -20") != null); // tail visible
+    try std.testing.expect(std.mem.indexOf(u8, out, "\n  cd ~/temp/chat") != null); // indented body
 }
