@@ -169,8 +169,9 @@ P0(安全网) → P1(结构) → P2(上下文) → P3(恢复) ∥ P4(交互) →
 |---|---|
 | P0 | ✅ 完成（2026-11-06，`scripts/pty_suite.py` 五场景全绿 + 旧二进制红灯验证；用法 `python3 scripts/pty_suite.py zig-out/bin/ziv`） |
 | P1 | ✅ 完成（2026-11-06，`5119177`..`18bbe9b` 共 9 步）：repl.zig 7103 → **1835 行**（验收 ≤2000 达成）。拆出 turn/{stream,ask,tools,history}、session/{memory_ops,model_switcher,input_history}、commands/{config_menu,history_cmds,dispatch}；终局为 ReplCtx（37 字段指针联动 run() 状态）+ dispatchSlash（622 行命令树函数化，四态 outcome 驱动循环）。每步双判据（325 pass / 5 skip 基线一致 + pty 五场景全绿）+ 纯度脚本校验 |
-| P2 | ✅ 完成（2026-11-06，`de3fd07`）：hybrid 三段式（老段 LLM 摘要 + 最近 5 轮原文 + 工具结果瘦身）落地 llm/compaction.zig + turn/history.zig；/compact 升级 hybrid、自动路径 phi+slim；验收三条全过（20 轮单测 <40% token、hybridSplit 边界锁定、agent_e2e mock 网关全链路）。套件 329 pass / 5 skip + pty 六场景（P1 收官补 S6 命令走查） |
-| P3–P7 | 待开始 |
+| P2 | ✅ 完成（2026-11-06，`de3fd07` + 闭环复查 `28e8da6`）：hybrid 三段式（老段 LLM 摘要 + 最近 5 轮原文 + 工具结果瘦身）落地 llm/compaction.zig + turn/history.zig；/compact 升级 hybrid、自动路径 phi+slim（溢出应急路径复查补瘦身）；压缩事件进 decision-trace。套件 330 pass / 5 skip |
+| P3 | ✅ 完成（2026-11-06，`eebf4ea`）：session/session_store.zig 持久化 .ziv/sessions.db（四块型无损往返）；/resume 列表+选择+恢复 history/模型/模式；崩溃检测启动提示；/clear 轮转。验收：S7 干净恢复（token 等值）+ S8 SIGKILL 恢复，pty 八场景。套件 333 pass / 5 skip |
+| P4–P7 | 待开始 |
 
 > P0 红灯基线：修复前二进制（会话 raw 改造前）在 S1/S3 失败——套件对终端
 > 模式回归有判别力。注意 S5「会话退出清场」原设计场景在无 LLM 的 pty 环境
