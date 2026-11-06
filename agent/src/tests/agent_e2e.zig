@@ -28,7 +28,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 // ── mock gateway ─────────────────────────────────────────────────────
 
-const MockMode = enum { happy, stall };
+const MockMode = enum { happy, stall, gate_yes, gate_no };
 
 const MockServer = struct {
     mode: MockMode,
@@ -81,8 +81,8 @@ fn mockServe(server: *MockServer) void {
         }
         _ = server.served.fetchAdd(1, .monotonic);
         switch (server.mode) {
-            .happy => {
-                writeResponse(stream, io);
+            .happy, .gate_yes, .gate_no => {
+                writeResponse(stream, io, server.mode);
                 stream.close(io);
             },
             .stall => {
@@ -140,11 +140,16 @@ fn readRequest(stream: std.Io.net.Stream, io: std.Io) bool {
     return false;
 }
 
-fn writeResponse(stream: std.Io.net.Stream, io: std.Io) void {
+fn writeResponse(stream: std.Io.net.Stream, io: std.Io, mode: MockMode) void {
+    const body: []const u8 = switch (mode) {
+        .gate_yes => "{\"id\":\"mock\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"yes\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}",
+        .gate_no => "{\"id\":\"mock\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"no\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}",
+        else => happy_body,
+    };
     var rsp: [256]u8 = undefined;
-    const head = std.fmt.bufPrint(&rsp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{happy_body.len}) catch return;
+    const head = std.fmt.bufPrint(&rsp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
     writeAll(stream, io, head);
-    writeAll(stream, io, happy_body);
+    writeAll(stream, io, body);
 }
 
 fn writeAll(stream: std.Io.net.Stream, io: std.Io, bytes: []const u8) void {
@@ -319,9 +324,9 @@ test "hybrid compact E2E: mock gateway summarizes, layout is three-tier" {
     defer switcher.deinit();
 
     // [system] + 12 × ([user] [assistant] [user tool_result 5 KiB]).
-    var history: std.ArrayList(@import("../llm/mod.zig").Message) = .empty;
+    const llm = @import("../llm/mod.zig");
+    var history: std.ArrayList(llm.Message) = .empty;
     {
-        const llm = @import("../llm/mod.zig");
         const sb = try alloc.alloc(llm.ContentBlock, 1);
         sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
         try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
@@ -385,4 +390,85 @@ test "hybrid compact E2E: mock gateway summarizes, layout is three-tier" {
     try std.testing.expect(after_tokens * 10 < before_tokens * 4);
     try std.testing.expect(total_in + total_out > 0); // usage accounted
     alloc.free(settings.api_keys.openai_base_url.?);
+}
+
+// ── P5 insight quality gate E2E ──────────────────────────────────────
+
+fn runReflectionWithMockGate(
+    comptime mode: MockMode,
+    comptime expect_stored: bool,
+) !void {
+    const alloc = std.heap.smp_allocator;
+    var server = MockServer{ .mode = mode };
+    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
+    th.detach();
+    const port = try waitReady(&server);
+    defer server.running.store(false, .release);
+
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const memory_ops = @import("../session/memory_ops.zig");
+    const reflection_mod = @import("../memory/reflection.zig");
+    const memory_mod = @import("../memory/mod.zig");
+    const model_switcher = @import("../session/model_switcher.zig");
+    const config_mod = @import("../config.zig");
+    const fs_ops = @import("../util/fs_ops.zig");
+    const database_mod = @import("../storage/database.zig");
+    const time_mod2 = @import("../util/time.zig");
+
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&pbuf, "/tmp/ziv_gate_{d}.db", .{time_mod2.nowMillis()});
+    defer _ = fs_ops.deleteFile(db_path);
+    var db = try database_mod.Database.init(alloc, db_path);
+    defer db.deinit();
+    try db.runMigrations();
+    var mem = memory_mod.MemorySystem.init(alloc, &db);
+    defer mem.deinit();
+
+    var settings = config_mod.Settings{};
+    settings.default_model = "gpt-mock-e2e";
+    settings.api_keys.openai = "test-key";
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{port});
+    var switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer switcher.deinit();
+    const prov = try switcher.getProvider();
+    defer alloc.free(settings.api_keys.openai_base_url.?);
+
+    var reflector = reflection_mod.ReflectionEngine.init(alloc);
+    defer reflector.deinit();
+    // Actionable window: error rate 1/2 > 38.2% → heuristic insight fires.
+    var window: std.ArrayList([]u8) = .empty;
+    defer {
+        for (window.items) |q| alloc.free(q);
+        window.deinit(alloc);
+    }
+    try window.append(alloc, try alloc.dupe(u8, "query one"));
+    try window.append(alloc, try alloc.dupe(u8, "query two"));
+    var tools: u32 = 0;
+    var errors: u32 = 1;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+
+    memory_ops.runReflection(&reflector, &mem, &window, &tools, &errors, alloc, &aw.writer, prov, .full, null, null);
+
+    // Exactly one gate round trip.
+    try std.testing.expectEqual(@as(u32, 1), server.served.load(.monotonic));
+    const ents = try mem.episodic_mem.retrieveRecent(10);
+    defer mem.episodic_mem.freeEntries(ents);
+    if (expect_stored) {
+        try std.testing.expectEqual(@as(usize, 1), ents.len);
+        try std.testing.expect(std.mem.indexOf(u8, ents[0].content, "失败率") != null);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), ents.len);
+    }
+}
+
+test "P5 quality gate: mock curator says no → misdiagnosis never stored" {
+    try runReflectionWithMockGate(.gate_no, false);
+}
+
+test "P5 quality gate: mock curator says yes → insight stored" {
+    try runReflectionWithMockGate(.gate_yes, true);
 }

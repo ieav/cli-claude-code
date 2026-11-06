@@ -701,6 +701,49 @@ fn reflectionIsDuplicate(mem: *memory_mod.MemorySystem, insight: []const u8) boo
 /// T3.2 (as-designed): background reflection result, handed from the
 /// worker to the main thread via a bounded MPSC — the main thread owns
 /// all SQLite writes (THREADSAFE=0) and all printing.
+/// P5 洞察质量门：启发式洞察（罐头文案）入库前的最后一道校验——
+/// provider 可达时问一次 LLM「真经验还是误诊」，只认 yes/no。
+/// 返回 null = 无法判定（网关错误/答非所问）→ fail-open 照常入库；
+/// 关闭路径与 flash 档不付这个往返（调用方门控）。
+fn parseInsightVerdict(reply: []const u8) ?bool {
+    var lower_buf: [64]u8 = undefined;
+    const n = @min(reply.len, lower_buf.len);
+    const lower = std.ascii.lowerString(lower_buf[0..n], reply[0..n]);
+    const yes = std.mem.indexOf(u8, lower, "yes");
+    const no = std.mem.indexOf(u8, lower, "no");
+    if (yes == null and no == null) return null;
+    if (yes != null and no != null) return yes.? < no.?;
+    return yes != null;
+}
+
+pub fn insightPassesGate(alloc: std.mem.Allocator, prov: llm.Provider, insight: []const u8) ?bool {
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(alloc);
+    prompt.appendSlice(alloc,
+        \\Judge this session insight: is it a genuine, durable lesson — or a misdiagnosis of normal/deliberate activity (e.g. planned timeouts, user-driven retries)? Answer ONLY "yes" (keep) or "no" (reject).
+        \\Insight:
+    ) catch return null;
+    prompt.appendSlice(alloc, insight) catch return null;
+
+    const sys_blocks = alloc.alloc(llm.ContentBlock, 1) catch return null;
+    defer alloc.free(sys_blocks);
+    sys_blocks[0] = .{ .text = "You are a strict memory curator. One word answers only." };
+    const user_blocks = alloc.alloc(llm.ContentBlock, 1) catch return null;
+    defer alloc.free(user_blocks);
+    user_blocks[0] = .{ .text = prompt.items };
+    const msgs = [_]llm.Message{
+        .{ .role = .system, .content = sys_blocks, .timestamp = util_time.nowMillis() },
+        .{ .role = .user, .content = user_blocks, .timestamp = util_time.nowMillis() },
+    };
+    var resp = prov.complete(&msgs, .{ .max_tokens = 8, .temperature = 0.0 }) catch return null;
+    defer resp.free(alloc);
+    for (resp.content) |b| {
+        if (b != .text) continue;
+        return parseInsightVerdict(b.text);
+    }
+    return null;
+}
+
 const ReflectOutcome = struct {
     insights: []u8, // alloc-owned; freed by the drainer
     trigger_name: []const u8, // enum tag string (static)
@@ -927,6 +970,20 @@ pub fn runReflection(
         // refresh the same row forever.
         logger.info("reflection: heuristic insight near-duplicate — store skipped", .{});
     } else {
+        // P5 质量门：启发式罐头洞察在入库前经一次 LLM 校验（provider
+        // 可达且 full 档才付这个往返；网关错误 fail-open 照常入库）。
+        // expected_stop 治标（计数剔除）之外的治本：误诊进不了库。
+        var store_insight = true;
+        if (provider != null and tier == .full) {
+            if (insightPassesGate(alloc, provider.?, insights)) |keep| {
+                store_insight = keep;
+                if (!keep) {
+                    logger.info("reflection: insight REJECTED by quality gate — misdiagnosis", .{});
+                    w.print("  \x1b[2m[洞察被质量门驳回（判定为误诊，未入库）]\x1b[0m\n", .{}) catch {};
+                }
+            }
+        }
+        if (store_insight) {
         const now = util_time.nowMillis();
         mem.store(.{
             .id = injection_mod.memoryId(insights, "reflection"),
@@ -938,6 +995,7 @@ pub fn runReflection(
             .created_at = now,
             .updated_at = now,
         }) catch {};
+        }
     }
     logger.info("reflection: quality={d:.2} heuristic insights stored (llm dispatched in background)", .{reflection.quality_score});
     if (bus) |b| b.emit(.{ .reflection_produced = .{ .quality = @floatCast(reflection.quality_score), .background = false } });
@@ -1285,4 +1343,17 @@ test "reflection inbox drains, prints, and empties (T3.2 wiring)" {
         defer mem.episodic_mem.freeEntries(ents);
         try std.testing.expectEqual(@as(usize, 2), ents.len);
     }
+}
+
+test "insight verdict parser: yes/no/garbage matrix" {
+    try std.testing.expect(parseInsightVerdict("yes") == true);
+    try std.testing.expect(parseInsightVerdict("Yes.") == true);
+    try std.testing.expect(parseInsightVerdict("  no") == false);
+    try std.testing.expect(parseInsightVerdict("NO") == false);
+    // Both present → the FIRST one wins (strict curator answers one word).
+    try std.testing.expect(parseInsightVerdict("yes, but no") == true);
+    try std.testing.expect(parseInsightVerdict("no — not yes") == false);
+    // Neither → null (fail-open at the caller).
+    try std.testing.expect(parseInsightVerdict("perhaps") == null);
+    try std.testing.expect(parseInsightVerdict("") == null);
 }
