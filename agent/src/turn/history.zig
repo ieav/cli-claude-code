@@ -95,13 +95,22 @@ pub fn estimateTextTokens(text: []const u8) u32 {
 /// token estimate AFTER any compaction — callers reuse it instead of
 /// re-scanning the whole history (the loop used to run the same O(n)
 /// estimate twice per iteration).
-pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog, facts: *?[]u8, model: []const u8, backend: llm.BackendType) u32 {
+/// What an auto-compaction pass did — repl turns this into a decision-trace
+/// step (roadmap P2 observability: before/after tokens land in /diagnose).
+pub const CompactEvent = struct {
+    tokens: u32,
+    before_tokens: u32 = 0,
+    compacted: bool = false,
+    slimmed: usize = 0,
+};
+
+pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog, facts: *?[]u8, model: []const u8, backend: llm.BackendType) CompactEvent {
     const current_tokens = estimateHistoryTokens(history.items);
     // T4.1: the ceiling follows the ACTIVE model's context estimate, not
     // the old hardcoded 128K — an 8K local model now compacts at ~5K
     // instead of overflowing first.
     const ceiling = llm.provider.contextEstimate(model, backend);
-    if (!compaction.needsCompaction(current_tokens, ceiling)) return current_tokens;
+    if (!compaction.needsCompaction(current_tokens, ceiling)) return .{ .tokens = current_tokens };
 
     applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
     // P2 tier 3 rides the auto path too: the φ-kept window still carries
@@ -122,7 +131,7 @@ pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocat
         std.Io.Writer.print(w, "  [Context auto-compacted: ~{d} → ~{d} tokens, {d} messages remaining]\n", .{ current_tokens, after_tokens, history.items.len }) catch {};
     }
     std.Io.File.Writer.flush(file_writer) catch {};
-    return after_tokens;
+    return .{ .tokens = after_tokens, .before_tokens = current_tokens, .compacted = true, .slimmed = slim.slimmed };
 }
 
 /// Force compact history via LLM summary (used by /compact) — Claude-style:
@@ -1157,4 +1166,62 @@ test "hybrid layout: 20 rounds keep last 5 verbatim, slim tool results, <40% tok
     const after_tokens = estimateHistoryTokens(history.items);
     try std.testing.expect(after_tokens * 10 < before_tokens * 4);
     try std.testing.expect(history.items.len < before_msgs);
+}
+
+test "maybeCompact auto path: phi cut + tier-3 slimming fire together" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    // Unknown model name → contextEstimate 32K → φ threshold ~20.2K tokens.
+    // 22 rounds × 5 KiB tool results (~1.3K tokens each) ≈ 29K tokens: φ has
+    // messages to cut AND the kept window still holds fat tool results.
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+    }
+    var round: usize = 0;
+    while (round < 22) : (round += 1) {
+        const ubb = try alloc.alloc(llm.ContentBlock, 1);
+        ubb[0] = .{ .text = try alloc.dupe(u8, "user question text padding for tokens") };
+        try history.append(alloc, .{ .role = .user, .content = ubb, .timestamp = 0 });
+        const fat = try alloc.alloc(u8, 5 * 1024);
+        @memset(fat, 'x');
+        const trb = try alloc.alloc(llm.ContentBlock, 1);
+        trb[0] = .{ .tool_result = .{
+            .tool_use_id = try alloc.dupe(u8, "id"),
+            .content = fat,
+        } };
+        try history.append(alloc, .{ .role = .user, .content = trb, .timestamp = 0 });
+    }
+    var w_buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&w_buf);
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const null_file = try std.Io.Dir.cwd().openFile(io_state.io(), "/dev/null", .{ .mode = .write_only });
+    defer null_file.close(io_state.io());
+    var fw_buf: [256]u8 = undefined;
+    var fw = std.Io.File.Writer.initStreaming(null_file, io_state.io(), &fw_buf);
+    var log = op_log.OperationLog.init(alloc);
+    defer log.deinit();
+    var facts: ?[]u8 = null;
+    defer if (facts) |f| alloc.free(f);
+
+    const ev = maybeCompact(&history, alloc, &w, &fw, &log, &facts, "unknown-model-x", .openai);
+    try std.testing.expect(ev.compacted);
+    try std.testing.expect(ev.before_tokens > ev.tokens);
+    try std.testing.expect(ev.slimmed > 0); // tier 3 rode along
+    // Every surviving tool_result is slimmed.
+    for (history.items) |m| for (m.content) |b| {
+        if (b == .tool_result) {
+            try std.testing.expect(b.tool_result.content.len < 2 * 1024);
+            try std.testing.expect(std.mem.indexOf(u8, b.tool_result.content, "字节") != null);
+        }
+    };
+    // Facts block landed in history[0] (decisions/paths distilled from cut).
+    // (No fact-marker text in this fixture → block may be absent; the phi
+    // cut itself is already asserted via ev.compacted.)
 }

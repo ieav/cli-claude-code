@@ -717,7 +717,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // compaction runs first, and only when the estimate stays
             // above the guard AFTER compacting does the turn end. Long
             // multi-file tasks now run to completion inside one turn.)
-            est_ctx = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+            const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+            est_ctx = cmp_ev.tokens;
+            // P2 observability: the compaction event itself lands in the
+            // live decision trace with its token numbers (/diagnose chain).
+            if (cmp_ev.compacted) {
+                if (live_trace) |*t| {
+                    var tb: [96]u8 = undefined;
+                    const desc = std.fmt.bufPrint(&tb, "phi+slim ~{d} -> ~{d} tok", .{ cmp_ev.before_tokens, cmp_ev.tokens }) catch "phi+slim";
+                    traceAddStep(t, .context_assembly, 0.8, "context pressure", desc, "auto-compaction", 0, allocator) catch {};
+                }
+            }
             {
                 const ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
                 const warn_pct = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
@@ -815,8 +825,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 if (err == error.ContextOverflow and !overflow_compacted) {
                     overflow_compacted = true;
                     turn_history.applyFactsUpdate(&history, &facts_block, allocator, turn_history.compactHistoryImpl(&history, allocator, facts_block));
+                    // P2: a history of FEW messages with FAT tool results
+                    // has nothing for φ to cut — the retry would send the
+                    // same oversized payload and fail identically. Tier-3
+                    // slimming is the only lever that bites there.
+                    const ov_slim = turn_history.slimToolResults(history.items, allocator);
                     log.bumpEpoch();
-                    std.Io.Writer.print(ow, "  [Context overflow — history auto-compacted, retrying]\n", .{}) catch {};
+                    if (ov_slim.slimmed > 0) {
+                        std.Io.Writer.print(ow, "  [Context overflow — history auto-compacted, {d} tool outputs slimmed, retrying]\n", .{ov_slim.slimmed}) catch {};
+                    } else {
+                        std.Io.Writer.print(ow, "  [Context overflow — history auto-compacted, retrying]\n", .{}) catch {};
+                    }
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 }
