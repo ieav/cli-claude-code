@@ -16,6 +16,7 @@ const turn_history = @import("turn/history.zig");
 const memory_ops = @import("session/memory_ops.zig");
 const config_menu = @import("commands/config_menu.zig");
 const history_cmds = @import("commands/history_cmds.zig");
+const dispatch_mod = @import("commands/dispatch.zig");
 const input_history_mod = @import("session/input_history.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
@@ -575,638 +576,49 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         if (input.len == 0) continue;
         if (!from_auto_queue) input_history_mod.saveInputHistory(allocator, &input_history);
 
-        var skill_injected = false;
-        // ──── Meta commands ────
-        // Multi-line input (pasted text, `\`+Enter drafts) is always a
-        // MESSAGE — a pasted blob that happens to start with '/' must not
-        // trip the command dispatcher.
-        if (std.mem.startsWith(u8, input, "/") and std.mem.indexOfScalar(u8, input, '\n') == null) {
-            if (std.ascii.eqlIgnoreCase(input, "/quit") or std.ascii.eqlIgnoreCase(input, "/q") or std.ascii.eqlIgnoreCase(input, "/exit")) {
-                // M4: session-end reflection on whatever the window still holds.
-                // Extract memories FIRST (valuable, durable, ms) — reflection
-                // is best-effort behind it; killing the window mid-exit
-                // used to lose the whole session's learnings.
-                if (mem_sys) |*ms| {
-                    const ext_t0 = util_time.nowMillis();
-                    memory_ops.extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
-                    logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
-                }
-                if (mem_sys != null and window_queries.items.len > 0) {
-                    memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
-                    // Best-effort drain: an insight that already landed in the
-                    // inbox is stored now; one still in flight dies with the
-                    // process (the heuristic reflection was stored synchronously
-                    // above — nothing of value blocks on a detached thread).
-                    memory_ops.drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
-                }
-                // Visibility: queued-but-unsent messages die with the
-                // session — say so instead of dropping silently.
-                if (lineinput.queuedHas()) {
-                    try std.Io.Writer.print(w, "\x1b[2m  [{d} 条排队消息未发送，已丢弃]\x1b[0m\n", .{lineinput.queuedCount()});
-                }
-                try std.Io.Writer.writeAll(w, "Goodbye!\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                break;
-            } else if (std.mem.eql(u8, input, "/help") or std.mem.eql(u8, input, "/h")) {
-                try printHelp(w);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.startsWith(u8, input, "/mcp")) {
-                const rest_mcp = std.mem.trim(u8, input[4..], " \t");
-                if (rest_mcp.len == 0 or std.mem.eql(u8, rest_mcp, "list")) {
-                    if (mcp_cfg.servers.items.len == 0) {
-                        try std.Io.Writer.writeAll(w, "  No MCP servers configured. /mcp install <name> | /mcp add <name> <command>\n\n");
-                    } else {
-                        try std.Io.Writer.writeAll(w, "  MCP servers:\n");
-                        for (mcp_cfg.servers.items) |srv| {
-                            const sess = findMcpSession(mcp_sessions.items, srv.name);
-                            const state = if (sess) |ss| (if (ss.connected) "connected" else "down") else "off";
-                            try std.Io.Writer.print(w, "    {s} [{s}] — {s}\n", .{ srv.name, state, if (srv.url) |u| u else srv.command });
-                        }
-                        try std.Io.Writer.writeAll(w, "\n");
-                    }
-                } else if (std.mem.startsWith(u8, rest_mcp, "install ")) {
-                    const want = std.mem.trim(u8, rest_mcp[8..], " \t");
-                    var found = false;
-                    for (mcp_mod.config.McpConfig.known_servers) |ks| {
-                        if (std.mem.eql(u8, ks.name, want)) {
-                            try mcp_cfg.upsert(ks.name, ks.command);
-                            try std.Io.Writer.print(w, "  Installed {s} -> {s}\n  Connect with: /mcp connect {s}\n\n", .{ ks.name, ks.command, ks.name });
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) try std.Io.Writer.print(w, "  Unknown package '{s}'. Known: playwright, filesystem, memory, fetch, sequential-thinking\n\n", .{want});
-                } else if (std.mem.startsWith(u8, rest_mcp, "add ")) {
-                    const args_str = std.mem.trim(u8, rest_mcp[4..], " \t");
-                    const sp = std.mem.indexOfScalar(u8, args_str, ' ') orelse {
-                        try std.Io.Writer.writeAll(w, "  Usage: /mcp add <name> <command...>\n\n");
-                        try std.Io.File.Writer.flush(&file_writer);
-                        continue;
-                    };
-                    const val = std.mem.trim(u8, args_str[sp + 1 ..], " \t");
-                    if (std.mem.startsWith(u8, val, "http://") or std.mem.startsWith(u8, val, "https://")) {
-                        try mcp_cfg.upsertUrl(args_str[0..sp], val);
-                    } else {
-                        try mcp_cfg.upsert(args_str[0..sp], val);
-                    }
-                    try std.Io.Writer.print(w, "  Added. Connect with: /mcp connect {s}\n\n", .{args_str[0..sp]});
-                } else if (std.mem.startsWith(u8, rest_mcp, "remove ")) {
-                    const want = std.mem.trim(u8, rest_mcp[7..], " \t");
-                    if (findMcpSession(mcp_sessions.items, want)) |sess| {
-                        mcp_mod.session.unbridgeSessionTools(sess, &reg);
-                        sess.disconnect(io);
-                    }
-                    if (mcp_cfg.remove(want)) {
-                        try std.Io.Writer.print(w, "  Removed {s}\n\n", .{want});
-                    } else {
-                        try std.Io.Writer.print(w, "  No such server: {s}\n\n", .{want});
-                    }
-                } else if (std.mem.startsWith(u8, rest_mcp, "connect ")) {
-                    const want = std.mem.trim(u8, rest_mcp[8..], " \t");
-                    const entry = mcp_cfg.find(want) orelse {
-                        try std.Io.Writer.print(w, "  No such server: {s} (see /mcp list)\n\n", .{want});
-                        try std.Io.File.Writer.flush(&file_writer);
-                        continue;
-                    };
-                    try connectMcpServer(entry, &mcp_sessions, &reg, allocator, io, w, &file_writer);
-                } else if (std.mem.startsWith(u8, rest_mcp, "disconnect ")) {
-                    const want = std.mem.trim(u8, rest_mcp[11..], " \t");
-                    if (findMcpSession(mcp_sessions.items, want)) |sess| {
-                        mcp_mod.session.unbridgeSessionTools(sess, &reg);
-                        sess.disconnect(io);
-                        try std.Io.Writer.print(w, "  {s} disconnected\n\n", .{want});
-                    } else {
-                        try std.Io.Writer.print(w, "  {s} was not connected\n\n", .{want});
-                    }
-                } else {
-                    try std.Io.Writer.writeAll(w, "  Usage: /mcp [list|install|add|remove|connect|disconnect] ...\n\n");
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/skills")) {
-                if (skill_loader.skills.items.len == 0) {
-                    try std.Io.Writer.writeAll(w, "  No skills found. Add SKILL.md packs under ~/.config/ziv/skills/<name>/ or .ziv/skills/<name>/\n\n");
-                } else {
-                    try std.Io.Writer.writeAll(w, "  Skills (invoke with /<name>):\n");
-                    for (skill_loader.skills.items) |skill| {
-                        try std.Io.Writer.print(w, "    /{s} — {s} [{s}]\n", .{ skill.name, skill.description, @tagName(skill.source) });
-                    }
-                    try std.Io.Writer.writeAll(w, "\n");
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/tools")) {
-                try std.Io.Writer.writeAll(w, "Registered tools:\n");
-                for (reg.definitions()) |tool| {
-                    const safety = if (tool.is_concurrency_safe_fn != null) "safe" else "serial";
-                    try std.Io.Writer.print(w, "  {s} - {s} [{s}|{s}]\n", .{
-                        tool.name,
-                        tool.description,
-                        if (tool.is_read_only) "read" else "write",
-                        safety,
-                    });
-                }
-                try std.Io.Writer.print(w, "\n  Total: {d} tools\n\n", .{reg.count()});
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.startsWith(u8, input, "/run ")) {
-                const rest = input[5..];
-                const space_idx = std.mem.indexOfScalar(u8, rest, ' ') orelse {
-                    try std.Io.Writer.writeAll(w, "Usage: /run <ToolName> <json-input>\n\n");
-                    try std.Io.File.Writer.flush(&file_writer);
-                    continue;
-                };
-                const tool_name = rest[0..space_idx];
-                const json_str = rest[space_idx + 1 ..];
-
-                // Per-command arena: the DOM (and every string the tool
-                // pulled out of it) dies at the end of the /run arm.
-                var run_arena = std.heap.ArenaAllocator.init(allocator);
-                defer run_arena.deinit();
-                const parsed = std.json.parseFromSliceLeaky(std.json.Value, run_arena.allocator(), json_str, .{}) catch {
-                    try std.Io.Writer.writeAll(w, "Invalid JSON input\n\n");
-                    try std.Io.File.Writer.flush(&file_writer);
-                    continue;
-                };
-
-                try std.Io.Writer.print(w, "  Running {s}...\n", .{tool_name});
-                try std.Io.File.Writer.flush(&file_writer);
-                logger.info("Tool /run: {s}", .{tool_name});
-
-                // Permission gate — /run goes through the same pipeline as
-                // agent-loop tool calls (previously it bypassed the mode
-                // entirely, letting Plan mode perform writes).
-                const run_tool = reg.findByName(tool_name) orelse {
-                    try std.Io.Writer.print(w, "  Unknown tool: {s}\n\n", .{tool_name});
-                    try std.Io.File.Writer.flush(&file_writer);
-                    continue;
-                };
-                if (!try turn_ask.permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state)) continue;
-
-                // Backup file before modification (for /run commands)
-                var run_snap_id: ?[16]u8 = null;
-                if (turn_tools.isFileModifyingTool(tool_name)) {
-                    if (registry.getStringField(parsed, "path")) |fp| {
-                        var sid: [16]u8 = undefined;
-                        const ts = util_time.nowMillis();
-                        for (&sid, 0..) |*byte, i| {
-                            byte.* = @truncate(@as(u64, @bitCast(ts)) +% @as(u64, i) *% 0x9e3779b97f4a7c15);
-                        }
-                        if (switcher.settings.checkpointing_enabled) {
-                            fhist.trackEdit(fp, sid, io) catch {};
-                            run_snap_id = sid;
-                        }
-                    }
-                }
-
-                const result = run_tool.execute(allocator, parsed, io) catch |err| {
-                    logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
-                    try std.Io.Writer.print(w, "  Tool error: {}\n\n", .{err});
-                    _ = log.record(tool_name, "execution", "error", run_snap_id, false, history.items.len) catch {};
-                    try std.Io.File.Writer.flush(&file_writer);
-                    continue;
-                };
-
-                // Same /last ring as agent-loop calls (finishToolCall) —
-                // the expansion valve must cover manual /run too.
-                turn_tools.LastTools.push(tool_name, result.output);
-
-                if (result.is_error) {
-                    try std.Io.Writer.print(w, "  ERROR: {s}\n\n", .{result.output});
-                } else {
-                    try std.Io.Writer.print(w, "  {s}\n\n", .{result.output});
-                }
-                _ = log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, history.items.len) catch {};
-                allocator.free(result.output);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/mode")) {
-                // Cycle permission mode
-                current_mode = auth.nextMode(current_mode);
-                // Persist the mode choice — it was runtime-only before, so
-                // every restart silently fell back to the configured mode.
-                switcher.settings.permission_mode = current_mode;
-                config_mod.saveSettings(&switcher.settings, allocator, io) catch {};
-                settings_fp_baseline = config_mod.settingsFingerprint(allocator, io);
-                try std.Io.Writer.print(w, "  Permission mode: {s} (已保存)\n\n", .{auth.modeLabel(current_mode)});
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/model") or std.mem.eql(u8, input, "/models")) {
-                // Interactive model picker (arrow keys + Enter); q shows the
-                // plain text listing instead.
-                try config_menu.runModelPicker(w, r, &file_writer, &switcher, io);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.startsWith(u8, input, "/model ")) {
-                // Switch model: /model <name>
-                const new_model = input[7..];
-                switcher.switchModel(new_model) catch |err| {
-                    if (err == error.MissingApiKey) {
-                        // Report the backend that VALIDATED the key
-                        // (effectiveBackend honors default_backend) — the
-                        // name-prefix detector could point at Ollama
-                        // (keyless) while the gateway backend rejected us.
-                        try std.Io.Writer.print(w, "  Error: API key not configured for {s} backend.\n", .{switcher.effectiveBackend(new_model).label()});
-                        try std.Io.Writer.writeAll(w, "  Use /config to set API keys, or add to ~/.config/ziv/settings.json.\n\n");
-                    } else {
-                        try std.Io.Writer.print(w, "  Error switching model: {}\n\n", .{err});
-                    }
-                    try std.Io.File.Writer.flush(&file_writer);
-                    continue;
-                };
-                try std.Io.Writer.print(w, "  Switched to {s} ({s})\n\n", .{ switcher.modelName(), switcher.backendLabel() });
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/config")) {
-                try config_menu.runConfigMenu(w, r, &file_writer, &switcher, allocator, io);
-                // The live permission gate reads `current_mode`, which the
-                // menu never touched — without this resync a mode picked in
-                // /config never reached the gate until restart.
-                current_mode = switcher.settings.permission_mode;
-                // A changed system prompt must reach the baked history[0]
-                // this session, not after the next restart.
-                reapplySystemPromptIfNeeded(&applied_prompt_setting, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt);
-                continue;
-            } else if (std.mem.eql(u8, input, "/compact") or std.mem.startsWith(u8, input, "/compact ")) {
-                // Claude-style: LLM summarizes the OLDER conversation; the
-                // summary replaces it and the most recent messages are kept
-                // verbatim (v0.7.7 — the old version summarized everything,
-                // including what you just said). Optional free text after
-                // the command steers the summary:
-                //   /compact 重点保留数据库迁移的决策
-                const focus = std.mem.trim(u8, input["/compact".len..], " \t");
-                if (std.mem.eql(u8, focus, "phi")) continue; // handled below
-                try turn_history.compactHistory(&history, &switcher, &log, allocator, w, &file_writer, &total_input_tokens, &total_output_tokens, focus);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/compact phi")) {
-                // Original φ truncation strategy, kept as an explicit option
-                // (also what auto-compaction runs).
-                try turn_history.compactHistoryPhi(&history, allocator, w, &log, &facts_block);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
-                // Reflect BEFORE the window is orphaned: /quit and Ctrl-D
-                // both reflect first; /clear used to skip it, leaking the
-                // cleared conversation's queries into the next one's
-                // reflection window.
-                // Extract memories FIRST (valuable, durable, ms) — reflection
-                // is best-effort behind it; killing the window mid-exit
-                // used to lose the whole session's learnings.
-                if (mem_sys) |*ms| {
-                    const ext_t0 = util_time.nowMillis();
-                    memory_ops.extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
-                    logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
-                }
-                if (mem_sys != null and window_queries.items.len > 0) {
-                    memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
-                    // Best-effort drain: an insight that already landed in the
-                    // inbox is stored now; one still in flight dies with the
-                    // process (the heuristic reflection was stored synchronously
-                    // above — nothing of value blocks on a detached thread).
-                    memory_ops.drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
-                }
-                turn_history.clearHistory(&history, allocator);
-                log.bumpEpoch();
-                // Drop the stale memory-injection block from the surviving
-                // system message so the fresh conversation isn't primed
-                // with the cleared one's memories.
-                if (memory_block) |mb| {
-                    allocator.free(mb);
-                    // Rebuild the prompt so the embedded date/time is fresh —
-                    // a session crossing midnight must not keep answering
-                    // date questions with yesterday. (defer frees whatever
-                    // sys_prompt_owned holds at scope exit, so swapping here
-                    // stays single-ownership.)
-                    if (sys_prompt_owned) |sp| allocator.free(sp);
-                    sys_prompt_owned = system_prompt_mod.buildSystemPrompt(allocator, switcher.settings.system_prompt) catch null;
-                    sys_prompt = sys_prompt_owned orelse system_prompt_mod.default_system_prompt;
-                    const fresh_count: usize = 1 + @as(usize, @intFromBool(skill_manifest != null));
-                    const fresh_blocks = try allocator.alloc(llm.ContentBlock, fresh_count);
-                    fresh_blocks[0] = .{ .text = sys_prompt };
-                    // The skill manifest must survive /clear — rebuilding a
-                    // single-block message dropped it, leaving the model
-                    // blind to every /<skill> until restart (the manifest
-                    // string stays owned by the outer defer).
-                    if (skill_manifest) |sm| fresh_blocks[1] = .{ .text = sm };
-                    allocator.free(history.items[0].content);
-                    history.items[0].content = fresh_blocks;
-                    memory_block = null; // the end-of-session defer must not double-free
-                    injected_count = 0;
-                }
-                message_count = 0;
-                total_input_tokens = 0;
-                total_output_tokens = 0;
-                _ = log.record("ClearHistory", "/", "/", null, false, 0) catch {};
-                try std.Io.Writer.writeAll(w, "  Conversation cleared. Starting fresh.\n\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/context")) {
-                try history_cmds.showContext(&history, total_input_tokens, total_output_tokens, w);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/trace")) {
-                // P2: per-step timing of the last turn, read straight from
-                // the .ziv/traces/*.jsonl the turn-end telemetry wrote —
-                // the data has existed since 2026-11-05, this is its
-                // in-TUI window.
-                if (turn_clock.tracePath().len == 0) {
-                    try std.Io.Writer.print(w, "  本会话尚无 trace（任一回合结束后生成；ZIV_TRACE=0 可关闭落盘）\n\n", .{});
-                } else {
-                    const tpath = turn_clock.tracePath();
-                    var fbuf: [131072]u8 = undefined;
-                    if (std.Io.Dir.cwd().readFile(io, tpath, &fbuf)) |data| {
-                        var lines_it = std.mem.splitScalar(u8, data, '\n');
-                        const header = lines_it.next() orelse "";
-                        var qb: [96]u8 = undefined;
-                        const qtxt = traceHeaderSummary(header, &qb) catch "（表头解析失败）";
-                        try std.Io.Writer.print(w, "  ⏱ 上一回合 {s}\n", .{qtxt});
-                        var step_no: usize = 0;
-                        while (lines_it.next()) |ln| {
-                            if (ln.len == 0) continue;
-                            step_no += 1;
-                            if (step_no > 80) break;
-                            var sb: [96]u8 = undefined;
-                            if (traceStepSummary(ln, &sb)) |s| {
-                                try std.Io.Writer.print(w, "    {d:>3}. {s}\n", .{ step_no, s });
-                            }
-                        }
-                        if (step_no > 80) try std.Io.Writer.print(w, "    …（超 80 步截断；全量见文件）\n", .{});
-                        try std.Io.Writer.print(w, "  文件: {s}\n\n", .{tpath});
-                    } else |_| {
-                        try std.Io.Writer.print(w, "  读取 trace 失败（文件可能已被移动）: {s}\n\n", .{tpath});
-                    }
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/tasks")) {
-                // ②: the task system (TaskCreate/TaskUpdate) had a full
-                // store + render() but no TUI surface at all.
-                const ts = task_store.global();
-                if (ts.count() == 0) {
-                    try std.Io.Writer.print(w, "  任务列表为空（模型用 TaskCreate 建任务后在此查看进度）\n\n", .{});
-                } else {
-                    const rendered = ts.render(allocator) catch {
-                        try std.Io.Writer.print(w, "  任务列表渲染失败\n\n", .{});
-                        try std.Io.File.Writer.flush(&file_writer);
-                        continue;
-                    };
-                    defer allocator.free(rendered);
-                    try std.Io.Writer.print(w, "{s}\n", .{rendered});
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/last") or std.mem.startsWith(u8, input, "/last ")) {
-                // ③: full output of a recent tool — the one-line preview in
-                // the transcript deliberately truncates; this is the
-                // expansion valve (/last = newest, /last 3 = third newest).
-                var n: usize = 1;
-                if (std.mem.startsWith(u8, input, "/last ")) {
-                    const arg = std.mem.trim(u8, input["/last ".len..], " \t");
-                    n = std.fmt.parseInt(usize, arg, 10) catch 1;
-                }
-                if (turn_tools.LastTools.get(n)) |e| {
-                    try std.Io.Writer.print(w, "  ── {s}（最近第 {d} 条，{d} 字节）──\n", .{ e.name, n, e.output.len });
-                    var at_ls = false;
-                    try memory_ops.writeMarginLines(w, e.output, "  ", &at_ls);
-                    if (!at_ls) try std.Io.Writer.writeAll(w, "\n");
-                    try std.Io.Writer.writeAll(w, "\n");
-                } else {
-                    try std.Io.Writer.print(w, "  无记录（/last=最近一条，/last N=第 N 近，最多保留 {d} 条）\n\n", .{turn_tools.LastTools.N});
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/memory")) {
-                try memory_ops.printMemoryStatus(if (mem_sys) |*ms| ms else null, injected_count, w);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.startsWith(u8, input, "/research ")) {
-                const topic = std.mem.trim(u8, input["/research ".len..], " \t");
-                if (topic.len == 0) {
-                    try std.Io.Writer.writeAll(w, "  Usage: /research <topic>\n\n");
-                } else {
-                    try memory_ops.runResearch(topic, allocator, io, w, switcher.settings.api_keys.brave_api_key, if (mem_sys) |*ms| ms else null, if (kgraph) |*g| g else null);
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/knowledge")) {
-                try printKnowledge(if (kgraph) |*g| g else null, w);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.startsWith(u8, input, "/diagnose")) {
-                const rest = if (input.len > "/diagnose".len) input["/diagnose".len..] else "";
-                const concern = std.mem.trim(u8, rest, " \t");
-                if (concern.len == 0) {
-                    try std.Io.Writer.writeAll(w, "  Usage: /diagnose <your concern about the last answer>\n\n");
-                } else {
-                    try memory_ops.runDiagnose(if (live_trace) |*t| t else null, concern, injected_count, window_tools, window_errors, if (mem_sys) |*ms| ms else null, allocator, w);
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/undo")) {
-                // Only invalidate older rewind points when something was
-                // actually removed — a no-op undo must not rewrite history.
-                if (try history_cmds.undoLastExchange(&history, allocator, w) > 0) {
-                    log.bumpEpoch();
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/history")) {
-                if (log.records.items.len == 0) {
-                    try std.Io.Writer.writeAll(w, "  No operations recorded yet.\n\n");
-                } else {
-                    try std.Io.Writer.print(w, "  Operation history ({d} operations):\n", .{log.records.items.len});
-                    for (log.records.items, 0..) |rec, i| {
-                        try std.Io.Writer.print(w, "    [{d}] {s}\n", .{ i + 1, rec.tool_name });
-                    }
-                    try std.Io.Writer.writeAll(w, "\n");
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/rewind")) {
-                try history_cmds.rewindOperation(&rollback_engine, &history, w, r, &file_writer, allocator, io);
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/plan") or std.mem.startsWith(u8, input, "/plan ")) {
-                const plan_arg = std.mem.trim(u8, input[5..], " \t");
-                if (std.mem.eql(u8, plan_arg, "off")) {
-                    std.Io.Dir.cwd().deleteFile(io, ".ziv/plan.md") catch {};
-                    turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
-                    try std.Io.Writer.writeAll(w, "  计划已停用（.ziv/plan.md 已删除，system 锚点已移除）\n\n");
-                } else if (plan_arg.len == 0) {
-                    if (plan_raw_last) |pr| {
-                        try std.Io.Writer.print(w, "  当前计划（.ziv/plan.md）：\n{s}\n\n", .{pr});
-                    } else {
-                        try std.Io.Writer.writeAll(w, "  当前无计划。用法：/plan <目标> 创建 ｜ /plan off 停用\n\n");
-                    }
-                } else {
-                    std.Io.Dir.cwd().createDirPath(io, ".ziv") catch {};
-                    var tp: [4096]u8 = undefined;
-                    const template = std.fmt.bufPrint(&tp, "# 计划：{s}\n\n- [ ] （补充步骤；勾选为 [x] 后，system 注入的摘要自动更新）\n", .{plan_arg}) catch "";
-                    if (template.len > 0) {
-                        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ".ziv/plan.md", .data = template }) catch {
-                            try std.Io.Writer.writeAll(w, "  写入 .ziv/plan.md 失败\n\n");
-                            try std.Io.File.Writer.flush(&file_writer);
-                            continue;
-                        };
-                        turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
-                        try std.Io.Writer.writeAll(w, "  计划已创建并锚定到 system prompt（每轮自动同步勾选进度）\n\n");
-                    }
-                }
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/stats")) {
-                const est_tokens = turn_history.estimateHistoryTokens(history.items);
-                try std.Io.Writer.print(w, "  Messages: {d} | History tokens: ~{d} | Operations: {d}\n", .{
-                    message_count,
-                    est_tokens,
-                    log.records.items.len,
-                });
-                try std.Io.Writer.print(w, "  Mode: {s} | Model: {s} ({s}) | Tier: {s}\n", .{
-                    auth.modeLabel(current_mode),
-                    switcher.modelName(),
-                    switcher.backendLabel(),
-                    @tagName(llm.provider.capabilityTier(switcher.modelName(), switcher.backend)),
-                });
-                try std.Io.Writer.print(w, "  Total: {d} in / {d} out tokens\n\n", .{
-                    total_input_tokens,
-                    total_output_tokens,
-                });
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/terminal-setup")) {
-                // Claude-Code-style Shift+Enter enabler: ziv understands the
-                // sequences; this tells the TERMINAL to actually send one.
-                const term = env.get("TERM_PROGRAM") orelse "";
-                try std.Io.Writer.writeAll(w,
-                    \\  Shift+Enter 换行配置指引
-                    \\
-                    \\  ─ kitty 键盘协议终端（开箱即用）────────────────
-                    \\    kitty / WezTerm / foot / ghostty / Alacritty ≥0.13 /
-                    \\    iTerm2 ≥3.5 / VS Code（较新 xterm.js）：
-                    \\    ziv 启动时已自动启用协议，Shift+Enter 直接换行。
-                    \\
-                    \\  ─ 通用（所有终端立即可用）────────────────────────
-                    \\    · 行尾反斜杠 `\` + Enter   续行
-                    \\    · Ctrl+J                  插入换行
-                    \\
-                );
-                if (std.mem.eql(u8, term, "vscode")) {
-                    try std.Io.Writer.writeAll(w,
-                        \\
-                        \\  ─ VS Code 集成终端 ────────────────────────────
-                        \\    Settings → Keyboard Shortcuts → Terminal: Run Recent Command?
-                        \\    简单做法：keybindings.json 加一条
-                        \\      { "key": "shift+enter", "command": "workbench.action.terminal.sendSequence",
-                        \\        "args": { "text": "\n" }, "when": "terminalFocus" }
-                        \\
-                    );
-                } else if (std.mem.eql(u8, term, "iTerm.app")) {
-                    try std.Io.Writer.writeAll(w,
-                        \\
-                        \\  ─ iTerm2 ──────────────────────────────────────
-                        \\    Settings → Profiles → Keys → Key Mappings → +:
-                        \\      Shortcut: Shift+Enter  Action: Send Escape Sequence
-                        \\      Esc+ 输入: \r    （ziv 识别 ESC+CR 为换行）
-                        \\
-                    );
-                } else if (std.mem.eql(u8, term, "WezTerm")) {
-                    try std.Io.Writer.writeAll(w,
-                        \\
-                        \\  ─ WezTerm ─────────────────────────────────────
-                        \\    wezterm.lua:
-                        \\      keys = { { key="Enter", mods="SHIFT", action=wezterm.action{SendString="\n"} } }
-                        \\
-                    );
-                } else {
-                    try std.Io.Writer.writeAll(w,
-                        \\
-                        \\  ─ 其他终端（含 Apple Terminal）─────────────────
-                        \\    Apple Terminal 不支持 kitty 协议，也不支持单键改映射，
-                        \\    推荐用 `\`+Enter 或 Ctrl+J。
-                        \\
-                    );
-                }
-                try std.Io.Writer.writeAll(w, "\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (std.mem.eql(u8, input, "/version")) {
-                try std.Io.Writer.writeAll(w, "  Ziv v" ++ version_mod.version ++ " (Zig " ++ @import("builtin").zig_version_string ++ ")\n\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            } else if (input.len > 1 and skill_loader.findByName(if (std.mem.indexOfScalar(u8, input[1..], ' ')) |sp| input[1 .. 1 + sp] else input[1..]) != null) {
-                // /<skill-name> [task...]: known skill -> inject its body as
-                // the user message (v1: prompt-only skills) and fall through
-                // to the normal agent path.
-                const rest = input[1..];
-                const sp_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
-                const skill = skill_loader.findByName(rest[0..sp_end]).?;
-                const task = std.mem.trim(u8, rest[sp_end..], " \t");
-                const body = skill_loader.readBody(skill, allocator) catch "";
-                // T7.2: trigger-time preview — the user sees the declared
-                // shape (steps + advisory tools) before the model runs it.
-                {
-                    const steps = skills_mod.loader.countSteps(body);
-                    var pb: [96]u8 = undefined;
-                    const prev = std.fmt.bufPrint(&pb, "  ▶ skill {s} · {d} 步{s}{s}\n", .{
-                        skill.name,
-                        steps,
-                        if (skill.tools.len > 0) " · 工具: " else "",
-                        skill.tools,
-                    }) catch "  ▶ skill\n";
-                    try std.Io.Writer.writeAll(w, prev);
-                    try std.Io.File.Writer.flush(&file_writer);
-                }
-                defer if (body.len > 0) allocator.free(body);
-                // $ARGUMENTS substitution: skills can template the whole
-                // argument string into their body (Claude-compatible).
-                var expanded: []const u8 = body;
-                var did_subst = false;
-                if (std.mem.indexOf(u8, body, "$ARGUMENTS") != null) {
-                    const arg_val = if (task.len > 0) task else "";
-                    // Only mark ownership on success — the old catch-body
-                    // fallback aliased `expanded` to `body` while did_subst
-                    // stayed true, double-freeing one of them at scope exit.
-                    if (std.mem.replaceOwned(u8, allocator, body, "$ARGUMENTS", arg_val)) |replaced| {
-                        expanded = replaced;
-                        did_subst = true;
-                    } else |_| {}
-                }
-                defer if (did_subst) allocator.free(expanded);
-                const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
-                    skill.name,
-                    expanded,
-                    if (task.len > 0) task else "follow the skill instructions",
-                }) catch continue;
-                var skill_blocks = try allocator.alloc(llm.ContentBlock, 1);
-                skill_blocks[0] = .{ .text = msg };
-                try history.append(allocator, .{
-                    .role = .user,
-                    .content = skill_blocks,
-                    .timestamp = util_time.nowMillis(),
-                });
-                skill_injected = true;
-            } else {
-                try std.Io.Writer.print(w, "Unknown command: {s}", .{input});
-                // Typo hints from the canonical command table.
-                if (slash_cmds.suggestMatching(allocator, input) catch null) |hits| {
-                    defer allocator.free(hits);
-                    if (hits.len > 0) {
-                        try std.Io.Writer.writeAll(w, "\nDid you mean:");
-                        for (hits[0..@min(hits.len, 5)]) |h| {
-                            try std.Io.Writer.print(w, " {s}", .{h});
-                        }
-                    }
-                }
-                try std.Io.Writer.writeAll(w, "\nType /help for available commands.\n\n");
-                try std.Io.File.Writer.flush(&file_writer);
-                continue;
-            }
-        }
-
-        // Append user message to history (skill invocations already did)
-        if (!skill_injected) {
+        var ctx = dispatch_mod.ReplCtx{
+        .w = w,
+        .ow = ow,
+        .r = r,
+        .io = io,
+        .file_writer = &file_writer,
+        .history = &history,
+        .switcher = &switcher,
+        .current_mode = &current_mode,
+        .log = &log,
+        .fhist = &fhist,
+        .rollback_engine = &rollback_engine,
+        .message_count = &message_count,
+        .injected_count = &injected_count,
+        .evbus = &evbus,
+        .mem_sys = &mem_sys,
+        .kgraph = &kgraph,
+        .mcp_cfg = &mcp_cfg,
+        .mcp_sessions = &mcp_sessions,
+        .skill_loader = &skill_loader,
+        .skill_manifest = skill_manifest,
+        .sys_prompt = &sys_prompt,
+        .sys_prompt_owned = &sys_prompt_owned,
+        .applied_prompt_setting = &applied_prompt_setting,
+        .memory_block = &memory_block,
+        .facts_block = &facts_block,
+        .plan_block = &plan_block,
+        .plan_raw_last = &plan_raw_last,
+        .total_input_tokens = &total_input_tokens,
+        .total_output_tokens = &total_output_tokens,
+        .live_trace = &live_trace,
+        .reflector = &reflector,
+        .reg = &reg,
+        .denial_state = &denial_state,
+        .window_queries = &window_queries,
+        .window_tools = &window_tools,
+        .window_errors = &window_errors,
+        .prompt = prompt,
+        };
+        const dres = try dispatch_mod.dispatchSlash(&ctx, input);
+        if (dres == .quit) break;
+        if (dres == .handled) continue;
+        if (dres == .message) {
             var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
             user_blocks[0] = .{ .text = try allocator.dupe(u8, input) };
             try history.append(allocator, .{
@@ -2127,7 +1539,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 }
 
 /// Semantic tier listing: /knowledge shows graph size and recent nodes.
-fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void {
+pub fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void {
     if (kg == null) {
         try std.Io.Writer.writeAll(w, "  Knowledge graph unavailable (database disabled).\n\n");
         return;
@@ -2158,7 +1570,7 @@ fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void
 /// lines (query/total — no "phase" key) return null. Field scanning, not
 /// JSON parsing: /trace stays light and the field order is fixed by
 /// decision_trace.toJsonl.
-fn traceStepSummary(line: []const u8, buf: []u8) ?[]const u8 {
+pub fn traceStepSummary(line: []const u8, buf: []u8) ?[]const u8 {
     const phase_key = "\"phase\":\"";
     const p0 = std.mem.indexOf(u8, line, phase_key) orelse return null;
     const p1 = p0 + phase_key.len;
@@ -2171,7 +1583,7 @@ fn traceStepSummary(line: []const u8, buf: []u8) ?[]const u8 {
 }
 
 /// Header row of a trace file: "「query」 · N 步 · 总 X.Ys".
-fn traceHeaderSummary(header: []const u8, buf: []u8) ![]const u8 {
+pub fn traceHeaderSummary(header: []const u8, buf: []u8) ![]const u8 {
     const qk = "\"query\":\"";
     const q0 = std.mem.indexOf(u8, header, qk) orelse return error.BadHeader;
     const q1 = q0 + qk.len;
@@ -2254,7 +1666,7 @@ fn traceAddStep(
 // three loose globals → one atomic namespaced object, single writer).
 
 
-fn findMcpSession(sessions: []*mcp_mod.session.McpSession, name: []const u8) ?*mcp_mod.session.McpSession {
+pub fn findMcpSession(sessions: []*mcp_mod.session.McpSession, name: []const u8) ?*mcp_mod.session.McpSession {
     for (sessions) |sess| {
         if (std.mem.eql(u8, sess.name, name)) return sess;
     }
@@ -2262,7 +1674,7 @@ fn findMcpSession(sessions: []*mcp_mod.session.McpSession, name: []const u8) ?*m
 }
 
 /// Spawn + handshake + bridge one server's tools into the runtime registry.
-fn connectMcpServer(
+pub fn connectMcpServer(
     entry: *mcp_mod.config.ServerEntry,
     sessions: *std.ArrayList(*mcp_mod.session.McpSession),
     reg: *runtime_registry.RuntimeRegistry,
@@ -2339,7 +1751,7 @@ fn sameOptSlice(a: ?[]const u8, b: ?[]const u8) bool {
 /// menu reported "(已保存)" while the model kept answering with the old
 /// prompt until /clear or restart — the baked-in variant of
 /// "配置仅启动加载" (bug-patterns.md).
-fn reapplySystemPromptIfNeeded(
+pub fn reapplySystemPromptIfNeeded(
     applied: *?[]const u8,
     owned: *?[]u8,
     prompt: *[]const u8,
@@ -2363,7 +1775,7 @@ fn reapplySystemPromptIfNeeded(
     history.items[0].content = nb;
 }
 
-fn printHelp(w: *std.Io.Writer) !void {
+pub fn printHelp(w: *std.Io.Writer) !void {
     try std.Io.Writer.writeAll(w,
         \\Available commands:
         \\  /help, /h         Show this help
