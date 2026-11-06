@@ -46,6 +46,7 @@ pub fn runConfigMenu(
         var b5: [64]u8 = undefined;
         var b6: [64]u8 = undefined;
         var b7: [64]u8 = undefined;
+        var b8: [96]u8 = undefined;
         const items = [_][]const u8{
             "API Keys",
             try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
@@ -55,6 +56,7 @@ pub fn runConfigMenu(
             try_std_fmt(&b3, "权限模式: {s}", .{auth.modeLabel(switcher.settings.permission_mode)}),
             try_std_fmt(&b4, "检查点: {s}", .{if (switcher.settings.checkpointing_enabled) "开" else "关"}),
             try_std_fmt(&b5, "系统提示词: {s}", .{if (switcher.settings.system_prompt != null) "(自定义)" else "(默认)"}),
+            try_std_fmt(&b8, "自动错误修复: {s}", .{if (switcher.settings.auto_fix) "开（429/超时退避重试）" else "关（直接出选择器）"}),
             "退出",
         };
         const picked = (menu.select(w, r, file_writer, "=== Ziv 配置 ===", &items, 0) catch break) orelse break;
@@ -127,7 +129,12 @@ pub fn runConfigMenu(
                     autoSaveSettings(w, file_writer, switcher, alloc, io);
                 }
             },
-            8 => break,
+            8 => {
+                switcher.settings.auto_fix = !switcher.settings.auto_fix;
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+                try std.Io.Writer.print(w, "  自动错误修复: {s}\n", .{if (switcher.settings.auto_fix) "开" else "关"});
+            },
+            9 => break,
             else => {},
         }
     }

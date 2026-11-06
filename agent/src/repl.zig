@@ -19,6 +19,7 @@ const history_cmds = @import("commands/history_cmds.zig");
 const dispatch_mod = @import("commands/dispatch.zig");
 const input_history_mod = @import("session/input_history.zig");
 const session_store = @import("session/session_store.zig");
+const error_recovery = @import("turn/error_recovery.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
 const json_tree = @import("util/json_tree.zig");
@@ -708,6 +709,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // (provider-side) and transparently retried — "发了消息模型一直
         // 没响应" self-heals instead of idling on the 180s watchdog.
         var ttft_retries: u8 = 0;
+        // P4 auto-fix ladder budget: transient-error backoff retries this
+        // turn (429 / network class; TTFT has its own counter above).
+        var auto_fix_retries: u8 = 0;
         var result_blocks = std.ArrayList(llm.ContentBlock).empty;
         defer result_blocks.deinit(allocator);
         // One emergency compaction per turn on ContextOverflow — a second
@@ -878,6 +882,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 }
+                // P4 auto-fix ladder (unified): transient errors back off
+                // and retry on their own before anything user-facing.
+                if (error_recovery.backoffPlan(err, switcher.settings.auto_fix, auto_fix_retries)) |plan| {
+                    auto_fix_retries += 1;
+                    if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic);
+                    std.Io.Writer.print(ow, "\x1b[2m  [{s} — 退避 {d}s 后自动重试 {d}/{d}…]\x1b[0m\n", .{ plan.reason, plan.ms / 1000, auto_fix_retries, error_recovery.MAX_AUTO_RETRIES }) catch {};
+                    try std.Io.File.Writer.flush(&file_writer);
+                    util_time.sleepMs(plan.ms);
+                    continue;
+                }
                 lineinput.regionEnd(w);
                 if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic); // monitor: real-429 evidence
                 try std.Io.Writer.print(ow, "  [LLM error: {}]\n", .{err});
@@ -922,6 +936,36 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 try std.Io.Writer.writeAll(ow, "\n");
                 try std.Io.File.Writer.flush(&file_writer);
+                // P4 (design §五): the numbered suggestions above become
+                // actionable — one arrow-key pick, no retyping. Esc = ignore.
+                if (error_recovery.selectorEligible(err)) {
+                    if (error_recovery.offerMenu(ow, r, &file_writer)) |choice| switch (choice) {
+                        .retry => {
+                            try std.Io.Writer.writeAll(ow, "  [重试本回合…]\n");
+                            try std.Io.File.Writer.flush(&file_writer);
+                            continue;
+                        },
+                        .compact_retry => {
+                            turn_history.applyFactsUpdate(&history, &facts_block, allocator, turn_history.compactHistoryImpl(&history, allocator, facts_block));
+                            _ = turn_history.slimToolResults(history.items, allocator);
+                            log.bumpEpoch();
+                            try std.Io.Writer.print(ow, "  [已压缩（φ+瘦身）— {d} 条消息，重试本回合…]\n", .{history.items.len});
+                            try std.Io.File.Writer.flush(&file_writer);
+                            continue;
+                        },
+                        .switch_model => {
+                            try config_menu.runModelPicker(w, r, &file_writer, &switcher, io);
+                            try std.Io.Writer.print(ow, "  [模型: {s} — 重试本回合…]\n", .{switcher.modelName()});
+                            try std.Io.File.Writer.flush(&file_writer);
+                            continue;
+                        },
+                        .ignore => {},
+                    };
+                    // ignore / Esc: prefill 「继续」 so one Enter resumes
+                    // once the user has fixed the environment.
+                    lineinput.recall_text = "继续";
+                    lineinput.recall_prefill = true;
+                }
                 break;
             };
 

@@ -38,14 +38,14 @@ class ZivSession:
     owns the controlling terminal — plain subprocess leaves /dev/tty
     'not configured' inside the child)."""
 
-    def __init__(self, reuse_dir=None):
+    def __init__(self, reuse_dir=None, settings='{"permission_mode":"bypass"}\n'):
         self._owns_dir = reuse_dir is None
         self.dir = reuse_dir or tempfile.mkdtemp(prefix="ziv-pty-")
         os.makedirs(os.path.join(self.dir, ".ziv"), exist_ok=True)
         # Deterministic, hermetic: project-level bypass so FileWrite/Bash
         # never hit the permission gate regardless of global settings.
         with open(os.path.join(self.dir, ".ziv", "settings.json"), "w") as f:
-            f.write('{"permission_mode":"bypass"}\n')
+            f.write(settings)
         self.pid, self.master = pty.fork()
         if self.pid == 0:
             os.chdir(self.dir)
@@ -379,6 +379,39 @@ def s8_crash_resume():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s9_error_selector():
+    """LLM error → auto backoff retries fire → interactive selector offers
+    real moves (roadmap P4). Dead-gateway injection: a key plus a base_url
+    on a closed port — ConnectionRefused is transient, so the ladder runs
+    first (1/2, 2/2), then the selector; Esc = ignore with 「继续」prefill."""
+    d = tempfile.mkdtemp(prefix="ziv-p4-")
+    try:
+        z = ZivSession(reuse_dir=d, settings='{"permission_mode":"bypass","api_keys":{"openai":"test-key","openai_base_url":"http://127.0.0.1:1/v1"}}\n')
+        try:
+            z.wait_prompt()
+            z.send("probe the dead gateway\n")
+            z.read_until("自动重试 1/2", 20)   # ladder fired
+            z.read_until("自动重试 2/2", 20)   # budget spent
+            out = z.read_until("如何处理这个错误", 15)  # selector appeared
+            for label in ("重试本回合", "压缩历史后重试", "换模型", "忽略"):
+                if label not in out:
+                    raise Fail(f"selector missing option: {label}")
+            # Option 1 (retry) actually re-runs the turn: pick it, the
+            # retry notice prints, the error repeats, the selector comes
+            # back — proof the choice drives the loop, not just prints.
+            z.send("\r")  # select item 0 = 重试本回合
+            z.read_until("重试本回合…", 10)
+            z.read_until("如何处理这个错误", 15)
+            z.send("\x1b")  # Esc = ignore
+            z.drain(1.0)
+            quit_and_wait(z)
+            return "auto backoff ×2 + selector 4 moves + retry takes effect ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -388,6 +421,7 @@ SCENARIOS = [
     ("S6 command-smoke", s6_command_smoke),
     ("S7 clean-resume", s7_clean_resume),
     ("S8 crash-resume", s8_crash_resume),
+    ("S9 error-selector", s9_error_selector),
 ]
 
 

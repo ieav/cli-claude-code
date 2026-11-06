@@ -30,6 +30,7 @@ test {
     _ = @import("turn/ask.zig");
     _ = @import("turn/tools.zig");
     _ = @import("turn/history.zig");
+    _ = @import("turn/error_recovery.zig");
     _ = @import("session/memory_ops.zig");
     _ = @import("commands/config_menu.zig");
     _ = @import("session/model_switcher.zig");
