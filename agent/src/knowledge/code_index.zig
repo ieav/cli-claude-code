@@ -261,6 +261,117 @@ fn freshOnDisk(io: std.Io, path: []const u8, mtime_ns: i64, size: i64) bool {
     return st.mtime.nanoseconds == mtime_ns and @as(i64, @intCast(st.size)) == size;
 }
 
+/// P6-③ prompt pipeline: build the per-question code context block from
+/// the index. Keywords come from the question (ASCII words ≥3 chars,
+/// stopworded, lowercased); each becomes an FTS5 prefix term (term*) joined
+/// by OR, ranked by bm25, freshness-gated. Result is a deterministic
+/// sorted block so an unchanged topic yields byte-identical text — the
+/// caller can then skip the swap and keep the prompt cache warm.
+/// Null when nothing fresh matched (caller drops the old block).
+pub fn buildContextBlock(alloc: std.mem.Allocator, io: std.Io, question: []const u8, max_snippets: usize) ?[]u8 {
+    const mu_lock = true;
+    _ = mu_lock;
+    global_mu.lockUncancelable(io);
+    defer global_mu.unlock(io);
+    const db = conn(alloc) orelse return null;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Keywords → "t1*" OR "t2*" … (quotes rejected per-term).
+    var terms: std.ArrayList([]const u8) = .empty;
+    defer terms.deinit(a);
+    var it = std.mem.tokenizeAny(u8, question, " \t\r\n,.;:!?()[]{}\"'`~^|<>=+-*/\\_#@$%&");
+    while (it.next()) |word| {
+        if (word.len < 3) continue;
+        var lbuf: [64]u8 = undefined;
+        if (word.len > lbuf.len) continue;
+        const w = std.ascii.lowerString(lbuf[0..word.len], word);
+        if (isStopword(w)) continue;
+        // Dedup terms.
+        var dup = false;
+        for (terms.items) |t| {
+            if (std.mem.eql(u8, t, w)) dup = true;
+        }
+        if (dup) continue;
+        terms.append(a, a.dupe(u8, w) catch continue) catch continue;
+        if (terms.items.len >= 6) break;
+    }
+    if (terms.items.len == 0) return null;
+
+    var expr: std.ArrayList(u8) = .empty;
+    defer expr.deinit(a);
+    for (terms.items, 0..) |t, i| {
+        if (i > 0) expr.appendSlice(a, " OR ") catch return null;
+        expr.print(a, "{s}*", .{t}) catch return null;
+    }
+
+    // bm25-ranked prefix query, freshness-gated like queryLiteral.
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(a);
+    sql.print(a,
+        "SELECT code_lines.path, code_lines.lineno, code_lines.body, f.mtime_ns, f.size FROM code_lines " ++
+            "JOIN code_files f ON f.path = code_lines.path " ++
+            "WHERE code_lines MATCH '{s}' ORDER BY rank LIMIT {d}",
+        .{ expr.items, max_snippets * 4 },
+    ) catch return null;
+
+    const Snip = struct { path: []const u8, lineno: i64, body: []const u8 };
+    var snips: std.ArrayList(Snip) = .empty;
+    defer snips.deinit(a);
+    var per_file: usize = 0;
+    var last_file: []const u8 = "";
+    var st2 = database_mod.Statement.prepare(a, db, sql.items) catch return null;
+    defer st2.finalize();
+    while (st2.step() catch false) {
+        const p = st2.columnText(0);
+        if (!freshOnDisk(io, p, st2.columnInt64(3), st2.columnInt64(4))) continue;
+        if (std.mem.eql(u8, p, last_file)) {
+            per_file += 1;
+            if (per_file >= 2) continue; // ≤2 lines per file
+        } else {
+            per_file = 0;
+            last_file = p;
+        }
+        snips.append(a, .{ .path = p, .lineno = st2.columnInt64(1), .body = st2.columnText(2) }) catch break;
+        if (snips.items.len >= max_snippets) break;
+    }
+    if (snips.items.len == 0) return null;
+
+    // Deterministic block text (already ordered by rank; keep that order —
+    // relevance-first, and rank order is stable for the same query).
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    errdefer aw.deinit();
+    aw.writer.print("Relevant code from this workspace (top {d} by relevance):\n", .{snips.items.len}) catch return null;
+    for (snips.items) |sn| {
+        const body = sn.body[0..@min(sn.body.len, 120)];
+        aw.writer.print("- {s}:{d}: {s}\n", .{ sn.path, sn.lineno, body }) catch break;
+    }
+    var list = aw.toArrayList();
+    last_injected = snips.items.len;
+    return list.toOwnedSlice(alloc) catch null;
+}
+
+/// How many snippets the last buildContextBlock produced (/stats surface).
+pub var last_injected: usize = 0;
+
+const stopwords = [_][]const u8{
+    "the", "and", "for", "with", "that", "this", "from", "what", "how",
+    "why", "are", "was", "were", "you", "your", "into", "not", "but",
+    "all", "can", "does", "did", "has", "have", "will", "would", "should",
+    "when", "which", "there", "their", "them", "then", "than", "some",
+    "about", "just", "like", "also", "make", "made", "use", "using",
+    "get", "set", "put", "add", "new", "old", "one", "two", "how",
+};
+
+fn isStopword(w: []const u8) bool {
+    for (stopwords) |sw| {
+        if (std.mem.eql(u8, w, sw)) return true;
+    }
+    return false;
+}
+
 pub fn freeMatch(alloc: std.mem.Allocator, m: Match) void {
     alloc.free(m.path);
     alloc.free(m.body);
@@ -352,4 +463,48 @@ test "upsert/query/staleness against a real index db (roadmap acceptance)" {
         if (r3.matches.len > 0) alloc.free(r3.matches);
     }
     try std.testing.expect(r3.stats.served_from_index);
+}
+
+test "buildContextBlock: question keywords retrieve fresh snippets (P6-③)" {
+    const alloc = std.testing.allocator;
+    const util_time2 = @import("../util/time.zig");
+    var dbuf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dbuf, "/tmp/ziv_ci_ctx_{d}", .{util_time2.nowMillis()});
+    try fs_ops.ensureDir(dir);
+    var pbuf: [160]u8 = undefined;
+    const file_a = try std.fmt.bufPrint(&pbuf, "{s}/widget.zig", .{dir});
+    try fs_ops.writeFile(file_a, "pub const WIDGET_MARKER = 7;\npub fn widgetRender() void {}\nconst unrelated = 1;\n");
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    defer std.Io.Dir.cwd().deleteTree(io_state.io(), dir) catch {};
+    const io = io_state.io();
+    var vbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&vbuf, "{s}/index.db", .{dir});
+    var db = try database_mod.Database.init(alloc, db_path);
+    defer db.deinit();
+    try ensureSchema(&db);
+    const st = try std.Io.Dir.cwd().statFile(io, file_a, .{});
+    upsertInto(alloc, &db, file_a, @as(i64, @intCast(st.mtime.nanoseconds)), st.size, "pub const WIDGET_MARKER = 7;\npub fn widgetRender() void {}\nconst unrelated = 1;\n");
+
+    // injectable core: run the builder against an explicit connection by
+    // temporarily pointing the global at it (the builder is global-conn
+    // shaped; tests borrow it under the same mutex discipline).
+    const saved = global_conn;
+    const saved_failed = global_failed;
+    global_conn = db;
+    global_failed = false;
+    defer {
+        global_conn = saved;
+        global_failed = saved_failed;
+        if (global_conn == null) {} // saved was null: nothing to restore
+    }
+    // stopword question: only the real keyword survives.
+    const block = buildContextBlock(alloc, io, "how does the widget render work", 8) orelse return error.TestUnexpectedResult;
+    defer alloc.free(block);
+    try std.testing.expect(std.mem.indexOf(u8, block, "widget.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "WIDGET_MARKER") != null);
+    try std.testing.expect(last_injected >= 1);
+    // Unrelated question → no block (caller drops stale context).
+    const none = buildContextBlock(alloc, io, "pasta carbonara dinner", 8);
+    try std.testing.expect(none == null);
 }

@@ -19,6 +19,7 @@ const history_cmds = @import("commands/history_cmds.zig");
 const dispatch_mod = @import("commands/dispatch.zig");
 const input_history_mod = @import("session/input_history.zig");
 const session_store = @import("session/session_store.zig");
+const code_index = @import("knowledge/code_index.zig");
 const error_recovery = @import("turn/error_recovery.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
@@ -327,6 +328,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var mem_topic_baseline: ?[]f32 = null;
     defer if (mem_topic_baseline) |v| allocator.free(v);
     var mem_block_rebuilt = false;
+    // P6-③: per-question code context block (index-backed). Swapped only
+    // when the new question's block differs byte-wise — prompt-cache warm
+    // while the topic holds (same philosophy as the memory re-anchor).
+    var code_block: ?[]u8 = null;
+    defer if (code_block) |cb| allocator.free(cb);
     // T8: plan-file anchor — .ziv/plan.md summarized into the system
     // prompt (own 150-token budget), refreshed by content fingerprint.
     var plan_block: ?[]u8 = null;
@@ -714,6 +720,45 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // flag the memory tier as a diagnosis root cause.
         if (live_trace) |*t| {
             traceAddStep(t, .memory_retrieval, if (injected_count > 0) 0.8 else 0.3, "session start", "memory block", if (injected_count > 0) "recency-ranked e-decay injection" else "no memories injected", 0, allocator) catch {};
+        }
+
+        // P6-③: refresh the code context block from the index for THIS
+        // question. Skip the swap when byte-identical (cache); drop the
+        // block when the index has nothing fresh to offer.
+        {
+            const nb = code_index.buildContextBlock(allocator, io, input, 8);
+            if (nb) |new_text| {
+                var swap_needed = true;
+                if (code_block) |cb| {
+                    if (std.mem.eql(u8, cb, new_text)) swap_needed = false;
+                }
+                if (swap_needed) {
+                    if (code_block) |cb| {
+                        if (turn_history.swapMemoryBlockText(&history, allocator, cb, new_text)) {
+                            allocator.free(cb);
+                            code_block = new_text;
+                        } else if (turn_history.appendSystemBlock(&history, allocator, new_text)) {
+                            allocator.free(cb);
+                            code_block = new_text;
+                        } else {
+                            allocator.free(new_text); // keep old block
+                        }
+                    } else if (turn_history.appendSystemBlock(&history, allocator, new_text)) {
+                        code_block = new_text;
+                    } else {
+                        allocator.free(new_text);
+                    }
+                } else {
+                    allocator.free(new_text);
+                }
+            } else if (code_block) |cb| {
+                // No fresh hits for this question — stale code context
+                // misleads; remove the block entirely.
+                if (turn_history.removeSystemBlockByText(&history, allocator, cb)) {
+                    allocator.free(cb);
+                    code_block = null;
+                }
+            }
         }
 
         // Agent loop

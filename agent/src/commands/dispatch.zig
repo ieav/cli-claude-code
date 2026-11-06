@@ -25,6 +25,7 @@ const history_cmds = @import("history_cmds.zig");
 const turn_ask = @import("../turn/ask.zig");
 const turn_history = @import("../turn/history.zig");
 const session_store_mod = @import("../session/session_store.zig");
+const session_store_mod_code = @import("../knowledge/code_index.zig");
 const menu = @import("../util/menu.zig");
 const turn_tools = @import("../turn/tools.zig");
 const registry = @import("../tools/registry.zig");
@@ -589,6 +590,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 est_tokens,
                 ctx.log.records.items.len,
             });
+            try std.Io.Writer.print(ctx.w, "  Code context: {d} snippets (last turn, from .ziv/index.db)\n", .{session_store_mod_code.last_injected});
             try std.Io.Writer.print(ctx.w, "  Mode: {s} | Model: {s} ({s}) | Tier: {s}\n", .{
                 auth.modeLabel(ctx.current_mode.*),
                 ctx.switcher.modelName(),

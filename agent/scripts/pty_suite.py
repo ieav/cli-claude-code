@@ -448,6 +448,41 @@ def s10_code_index():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s11_code_context_injection():
+    """P6-③: a question whose keywords match indexed code gets that code
+    injected into context (observable via /stats), and the injection is
+    silent for the user."""
+    d = tempfile.mkdtemp(prefix="ziv-p6c-")
+    try:
+        marker_file = os.path.join(d, "gadget.zig")
+        with open(marker_file, "w") as f:
+            f.write("const GADGET_SNIPPET_TOKEN = 11;\n")
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            # Deposit the file via FileRead.
+            z.send(f'/run FileRead {{"path":"{marker_file}"}}\n')
+            z.read_until("GADGET_SNIPPET_TOKEN", 15)
+            # Ask about it — the turn fails (no gateway) AFTER injection.
+            z.send("how does the gadget work\n")
+            z.read_until("No API key", 20)
+            z.drain(1.2)  # settle: injection + prompt repaint
+            z.clear_buf()
+            z.send("/stats\n")
+            out = z.read_until("Code context:", 10)
+            m = re.search(r"Code context: (\d+) snippets", out)
+            if not m:
+                raise Fail("no Code context line in /stats")
+            if int(m.group(1)) < 1:
+                raise Fail(f"expected ≥1 injected snippet, got {m.group(1)}")
+            quit_and_wait(z)
+            return f"question→index→{m.group(1)} snippet(s) injected ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -459,6 +494,7 @@ SCENARIOS = [
     ("S8 crash-resume", s8_crash_resume),
     ("S9 error-selector", s9_error_selector),
     ("S10 code-index", s10_code_index),
+    ("S11 code-context", s11_code_context_injection),
 ]
 
 
