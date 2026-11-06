@@ -2074,9 +2074,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         window_tools += 1;
                         const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
                         if (errored) {
-                            window_errors += 1;
                             batch_errors += 1;
-                            evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                            // expected_stop (timeout kill / user cancel / declined
+                            // question) is deliberate control flow — feeding it to
+                            // the reflection window's error rate diagnosed a
+                            // timeout-driven debugging marathon as "unstable
+                            // environment" and stored that as a cross-session
+                            // "insight" (2026-11-06).
+                            if (!results[i].result.expected_stop) {
+                                window_errors += 1;
+                                evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                            }
                         }
                     }
 
@@ -4279,7 +4287,7 @@ fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.
     // model the raw byte used to turn "user pressed Esc" into junk text.
     if (ans.len > 0 and (ans[0] == 0x1b or ans[0] == 0x03)) {
         lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-        return registry.ToolResult{ .output = "user cancelled the question (Esc)" };
+        return registry.ToolResult{ .output = "user cancelled the question (Esc)", .expected_stop = true };
     }
     lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
     return registry.ToolResult{

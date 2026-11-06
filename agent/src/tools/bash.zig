@@ -79,7 +79,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // output transfers to history which FREES it — must be allocated,
     // never a literal (freeContentBlocks would free static memory).
     if (cancel.toolBatchCancelled()) {
-        return registry.ToolResult{ .output = try alloc.dupe(u8, "cancelled by user (not run)"), .is_error = true };
+        return registry.ToolResult{ .output = try alloc.dupe(u8, "cancelled by user (not run)"), .is_error = true, .expected_stop = true };
     }
 
     // timeout in seconds; 0 = unlimited, negative treated as 0.
@@ -168,12 +168,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{
             .output = try alloc.print("Command timed out after {d}s and was killed: {s}", .{ timeout_s, command }),
             .is_error = true,
+            .expected_stop = true, // deliberate control flow, not instability
         };
     }
     if (user_cancelled.load(.acquire)) {
         return registry.ToolResult{
             .output = try alloc.print("Command cancelled by user (Esc) and was killed: {s}", .{command}),
             .is_error = true,
+            .expected_stop = true,
         };
     }
     if (out_reader.truncated or err_reader.truncated) {
