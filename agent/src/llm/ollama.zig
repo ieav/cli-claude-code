@@ -3,6 +3,8 @@
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
+const logger = @import("../util/log.zig");
+const time_mod = @import("../util/time.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 
@@ -64,6 +66,8 @@ pub const OllamaProvider = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
+        // Transport-failure forensics — see the twin comment in openai.zig.
+        const stream_t0 = time_mod.nowMillis();
 
         const uri_str = try self.allocator.print("{s}/api/chat", .{self.config.base_url});
         defer self.allocator.free(uri_str);
@@ -80,13 +84,20 @@ pub const OllamaProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            provider.setErrorDetailIfEmpty("ollama: request failed: {s}", .{@errorName(e)});
+            return e;
+        };
+        // Headers arrived — alive; lift the TTFT sub-deadline so a local
+        // model that takes >30s to first token is not killed mid-startup.
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "Ollama stream", &response);
@@ -94,6 +105,7 @@ pub const OllamaProvider = struct {
 
         // Ollama streaming: each line is a JSON object (line-delimited, not SSE)
         // Read chunks and parse line by line incrementally
+        var received_bytes: u64 = 0;
         var resp_read_buf: [8192]u8 = undefined;
         const resp_reader = response.reader(&resp_read_buf);
         var chunk_buf: [4096]u8 = undefined;
@@ -101,9 +113,14 @@ pub const OllamaProvider = struct {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.allocator);
         var total_usage: ?provider.Usage = null;
+        var total_stop: ?provider.CompleteResponse.StopReason = null;
         var read_err: ?anyerror = null;
 
         while (true) {
+            // Bumped per chunk: pushes the watchdog's idle deadline forward
+            // so a long live stream is never killed on total age (see
+            // llm_watchdog's 2026-11-05 note).
+            wd.firstByte();
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
@@ -119,14 +136,16 @@ pub const OllamaProvider = struct {
             const n = @min(avail.len, chunk_buf.len);
             @memcpy(chunk_buf[0..n], avail[0..n]);
             resp_reader.toss(n);
+            received_bytes += n;
 
             for (chunk_buf[0..n]) |byte| {
                 if (byte == '\n') {
                     if (line_buf.items.len > 0) {
                         const res = try self.handleStreamLine(line_buf.items, ctx, cb);
                         if (res.usage) |u| total_usage = u;
+                        if (res.stop_reason) |sr| total_stop = sr;
                         if (res.finished) {
-                            try cb(ctx, .{ .done = total_usage });
+                            try cb(ctx, .{ .done = .{ .usage = total_usage, .stop_reason = total_stop } });
                             return;
                         }
                         line_buf.shrinkRetainingCapacity(0);
@@ -141,16 +160,27 @@ pub const OllamaProvider = struct {
         if (line_buf.items.len > 0) {
             const res = try self.handleStreamLine(line_buf.items, ctx, cb);
             if (res.usage) |u| total_usage = u;
+            if (res.stop_reason) |sr| total_stop = sr;
         }
 
         if (read_err) |e| {
+            const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
+            // A kill by OUR idle watchdog (stream went silent) is
+            // attributed to ziv, not the gateway — see openai.zig's
+            // 2026-11-05 note.
+            if (wd.idleKilled()) {
+                provider.setErrorDetailIfEmpty("ollama stream: killed by ziv idle watchdog — stream went silent past the deadline (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            } else {
+                provider.setErrorDetailIfEmpty("ollama stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            }
+            logger.err("{s}", .{provider.lastErrorDetail()});
             try cb(ctx, .{ .error_occurred = switch (e) {
                 error.ConnectionResetByPeer, error.BrokenPipe => provider.ProviderError.NetworkTimeout,
                 else => provider.ProviderError.ServerError,
             } });
             return;
         }
-        try cb(ctx, .{ .done = total_usage });
+        try cb(ctx, .{ .done = .{ .usage = total_usage, .stop_reason = total_stop } });
     }
 
     fn supportsToolUse(ptr: *anyopaque) bool {
@@ -312,13 +342,20 @@ pub const OllamaProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            provider.setErrorDetailIfEmpty("ollama: request failed: {s}", .{@errorName(e)});
+            return e;
+        };
+        // Headers arrived — alive; lift the TTFT sub-deadline (same as the
+        // stream path).
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "Ollama API", &response);
@@ -393,6 +430,10 @@ pub const OllamaProvider = struct {
     const OllamaLineResult = struct {
         finished: bool = false,
         usage: ?provider.Usage = null,
+        /// done_reason from the final line ("stop"/"length"), mapped for
+        /// the REPL — a `length` cap must surface as max_tokens, not the
+        /// consumer's end_turn default.
+        stop_reason: ?provider.CompleteResponse.StopReason = null,
     };
 
     /// Process one line-delimited stream JSON object. Emits events through
@@ -413,6 +454,7 @@ pub const OllamaProvider = struct {
         // In-band error line (model load failure etc.): without this the
         // line is dropped and the truncated stream completes "normally".
         if (parsed.object.get("error") != null) {
+            provider.noteInBandError("ollama", parsed);
             try cb(ctx, .{ .error_occurred = provider.ProviderError.ServerError });
             return .{ .finished = true };
         }
@@ -430,7 +472,17 @@ pub const OllamaProvider = struct {
                         }
                     }
                 }
-                return .{ .finished = true, .usage = usage };
+                var stop_reason: ?provider.CompleteResponse.StopReason = null;
+                if (parsed.object.get("done_reason")) |dr| {
+                    if (dr == .string) {
+                        if (std.mem.eql(u8, dr.string, "length")) {
+                            stop_reason = .max_tokens;
+                        } else {
+                            stop_reason = .end_turn;
+                        }
+                    }
+                }
+                return .{ .finished = true, .usage = usage, .stop_reason = stop_reason };
             }
         }
 
@@ -502,13 +554,15 @@ pub const OllamaProvider = struct {
             .extra_headers = &extra_headers,
         }) catch return false;
         defer req.deinit();
-        const wd = llm_watchdog.arm(&req);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         req.sendBodyComplete(@constCast("")) catch return false;
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch return false;
+        wd.firstByte(); // headers arrived — lift the TTFT sub-deadline
 
         return response.head.status.class() == .success;
     }

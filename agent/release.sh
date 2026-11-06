@@ -30,11 +30,32 @@ targets=(
   "aarch64-linux-musl"
 )
 
+# 并行构建 4 个 target：瓶颈是 LLVM 全程序优化（~58s/目标，实测），多进程吃满多核。
+# 每个 target 独立 --prefix，避免并行安装互相覆盖 zig-out/bin/ziv；
+# 成功与否用 stamp 文件标记，不依赖数组下标（zsh/bash 解释器语义不同）。
+PFXROOT=$(mktemp -d)
+trap 'rm -rf "$PFXROOT"' EXIT
+
 for t in "${targets[@]}"; do
   echo "── building $t (ReleaseFast)…"
-  zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$t"
-  cp zig-out/bin/ziv "$OUT/ziv-$t"
+  ( zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$t" \
+      --prefix "$PFXROOT/$t" >"$PFXROOT/$t.log" 2>&1 \
+    && touch "$PFXROOT/$t.stamp" ) &
 done
+wait
+
+fail=0
+for t in "${targets[@]}"; do
+  if [ -f "$PFXROOT/$t.stamp" ]; then
+    cp "$PFXROOT/$t/bin/ziv" "$OUT/ziv-$t"
+    echo "✓ $t"
+  else
+    echo "✗ $t build failed — tail of log:"
+    tail -5 "$PFXROOT/$t.log"
+    fail=1
+  fi
+done
+[ "$fail" = 0 ] || exit 1
 
 # ── tar.gz per target (standard CLI-tool release form)
 for t in "${targets[@]}"; do

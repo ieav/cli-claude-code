@@ -17,6 +17,12 @@ pub const ToolError = error{
 pub const ToolResult = struct {
     output: []const u8,
     is_error: bool = false,
+    /// The tool stopped BY DESIGN — timeout kill, user cancel, declined
+    /// question. Still surfaced to the model (is_error semantics hold),
+    /// but excluded from the reflection window's error-rate signal: a
+    /// debugging marathon that deliberately kills hung commands must not
+    /// be diagnosed as "unstable environment" (2026-11-06).
+    expected_stop: bool = false,
 };
 
 pub const ValidationResult = union(enum) {

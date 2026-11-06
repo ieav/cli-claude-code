@@ -10,6 +10,21 @@ const database = @import("../storage/database.zig");
 pub const EpisodicStore = struct {
     allocator: std.mem.Allocator,
     db: *database.Database,
+    // Prepared-once statements: store/retrieveRecent/touch all run on the
+    // per-prompt or per-store paths; re-preparing the SQL text each call
+    // was pure parse overhead. deleteByIds builds its IN(...) list
+    // dynamically and stays ad-hoc (rare decay-cron path).
+    stmt_store: database.CachedStatement = .{ .sql =
+        \\INSERT OR REPLACE INTO memories (id, type, scope, name, description, content, access_count, created_at, updated_at)
+        \\VALUES (?1, ?2, 'private', ?3, ?4, ?5, ?6, ?7, ?8)
+    },
+    stmt_retrieve: database.CachedStatement = .{ .sql =
+        "SELECT id, type, name, description, content, access_count, created_at, updated_at " ++
+            "FROM memories ORDER BY updated_at DESC LIMIT ?1"
+    },
+    stmt_touch: database.CachedStatement = .{ .sql =
+        "UPDATE memories SET access_count = access_count + 1, updated_at = ?1 WHERE id = ?2"
+    },
 
     const Self = @This();
 
@@ -17,12 +32,15 @@ pub const EpisodicStore = struct {
         return .{ .allocator = allocator, .db = db };
     }
 
+    /// Finalize the cached statements. Must run before the Database closes.
+    pub fn deinit(self: *Self) void {
+        self.stmt_store.deinit();
+        self.stmt_retrieve.deinit();
+        self.stmt_touch.deinit();
+    }
+
     pub fn store(self: *Self, entry: types.MemoryEntry) !void {
-        var stmt = try database.Statement.prepare(self.allocator, self.db,
-            \\INSERT OR REPLACE INTO memories (id, type, scope, name, description, content, access_count, created_at, updated_at)
-            \\VALUES (?1, ?2, 'private', ?3, ?4, ?5, ?6, ?7, ?8)
-        );
-        defer stmt.finalize();
+        var stmt = try self.stmt_store.acquire(self.allocator, self.db);
         try stmt.bindBlob(1, &entry.id);
         try stmt.bindText(2, @tagName(entry.mem_type));
         try stmt.bindText(3, entry.name);
@@ -58,15 +76,10 @@ pub const EpisodicStore = struct {
     }
 
     /// Most recently updated memories first. Caller owns the returned slice
-    /// and each entry's strings; release with freeEntries().
+    /// and each entry's strings; release with freeEntries(). For the hot
+    /// per-prompt path prefer retrieveRecentArena (no per-row frees).
     pub fn retrieveRecent(self: *Self, limit: usize) ![]types.MemoryEntry {
-        var stmt = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            "SELECT id, type, name, description, content, access_count, created_at, updated_at " ++
-                "FROM memories ORDER BY updated_at DESC LIMIT ?1",
-        );
-        defer stmt.finalize();
+        var stmt = try self.stmt_retrieve.acquire(self.allocator, self.db);
         try stmt.bindInt64(1, @intCast(limit));
 
         var list: std.ArrayList(types.MemoryEntry) = .empty;
@@ -75,33 +88,52 @@ pub const EpisodicStore = struct {
             list.deinit(self.allocator);
         }
         while (try stmt.step()) {
-            const id_blob = stmt.columnBlob(0);
-            var id: [16]u8 = @splat(0);
-            if (id_blob.len == 16) @memcpy(&id, id_blob);
-            const mem_type = std.meta.stringToEnum(types.MemoryType, stmt.columnText(1)) orelse .reference;
-            try list.append(self.allocator, .{
-                .id = id,
-                .mem_type = mem_type,
-                .name = try self.allocator.dupe(u8, stmt.columnText(2)),
-                .description = try self.allocator.dupe(u8, stmt.columnText(3)),
-                .content = try self.allocator.dupe(u8, stmt.columnText(4)),
-                .access_count = @intCast(@max(0, stmt.columnInt64(5))),
-                .created_at = stmt.columnInt64(6),
-                .updated_at = stmt.columnInt64(7),
-            });
+            try list.append(self.allocator, try self.rowToEntry(&stmt));
         }
         return list.toOwnedSlice(self.allocator);
+    }
+
+    /// Same rows as retrieveRecent, allocated from a caller-owned arena:
+    /// the per-prompt 1000-row injection path drops ~3000 individual
+    /// alloc/free pairs for one arena reset. Do NOT call freeEntries on
+    /// the result — deinit/reset the arena instead.
+    pub fn retrieveRecentArena(self: *Self, arena: std.mem.Allocator, limit: usize) ![]types.MemoryEntry {
+        var stmt = try self.stmt_retrieve.acquire(self.allocator, self.db);
+        try stmt.bindInt64(1, @intCast(limit));
+
+        var list: std.ArrayList(types.MemoryEntry) = .empty;
+        while (try stmt.step()) {
+            try list.append(arena, try rowToEntryAlloc(arena, &stmt));
+        }
+        return list.toOwnedSlice(arena);
+    }
+
+    /// Row → entry with strings duped onto `alloc` (arena or otherwise).
+    fn rowToEntryAlloc(alloc: std.mem.Allocator, stmt: *database.Statement) !types.MemoryEntry {
+        const id_blob = stmt.columnBlob(0);
+        var id: [16]u8 = @splat(0);
+        if (id_blob.len == 16) @memcpy(&id, id_blob);
+        const mem_type = std.meta.stringToEnum(types.MemoryType, stmt.columnText(1)) orelse .reference;
+        return .{
+            .id = id,
+            .mem_type = mem_type,
+            .name = try alloc.dupe(u8, stmt.columnText(2)),
+            .description = try alloc.dupe(u8, stmt.columnText(3)),
+            .content = try alloc.dupe(u8, stmt.columnText(4)),
+            .access_count = @intCast(@max(0, stmt.columnInt64(5))),
+            .created_at = stmt.columnInt64(6),
+            .updated_at = stmt.columnInt64(7),
+        };
+    }
+
+    fn rowToEntry(self: *Self, stmt: *database.Statement) !types.MemoryEntry {
+        return rowToEntryAlloc(self.allocator, stmt);
     }
 
     /// Bump access_count and updated_at for one memory. Best effort: errors
     /// are swallowed, matching the previous behavior.
     pub fn touch(self: *Self, memory_id: [16]u8) void {
-        var stmt = database.Statement.prepare(
-            self.allocator,
-            self.db,
-            "UPDATE memories SET access_count = access_count + 1, updated_at = ?1 WHERE id = ?2",
-        ) catch return;
-        defer stmt.finalize();
+        var stmt = self.stmt_touch.acquire(self.allocator, self.db) catch return;
         stmt.bindInt64(1, time_mod.nowMillis()) catch return;
         stmt.bindBlob(2, &memory_id) catch return;
         _ = stmt.step() catch {};
@@ -129,6 +161,7 @@ test "EpisodicStore parameterized round-trip with injection payload" {
     try db.runMigrations();
 
     var store = EpisodicStore.init(std.testing.allocator, &db);
+    defer store.deinit();
 
     const payload = "'; DROP TABLE memories;--";
     var id: [16]u8 = undefined;

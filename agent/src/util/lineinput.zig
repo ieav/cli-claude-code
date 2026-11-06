@@ -97,11 +97,21 @@ fn termWidth() usize {
     return 80;
 }
 
-/// Test hook: nonzero overrides TIOCGWINSZ so renderer math is testable.
+/// Test hooks: nonzero overrides TIOCGWINSZ so renderer math is testable.
 pub var force_width: usize = 0;
+pub var force_height: usize = 0;
 
 fn effWidth() usize {
     return if (force_width != 0) force_width else termWidth();
+}
+
+/// Terminal row count via TIOCGWINSZ; 24 as the conservative fallback
+/// (the scroll-region math clamps on tiny terminals anyway).
+fn termHeight() usize {
+    if (force_height != 0) return force_height;
+    var ws: std.c.winsize = undefined;
+    if (std.c.ioctl(0, std.c.T.IOCGWINSZ, &ws) == 0 and ws.row > 0) return ws.row;
+    return 24;
 }
 
 /// Physical rows the input block may occupy (prompt + wrapped lines). A
@@ -244,7 +254,6 @@ fn moveVertically(buf: []const u8, pos: usize, dir: i8) ?usize {
 /// unforgeable marker (NUL, slot digit, NUL) and the full content lives in
 /// an Editor side slot. The renderer shows a one-line pill
 /// ("[📄 粘贴 · N 行 · B]"); submit expands markers back to the full text.
-
 /// Fold thresholds: a paste beyond EITHER becomes a pill. Small pastes
 /// keep today's behavior (raw text in the buffer).
 pub const PASTE_FOLD_LINES: usize = 8;
@@ -471,6 +480,35 @@ fn pasteNormalize(pc: u8, skip_lf: *bool) ?u8 {
 /// Test hook: force the editor path even when stdin is not a TTY.
 pub var force_editor = false;
 
+/// ── P1 (tui-event-loop): the session editor ─────────────────────────
+/// ONE Editor instance for the whole process, lazily created on the
+/// first readLine and reused by every later one AND by the
+/// generation-period key pump (editorLiveKey) — the buffer survives
+/// across a turn boundary, so a draft typed mid-generation is the SAME
+/// draft the next prompt opens with. No handoff, no typeahead merge.
+/// The initial allocation (and any growth) lives until editorDeinit.
+var live_ed: ?*Editor = null;
+var live_ed_buf: []u8 = &.{};
+
+pub fn editorLive() ?*Editor {
+    return live_ed;
+}
+
+/// Session teardown (process exit / tests): releases the persistent
+/// buffer. After this the next readLine lazily re-creates the editor.
+pub fn editorDeinit(alloc: std.mem.Allocator) void {
+    if (live_ed) |ed| {
+        ed.releaseSlots();
+        if (ed.draft_owned) |d| alloc.free(d);
+        alloc.destroy(ed);
+        live_ed = null;
+    }
+    if (live_ed_buf.len > 0) {
+        alloc.free(live_ed_buf);
+        live_ed_buf = &.{};
+    }
+}
+
 // ── Esc-to-recall handshake (set by the REPL, consumed by readLine) ──
 
 /// Borrowed text the next prompt should preload into the editor (Esc
@@ -485,29 +523,41 @@ pub var recall_prefill = false;
 /// only fires within a short window after this.
 pub var last_submit_ms: i64 = 0;
 
-/// Type-ahead bytes typed while the LLM was generating (they must not be
-/// lost just because we polled stdin for Esc). Replayed into the next
-/// prompt by readLine. Same capacity as pending so a fully-typed
-/// unsubmitted line never truncates on merge.
-pub var typeahead_buf: [2048]u8 = undefined;
-pub var typeahead_len: usize = 0;
-
-/// ── P4: generation-period live input ─────────────────────────────────────
-/// While the model streams, the stream callback's stdin poll feeds the
-/// pending line below (live dim echo) instead of silently buffering.
-/// Enter QUEUES the text as a message: the agent loop injects it between
-/// tool rounds (the model sees it one round later — no interruption), and
-/// anything still queued when the turn ends auto-submits as the next
-/// message. Unsubmitted pending merges into typeahead at readLine entry.
-pub var pending_buf: [2048]u8 = undefined;
-pub var pending_len: usize = 0;
-/// The dim echo line is currently drawn at the cursor (no \n yet).
+/// ── Turn-scoped live region state ─────────────────────────────────────
+/// The persistent editor IS the live draft (P1): keystrokes during a
+/// generation edit it directly via editorLiveKey; the input row renders
+/// its tail. Enter QUEUES the draft as a message: the agent loop injects
+/// it between tool rounds, and anything still queued when the turn ends
+/// auto-submits as the next message.
+/// The drawn region occupies TWO screen rows (status on top, input below).
 pub var pending_shown: bool = false;
-/// Status row under the pending input row (elapsed wait / queue info).
-/// Written by the REPL's tick handler; both rows form the generation-
-/// period live region. Empty = no status row.
+/// Status row ABOVE the pending input row (elapsed wait / queue info).
+/// Written by the REPL's tick handler; both rows form the turn-scoped
+/// live region. Empty = no status row. The status sits ABOVE the input
+/// row so the input row is always the LAST screen row — the natural
+/// prompt-at-bottom position.
 pub var pending_status_buf: [96]u8 = undefined;
 pub var pending_status_len: usize = 0;
+/// The REAL prompt prefix ("ziv (model) [42%] > ") for the region's input
+/// row — set by the REPL whenever it builds the prompt. The turn-scoped
+/// input row renders with the SAME identity as the readLine editor, so
+/// typed text never changes appearance or position when the turn ends
+/// (the old "⌨" dim row next to a bright editor row read as two
+/// different input areas).
+pub var pending_prompt_buf: [192]u8 = undefined;
+pub var pending_prompt_len: usize = 0;
+/// The drawn region occupies TWO screen rows (status on top, input below).
+pub var pending_status_shown: bool = false;
+
+pub fn regionPromptSet(s: []const u8) void {
+    const n = @min(s.len, pending_prompt_buf.len);
+    @memcpy(pending_prompt_buf[0..n], s[0..n]);
+    pending_prompt_len = n;
+}
+
+fn pendingPrompt() []const u8 {
+    return pending_prompt_buf[0..pending_prompt_len];
+}
 
 pub fn pendingStatusSet(s: []const u8) void {
     const n = @min(s.len, pending_status_buf.len);
@@ -519,12 +569,6 @@ pub fn queuedCount() usize {
     return queued_count - queued_read;
 }
 
-/// Stream-side cursor state: the stream callback syncs its at_line_start
-/// here BEFORE the esc probe, so the pending echo knows whether the cursor
-/// sits mid-output-line — redrawing with \r\x1b[2K there would EAT the
-/// half-printed line. When mid-line, the echo first moves below it (\n).
-pub var stream_at_line_start: bool = true;
-
 pub const QUEUED_MAX: usize = 4;
 pub const QUEUED_CAP: usize = 2048;
 pub var queued_msgs: [QUEUED_MAX][QUEUED_CAP]u8 = undefined;
@@ -535,6 +579,13 @@ pub var queued_count: usize = 0;
 /// (take #1 handed out slot 0's bytes AFTER copying message 2 into it).
 /// Compaction happens only when the queue drains fully.
 pub var queued_read: usize = 0;
+/// P1 visibility: whether each slot's message was already ECHOED into the
+/// transcript at QUEUE time (the user must SEE what they queued, not a
+/// bare counter). Injection/auto-send consult the flag via
+/// last_take_echoed to avoid double echoes.
+pub var queued_echoed: [QUEUED_MAX]bool = @splat(false);
+/// Set by queuedTake: whether the returned message was already echoed.
+pub var last_take_echoed: bool = false;
 
 /// True while unconsumed messages remain.
 pub fn queuedHas() bool {
@@ -543,22 +594,41 @@ pub fn queuedHas() bool {
 
 /// Hand out the oldest unconsumed message. The slice stays valid until
 /// the queue fully drains (compaction) — read or dupe it promptly.
+/// `last_take_echoed` reports whether it was already shown in the
+/// transcript at queue time.
 pub fn queuedTake() ?[]const u8 {
     if (queued_read >= queued_count) {
         queued_count = 0;
         queued_read = 0;
         @memset(&queued_lens, 0);
+        @memset(&queued_echoed, false);
         return null;
     }
     const out = queued_msgs[queued_read][0..queued_lens[queued_read]];
+    last_take_echoed = queued_echoed[queued_read];
     queued_read += 1;
     return out;
 }
 
-/// Display-capped tail of the pending buffer, cut at a UTF-8 boundary.
-fn pendingDisplay() []const u8 {
-    const s = pending_buf[0..pending_len];
-    // ~60 display cols from the tail (newest keystrokes stay visible)
+/// P1: the live draft = the persistent editor's buffer (generation-period
+/// keystrokes edit the SAME draft the prompt shows). Empty when no editor
+/// exists yet (before the first readLine).
+fn liveDraft() []const u8 {
+    const ed = live_ed orelse return "";
+    return ed.buf[0..ed.len];
+}
+
+/// Display-capped tail of the live draft, cut at a UTF-8 boundary and
+/// fitting the terminal width minus the prompt prefix (the input row must
+/// stay ONE row — an overflowing echo would wrap over the status row).
+/// Interim single-row view: the P3 renderer gives the editor its full
+/// multi-row block back.
+fn editorTail() []const u8 {
+    const s = liveDraft();
+    const tw = currentTermWidth(); // honors the force_width test hook
+    var budget: usize = if (tw > 40) tw - 40 else 16;
+    const pw = strWidth(pendingPrompt());
+    if (tw > pw + 2) budget = tw - pw - 2;
     var i = s.len;
     var cols: usize = 0;
     while (i > 0) {
@@ -566,181 +636,810 @@ fn pendingDisplay() []const u8 {
         var start = i - 1;
         while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
         const rune_cols: usize = if (s[start] >= 0xE0) 2 else 1;
-        if (cols + rune_cols > 60) break;
+        if (cols + rune_cols > budget) break;
         cols += rune_cols;
         i = start;
     }
     return s[i..];
 }
 
-/// (Re)draw the generation-period live region at the cursor: input row
-/// (`⌨ …`, display-capped) plus a dim status row below it. CUD/CUU move
-/// between the rows (never \n downward — the region usually sits on the
-/// last screen rows and \n would scroll). Cursor parks on the input row.
-/// When the stream cursor is mid-output-line, first drop below it.
-pub fn renderPendingLine(w: *std.Io.Writer) void {
-    if (pending_len == 0 and pending_status_len == 0) {
-        if (pending_shown) clearPendingRegion(w);
+/// ── P3: turn-scoped live region (DECSTBM scroll-region protocol) ────
+/// The terminal is split by a scroll region: rows [1, H-2] are the
+/// TRANSCRIPT (scrolls), the bottom TWO rows are PINNED (status above,
+/// the prompt-identical input row below) and are written with absolute
+/// cursor addressing only. A transcript line prints at the region's
+/// bottom-left and scrolls WITHIN the region — the pinned rows are never
+/// cleared for transcript growth, which is exactly what flickered in the
+/// old clear-and-repaint protocol. Repaints touch only the changed row.
+/// Height the region was armed with (resize detection re-applies bounds).
+var region_h: usize = 0;
+
+/// Max editor block rows during a generation (prompt-identical window on
+/// the draft; matches MAX_VIEW_ROWS' spirit, smaller to keep the
+/// transcript area on short terminals).
+const MAX_LIVE_BLOCK_ROWS: usize = 6;
+
+/// The editor block's CURRENT row count (>=1): soft-wrapped display rows
+/// of the persistent draft, prompt sharing row 0, tail-windowed with a
+/// "↟ +N" marker row when clipped — the same reading model as the
+/// readLine editor, so a multi-line draft during a generation is fully
+/// legible (P3b).
+fn blockRows() usize {
+    if (liveDraft().len == 0) return 1;
+    var rows: usize = 0;
+    var first = true;
+    var it = std.mem.splitScalar(u8, liveDraft(), '\n');
+    const tw = currentTermWidth();
+    const pw = strWidth(pendingPrompt());
+    while (it.next()) |logical| {
+        const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
+        // Wrapped-row count by display width (wide chars never split —
+        // count like scanLine but only the row total).
+        var col: usize = 0;
+        var r: usize = 1;
+        var i: usize = 0;
+        while (i < logical.len) {
+            const next = nextChar(logical, i);
+            const cw = strWidth(logical[i..next]);
+            if (col > 0 and col + cw > avail) {
+                r += 1;
+                col = 0;
+            }
+            col += cw;
+            i = next;
+        }
+        first = false;
+        rows += r;
+    }
+    if (rows > MAX_LIVE_BLOCK_ROWS) return MAX_LIVE_BLOCK_ROWS + 1; // + ↟ marker row
+    return @max(rows, 1);
+}
+
+/// Split row = last transcript row = H - (1 status + block rows).
+fn regionRows() usize {
+    const h = @max(region_h, 4);
+    const split = h -| (1 + blockRows());
+    return @max(split, 1);
+}
+
+/// (Re)apply the scroll-region bounds and paint all pinned rows fresh:
+/// one status row + the editor block's rows.
+var last_block_rows: usize = 0;
+
+/// Serializes every terminal-mutating sequence across threads. During a
+/// turn the UI thread repaints the pinned rows (keystrokes via
+/// renderPendingLine, the 500ms status tick via regionStatus) WHILE the
+/// tool/stream worker prints transcript lines (regionPrintLine through
+/// RegionWriter). Each print is a multi-step escape dance sharing ONE
+/// DECSC cursor slot (`\x1b8` restore flow → write → `\x1b7` save flow →
+/// park); a status/keystroke paint interleaved between the write and the
+/// save stores the PARKED input-row position as the transcript flow, and
+/// every later transcript line then lands ON the input block — the
+/// "long turn corrupts the input area" bug. One lock per whole
+/// operation; public fns hold it, internal *Locked fns assume it.
+var tty_mu: std.Io.Mutex = .init;
+
+/// std.Io.Mutex's lock/unlock take the Io instance; the terminal paths
+/// here only ever see *std.Io.Writer, so repl.run injects its Io once at
+/// startup. Null (unit tests, pre-init) degrades to NO locking — those
+/// callers are single-threaded by construction.
+var tty_io: ?std.Io = null;
+
+pub fn setIo(io: std.Io) void {
+    tty_io = io;
+}
+
+fn ttyLock() void {
+    const io = tty_io orelse return;
+    tty_mu.lockUncancelable(io);
+}
+
+fn ttyUnlock() void {
+    const io = tty_io orelse return;
+    tty_mu.unlock(io);
+}
+
+/// Push the real writer's buffered bytes OUT before releasing tty_mu.
+/// Every locked op then leaves the buffer empty, so the REPL's legacy
+/// call-site flushes (outside any lock) can never race a half-written
+/// escape sequence — on an empty buffer they are harmless no-ops.
+fn flushReal(w: *std.Io.Writer) void {
+    std.Io.Writer.flush(w) catch {};
+}
+
+/// (Re)apply the scroll-region bounds and paint all pinned rows fresh.
+/// The transcript FLOW position (where the conversation prints) is the
+/// cursor position at arm time — preserved across the DECSTBM change by
+/// DECSC/DECRC. From then on: transcript lines print RELATIVELY at the
+/// flow position (content grows downward from the top — no bottom-gap),
+/// pinned rows paint with ABSOLUTE positioning, and the visible cursor
+/// parks at the input block's end (the typing position).
+fn regionApply(w: *std.Io.Writer) void {
+    const h = @max(termHeight(), 4);
+    region_h = h;
+    const split = regionRows();
+    last_block_rows = blockRows();
+    if (!pending_shown) {
+        // FIRST ARM. The cursor sits at the FLOW position (right after
+        // the committed echo) — on an UNKNOWN row R (full-screen shell
+        // history puts it at the bottom; a fresh screen near the top).
+        // If R is below the split, naive printing lands ON the pinned
+        // rows and erases itself ("nothing visible"). Fix WITHOUT
+        // knowing R: scroll the WHOLE screen up by the pinned-row count
+        // (SU), then move the cursor up the same amount — the content
+        // that was at R is now at R-N, and CUU clamps at the top margin
+        // for fresh screens, so every case lands inside the region.
+        const n = h - split; // pinned rows: status + block
+        std.Io.Writer.writeAll(w, "\x1b7") catch {}; // save flow (R,col)
+        std.Io.Writer.writeAll(w, "\x1b[r") catch {}; // full-screen region
+        std.Io.Writer.print(w, "\x1b[{d}S", .{n}) catch {}; // push all up n
+        std.Io.Writer.print(w, "\x1b[1;{d}r", .{split}) catch {}; // real bounds (homes)
+        std.Io.Writer.writeAll(w, "\x1b8") catch {}; // back to (R,col)
+        std.Io.Writer.print(w, "\x1b[{d}A", .{n}) catch {}; // follow content: R-n (clamped)
+        std.Io.Writer.writeAll(w, "\x1b7") catch {}; // re-save corrected flow
+    } else {
+        // RE-APPLY (block height changed / resize): the DECSC slot still
+        // holds the FLOW position — do NOT touch it. DECSTBM homes the
+        // cursor, which is fine: everything below paints absolutely and
+        // parks explicitly. (Saving here would clobber the flow with the
+        // parked typing position — every later transcript line then
+        // printed ONTO the input block and erased itself: "nothing
+        // visible".)
+        std.Io.Writer.print(w, "\x1b[1;{d}r", .{split}) catch {};
+    }
+    // Status row (absolute), dim.
+    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
+    if (pending_status_len > 0) {
+        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
+    }
+    writeEditorBlock(w);
+    pending_shown = true;
+    pending_status_shown = true;
+}
+
+/// Paint the editor block into its pinned rows (absolute): every soft-
+/// wrapped display row of the draft, prompt sharing row 0, tail-windowed
+/// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
+/// Cursor parks at the end of the LAST row's text — the typing position.
+fn writeEditorBlock(w: *std.Io.Writer) void {
+    const split = regionRows();
+    const tw = currentTermWidth();
+    const pw = strWidth(pendingPrompt());
+
+    // Collect display rows first (tail window decision needs the total).
+    var rows_buf: [64][]const u8 = undefined;
+    var nrows: usize = 0;
+    var first_logical = true;
+    var iter = std.mem.splitScalar(u8, liveDraft(), '\n');
+    while (iter.next()) |logical| {
+        const avail: usize = if (first_logical) (if (tw > pw) tw - pw else 1) else tw;
+        var col: usize = 0;
+        var i: usize = 0;
+        var row_start: usize = 0;
+        while (i <= logical.len) {
+            if (i == logical.len or (col > 0 and blk: {
+                const next = nextChar(logical, i);
+                const cw = strWidth(logical[i..next]);
+                break :blk col + cw > avail;
+            })) {
+                if (nrows < rows_buf.len) {
+                    rows_buf[nrows] = logical[row_start..i];
+                    nrows += 1;
+                }
+                row_start = i;
+                col = 0;
+                if (i == logical.len) break;
+            }
+            const next = nextChar(logical, i);
+            col += strWidth(logical[i..next]);
+            i = next;
+        }
+        first_logical = false;
+    }
+    if (nrows == 0) nrows = 1; // empty draft: one blank input row
+
+    const hidden = nrows -| MAX_LIVE_BLOCK_ROWS;
+    const start = if (nrows > MAX_LIVE_BLOCK_ROWS) hidden else 0;
+    var row_idx = split + 2;
+    if (hidden > 0) {
+        std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m↟ +{d} 行\x1b[0m", .{ row_idx, hidden }) catch {};
+        row_idx += 1;
+    }
+    var shown = start;
+    while (shown < nrows and shown - start < MAX_LIVE_BLOCK_ROWS) : (shown += 1) {
+        std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
+        if (shown == 0 and hidden == 0) {
+            std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
+        }
+        std.Io.Writer.writeAll(w, rows_buf[shown]) catch {};
+        row_idx += 1;
+    }
+    if (nrows > 0 and start >= nrows) {
+        // Degenerate (shouldn't happen): keep an empty input row.
+        std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
+        std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
+    }
+}
+
+/// True while the region is armed — REPL output funnels through
+/// regionPrintLine/RegionWriter so the persistent input row is never
+/// overwritten.
+pub fn regionUp() bool {
+    return pending_shown;
+}
+
+/// Show the region with the given status: split the screen and pin the
+/// two rows. The cursor ends on the input row after its text.
+pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
+    pendingStatusSet(status);
+    regionApply(w);
+    flushReal(w);
+}
+
+/// Print one complete output line into the TRANSCRIPT area: park at the
+/// scroll region's bottom-left and write (the trailing newline scrolls
+/// the region; the pinned rows are untouched). Region down = plain
+/// passthrough at the cursor.
+pub fn regionPrintLine(w: *std.Io.Writer, line: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
+    regionPrintLineLocked(w, line);
+    flushReal(w);
+}
+
+fn regionPrintLineLocked(w: *std.Io.Writer, line: []const u8) void {
+    if (!pending_shown) {
+        std.Io.Writer.writeAll(w, line) catch {};
+        if (line.len == 0 or line[line.len - 1] != '\n') {
+            std.Io.Writer.writeAll(w, "\n") catch {};
+        }
         return;
     }
-    if (!stream_at_line_start) {
-        std.Io.Writer.writeAll(w, "\n") catch {};
-        stream_at_line_start = true;
-    }
-    std.Io.Writer.writeAll(w, "\r\x1b[2K") catch {};
-    if (pending_len > 0) {
-        std.Io.Writer.print(w, "\x1b[2m⌨ {s}\x1b[0m", .{pendingDisplay()}) catch {};
-    }
-    if (pending_status_len > 0) {
-        std.Io.Writer.writeAll(w, "\x1b[B\r\x1b[2K") catch {};
-        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
-        std.Io.Writer.writeAll(w, "\r\x1b[A") catch {};
-    }
-    pending_shown = true;
-}
-
-/// Erase the two-row region; cursor returns to the (former) input row.
-fn clearPendingRegion(w: *std.Io.Writer) void {
-    std.Io.Writer.writeAll(w, "\r\x1b[2K\x1b[B\r\x1b[2K\r\x1b[A") catch {};
-}
-
-/// ── Turn-scoped live region lifecycle ──────────────────────────────
-/// The region (input row + status row) stays visible for the WHOLE turn:
-/// begun at generation start, every output line prints ABOVE it via
-/// regionPrintLine (line-atomic — text never flows mid-line across the
-/// region boundary), ended at turn end. This is what keeps the input
-/// area on screen while the model streams.
-
-/// Show the region at the cursor with the given status. Idempotent.
-pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
-    pendingStatusSet(status);
-    if (!stream_at_line_start) {
-        std.Io.Writer.writeAll(w, "\n") catch {};
-        stream_at_line_start = true;
-    }
-    pending_shown = true; // draw even with an empty input row
-    renderPendingLine(w);
-}
-
-/// Print one complete output line ABOVE the region: clear the two region
-/// rows, write the line (newline appended when missing), redraw the
-/// region at the new bottom. The cursor parks on the region's input row.
-pub fn regionPrintLine(w: *std.Io.Writer, line: []const u8) void {
-    if (pending_shown) clearPendingRegion(w);
+    // Resize between frames: re-apply bounds before printing.
+    if (termHeight() != region_h) regionApply(w);
+    // Return to the flow position (saved by the last print/paint), write
+    // RELATIVELY — the conversation grows downward from wherever it is;
+    // the trailing newline scrolls the region only at its bottom row.
+    std.Io.Writer.writeAll(w, "\x1b8") catch {};
     std.Io.Writer.writeAll(w, line) catch {};
     if (line.len == 0 or line[line.len - 1] != '\n') {
         std.Io.Writer.writeAll(w, "\n") catch {};
     }
-    if (pending_status_len > 0 or pending_len > 0) {
-        renderPendingLine(w);
-    } else {
-        pending_shown = false;
-    }
-    stream_at_line_start = true;
+    // Save the ADVANCED flow position, then park the visible cursor on
+    // the input block's last row (the typing position).
+    std.Io.Writer.writeAll(w, "\x1b7") catch {};
+    parkCursor(w);
 }
 
-/// End of turn: drop the region. Typed pending text is NOT frozen into
-/// the transcript — it merges into the next prompt (typeahead path).
+/// Park the cursor at the end of the editor block's last visible row.
+fn parkCursor(w: *std.Io.Writer) void {
+    const last = editorTail();
+    var cols = strWidth(pendingPrompt());
+    cols += strWidth(last);
+    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ region_h, cols + 1 }) catch {};
+}
+
+/// In-place repaint of the pinned rows (keystroke path): status row only
+/// when its text changed is handled by regionStatus; here both rows get
+/// refreshed (the draft changed).
+pub fn renderPendingLine(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
+    renderPendingLineLocked(w);
+    flushReal(w);
+}
+
+fn renderPendingLineLocked(w: *std.Io.Writer) void {
+    if (liveDraft().len == 0 and pending_status_len == 0) {
+        if (pending_shown) regionEndLocked(w);
+        return;
+    }
+    if (!pending_shown) {
+        regionApply(w);
+        return;
+    }
+    // Terminal resize OR a draft whose row count changed (multi-line
+    // growth/shrink) re-applies the DECSTBM bounds; otherwise repaint
+    // only the block's rows.
+    if (termHeight() != region_h or blockRows() != last_block_rows) {
+        regionApply(w);
+        return;
+    }
+    writeEditorBlock(w);
+}
+
+/// End of turn: reset the scroll region, erase the pinned rows, park the
+/// cursor directly below the transcript's last line — the next prompt
+/// prints exactly there. Typed draft text is NOT frozen into the
+/// transcript (the persistent editor keeps it for the next prompt).
 pub fn regionEnd(w: *std.Io.Writer) void {
-    if (pending_shown) clearPendingRegion(w);
+    ttyLock();
+    defer ttyUnlock();
+    regionEndLocked(w);
+    flushReal(w);
+}
+
+fn regionEndLocked(w: *std.Io.Writer) void {
+    if (!pending_shown) {
+        pendingStatusSet("");
+        return;
+    }
+    const split = regionRows();
+    // Erase every pinned row (status + block), reset the scroll region,
+    // and leave the cursor AT THE FLOW POSITION — directly below the
+    // transcript's last line, where the next prompt naturally prints.
+    // (The old protocol parked on a PINNED row; the next turn's status
+    // paint overwrote the message echoed there — "history invisible".)
+    std.Io.Writer.writeAll(w, "\x1b7") catch {}; // save flow
+    var row = region_h;
+    var b: [32]u8 = undefined;
+    while (row > split) : (row -= 1) {
+        const seq = std.fmt.bufPrint(&b, "\x1b[{d};1H\x1b[2K", .{row}) catch break;
+        std.Io.Writer.writeAll(w, seq) catch {};
+    }
+    std.Io.Writer.writeAll(w, "\x1b[r\x1b8") catch {}; // reset bounds, back to flow
     pending_shown = false;
+    pending_status_shown = false;
+    region_h = 0;
+    last_block_rows = 0;
     pendingStatusSet("");
+}
+
+/// End of turn, NORMAL completion: the status text (set via regionStatus
+/// right before — the "✓ 完成 · in N → out M" summary) scrolls into the
+/// TRANSCRIPT as its last line, then the region comes down. The summary
+/// stays visible directly above the next prompt; the in/out numbers the
+/// user tracks are never lost.
+pub fn regionFreeze(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
+    if (pending_shown and pending_status_len > 0) {
+        var buf: [128]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "\x1b[2m{s}\x1b[0m\n", .{pending_status_buf[0..pending_status_len]}) catch "";
+        regionPrintLineLocked(w, summary);
+    }
+    regionEndLocked(w);
+    flushReal(w);
+}
+
+/// Paint the status row (absolute) and park the cursor back on the
+/// input row's end. Caller sets pending_status first.
+fn paintStatusRow(w: *std.Io.Writer) void {
+    const split = regionRows();
+    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
+    if (pending_status_len > 0) {
+        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
+    }
+    parkCursor(w);
 }
 
 /// Refresh the status row only (tick path); the region stays put.
 pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
     pendingStatusSet(status);
-    if (pending_shown) renderPendingLine(w);
+    if (!pending_shown) return;
+    if (termHeight() != region_h) {
+        regionApply(w);
+        flushReal(w);
+        return;
+    }
+    paintStatusRow(w);
+    flushReal(w);
 }
 
-pub fn pendingAppend(c: u8, w: ?*std.Io.Writer) void {
-    if (pending_len >= pending_buf.len) return; // hard cap, drop silently
-    pending_buf[pending_len] = c;
-    pending_len += 1;
-    if (w) |ww| renderPendingLine(ww);
+/// ── Region-aware transcript writer (the P0-b mechanism) ────────────
+///
+/// The REPL's business output during a turn funnels through this
+/// UNBUFFERED Writer: with the live region UP every write is
+/// line-atomic — bytes accumulate until '\n', then print ABOVE the
+/// region via regionPrintLine; with the region DOWN bytes forward
+/// verbatim (cursor codes, interactive prompts, and multi-write logical
+/// lines keep their exact byte stream). Business code can therefore
+/// print PLAINLY; a stray direct write can no longer scribble over the
+/// persistent input row and desync the region's cursor anchor — the bug
+/// class where the diff preview ate transcript rows.
+///
+/// Reentrancy rule: the region MECHANICS functions (regionBegin/End/
+/// Freeze/Status, renderPendingLine, escProbe echo) must keep receiving
+/// the REAL writer — this wrapper is for transcript text only.
+/// ── Markdown table rendering (v0.7.5) ───────────────────────────────
+/// Consecutive transcript lines that look like markdown table rows are
+/// buffered and printed as ONE aligned block: column widths computed in
+/// DISPLAY columns (CJK counts 2 — strWidth), separator rows (|---|)
+/// rendered as a rule line, and an over-wide table shrunk to the current
+/// terminal width by truncating the widest cells first. Printed rows are
+/// committed — a later resize cannot reflow them (terminal scrollback is
+/// immutable; no TUI can), but every table is CORRECT for the width at
+/// print time.
+/// A candidate table row: starts and ends with '|' after trimming.
+fn isTableRow(line: []const u8) bool {
+    const t = std.mem.trim(u8, line, " \t");
+    return t.len >= 2 and t[0] == '|' and t[t.len - 1] == '|';
 }
 
-pub fn pendingBackspace(w: ?*std.Io.Writer) void {
-    if (pending_len == 0) return;
-    pending_len -= 1;
-    while (pending_len > 0 and (pending_buf[pending_len] & 0xC0) == 0x80) pending_len -= 1;
-    if (w) |ww| renderPendingLine(ww);
-}
-
-/// Enter pressed during generation: queue the pending text as a message
-/// (mid-turn injection / auto-send at turn end). Returns true when a
-/// message was queued.
-pub fn pendingSubmit(w: ?*std.Io.Writer) bool {
-    if (pending_len == 0) return false;
-    if (queued_count >= QUEUED_MAX) return false;
-    @memcpy(queued_msgs[queued_count][0..pending_len], pending_buf[0..pending_len]);
-    queued_lens[queued_count] = pending_len;
-    queued_count += 1;
-    pending_len = 0;
-    if (w) |ww| {
-        regionPrintLine(ww, "  \x1b[2m↳ 已排队（本轮生效或回合后自动发送）\x1b[0m\n");
+/// A separator row: every cell between the pipes is only -, :, or empty.
+fn isTableSeparator(line: []const u8) bool {
+    if (!isTableRow(line)) return false;
+    var it = splitCells(line);
+    while (it.next()) |cell| {
+        for (cell) |ch| {
+            if (ch != '-' and ch != ':') return false;
+        }
     }
     return true;
 }
 
-/// Merge unsubmitted pending into typeahead (readLine entry) — the old
-/// behavior (bytes survive into the editor) is preserved for text typed
-/// without Enter.
-pub fn pendingMergeIntoTypeahead() void {
-    var i: usize = 0;
-    while (i < pending_len and typeahead_len < typeahead_buf.len) : (i += 1) {
-        typeahead_buf[typeahead_len] = pending_buf[i];
-        typeahead_len += 1;
+/// Split "| a | b |" into cells "a", "b" (trimmed; no leading/trailing
+/// empty artifacts). Allocator needed only for the slice list.
+const CellIter = struct {
+    rest: []const u8,
+    fn next(self: *CellIter) ?[]const u8 {
+        const r = std.mem.trim(u8, self.rest, " \t");
+        if (r.len == 0) return null;
+        // r starts with '|'
+        var rest = r[1..];
+        const bar = std.mem.indexOfScalar(u8, rest, '|') orelse return null; // no closing bar
+        const cell = std.mem.trim(u8, rest[0..bar], " \t");
+        rest = rest[bar..];
+        self.rest = rest;
+        return cell;
     }
-    pending_len = 0;
-    pending_shown = false;
-    // Resync: a paste whose stream ended before the terminator would
-    // otherwise keep the probe swallowing prompt bytes as paste content.
-    paste_active = false;
+};
+
+fn splitCells(line: []const u8) CellIter {
+    return .{ .rest = std.mem.trim(u8, line, " \t") };
 }
 
-/// Non-blocking Esc probe for the streaming callback: true when the user
-/// pressed Esc (a following CSI sequence is swallowed so arrow keys don't
-/// leak into the prompt). Other bytes feed the P4 live pending line:
-/// printable/CR-LF echo live, Backspace edits, CR queues the message.
-/// `w` is null in drain contexts (post-cancel) — capture without echo.
-/// Checks the reader's OWN buffer first — a burst "text…ESC" lands in one
-/// read and the kernel fd goes dry, so polling fd alone never sees the Esc
-/// (same trap menu.readKey fixed with its bufferedLen check).
+/// Render the buffered table block into `out` (already newline-joined
+/// rows). Width-adaptive: total display width ≤ term width, shrinking
+/// the widest columns first (truncate cells with an ellipsis at a rune
+/// boundary).
+fn renderTableBlock(alloc: std.mem.Allocator, rows: []const []const u8, term_w: usize, out: *std.ArrayList(u8)) !void {
+    // Parse all rows into cells; track column count.
+    var cell_rows: std.ArrayList([]const []const u8) = .empty;
+    defer {
+        for (cell_rows.items) |cr| alloc.free(cr);
+        cell_rows.deinit(alloc);
+    }
+    var max_cols: usize = 0;
+    var has_sep = false;
+    for (rows) |row| {
+        if (isTableSeparator(row)) {
+            has_sep = true;
+            continue; // replaced by a rule line
+        }
+        var cells: std.ArrayList([]const u8) = .empty;
+        errdefer cells.deinit(alloc);
+        var it = splitCells(row);
+        while (it.next()) |c| try cells.append(alloc, c);
+        max_cols = @max(max_cols, cells.items.len);
+        try cell_rows.append(alloc, try cells.toOwnedSlice(alloc));
+    }
+    if (cell_rows.items.len == 0) return;
+    if (max_cols == 0) max_cols = 1;
+
+    // Column widths in display columns ( widest cell per column ).
+    const widths = try alloc.alloc(usize, max_cols);
+    defer alloc.free(widths);
+    @memset(widths, 0);
+    for (cell_rows.items) |cr| {
+        for (cr, 0..) |c, i| widths[i] = @max(widths[i], strWidth(c));
+    }
+
+    // Structure cost: "| " + " | "×(cols-1) + " |\n" = 2*cols + 1.
+    const budget: usize = if (term_w > 4) term_w - 2 else 10; // small margin
+    // Shrink the widest column by one display column until the table
+    // fits the terminal (cells then clip with an ellipsis at emit time).
+    while (widthsTotal(widths, max_cols) + 2 * max_cols + 1 > budget) {
+        var widest: usize = 0;
+        for (widths[1..], 1..) |wd, i| {
+            if (wd > widths[widest]) widest = i;
+        }
+        if (widths[widest] <= 3) break; // nothing left to shave
+        widths[widest] -= 1;
+    }
+
+    // Emit rows.
+    for (cell_rows.items, 0..) |cr, ri| {
+        if (has_sep and ri == 1) {
+            // Rule line under the header row (replaces the |---| row).
+            try out.appendSlice(alloc, "\x1b[2m|");
+            for (widths) |wd| {
+                var k: usize = 0;
+                while (k < wd + 2) : (k += 1) try out.appendSlice(alloc, "\u{2500}");
+            }
+            try out.appendSlice(alloc, "|\x1b[0m\n");
+        }
+        try out.append(alloc, '|');
+        for (0..max_cols) |ci| {
+            const cell = if (ci < cr.len) cr[ci] else "";
+            try out.append(alloc, ' ');
+            try appendClipped(alloc, out, cell, widths[ci]);
+            var pad = widths[ci] -| strWidth(cell);
+            while (pad > 0) : (pad -= 1) try out.append(alloc, ' ');
+            try out.appendSlice(alloc, " |");
+        }
+        try out.append(alloc, '\n');
+    }
+}
+
+fn widthsTotal(w: []const usize, n: usize) usize {
+    var t: usize = 0;
+    for (w[0..n]) |x| t += x;
+    return t;
+}
+
+/// Append `s` clipped to `budget` display columns (ellipsis when cut, at
+/// a rune boundary).
+fn appendClipped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, budget: usize) !void {
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const next = nextChar(s, i);
+        const cw = strWidth(s[i..next]);
+        if (col + cw > budget) {
+            if (budget >= 2) try out.appendSlice(alloc, "…");
+            return;
+        }
+        try out.appendSlice(alloc, s[i..next]);
+        col += cw;
+        i = next;
+    }
+}
+
+pub const RegionWriter = struct {
+    real: *std.Io.Writer,
+    /// Scratch allocator for the markdown-table renderer (null = table
+    /// rendering disabled, passthrough).
+    table_alloc: ?std.mem.Allocator = null,
+    /// Buffered table rows (markdown table detected; flushed as one
+    /// aligned block when the table ends).
+    table_rows: std.ArrayList([]const u8) = .empty,
+    /// Logical line under construction. A complete line (or a full
+    /// accumulator — lines longer than the cap flush in pieces, since
+    /// regionPrintLine terminates a newline-less payload) prints above
+    /// the region immediately. Invariant: line_len < LINE_CAP between
+    /// feeds, so the memcpy below always advances.
+    line: [LINE_CAP]u8 = undefined,
+    line_len: usize = 0,
+    interface: std.Io.Writer = .{ .vtable = &vt, .buffer = &.{} },
+
+    pub const LINE_CAP: usize = 8192;
+
+    const vt = std.Io.Writer.VTable{
+        .drain = drain,
+        .flush = flush,
+    };
+
+    fn fromIface(w: *std.Io.Writer) *RegionWriter {
+        return @alignCast(@fieldParentPtr("interface", w));
+    }
+
+    /// Buffer `bytes` up to the next '\n'; each complete line prints
+    /// above the region as one regionPrintLine call. Markdown-table rows
+    /// are held back and flushed as one ALIGNED block when the table
+    /// ends (see renderTableBlock).
+    fn feed(self: *RegionWriter, bytes: []const u8) void {
+        ttyLock();
+        defer ttyUnlock();
+        self.feedLocked(bytes);
+    }
+
+    fn feedLocked(self: *RegionWriter, bytes: []const u8) void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const nl = std.mem.indexOfScalar(u8, rest, '\n');
+            const take = if (nl) |i| i + 1 else rest.len;
+            var seg = rest[0..take];
+            rest = rest[take..];
+            while (seg.len > 0) {
+                const n = @min(seg.len, LINE_CAP - self.line_len);
+                @memcpy(self.line[self.line_len..][0..n], seg[0..n]);
+                self.line_len += n;
+                seg = seg[n..];
+                const complete = self.line[self.line_len - 1] == '\n';
+                if (complete or self.line_len == LINE_CAP) {
+                    self.emitLine(self.line[0..self.line_len]);
+                    self.line_len = 0;
+                }
+            }
+        }
+    }
+
+    /// One complete (or cap-flushed) line: table rows buffer, everything
+    /// else flushes any open table first and prints.
+    fn emitLine(self: *RegionWriter, raw: []const u8) void {
+        const body = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
+        if (self.table_alloc) |alloc| {
+            if (isTableRow(body)) {
+                const dup = alloc.dupe(u8, body) catch {
+                    self.flushTableBlockLocked();
+                    regionPrintLineLocked(self.real, raw);
+                    return;
+                };
+                self.table_rows.append(alloc, dup) catch {
+                    alloc.free(dup);
+                    self.flushTableBlockLocked();
+                    regionPrintLineLocked(self.real, raw);
+                    return;
+                };
+                if (self.table_rows.items.len >= 64) self.flushTableBlockLocked(); // safety
+                return;
+            }
+        }
+        self.flushTableBlockLocked();
+        regionPrintLineLocked(self.real, raw);
+    }
+
+    /// Emit the buffered table (if any) as one aligned block.
+    pub fn flushTableBlock(self: *RegionWriter) void {
+        ttyLock();
+        defer ttyUnlock();
+        self.flushTableBlockLocked();
+        flushReal(self.real);
+    }
+
+    fn flushTableBlockLocked(self: *RegionWriter) void {
+        if (self.table_rows.items.len == 0) return;
+        const alloc = self.table_alloc orelse {
+            self.table_rows.clearRetainingCapacity();
+            return;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        renderTableBlock(alloc, self.table_rows.items, currentTermWidth(), &out) catch {
+            out.deinit(alloc);
+            for (self.table_rows.items) |r| regionPrintLineLocked(self.real, r);
+            self.clearTableRows();
+            return;
+        };
+        regionPrintLineLocked(self.real, out.items);
+        out.deinit(alloc);
+        self.clearTableRows();
+    }
+
+    fn clearTableRows(self: *RegionWriter) void {
+        const alloc = self.table_alloc orelse {
+            self.table_rows = .empty;
+            return;
+        };
+        for (self.table_rows.items) |r| alloc.free(@constCast(r));
+        self.table_rows.deinit(alloc);
+        self.table_rows = .empty;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self = fromIface(w);
+        ttyLock();
+        defer ttyUnlock();
+        var consumed: usize = 0;
+        if (regionUp()) {
+            for (data[0 .. data.len - 1]) |s| self.feedLocked(s);
+            var i: usize = 0;
+            while (i < splat) : (i += 1) self.feedLocked(data[data.len - 1]);
+            for (data[0 .. data.len - 1]) |s| consumed += s.len;
+            consumed += data[data.len - 1].len * splat;
+            flushReal(self.real);
+            return consumed;
+        }
+        // Region down: verbatim passthrough. Buffered table rows and a
+        // partial line buffered while the region was up go out first so
+        // ordering is preserved.
+        self.flushTableBlockLocked();
+        if (self.line_len > 0) {
+            std.Io.Writer.writeAll(self.real, self.line[0..self.line_len]) catch return error.WriteFailed;
+            self.line_len = 0;
+        }
+        for (data[0 .. data.len - 1]) |s| {
+            try std.Io.Writer.writeAll(self.real, s);
+            consumed += s.len;
+        }
+        var i: usize = 0;
+        while (i < splat) : (i += 1) {
+            try std.Io.Writer.writeAll(self.real, data[data.len - 1]);
+            consumed += data[data.len - 1].len;
+        }
+        return consumed;
+    }
+
+    /// Emit a buffered partial line (region up) — e.g. before the turn
+    /// hands the bottom rows to a blocking interactive read. The REAL
+    /// writer's flush stays the caller's job: the REPL flushes
+    /// File.Writer explicitly at every print site, exactly as before.
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self = fromIface(w);
+        ttyLock();
+        defer ttyUnlock();
+        self.flushTableBlockLocked();
+        if (self.line_len > 0 and regionUp()) {
+            regionPrintLineLocked(self.real, self.line[0..self.line_len]);
+            self.line_len = 0;
+        }
+    }
+};
+
+test "RegionWriter: line-atomic above the region, verbatim when down" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    resetPendingState();
+    regionBegin(&aw.writer, "st");
+    const drawn = aw.written().len;
+    var rw = RegionWriter{ .real = &aw.writer };
+
+    // A logical line split across THREE writes (the old leak shape:
+    // "  [tool result: " + body + "]\n") must emit NOTHING until the
+    // newline — a partial write into the region rows is exactly the
+    // corruption this writer exists to prevent.
+    try std.Io.Writer.writeAll(&rw.interface, "  [tool result: ");
+    try std.Io.Writer.writeAll(&rw.interface, "abc");
+    try std.testing.expectEqual(drawn, aw.written().len); // fully buffered
+    try std.Io.Writer.print(&rw.interface, "]\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "  [tool result: abc]\n") != null);
+    // It printed INTO the transcript area via the FLOW protocol: DECRC
+    // back to the flow position, relative write, DECSC re-save — the
+    // pinned rows are never touched by transcript growth.
+    try std.testing.expect(std.mem.indexOf(u8, aw.written()[drawn..], "\x1b8  [tool result: abc]\n\x1b7") != null);
+    // print() through the unbuffered interface is chunk-safe too.
+    try std.Io.Writer.print(&rw.interface, "x={d}\n", .{7});
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "x=7\n") != null);
+
+    // A partial line buffered while UP must come out in order once the
+    // region drops, and post-drop writes pass through verbatim.
+    try std.Io.Writer.writeAll(&rw.interface, "tail");
+    regionEnd(&aw.writer);
+    try std.Io.Writer.writeAll(&rw.interface, "+end\n");
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "tail+end\n") != null);
+    const before_plain = aw.written().len;
+    try std.Io.Writer.writeAll(&rw.interface, "plain\n");
+    try std.testing.expectEqual(before_plain + "plain\n".len, aw.written().len);
+}
+
+test "regionFreeze keeps the summary row and frees the prompt row" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    resetPendingState();
+    regionBegin(&aw.writer, "✓ 完成 · in 3 → out 4 · 1.5s");
+    const drawn = aw.written().len;
+    regionFreeze(&aw.writer);
+    const out = aw.written()[drawn..];
+    // The summary scrolled INTO the transcript as its last line (dim)…
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2m✓ 完成 · in 3 → out 4 · 1.5s\x1b[0m") != null);
+    // …the scroll region reset and the pinned rows were erased.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2K") != null);
+    try std.testing.expect(!regionUp());
+}
+
 /// Bracketed-paste state for the generation-period input path: a paste
-/// during streaming feeds pending as CONTENT (CR → newline, never submit)
-/// instead of cancelling the generation the way a bare Esc/CSI does.
+/// during streaming feeds the editor as CONTENT (CR → newline, never
+/// submit) instead of cancelling the generation the way a bare Esc does.
 pub var paste_active: bool = false;
 
 /// What a captured ESC-following sequence means.
-const EscSeq = enum { cancel, paste_start, paste_end };
+const EscSeq = enum { cancel, paste_start, paste_end, newline };
 
 fn classifyEscSeq(seq: []const u8) EscSeq {
     if (std.mem.eql(u8, seq, "[200~")) return .paste_start;
     if (std.mem.eql(u8, seq, "[201~")) return .paste_end;
+    // Shift/Ctrl+Enter — legacy encoding (ESC then CR/LF, so `seq` is a
+    // single "\r"/"\n") or kitty CSI-u ("13;<mods>u"). The editor inserts
+    // a NEWLINE for these; the generation-period probe must do the SAME
+    // into the pending buffer — classifying them as cancel killed the
+    // turn and recalled the just-sent message the moment a supplement
+    // went multi-line.
+    if (seq.len == 1 and (seq[0] == '\r' or seq[0] == '\n')) return .newline;
+    // `seq` includes the '[' introducer (captureEscSeq strips only the ESC).
+    if (seq.len >= 4 and std.mem.startsWith(u8, seq, "[13;") and seq[seq.len - 1] == 'u') return .newline;
     return .cancel;
-}
-
-pub fn escProbe(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
-    // Drain ALL pending bytes per invocation: the old take-one-byte-per-
-    // call shape capped live input at ~20 bytes/s (one byte per 50ms
-    // throttle window) — a typed supplement outlived the stream and its
-    // Enter leaked into the next prompt.
-    while (true) {
-        if (r.bufferedLen() == 0) {
-            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-            if (std.c.poll(&pfd, 1, 0) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
-        }
-        const esc = escProbeOne(r, w);
-        if (esc) return true;
-    }
 }
 
 /// Capture the bytes following an ESC promptly (5ms per byte, `~`-styles
 /// are 4-5 long). Returns the captured sequence WITHOUT the ESC. Checks
 /// the reader's OWN buffer before polling the fd — a burst "ESC[200~…"
 /// lands in ONE read and the kernel fd goes dry, so a poll-only loop
-/// would see an empty sequence and misclassify (the escProbe drain trap).
+/// would see an empty sequence and misclassify.
 fn captureEscSeq(r: *std.Io.Reader) [8]u8 {
     var seq: [8]u8 = @splat(0);
     var n: usize = 0;
@@ -760,77 +1459,279 @@ fn captureEscSeq(r: *std.Io.Reader) [8]u8 {
     return seq;
 }
 
-/// Feed one non-Esc keystroke into the generation-period input line and
-/// (when `w` is given) echo it live: printable/Backspace edit the dim
-/// pending line, Enter queues the message. Shared by the esc probe
-/// (in-stream) and the provider's stream-interrupt wait (silent stall) —
-/// the latter used to stash bytes with no echo, so typing during a
-/// gateway stall was invisible.
-pub fn feedLiveByte(c: u8, w: ?*std.Io.Writer) void {
-    if (c == '\r') {
-        _ = pendingSubmit(w);
-    } else if (c == 0x7f) {
-        pendingBackspace(w);
-    } else if (c >= 0x20 or c == '\n') {
-        pendingAppend(c, w);
+/// Committed-style echo of a queued user message that has now ENTERED the
+/// conversation (mid-turn injection or auto-send at turn end): the real
+/// prompt prefix + magenta text, identical to a normally submitted line —
+/// every user message looks alike in the transcript. Region-safe: prints
+/// ABOVE the live region when it is up.
+pub fn regionEchoCommitted(w: *std.Io.Writer, line: []const u8) void {
+    var buf: [640]u8 = undefined;
+    regionPrintLine(w, committedBuf(&buf, line));
+}
+
+/// Same echo at the cursor (region down — the auto-send path right after
+/// a turn ended).
+pub fn echoCommittedDirect(w: *std.Io.Writer, line: []const u8) void {
+    var buf: [640]u8 = undefined;
+    std.Io.Writer.writeAll(w, committedBuf(&buf, line)) catch {};
+}
+
+/// Build "<prompt><magenta>text<reset>\n" into buf; head-capped at a
+/// UTF-8 boundary. buf must be >= prompt(<=192) + text cap(380) + escapes:
+/// 640 keeps every write below the cap — a mid-write overflow would drop
+/// the trailing SGR reset and bleed magenta into the transcript.
+fn committedBuf(buf: []u8, line: []const u8) []const u8 {
+    var f = std.Io.Writer.fixed(buf);
+    std.Io.Writer.writeAll(&f, pendingPrompt()) catch return "\n";
+    std.Io.Writer.writeAll(&f, "\x1b[1;35m") catch return "\n";
+    var cut = @min(line.len, 380);
+    while (cut > 0 and cut < line.len and (line[cut] & 0xC0) == 0x80) cut -= 1;
+    std.Io.Writer.writeAll(&f, line[0..cut]) catch {};
+    if (cut < line.len) std.Io.Writer.writeAll(&f, "…") catch {};
+    std.Io.Writer.writeAll(&f, "\x1b[0m\n") catch {};
+    return f.buffered();
+}
+
+/// ── P1: generation-period key pump ──────────────────────────────────
+/// During a turn the SAME persistent editor handles keystrokes as the
+/// prompt does — one identity, full editing capability (D2). Bytes come
+/// from the stream callback's stdin drain and the provider stall waits
+/// (waitSlice .input → liveSpoolPut). Enter queues the draft (existing
+/// queue semantics); ONLY Esc/Ctrl-C cancel the generation (D4) —
+/// editing keys can no longer kill a turn.
+/// Bytes captured by the provider's stall wait (one at a time, ESC-led
+/// sequences already resolved there): drained by editorLiveKey before
+/// the reader.
+pub var live_spool: [64]u8 = undefined;
+pub var live_spool_len: usize = 0;
+
+pub fn liveSpoolPut(b: u8) void {
+    if (live_spool_len < live_spool.len) {
+        live_spool[live_spool_len] = b;
+        live_spool_len += 1;
     }
 }
 
-fn escProbeOne(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
-    const c = r.takeByte() catch return false;
-    if (paste_active) {
-        if (c == 0x1b) {
-            const seq = captureEscSeq(r);
-            if (classifyEscSeq(std.mem.sliceTo(&seq, 0)) == .paste_end) {
-                paste_active = false;
-                if (w) |ww| renderPendingLine(ww);
-                return false;
-            }
-            // ESC inside pasted text: keep it as content (plus whatever
-            // sequence bytes were captured).
-            pendingAppend(0x1b, w);
-            for (seq) |b| {
-                if (b == 0) break;
-                pendingAppend(b, w);
-            }
-            return false;
+/// History walk shared by the prompt path and the live pump (D2 parity:
+/// ↑/↓ during a generation browse history exactly like at the prompt).
+fn editorHistoryUp(ed: *Editor) void {
+    const history = ed.history orelse return;
+    const alloc = ed.grow orelse return;
+    if (ed.nav == null) {
+        // A stale draft from an earlier navigation round (↓ back to
+        // bottom, Ctrl-C) must be released before re-duping.
+        if (ed.draft_owned) |d| {
+            alloc.free(d);
+            ed.draft_owned = null;
         }
-        // Paste content: CR becomes a newline (a pasted multi-line blob is
-        // ONE message, never N submits); other control bytes drop.
-        if (c == '\r') {
-            pendingAppend('\n', w);
-        } else if (c >= 0x20 or c == '\n' or c == '\t') {
-            pendingAppend(c, w);
-        }
-        return false;
+        ed.draft_owned = alloc.dupe(u8, ed.buf[0..ed.len]) catch null;
+        ed.nav = history.items.len;
     }
-    if (c == 0x03) {
-        // Ctrl-C during generation interrupts like Esc (generation runs in
-        // raw mode with ISIG off, so the byte arrives here instead of as a
-        // signal). Swallow an immediately-following second one so it cannot
-        // leak into the next prompt.
-        var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        if (std.c.poll(&p2, 1, 5) == 1 and (p2[0].revents & std.c.POLL.IN) != 0) {
-            _ = r.takeByte() catch {};
-        }
-        return true;
+    if (ed.nav.? > 0) {
+        ed.nav.? -= 1;
+        ed.loadHistory(history.items[ed.nav.?]);
+        ed.browsing = true;
     }
-    if (c != 0x1b) {
-        feedLiveByte(c, w);
-        return false;
+}
+
+fn editorHistoryDown(ed: *Editor) void {
+    const history = ed.history orelse return;
+    if (ed.nav == null) return;
+    if (ed.nav.? + 1 < history.items.len) {
+        ed.nav.? += 1;
+        ed.loadHistory(history.items[ed.nav.?]);
+    } else {
+        ed.nav = null;
+        if (ed.draft_owned) |d| ed.loadHistory(d);
+        ed.browsing = false;
     }
-    // ESC: classify the sequence. Paste markers feed pending; anything
-    // else (arrow keys, plain Esc) cancels the generation, as before.
-    // sliceTo(0): the capture array is fixed-length zero-padded — comparing
-    // the whole [8]u8 never matched and every paste fell through to cancel.
-    const seq = captureEscSeq(r);
-    switch (classifyEscSeq(std.mem.sliceTo(&seq, 0))) {
-        .paste_start => {
-            paste_active = true;
-            return false;
+}
+
+/// Apply one classified CSI body (without ESC/[) to the editor.
+/// Returns false when the sequence is NOT an editing key (caller treats
+/// it as a cancel — e.g. kitty CSI 27u = the Esc key).
+fn liveCsiEdit(ed: *Editor, body: []const u8) bool {
+    switch (classifyCsi(body)) {
+        .right => {
+            if (ed.pos < ed.len) ed.pos = nextChar(ed.buf[0..ed.len], ed.pos);
         },
-        .paste_end => return false, // stray end marker: swallow
-        .cancel => return true,
+        .left => {
+            if (ed.pos > 0) ed.pos = prevChar(ed.buf[0..ed.len], ed.pos);
+        },
+        .up => {
+            if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
+                if (moveVertically(ed.buf[0..ed.len], ed.pos, -1)) |np| ed.pos = np;
+            } else editorHistoryUp(ed);
+        },
+        .down => {
+            if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
+                if (moveVertically(ed.buf[0..ed.len], ed.pos, 1)) |np| ed.pos = np;
+            } else editorHistoryDown(ed);
+        },
+        .home => ed.pos = 0,
+        .end => ed.pos = ed.len,
+        .delete => ed.deleteAt(),
+        .newline => ed.insertBytes("\n") catch {},
+        .ctrl => {
+            // Reuse the prompt's ctrl bindings where they edit; Ctrl-R
+            // search is prompt-only (its UI owns extra rows), Ctrl-C is
+            // handled by the caller as cancel.
+            const b = ctrlLetterByte(body) orelse return true;
+            switch (b) {
+                0x01 => ed.pos = 0,
+                0x05 => ed.pos = ed.len,
+                0x02 => {
+                    if (ed.pos > 0) ed.pos = prevGlyph(ed.buf[0..ed.len], ed.pos);
+                },
+                0x06 => {
+                    if (ed.pos < ed.len) ed.pos = nextGlyph(ed.buf[0..ed.len], ed.pos);
+                },
+                0x17 => ed.deleteWordBack(),
+                0x15 => ed.deleteToStart(),
+                0x0b => ed.deleteToEnd(),
+                0x04 => ed.deleteAt(),
+                else => {}, // 0x12 (Ctrl-R) and friends: ignored live
+            }
+        },
+        .esc => return false,
+        .ignore => {},
+        .paste_start => {}, // unreachable live: paste mode is handled upstream
+    }
+    return true;
+}
+
+/// Enter during a generation: queue the editor's draft as a message
+/// (mid-turn injection / auto-send at turn end — unchanged semantics),
+/// then reset the draft. Confirmation flashes in the STATUS row.
+fn liveQueueSubmit(ed: *Editor, w: ?*std.Io.Writer) bool {
+    if (ed.len == 0) return false;
+    if (queued_count >= QUEUED_MAX) return false;
+    const alloc = ed.grow orelse return false;
+    const line = ed.takeLine(alloc) catch return false;
+    defer alloc.free(line);
+    const n = @min(line.len, QUEUED_CAP);
+    @memcpy(queued_msgs[queued_count][0..n], line[0..n]);
+    queued_lens[queued_count] = n;
+    queued_echoed[queued_count] = w != null;
+    queued_count += 1;
+    if (w) |ww| {
+        // VISIBILITY (the "排队+1 啥也看不见" fix): the queued message
+        // echoes into the TRANSCRIPT immediately — committed-style, with
+        // a dim queue marker — so the user sees WHAT they sent, not a
+        // counter. Injection/auto-send skip their own echo (the flag).
+        var buf: [768]u8 = undefined;
+        var f = std.Io.Writer.fixed(&buf);
+        std.Io.Writer.writeAll(&f, pendingPrompt()) catch {};
+        std.Io.Writer.writeAll(&f, "\x1b[1;35m") catch {};
+        var cut = @min(line.len, 380);
+        while (cut > 0 and cut < line.len and (line[cut] & 0xC0) == 0x80) cut -= 1;
+        std.Io.Writer.writeAll(&f, line[0..cut]) catch {};
+        if (cut < line.len) std.Io.Writer.writeAll(&f, "…") catch {};
+        std.Io.Writer.writeAll(&f, "\x1b[0m\x1b[2m ↳ 已排队\x1b[0m\n") catch {};
+        // Echo + status repaint under ONE hold (review ① 2026-11-06): the
+        // old shape called locked regionPrintLine, released, then painted
+        // the status row UNLOCKED — the exact DECSC-clobber interleave the
+        // tty mutex exists to kill, reachable on every mid-turn Enter.
+        ttyLock();
+        regionPrintLineLocked(ww, f.buffered());
+        var sb: [96]u8 = undefined;
+        const st = std.fmt.bufPrint(&sb, "↳ 已排队 {d} 条 · 本轮生效或回合后自动发送", .{queuedCount()}) catch "";
+        pendingStatusSet(st);
+        if (pending_shown) {
+            if (termHeight() != region_h) {
+                regionApply(ww);
+            } else {
+                paintStatusRow(ww);
+            }
+        }
+        flushReal(ww);
+        ttyUnlock();
+    }
+    return true;
+}
+
+/// Drain every available keystroke into the persistent editor. Returns
+/// true when the user cancelled the generation (Esc / Ctrl-C). `w` null
+/// in drain contexts — capture without echo.
+pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
+    const ed = live_ed orelse return false;
+    while (true) {
+        var c: u8 = undefined;
+        if (live_spool_len > 0) {
+            c = live_spool[0];
+            live_spool_len -= 1;
+            std.mem.copyForwards(u8, live_spool[0..live_spool_len], live_spool[1 .. live_spool_len + 1]);
+        } else {
+            if (r.bufferedLen() == 0) {
+                var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+                if (std.c.poll(&pfd, 1, 0) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+            }
+            c = r.takeByte() catch return false;
+        }
+        if (paste_active) {
+            // Paste content (no folding live: pills need the whole body
+            // staged at once; the prompt path folds). CR becomes a newline
+            // so a multi-line paste is ONE message; other control bytes
+            // drop. Markers arrive byte-wise through this same drain.
+            if (c == 0x1b) {
+                const seq = captureEscSeq(r);
+                const sl = std.mem.sliceTo(&seq, 0);
+                if (classifyEscSeq(sl) == .paste_end) {
+                    paste_active = false;
+                    if (w) |ww| renderPendingLine(ww);
+                    continue;
+                }
+                ed.insertBytes("\x1b") catch {};
+                for (seq) |b| {
+                    if (b == 0) break;
+                    ed.insertBytes(&.{b}) catch {};
+                }
+                continue;
+            }
+            if (c == '\r') {
+                ed.insertBytes("\n") catch {};
+            } else if (c >= 0x20 or c == '\n' or c == '\t') {
+                ed.insertBytes(&.{c}) catch {};
+            }
+            if (w) |ww| renderPendingLine(ww);
+            continue;
+        }
+        if (c == 0x03) {
+            // Ctrl-C cancels like Esc; swallow an immediately-following
+            // second press so it cannot leak into the next prompt.
+            var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&p2, 1, 5) == 1 and (p2[0].revents & std.c.POLL.IN) != 0) {
+                _ = r.takeByte() catch {};
+            }
+            return true;
+        }
+        if (c != 0x1b) {
+            if (c == '\r') {
+                _ = liveQueueSubmit(ed, w);
+            } else if (c == 0x7f or c == 0x08) {
+                ed.backspace();
+                ed.browsing = false;
+            } else if (c >= 0x20 or c == '\n') {
+                ed.insertBytes(&.{c}) catch {};
+                ed.browsing = false;
+            }
+            if (w) |ww| renderPendingLine(ww);
+            continue;
+        }
+        // ESC: classify what follows. Editing CSIs edit; newline inserts;
+        // only a REAL Esc key cancels (D4).
+        const seq = captureEscSeq(r);
+        const sl = std.mem.sliceTo(&seq, 0);
+        switch (classifyEscSeq(sl)) {
+            .paste_start => paste_active = true,
+            .paste_end => {},
+            .newline => ed.insertBytes("\n") catch {},
+            .cancel => {
+                if (sl.len == 0) return true; // lone Esc
+                if (!liveCsiEdit(ed, sl[1..])) return true; // CSI 27u etc.
+            },
+        }
+        if (w) |ww| renderPendingLine(ww);
     }
 }
 
@@ -930,6 +1831,57 @@ const Editor = struct {
     /// Folded-paste side slots: full content behind each buffer marker.
     /// data is grow-allocator owned; readLine frees them on every exit.
     pastes: [PASTE_SLOTS]?PasteSlot = @splat(null),
+    /// ── P1 (tui-event-loop): session-shared editor state ──
+    /// The editor instance now outlives a single readLine call (the
+    /// generation-period key pump drives the SAME buffer), so navigation
+    /// state moves from readLine locals into the editor where both key
+    /// sources see it.
+    history: ?*std.ArrayList([]u8) = null,
+    nav: ?usize = null, // history index while navigating
+    draft_owned: ?[]u8 = null, // pre-navigation draft (heap: line may be long)
+
+    /// Free every folded-paste slot (buffer markers referencing them die
+    /// with the buffer content they annotated).
+    fn releaseSlots(self: *Editor) void {
+        const g = self.grow orelse {
+            self.pastes = @splat(null);
+            return;
+        };
+        for (&self.pastes) |*ps| {
+            if (ps.*) |d| g.free(d.data);
+            ps.* = null;
+        }
+    }
+
+    /// Reset to a fresh empty draft: submit/queue handoff. Paste slots
+    /// were expanded into the taken line; nav/draft state ends with the
+    /// draft that used it.
+    pub fn clearForNewDraft(self: *Editor) void {
+        self.len = 0;
+        self.pos = 0;
+        self.browsing = false;
+        self.nav = null;
+        if (self.draft_owned) |d| {
+            if (self.grow) |g| g.free(d);
+            self.draft_owned = null;
+        }
+        self.releaseSlots();
+        self.last_rows = 0;
+        self.park_row = 0;
+    }
+
+    /// Expand folded pastes, return the line as a fresh allocation, and
+    /// leave the editor as an empty draft. Null on allocation failure
+    /// (editor keeps its content — the caller may retry).
+    pub fn takeLine(self: *Editor, alloc: std.mem.Allocator) ![]u8 {
+        var exp: ?[]u8 = null;
+        if (std.mem.indexOfScalar(u8, self.buf[0..self.len], 0) != null) {
+            exp = expandPasted(alloc, self.buf[0..self.len], &self.pastes) catch null;
+        }
+        const line = exp orelse try alloc.dupe(u8, self.buf[0..self.len]);
+        self.clearForNewDraft();
+        return line;
+    }
 
     fn pasteStats(self: *const Editor) [PASTE_SLOTS]?PasteStat {
         var st: [PASTE_SLOTS]?PasteStat = @splat(null);
@@ -1275,6 +2227,10 @@ const Editor = struct {
         @memcpy(self.buf[0..n], item[0..n]);
         self.len = n;
         self.pos = snapBack(self.buf[0..n], n); // never park mid-UTF-8
+        // The replaced buffer may have carried paste markers — their slots
+        // are unreachable now; free them (expanded history text never has
+        // markers, so this only drops the live draft's pills).
+        self.releaseSlots();
     }
 
     /// Stream the bracketed-paste body until the 201~ terminator (matched
@@ -1437,6 +2393,23 @@ fn drainRestOfLine(r: *std.Io.Reader) void {
 /// allocator-owned slice (caller frees — it may exceed 4 KiB after a paste),
 /// or null on EOF / Ctrl-D / double Ctrl-C on an empty line. `history`
 /// receives committed non-empty lines and drives up/down navigation.
+/// fd 0 is a terminal? (Raw mode itself is owned by the SESSION guard in
+/// repl.run — scoping it per-prompt left every mid-turn keystroke to the
+/// cooked line discipline, which echoed control keys as ^[[C/^R garbage
+/// and line-buffered input the editor never saw until Enter.)
+fn stdinIsTty() bool {
+    var t: std.c.termios = undefined;
+    return std.c.tcgetattr(0, &t) == 0;
+}
+
+/// The session RawGuard (repl.run), for Ctrl-Z's manual suspend: restore
+/// cooked while stopped, re-enter raw on resume. Null in tests/pipe mode.
+var session_guard: ?*menu.RawGuard = null;
+
+pub fn setSessionGuard(g: *menu.RawGuard) void {
+    session_guard = g;
+}
+
 pub fn readLine(
     w: *std.Io.Writer,
     r: *std.Io.Reader,
@@ -1445,11 +2418,7 @@ pub fn readLine(
     history: *std.ArrayList([]u8),
     alloc: std.mem.Allocator,
 ) !?[]u8 {
-    var guard = menu.RawGuard{};
-    guard.enterNoSig();
-    defer guard.restore();
-
-    if (!guard.active and !force_editor) {
+    if (!stdinIsTty() and !force_editor) {
         // Non-TTY: behave exactly like the old reader, except an overlong
         // line is truncated instead of being mistaken for EOF — the old
         // path returned null (Goodbye!) and left the tail of the long line
@@ -1482,28 +2451,35 @@ pub fn readLine(
         std.Io.File.Writer.flush(file_writer) catch {};
     }
 
-    const initial = try alloc.alloc(u8, 8192);
-    var ed = Editor{
-        .w = w,
-        .file_writer = file_writer,
-        .r = r,
-        .prompt = prompt,
-        .buf = initial,
-        .grow = alloc,
-        .owned_buf = initial,
-    };
-    // ed.owned_buf stays current across growth reallocs — free THAT, never
-    // a stale copy of the initial pointer.
-    var submitted = false;
-    defer if (!submitted) alloc.free(ed.owned_buf.?);
-    // Folded-paste side data dies with the editor (submit copies it out).
-    defer for (&ed.pastes) |*ps| {
-        if (ps.*) |d| alloc.free(d.data);
-    };
+    // P1: the persistent session editor — the first call lazily creates
+    // it; every later readLine AND the generation-period key pump
+    // (editorLiveKey) reuse the SAME buffer. A draft typed mid-generation
+    // simply IS the draft the next prompt opens with — no handoff, no
+    // typeahead merge. IO handles re-bind per call (identical in
+    // production; keeps tests independent).
+    if (live_ed == null) {
+        const initial = try alloc.alloc(u8, 8192);
+        live_ed_buf = initial;
+        const created = try alloc.create(Editor);
+        created.* = .{
+            .w = w,
+            .file_writer = file_writer,
+            .r = r,
+            .prompt = prompt,
+            .buf = initial,
+            .grow = alloc,
+            .owned_buf = initial,
+        };
+        live_ed = created;
+    }
+    const ed = live_ed.?;
+    ed.w = w;
+    ed.file_writer = file_writer;
+    ed.r = r;
+    ed.prompt = prompt;
+    ed.grow = alloc;
+    ed.history = history;
 
-    var nav: ?usize = null; // history index while navigating
-    var draft_owned: ?[]u8 = null; // pre-navigation draft (heap: line may be long)
-    defer if (draft_owned) |d| alloc.free(d);
     var ctrl_c_at: i64 = 0; // last Ctrl-C press — two within 3s exit gracefully
     // Ctrl+R reverse search state.
     var search_on = false;
@@ -1522,14 +2498,6 @@ pub fn readLine(
             ed.insertBytes(t) catch {};
         }
     }
-    // P4: live-typed pending during generation (never submitted with
-    // Enter) becomes the editor seed through the existing typeahead path.
-    pendingMergeIntoTypeahead();
-    if (typeahead_len > 0) {
-        ed.insertBytes(typeahead_buf[0..typeahead_len]) catch {};
-        typeahead_len = 0;
-    }
-
     try ed.render();
     while (true) {
         // Kitty ctrl+letter arrives as CSI u and is mapped back to its C0
@@ -1714,20 +2682,20 @@ pub fn readLine(
                         }
                     }
                     if (history.items.len == 0) continue;
-                    if (nav == null) {
+                    if (ed.nav == null) {
                         // A stale draft from an earlier navigation round
                         // (↓ back to bottom, Ctrl-C) must be released before
                         // re-duping — overwriting the pointer leaked it.
-                        if (draft_owned) |d| {
+                        if (ed.draft_owned) |d| {
                             alloc.free(d);
-                            draft_owned = null;
+                            ed.draft_owned = null;
                         }
-                        draft_owned = alloc.dupe(u8, ed.buf[0..ed.len]) catch null;
-                        nav = history.items.len;
+                        ed.draft_owned = alloc.dupe(u8, ed.buf[0..ed.len]) catch null;
+                        ed.nav = history.items.len;
                     }
-                    if (nav.? > 0) {
-                        nav.? -= 1;
-                        ed.loadHistory(history.items[nav.?]);
+                    if (ed.nav.? > 0) {
+                        ed.nav.? -= 1;
+                        ed.loadHistory(history.items[ed.nav.?]);
                         ed.browsing = true;
                     }
                 },
@@ -1739,13 +2707,13 @@ pub fn readLine(
                             continue;
                         }
                     }
-                    if (nav == null) continue;
-                    if (nav.? + 1 < history.items.len) {
-                        nav.? += 1;
-                        ed.loadHistory(history.items[nav.?]);
+                    if (ed.nav == null) continue;
+                    if (ed.nav.? + 1 < history.items.len) {
+                        ed.nav.? += 1;
+                        ed.loadHistory(history.items[ed.nav.?]);
                     } else {
-                        nav = null;
-                        if (draft_owned) |d| ed.loadHistory(d);
+                        ed.nav = null;
+                        if (ed.draft_owned) |d| ed.loadHistory(d);
                         ed.browsing = false;
                     }
                 },
@@ -1801,18 +2769,15 @@ pub fn readLine(
                     // now) — the echo below prints at the freed top row and
                     // the cleared rows below are reused by the REPL output.
                     try ed.clearBlock();
-                    // Folded pastes expand BEFORE anything downstream sees
-                    // the line: echo, history and the returned slice all get
-                    // the full content — the model receives exactly what an
-                    // unfolded paste would have produced.
-                    var exp: ?[]u8 = null;
-                    // On any error below, the defer frees the expansion;
-                    // on success it is returned (submitted guards it).
-                    defer if (!submitted and exp != null) alloc.free(exp.?);
-                    if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], 0) != null) {
-                        exp = expandPasted(alloc, ed.buf[0..ed.len], &ed.pastes) catch null;
-                    }
-                    const line = exp orelse ed.buf[0..ed.len];
+                    // P1: takeLine expands folded pastes, hands the line
+                    // out as its own allocation, and leaves the persistent
+                    // editor as a fresh empty draft. On OOM the editor
+                    // KEEPS its content — show it again and let the user
+                    // retry (the session survives).
+                    const line = ed.takeLine(alloc) catch {
+                        try ed.render();
+                        continue;
+                    };
                     // Re-render the committed line in the history color so
                     // sent messages stay distinguishable in the transcript.
                     try renderCommitted(ed.w, ed.prompt, line);
@@ -1825,26 +2790,7 @@ pub fn readLine(
                             history.append(alloc, o) catch alloc.free(o);
                         }
                     }
-                    submitted = true;
-                    if (exp) |e| {
-                        // Expansion owns its buffer: hand it out directly.
-                        alloc.free(ed.owned_buf.?);
-                        return e;
-                    }
-                    // Realloc down to the exact length so the caller can
-                    // free() the returned slice directly; on failure dupe
-                    // (never hand out a subslice of a larger allocation),
-                    // and if even the dupe fails, release the buffer before
-                    // propagating — submitted already skipped the defer.
-                    const exact = alloc.realloc(ed.owned_buf.?, ed.len) catch blk: {
-                        const dup = alloc.dupe(u8, line) catch {
-                            alloc.free(ed.owned_buf.?);
-                            return error.OutOfMemory;
-                        };
-                        alloc.free(ed.owned_buf.?);
-                        break :blk dup;
-                    };
-                    return exact;
+                    return line; // caller frees; the editor already reset
                 }
             },
             '\n' => {
@@ -1874,7 +2820,7 @@ pub fn readLine(
                 ctrl_c_at = now;
                 ed.len = 0;
                 ed.pos = 0;
-                nav = null;
+                ed.nav = null;
                 ed.browsing = false;
                 try ed.w.writeAll("^C  (再按一次 Ctrl-C 退出)\n");
                 // Status text moved the cursor out of the block — drop the
@@ -1886,16 +2832,18 @@ pub fn readLine(
                 // Ctrl-Z: ISIG is off in raw mode, so suspend manually —
                 // restore the terminal, stop with the default disposition,
                 // then re-enter raw mode once the shell resumes us.
-                if (guard.active) {
-                    guard.restore();
-                    const dfl_tstp: std.posix.Sigaction = .{
-                        .handler = .{ .handler = @ptrFromInt(0) },
-                        .mask = std.posix.sigemptyset(),
-                        .flags = 0,
-                    };
-                    std.posix.sigaction(.TSTP, &dfl_tstp, null);
-                    std.posix.raise(.TSTP) catch {};
-                    guard.enterNoSig();
+                if (session_guard) |g| {
+                    if (g.active) {
+                        g.restore();
+                        const dfl_tstp: std.posix.Sigaction = .{
+                            .handler = .{ .handler = @ptrFromInt(0) },
+                            .mask = std.posix.sigemptyset(),
+                            .flags = 0,
+                        };
+                        std.posix.sigaction(.TSTP, &dfl_tstp, null);
+                        std.posix.raise(.TSTP) catch {};
+                        g.enterNoSig();
+                    }
                 }
             },
             0x04 => { // Ctrl-D: EOF on empty line, delete-forward otherwise
@@ -2349,91 +3297,503 @@ test "folded paste renders as a pill and keeps the block tiny" {
     alloc.free(pd);
 }
 
-// ── P4: generation-period live input tests ──
+// ── P1: generation-period key pump tests ──
 
+/// Full test reset: region flags, queue, spool, paste state, and the
+/// persistent editor's draft (slots/draft freed through its grow
+/// allocator — testing.allocator leak checks stay honest).
 fn resetPendingState() void {
-    pending_len = 0;
+    live_spool_len = 0;
+    paste_active = false;
     pending_shown = false;
+    pending_status_shown = false;
     queued_count = 0;
     queued_read = 0;
     @memset(&queued_lens, 0);
-    typeahead_len = 0;
+    if (live_ed) |ed| ed.clearForNewDraft();
 }
 
-test "pending submit queues FIFO and queuedTake pops in order" {
+/// Create the persistent editor for pump tests (no reader interaction
+/// needed beyond Reader.fixed drains).
+fn editorEnsure(alloc: std.mem.Allocator, w: *std.Io.Writer, r: *std.Io.Reader, prompt: []const u8) *Editor {
+    if (live_ed) |ed| {
+        ed.w = w;
+        ed.r = r;
+        ed.prompt = prompt;
+        ed.grow = alloc;
+        return ed;
+    }
+    const initial = alloc.alloc(u8, 8192) catch @panic("OOM");
+    live_ed_buf = initial;
+    const created = alloc.create(Editor) catch @panic("OOM");
+    created.* = .{
+        .w = w,
+        .file_writer = undefined,
+        .r = r,
+        .prompt = prompt,
+        .buf = initial,
+        .grow = alloc,
+        .owned_buf = initial,
+    };
+    live_ed = created;
+    return created;
+}
+
+test "editorLiveKey: typing edits the draft, Enter queues it FIFO" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
     resetPendingState();
-    // "abc" + Enter, then CJK "\u{7B2C}\u{4E8C}" (di-er) + Enter — UTF-8 multibyte
-    const cjk = "\u{7B2C}\u{4E8C}";
-    for ("abc") |c| pendingAppend(c, null);
-    try std.testing.expect(pendingSubmit(null));
-    for (cjk) |c| pendingAppend(c, null);
-    try std.testing.expect(pendingSubmit(null));
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var fr0 = std.Io.Reader.fixed("");
+    const ed = editorEnsure(alloc, &aw.writer, &fr0, "> ");
+    var fr = std.Io.Reader.fixed("abc");
+    ed.r = &fr;
+    try std.testing.expect(!editorLiveKey(&fr, null));
+    try std.testing.expectEqualStrings("abc", ed.buf[0..ed.len]);
+
+    // Enter (queued submit): the draft MOVES into the queue and the
+    // editor resets — Enter during a generation is 排队, not prompt submit.
+    var fr_enter = std.Io.Reader.fixed("\r");
+    ed.r = &fr_enter;
+    try std.testing.expect(!editorLiveKey(&fr_enter, null));
+    try std.testing.expectEqual(@as(usize, 1), queued_count);
+    try std.testing.expectEqualStrings("abc", queued_msgs[0][0..queued_lens[0]]);
+    try std.testing.expectEqual(@as(usize, 0), ed.len); // draft reset
+
+    // CJK + backspace-rune + queue: same semantics as the prompt editor.
+    var fr2 = std.Io.Reader.fixed("\u{4E2D}\u{6587}x\x7f\x7f\r");
+    ed.r = &fr2;
+    try std.testing.expect(!editorLiveKey(&fr2, null));
     try std.testing.expectEqual(@as(usize, 2), queued_count);
-
-    const first = queuedTake().?;
-    try std.testing.expectEqualStrings("abc", first);
-    const second = queuedTake().?;
-    try std.testing.expectEqualStrings(cjk, second);
-    try std.testing.expect(queuedTake() == null);
-    try std.testing.expectEqual(@as(usize, 0), queued_count);
+    try std.testing.expectEqualStrings("\u{4E2D}", queued_msgs[1][0..queued_lens[1]]);
 }
 
-test "pending backspace removes whole runes; empty submit is a no-op" {
+test "editorLiveKey: arrows EDIT, lone Esc cancels, Shift+Enter newlines" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
     resetPendingState();
-    const cjk2 = "\u{4E2D}\u{6587}x"; // zhong-wen + x
-    for (cjk2) |c| pendingAppend(c, null);
-    pendingBackspace(null); // drop 'x'
-    pendingBackspace(null); // drop the second CJK rune atomically
-    try std.testing.expectEqual(@as(usize, 3), pending_len);
-    try std.testing.expectEqualSlices(u8, "\u{4E2D}", pending_buf[0..pending_len]);
-    pendingBackspace(null);
-    try std.testing.expectEqual(@as(usize, 0), pending_len);
-    try std.testing.expect(!pendingSubmit(null));
-    try std.testing.expectEqual(@as(usize, 0), queued_count);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var fr = std.Io.Reader.fixed("ab\x1b[D");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, null));
+    try std.testing.expectEqualStrings("ab", ed.buf[0..ed.len]);
+    try std.testing.expectEqual(@as(usize, 1), ed.pos); // Left moved the cursor
+
+    // Shift+Enter (legacy ESC+CR): newline AT THE CURSOR (full editor
+    // semantics — the cursor sits after 'a'), NOT a cancel.
+    var fr2 = std.Io.Reader.fixed("\x1b\r");
+    ed.r = &fr2;
+    try std.testing.expect(!editorLiveKey(&fr2, null));
+    try std.testing.expectEqualStrings("a\nb", ed.buf[0..ed.len]);
+
+    // Lone Esc (nothing follows within the 5ms capture): cancels.
+    var fr3 = std.Io.Reader.fixed("\x1b");
+    ed.r = &fr3;
+    try std.testing.expect(editorLiveKey(&fr3, null));
 }
 
-test "unsubmitted pending merges into typeahead for the editor" {
+test "editorLiveKey: paste feeds the draft as content, CR queues it" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
     resetPendingState();
-    for ("draft") |c| pendingAppend(c, null);
-    pendingMergeIntoTypeahead();
-    try std.testing.expectEqual(@as(usize, 0), pending_len);
-    try std.testing.expectEqualSlices(u8, "draft", typeahead_buf[0..typeahead_len]);
-    try std.testing.expectEqual(@as(usize, 0), queued_count);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const burst = "\x1b[200~hello paste\x1b[201~\r";
+    var fr = std.Io.Reader.fixed(burst);
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, null)); // paste must NOT cancel
+    try std.testing.expectEqualStrings("hello paste", queued_msgs[0][0..queued_lens[0]]);
+    try std.testing.expectEqual(@as(usize, 0), ed.len);
+    try std.testing.expect(!paste_active);
+}
+
+test "editorLiveKey: queue submit confirms via status row, not transcript" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    regionPromptSet("> ");
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "⏳ 等待响应 1.0s");
+    aw.clearRetainingCapacity();
+    var fr = std.Io.Reader.fixed("note\r");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, &aw.writer));
+    // The confirmation flashed into the ABSOLUTE status row (DECSTBM
+    // protocol: status is a pinned row, not a transcript line).
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2K\x1b[2m↳ 已排队 1 条") != null);
+    try std.testing.expectEqual(@as(usize, 0), ed.len);
 }
 
 test "esc sequence classification: paste markers vs cancel" {
-    try std.testing.expectEqual(EscSeq.paste_start, classifyEscSeq("[200~"));
-    try std.testing.expectEqual(EscSeq.paste_end, classifyEscSeq("[201~"));
-    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("[A")); // arrow
-    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("")); // bare Esc
-    try std.testing.expectEqual(EscSeq.cancel, classifyEscSeq("[27u")); // kitty Esc
+    try std.testing.expect(classifyEscSeq("[200~") == .paste_start);
+    try std.testing.expect(classifyEscSeq("[201~") == .paste_end);
+    try std.testing.expect(classifyEscSeq("[A") == .cancel);
+    try std.testing.expect(classifyEscSeq("") == .cancel);
 }
 
-test "escProbe paste flow: markers feed pending, CR queues, no cancel" {
+test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
     resetPendingState();
     defer resetPendingState();
-    // Drive the byte machine one byte at a time (escProbe's drain gate
-    // polls fd 0, which has no data under the test runner — Reader.fixed
-    // never reports bufferedLen either). Production drain behavior is
-    // covered by the pty E2Es.
-    const burst = "\x1b[200~hello paste\x1b[201~\r";
-    var fr = std.Io.Reader.fixed(burst);
-    var cancelled = false;
-    for (0..burst.len + 2) |_| {
-        if (escProbeOne(&fr, null)) {
-            cancelled = true;
-            break;
-        }
-    }
-    try std.testing.expect(!cancelled); // paste must NOT cancel
-    // The trailing CR moved the pasted text into the queue (that IS the
-    // design): pending is empty, the queued message holds it.
-    try std.testing.expectEqual(@as(usize, 0), pending_len);
-    try std.testing.expectEqual(@as(usize, 1), queued_count);
-    try std.testing.expectEqualStrings("hello paste", queued_msgs[0][0..queued_lens[0]]);
-    try std.testing.expect(!paste_active);
+    force_width = 100;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("ziv (m) [10%] > ");
 
-    // a bare Esc after that still cancels (arrow keys etc. unchanged)
-    var fr2 = std.Io.Reader.fixed("\x1b[A");
-    try std.testing.expect(escProbeOne(&fr2, null));
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    // Turn start: scroll region splits the screen (rows 1..22 transcript,
+    // 23 status, 24 input); the input row carries the REAL prompt prefix.
+    regionBegin(w, "⏳ 等待响应 0.0s");
+    const begin_out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[1;22r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[23;1H\x1b[2K\x1b[2m⏳ 等待响应 0.0s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[24;1H\x1b[2Kziv (m) [10%] > ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "⌨") == null);
+
+    // Keystrokes through the persistent editor: ONLY the input row
+    // repaints (absolute) — status and transcript untouched.
+    aw.clearRetainingCapacity();
+    var fr = std.Io.Reader.fixed("hi");
+    const ed = editorEnsure(alloc, w, &fr, "ziv (m) [10%] > ");
+    try std.testing.expect(!editorLiveKey(&fr, w));
+    const typed = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, typed, "\x1b[24;1H\x1b[2Kziv (m) [10%] > hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "⏳") == null); // no status repaint
+    _ = ed;
+
+    // Transcript line: DECRC to the flow position + RELATIVE write + DECSC
+    // re-save — content grows downward from wherever it is (no bottom
+    // jump, no gap); the pinned rows are never cleared or repainted for
+    // transcript growth.
+    aw.clearRetainingCapacity();
+    regionPrintLine(w, "  response line 1\n");
+    const printed = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "\x1b8  response line 1\n\x1b7") != null);
+    try std.testing.expect(std.mem.count(u8, printed, "\x1b[2K") == 0); // no row erasing
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ziv (m) [10%] > hi") == null); // input row not redrawn
+
+    // Status tick: ONLY the status row repaints.
+    aw.clearRetainingCapacity();
+    regionStatus(w, "⏳ 本轮 1.2s");
+    const ticked = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[23;1H\x1b[2K\x1b[2m⏳ 本轮 1.2s") != null);
+    // Input row not REPAINTED (only the cursor parks back on it).
+    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[24;1H\x1b[2K") == null);
+
+    // Turn end: scroll region reset, pinned rows erased, region down.
+    aw.clearRetainingCapacity();
+    regionEnd(w);
+    const ended = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, ended, "\x1b[r") != null);
+    try std.testing.expect(std.mem.count(u8, ended, "\x1b[2K") == 2); // two pinned rows
+    try std.testing.expect(!regionUp());
+}
+
+test "live region: multi-line draft renders as a full editor block (P3b)" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 100;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+
+    // Three logical lines: block grows to 3 rows → split moves to 20.
+    var fr = std.Io.Reader.fixed("a\nb\nc");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, &aw.writer));
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;20r") != null); // DECSTBM re-split
+    // Each logical line paints its own absolute pinned row (22..24;
+    // 21 is the status row).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2K> a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24;1H\x1b[2Kc") != null);
+    _ = ed;
+}
+
+test "markdown table renders aligned and width-clipped" {
+    const alloc = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 80;
+    defer force_width = 0;
+    regionBegin(&aw.writer, "st");
+
+    var rw = RegionWriter{ .real = &aw.writer, .table_alloc = alloc };
+    // A CJK table: columns must align by DISPLAY width (板块 = 4 cols,
+    // 一、常用底层算法 = 18) — the renderer pads every cell to its
+    // column's width so the pipes form straight columns.
+    const tbl = " | 板块 | 计划 | 已完成 |\n |---|---|---|\n | 一、常用底层算法 | 55 | **55** |\n | 二、LLM 算法 | 100 | **25** |\ndone\n";
+    try std.Io.Writer.writeAll(&rw.interface, tbl);
+    rw.flushTableBlock();
+
+    // Collect the rendered table lines (start with '|').
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, aw.written(), '\n');
+    while (it.next()) |ln| {
+        var t2 = std.mem.trimStart(u8, ln, "\x1b8");
+        t2 = std.mem.trimStart(u8, t2, "\x1b[2m");
+        if (std.mem.startsWith(u8, t2, "|")) try lines.append(alloc, ln);
+    }
+    // The header row is glued to the region-arming control sequence (no
+    // newline between them), so the per-line collection sees rule + 2
+    // body rows; the header is asserted as a substring directly.
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b8| 板块") != null);
+    // THE invariant: pipe byte-offsets identical across the data rows
+    // (padding aligned the columns).
+    // Pipe positions in DISPLAY columns (CJK = 2): alignment is a
+    // display property — byte offsets differ when CJK/ASCII mix.
+    const pipeCols = struct {
+        fn of(line: []const u8, buf: *[32]usize) usize {
+            var n: usize = 0;
+            var col: usize = 0;
+            var i: usize = 0;
+            while (i < line.len) {
+                const next = nextChar(line, i);
+                if (line[i] == '|') {
+                    if (n < buf.len) {
+                        buf[n] = col;
+                        n += 1;
+                    }
+                }
+                col += strWidth(line[i..next]);
+                i = next;
+            }
+            return n;
+        }
+    };
+    // Reference = the FIRST data row (the rule line only has 2 pipes).
+    var ref: [32]usize = undefined;
+    const ref_n = pipeCols.of(lines.items[1], &ref);
+    for (lines.items[2..]) |ln| {
+        var cur: [32]usize = undefined;
+        const cur_n = pipeCols.of(ln, &cur);
+        try std.testing.expectEqual(ref_n, cur_n);
+        try std.testing.expectEqualSlices(usize, ref[0..ref_n], cur[0..cur_n]);
+    }
+    // Separator rendered as a rule line, post-table text intact.
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\u{2500}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "done") != null);
+}
+
+test "over-wide table clips to terminal width" {
+    const alloc = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 40; // narrow terminal
+    defer force_width = 0;
+    regionBegin(&aw.writer, "st");
+
+    var rw = RegionWriter{ .real = &aw.writer, .table_alloc = alloc };
+    const long = "01234567890123456789012345678901234567890123456789";
+    try std.Io.Writer.print(&rw.interface, " | {s} | b |\n |---|---|\n | {s} | c |\ntail\n", .{ long, long });
+    rw.flushTableBlock();
+    const out = aw.written();
+    // No rendered row may exceed the width budget: clipped cells end
+    // with the ellipsis.
+    try std.testing.expect(std.mem.indexOf(u8, out, "…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tail\n") != null);
+}
+
+test "RegionWriter renders streamed markdown tables, not raw pipes" {
+    // The 2026-11-06 wiring regression this locks: model text streams in
+    // as margin-seeded lines through the RegionWriter — pipe tables must
+    // come out as aligned blocks with a rule line, never raw |---|.
+    // drain() gates the table path on regionUp(); tests have no live
+    // region, so enter one step down at feed() — the exact function the
+    // region-up branch dispatches to. Same-file access keeps the seam
+    // private.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(std.testing.allocator, &out);
+    var rw = RegionWriter{ .real = &aw.writer, .table_alloc = std.testing.allocator };
+    rw.feed(" | 节奏 | 完成时间 |\n|---|---|\n| 每天 1 轮 | ~27 天 |\nplain line\n");
+    out = aw.toArrayList();
+    const s = out.items;
+    try std.testing.expect(std.mem.indexOf(u8, s, "|---|") == null); // raw separator gone
+    try std.testing.expect(std.mem.indexOf(u8, s, "\u{2500}") != null); // rule line rendered
+    try std.testing.expect(std.mem.indexOf(u8, s, "节奏") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "plain line") != null);
+}
+
+// ── Phase 0 lock tests (tui-event-loop plan) ─────────────────────────
+// End-to-end readLine through a REAL Io (Threaded) + /dev/null
+// File.Writer + Reader.fixed input. These lock the behaviors the event-
+// loop refactor must preserve verbatim; assertions here must survive
+// every later phase (call shape may change, behavior may not).
+
+/// Shared rig for one readLine call. `input` is the byte stream the
+/// "user" produces.
+const ReadRig = struct {
+    io_state: std.Io.Threaded,
+    devnull: std.Io.File,
+    fw_buf: [64]u8 = undefined,
+    fw: std.Io.File.Writer,
+    aw: std.Io.Writer.Allocating,
+    fr: std.Io.Reader,
+    history: std.ArrayList([]u8) = .empty,
+    alloc: std.mem.Allocator,
+
+    fn init(alloc: std.mem.Allocator, input: []const u8) !ReadRig {
+        var io_state = std.Io.Threaded.init(alloc, .{});
+        const devnull = try std.Io.Dir.openFileAbsolute(io_state.io(), "/dev/null", .{ .mode = .write_only });
+        var rig = ReadRig{
+            .io_state = io_state,
+            .devnull = devnull,
+            .fw = undefined,
+            .aw = .init(alloc),
+            .fr = std.Io.Reader.fixed(input),
+            .alloc = alloc,
+        };
+        rig.fw = std.Io.File.Writer.initStreaming(rig.devnull, rig.io_state.io(), &rig.fw_buf);
+        return rig;
+    }
+
+    fn deinit(self: *ReadRig) void {
+        editorDeinit(self.alloc);
+        self.devnull.close(self.io_state.io());
+        self.io_state.deinit();
+        for (self.history.items) |h| self.alloc.free(h);
+        self.history.deinit(self.alloc);
+        self.aw.deinit();
+    }
+
+    fn call(self: *ReadRig) !?[]u8 {
+        force_editor = true;
+        defer force_editor = false;
+        return readLine(&self.aw.writer, &self.fr, &self.fw, "> ", &self.history, self.alloc);
+    }
+};
+
+test "readLine e2e: multi-line via Shift+Enter CSI-u, Enter submits" {
+    const alloc = std.testing.allocator;
+    var rig = try ReadRig.init(alloc, "line1\x1b[13;2uline2\r");
+    defer rig.deinit();
+    const line = (try rig.call()).?;
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("line1\nline2", line);
+    // Committed echo shows the multi-line body (the typed block is erased
+    // on submit — the echo is its only trace).
+    try std.testing.expect(std.mem.indexOf(u8, rig.aw.written(), "line1\nline2") != null);
+}
+
+test "readLine e2e: big paste folds to a pill, submit expands it back" {
+    const alloc = std.testing.allocator;
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(alloc);
+    for (0..12) |i| {
+        if (i > 0) try blob.append(alloc, '\n');
+        try blob.appendSlice(alloc, "paste line");
+    }
+    const input = try std.fmt.allocPrint(alloc, "\x1b[200~{s}\x1b[201~\r", .{blob.items});
+    defer alloc.free(input);
+
+    var rig = try ReadRig.init(alloc, input);
+    defer rig.deinit();
+    const line = (try rig.call()).?;
+    defer alloc.free(line);
+    // The model must receive the EXACT bytes an unfolded paste would have
+    // produced — markers expanded, all 12 lines intact.
+    try std.testing.expectEqualStrings(blob.items, line);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, 0) == null); // no marker bytes
+}
+
+test "readLine e2e: up-arrow recalls the previous submission" {
+    // Two readLine calls share one history list; each gets its own Io
+    // lifetime (Threaded Io is not re-initiable inside one rig).
+    try runSecondRecall(std.testing.allocator);
+}
+
+fn runSecondRecall(alloc: std.mem.Allocator) !void {
+    var history: std.ArrayList([]u8) = .empty;
+    defer {
+        for (history.items) |h| alloc.free(h);
+        history.deinit(alloc);
+    }
+    {
+        var rig = try ReadRig.init(alloc, "first input\r");
+        defer rig.deinit();
+        rig.history = history; // readLine appends into THIS list
+        const l = (try rig.call()).?;
+        alloc.free(l);
+        history = rig.history;
+        rig.history = .empty; // ownership moved out — deinit must not touch it
+    }
+    {
+        var rig = try ReadRig.init(alloc, "\x1b[A\r");
+        defer rig.deinit();
+        rig.history = history;
+        const l = (try rig.call()).?;
+        defer alloc.free(l);
+        try std.testing.expectEqualStrings("first input", l);
+        history = rig.history;
+        rig.history = .empty;
+    }
+}
+
+test "readLine non-TTY: byte-compat line read, overlong truncated not EOF" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList([]u8) = .empty;
+    defer history.deinit(alloc);
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const devnull = try std.Io.Dir.openFileAbsolute(io_state.io(), "/dev/null", .{ .mode = .write_only });
+    defer devnull.close(io_state.io());
+    var fw_buf: [64]u8 = undefined;
+    var fw = std.Io.File.Writer.initStreaming(devnull, io_state.io(), &fw_buf);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+
+    // force_editor stays false and stdin is not a TTY under the test
+    // runner → the pipe-compatible path, byte-for-byte like the old one.
+    var fr = std.Io.Reader.fixed("hello pipe\nJUNK");
+    const l = try readLine(&aw.writer, &fr, &fw, "> ", &history, alloc);
+    defer alloc.free(l.?);
+    try std.testing.expectEqualStrings("hello pipe", l.?);
+
+    // Overlong: truncated to the fixed 4096, returns a line (NOT null —
+    // the old code mistook WriteFailed for EOF and said Goodbye).
+    const big = try alloc.alloc(u8, 5000);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    big[4999] = '\n';
+    var fr2 = std.Io.Reader.fixed(big);
+    const l2 = try readLine(&aw.writer, &fr2, &fw, "> ", &history, alloc);
+    defer alloc.free(l2.?);
+    try std.testing.expect(l2.?.len == 4096);
+}
+
+test "editorLiveKey: Shift+Enter during generation is a newline, not a cancel" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var fr = std.Io.Reader.fixed("\x1b\r");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, null));
+    try std.testing.expectEqualStrings("\n", ed.buf[0..ed.len]);
 }

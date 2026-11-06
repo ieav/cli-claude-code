@@ -24,6 +24,9 @@ pub const MemorySystem = struct {
 
     pub fn deinit(self: *Self) void {
         self.working_mem.deinit();
+        // Finalize the episodic store's cached statements so the Database
+        // can close cleanly (an open statement makes sqlite3_close BUSY).
+        self.episodic_mem.deinit();
     }
 
     /// Store a memory entry across tiers.

@@ -90,13 +90,14 @@ pub fn buildMemoryBlockAnchored(allocator: std.mem.Allocator, entries: []const t
     const Rank = struct { idx: usize, score: f64 };
     const ranks = try allocator.alloc(Rank, entries.len);
     defer allocator.free(ranks);
+    // One stack vector reused for every row: the old per-row embed()
+    // allocation made the 1000-candidate ranking ~2000 heap ops per call.
+    var ev_buf: [embedding.DIMS]f32 = undefined;
     for (entries, 0..) |e, i| {
         var s: f64 = decayScore(e.updated_at, now);
         if (anchor_vec) |a| {
-            if (embedding.embed(allocator, e.content) catch null) |ev| {
-                defer allocator.free(ev);
-                s = 0.5 * s + 0.5 * @as(f64, embedding.cosine(a, ev));
-            }
+            embedding.embedInto(&ev_buf, e.content);
+            s = 0.5 * s + 0.5 * @as(f64, embedding.cosine(a, &ev_buf));
         }
         ranks[i] = .{ .idx = i, .score = s };
     }
@@ -144,9 +145,10 @@ pub fn buildMemoryBlockAnchored(allocator: std.mem.Allocator, entries: []const t
     }
 
     if (included == 0) return null;
+    // toOwnedSlice hands over the backing buffer — no full-block copy.
     var list = aw.toArrayList();
-    defer list.deinit(allocator);
-    return .{ .text = try allocator.dupe(u8, list.items), .included = included };
+    errdefer list.deinit(allocator); // on a failed takeover the list still owns it
+    return .{ .text = try list.toOwnedSlice(allocator), .included = included };
 }
 
 /// Cap a slice at `max` bytes but never mid-UTF-8-rune: back off to the
@@ -291,6 +293,7 @@ test "end-to-end: store via EpisodicStore, reload, inject" {
     // Session 1: persist.
     {
         var store = episodic.EpisodicStore.init(std.testing.allocator, &db);
+        defer store.deinit(); // finalize cached stmts
         try store.store(.{
             .id = memoryId("session1", "episodic"),
             .mem_type = .user,
@@ -305,6 +308,7 @@ test "end-to-end: store via EpisodicStore, reload, inject" {
 
     // Session 2: reload and inject.
     var store2 = episodic.EpisodicStore.init(std.testing.allocator, &db);
+    defer store2.deinit();
     const entries = try store2.retrieveRecent(20);
     defer store2.freeEntries(entries);
     try std.testing.expect(entries.len == 1);

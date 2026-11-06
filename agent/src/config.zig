@@ -29,7 +29,12 @@ pub const Settings = struct {
     /// beats name-based detection, so custom model names (glm-4.6, deepseek-…)
     /// can be routed through a configured compatible gateway.
     default_backend: ?[]const u8 = null,
-    max_tokens: u32 = 4096,
+    /// Response budget. 16384, not 4096: reasoning models stream their
+    /// thinking as output tokens (GLM reasoning_content, Claude thinking),
+    /// and a heavy turn can burn 4K+ before writing a word of the actual
+    /// answer — at 4096 the model literally ran out of room mid-thought
+    /// (the "out=4096, zero content" empty-response pathology).
+    max_tokens: u32 = 16384,
     /// Cross-session memory injection budget (tokens): how much of the
     /// system prompt the memory block may occupy. Manual knob (T1.1);
     /// adaptive per-model scaling arrives with T1.2. 1200 default — 800
@@ -40,6 +45,11 @@ pub const Settings = struct {
     /// (escape hatch); clamped to 1..8 on load — values beyond the
     /// per-dispatch task cap (3) simply mean "all tasks parallel".
     subagent_concurrency: u32 = 3,
+    /// Agent-loop iterations per turn (LLM rounds). A systematic
+    /// debugging marathon legitimately needs more than 50 — reaching the
+    /// cap now prefills 「继续」 instead of a bare stop; raise via
+    /// settings.json. Clamp at parse: 1..200.
+    agent_loop_limit: u32 = 50,
     max_snapshots: u32 = 100,
     checkpointing_enabled: bool = true,
     system_prompt: ?[]const u8 = null,
@@ -180,6 +190,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getInt(value, "subagent_concurrency")) |sc| {
         if (sc >= 1 and sc <= 8) {
             settings.subagent_concurrency = @intCast(sc);
+        }
+    }
+    if (json_helpers.getInt(value, "agent_loop_limit")) |al| {
+        if (al >= 1 and al <= 200) {
+            settings.agent_loop_limit = @intCast(al);
         }
     }
     if (json_helpers.getBool(value, "checkpointing_enabled")) |ce| {
@@ -361,6 +376,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     buf.print(allocator, "  \"max_tokens\": {d},\n", .{settings.max_tokens}) catch {};
     buf.print(allocator, "  \"memory_budget_tokens\": {d},\n", .{settings.memory_budget_tokens}) catch {};
     buf.print(allocator, "  \"subagent_concurrency\": {d},\n", .{settings.subagent_concurrency}) catch {};
+    buf.print(allocator, "  \"agent_loop_limit\": {d},\n", .{settings.agent_loop_limit}) catch {};
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};

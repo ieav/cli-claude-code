@@ -49,12 +49,12 @@ test {
     _ = @import("runtime/self_diagnostic.zig");
     _ = @import("storage/database.zig");
     _ = @import("storage/vector.zig");
-    _ = @import("util/stream_interrupt.zig");
     _ = @import("task/cron.zig");
     _ = @import("task/event_bus.zig");
     _ = @import("task/mpsc_queue.zig");
     _ = @import("task/thread_pool.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/agent_e2e.zig");
     _ = @import("tools/auth_mode.zig");
     _ = @import("tools/classifier.zig");
     _ = @import("tools/denial_tracker.zig");
@@ -213,8 +213,13 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    // Start REPL
+    // Start REPL. Every exit path (/quit, EOF, double Ctrl-C) unwinds to
+    // here — run registered shutdown handlers (bash tool group-kill and
+    // anything else registered via util/cleanup.zig) on the way out. The
+    // registry existed but runAll() was never wired, so nothing ever ran.
     const repl = @import("repl.zig");
+    const cleanup = @import("util/cleanup.zig");
+    defer cleanup.runAll();
     try repl.run(io, stdin_file, stdout_file);
 }
 

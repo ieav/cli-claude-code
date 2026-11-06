@@ -62,9 +62,11 @@ fn isLeapYear(year: i32) bool {
     return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
 }
 
-/// Sleep for a given number of milliseconds.
+/// Sleep for a given number of milliseconds (std.time.sleep is gone in
+/// 0.17 — nanosleep directly, same as the thread pool's poll backoff).
 pub fn sleepMs(ms: u64) void {
-    std.time.sleep(ms * std.time.ns_per_ms);
+    var req: std.c.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
+    _ = std.c.nanosleep(&req, null);
 }
 
 /// Local date/time parts. `weekday` is 0=Sunday .. 6=Saturday.

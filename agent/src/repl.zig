@@ -35,16 +35,19 @@ const database_mod = @import("storage/database.zig");
 const math_mod = @import("math/mod.zig");
 const embedding_mod = @import("util/embedding.zig");
 const tokens_mod = @import("util/tokens.zig");
+const mpsc_queue = @import("task/mpsc_queue.zig");
 const task_mod = @import("task/mod.zig");
 const agent_dispatch = @import("tools/agent_dispatch.zig");
-
 
 const knowledge_search = @import("knowledge/search.zig");
 const knowledge_graph = @import("knowledge/graph.zig");
 const researcher_mod = @import("research/optimization_researcher.zig");
 const env = @import("util/env.zig");
+const turn_clock = @import("util/turn_clock.zig");
+const task_store = @import("tools/task_store.zig");
 const format_mod = @import("util/format.zig");
 const diff_util = @import("util/diff.zig");
+const cancel_mod = @import("util/cancel.zig");
 const llm_watchdog = @import("util/llm_watchdog.zig");
 const self_diagnostic = @import("runtime/self_diagnostic.zig");
 const decision_trace = @import("runtime/decision_trace.zig");
@@ -53,13 +56,24 @@ const runtime_rules = @import("runtime/rules.zig");
 const error_handler = @import("runtime/error_handler.zig");
 const allocator = std.heap.smp_allocator;
 
-const MAX_AGENT_ITERATIONS: usize = 50;
+/// The REPL's cron scheduler, for mid-turn UI slices (same pattern as
+/// lineinput.setSessionGuard): drainDue used to run ONLY at the loop
+/// top, so a marathon turn starved health checks and memory decay for
+/// its entire duration. Both turn-phase UI loops (streaming + tools)
+/// now drain due tasks on their quiet 100ms slices.
+var cron_ptr: ?*task_mod.CronScheduler = null;
+
+// Agent-loop cap lives in settings.agent_loop_limit (default 50, clamp
+// 1..200) — see the turn loop's max_agent_iters.
 const MAX_CONTEXT_TOKENS: u32 = 128_000;
 
 /// Code-change diff preview (TUI) — see renderCodeDiff. Cap one edit's
 /// block at 15 rows × 110 display columns so a big rewrite can't flood
 /// the screen; oversized files skip the preview instead of diffing them.
-const DIFF_MAX_LINES: usize = 15;
+/// v0.7.5 (user call): show the WHOLE diff — no folding. The cap only
+/// guards pathological sizes (a 1000-line generated blob would flood the
+/// screen past any usefulness).
+const DIFF_MAX_LINES: usize = 1000;
 const DIFF_MAX_COLS: usize = 110;
 const DIFF_MAX_DIFFABLE_LINES: usize = 800;
 const DIFF_READ_CAP: usize = 1024 * 1024;
@@ -255,10 +269,32 @@ const ModelSwitcher = struct {
 };
 
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
+    // Terminal-write serialization needs the Io instance (std.Io.Mutex
+    // lock/unlock take it) — inject before any region call below.
+    lineinput.setIo(io);
+    // SESSION-scoped raw mode (2026-11-06): raw used to be entered per
+    // readLine call, so the tty sat in cooked+echo for every entire TURN —
+    // the line discipline echoed mid-turn keystrokes as ^[[C/^R garbage
+    // and line-buffered input away from the editor. One guard for the
+    // whole session; every exit path restores via defer, crashes via the
+    // guard's INT/TERM signal restore. Mid-turn y/N gates temporarily go
+    // cooked (menu.CookedGuard) around their reads.
+    var tty_guard = menu.RawGuard{};
+    tty_guard.enterNoSig();
+    defer tty_guard.restore();
+    lineinput.setSessionGuard(&tty_guard); // Ctrl-Z manual suspend needs it
     // Writer setup
     var write_buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.Writer.initStreaming(stdout_file, io, &write_buf);
     const w = &file_writer.interface;
+    // Turn-body transcript writer (P0-b mechanism): funnels every business
+    // print through the live-region protocol — line-atomic ABOVE the
+    // region while it is up, verbatim passthrough while it is down. A
+    // direct write over the persistent input row (the diff-preview bug
+    // class) becomes impossible; the region MECHANICS calls
+    // (regionBegin/End/Freeze/Status, editorLiveKey) keep using `w`.
+    var region_wr = lineinput.RegionWriter{ .real = w, .table_alloc = allocator };
+    const ow = &region_wr.interface;
 
     // Reader setup
     var read_buf: [4096]u8 = undefined;
@@ -296,6 +332,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // ──── Persistent memory (episodic tier, cross-session) ────
     var injected_count: usize = 0;
     std.Io.Dir.cwd().createDirPath(io, ".ziv") catch {};
+    // Persistent diagnostics: the interactive-stderr mute hides every log
+    // line in TUI mode, so gateway failures used to leave no trail at all.
+    logger.setLogFile(io, ".ziv/logs");
     var mem_db: ?database_mod.Database = blk: {
         var db = database_mod.Database.init(allocator, ".ziv/memory.db") catch break :blk null;
         db.runMigrations() catch {
@@ -316,6 +355,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         knowledge_graph.KnowledgeGraph.init(allocator, &mem_db.?)
     else
         null;
+    defer if (kgraph) |*g| g.deinit(); // finalize cached stmts before db close
 
     // ──── P3: runtime layer — typed event bus + cron (main-thread exec) ────
     // Threading contract: the bus emits ONLY on the main thread; the cron
@@ -328,6 +368,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     monitor.setEventBus(&evbus);
     // Live stats the health check reads (updated in the main loop below).
     var live_llm_calls = std.atomic.Value(u32).init(0);
+    var live_llm_429s = std.atomic.Value(u32).init(0); // real 429s → monitor rule
     var live_est_tokens = std.atomic.Value(u32).init(0);
     // Test hook: ZIV_CRON_SCALE=60 compresses the timeline (81.5min → ~82s)
     // so scheduled maintenance is observable in a smoke run.
@@ -342,12 +383,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .monitor = &monitor,
         .bus = &evbus,
         .w = w,
+        .ow = ow,
+        .file_writer = &file_writer,
         .switcher = &switcher,
         .llm_calls = &live_llm_calls,
+        .llm_429s = &live_llm_429s,
         .est_tokens = &live_est_tokens,
     };
     var cron = task_mod.CronScheduler.init(allocator);
     defer cron.deinit();
+    cron_ptr = &cron;
+    defer cron_ptr = null;
     if (mem_db != null) {
         cron.addTask(.{
             .name = "memory_decay",
@@ -426,8 +472,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // Candidate pool of 200, not 20: the e-decay + cosine ranking only
         // reorders what SQL already returned — with LIMIT 20, older
         // high-value memories were evicted before ranking ever saw them.
-        if (ms.episodic_mem.retrieveRecent(200) catch null) |entries| {
-            defer ms.episodic_mem.freeEntries(entries);
+        // Arena-owned rows: ~3000 per-row dupes collapse into one reset.
+        var rows_arena = std.heap.ArenaAllocator.init(allocator);
+        defer rows_arena.deinit();
+        if (ms.episodic_mem.retrieveRecentArena(rows_arena.allocator(), 1000) catch null) |entries| {
             // T1.2: scale the manual budget by the active model's context
             // window (8K→x0.66 … 128K→x1.66) — small local models keep a
             // lean workspace, large contexts get recall headroom.
@@ -502,7 +550,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // the user" actually asks (it used to return "(Awaiting user response)"
     // and the model kept going on a fabricated answer). Attached before any
     // defs cache is built.
-    var ask_ctx = AskUserCtx{ .r = r, .w = w, .file_writer = &file_writer };
+    var ask_ctx = AskUserCtx{ .r = r, .w = w, .ow = ow, .file_writer = &file_writer };
     for (reg.entries.items) |*entry| {
         if (std.mem.eql(u8, entry.def.name, "AskUserQuestion")) {
             entry.def.execute_ctx_fn = askUserExecute;
@@ -534,18 +582,22 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
     };
-    // T6.4 status: the subagent dispatch tool is conservatively DISABLED
-    // by default. The old "intermittent hang after an agent-tool turn" was
-    // root-caused on 2026-10-30 (TODO P38): the gateway occasionally
+    // T6.4 status: the subagent dispatch tool is ENABLED by default
+    // (2026-11-04). The old "intermittent hang after an agent-tool turn"
+    // was root-caused on 2026-10-30 (TODO P38): the gateway occasionally
     // accepts a request and then never answers, and the provider layer had
     // no timeout — the dynamic-tool path itself was exonerated. Every LLM
     // request is now guarded by the stall watchdog (util/llm_watchdog.zig,
-    // default 180s, ZIV_LLM_TIMEOUT_MS), so the default could flip back on
-    // after a default-on E2E re-validation; until then opt in with
-    // ZIV_AGENT_TOOL=1.
+    // default 180s idle — pushed forward by every received byte since
+    // 2026-11-05, ZIV_LLM_TIMEOUT_MS), and the default-on E2E
+    // re-validation ran both shapes against a real mock gateway
+    // (tests/agent_e2e.zig): happy fan-out AND the P38 stall (gateway
+    // accepts, never answers → watchdog kills → fail-fast retry fails →
+    // dispatch still returns merged output, bounded). Opt OUT with
+    // ZIV_AGENT_TOOL=0 / false.
     const agent_tool_enabled = blk: {
-        const v = env.get("ZIV_AGENT_TOOL") orelse break :blk false;
-        break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+        const v = env.get("ZIV_AGENT_TOOL") orelse break :blk true;
+        break :blk !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
     };
     if (agent_tool_enabled) reg.registerDynamic(
         "agent",
@@ -642,6 +694,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ctx_ceiling)) * 100.0));
         var prompt_buf: [160]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
+        // The turn-scoped live region's input row renders with this SAME
+        // prefix — one input area identity across turn and prompt.
+        lineinput.regionPromptSet(prompt);
 
         // Read line via the raw-mode editor: arrows move the cursor,
         // up/down walk history (or move between lines on multi-line input),
@@ -655,7 +710,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             auto_submit = null;
             maybe_line = a;
             lineinput.regionEnd(w);
-            std.Io.Writer.print(w, "  ↳ 自动发送排队消息\n", .{}) catch {};
+            // The auto-sent message gets the committed echo UNLESS the
+            // queue-time echo already showed it (with its ↳ 已排队 marker).
+            if (!lineinput.last_take_echoed) lineinput.echoCommittedDirect(w, a);
+            std.Io.File.Writer.flush(&file_writer) catch {};
         } else {
             maybe_line = lineinput.readLine(w, r, &file_writer, prompt, &input_history, allocator) catch |err| {
                 std.debug.print("Error reading input: {}\n", .{err});
@@ -669,7 +727,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Extract first, reflect last — see the /quit path note.
             if (mem_sys) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
+                extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {
@@ -706,16 +764,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // used to lose the whole session's learnings.
                 if (mem_sys) |*ms| {
                     const ext_t0 = util_time.nowMillis();
-                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
-                // Best-effort drain: an insight that already landed in the
-                // inbox is stored now; one still in flight dies with the
-                // process (the heuristic reflection was stored synchronously
-                // above — nothing of value blocks on a detached thread).
-                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
+                    // Best-effort drain: an insight that already landed in the
+                    // inbox is stored now; one still in flight dies with the
+                    // process (the heuristic reflection was stored synchronously
+                    // above — nothing of value blocks on a detached thread).
+                    drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
+                }
+                // Visibility: queued-but-unsent messages die with the
+                // session — say so instead of dropping silently.
+                if (lineinput.queuedHas()) {
+                    try std.Io.Writer.print(w, "\x1b[2m  [{d} 条排队消息未发送，已丢弃]\x1b[0m\n", .{lineinput.queuedCount()});
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -855,7 +918,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 };
-                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, &file_writer, &denial_state)) continue;
+                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state)) continue;
 
                 // Backup file before modification (for /run commands)
                 var run_snap_id: ?[16]u8 = null;
@@ -880,6 +943,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 };
+
+                // Same /last ring as agent-loop calls (finishToolCall) —
+                // the expansion valve must cover manual /run too.
+                LastTools.push(tool_name, result.output);
 
                 if (result.is_error) {
                     try std.Io.Writer.print(w, "  ERROR: {s}\n\n", .{result.output});
@@ -937,10 +1004,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // this session, not after the next restart.
                 reapplySystemPromptIfNeeded(&applied_prompt_setting, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt);
                 continue;
-            } else if (std.mem.eql(u8, input, "/compact")) {
-                // Claude-style: LLM summarizes the conversation, the summary
-                // replaces the history (context condensed, not dropped).
-                try compactHistory(&history, &switcher, &log, allocator, w, &file_writer, &total_input_tokens, &total_output_tokens);
+            } else if (std.mem.eql(u8, input, "/compact") or std.mem.startsWith(u8, input, "/compact ")) {
+                // Claude-style: LLM summarizes the OLDER conversation; the
+                // summary replaces it and the most recent messages are kept
+                // verbatim (v0.7.7 — the old version summarized everything,
+                // including what you just said). Optional free text after
+                // the command steers the summary:
+                //   /compact 重点保留数据库迁移的决策
+                const focus = std.mem.trim(u8, input["/compact".len..], " \t");
+                if (std.mem.eql(u8, focus, "phi")) continue; // handled below
+                try compactHistory(&history, &switcher, &log, allocator, w, &file_writer, &total_input_tokens, &total_output_tokens, focus);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/compact phi")) {
@@ -959,16 +1032,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // used to lose the whole session's learnings.
                 if (mem_sys) |*ms| {
                     const ext_t0 = util_time.nowMillis();
-                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w) catch {};
+                    extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
                     logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
                 }
                 if (mem_sys != null and window_queries.items.len > 0) {
                     runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
-                // Best-effort drain: an insight that already landed in the
-                // inbox is stored now; one still in flight dies with the
-                // process (the heuristic reflection was stored synchronously
-                // above — nothing of value blocks on a detached thread).
-                drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
+                    // Best-effort drain: an insight that already landed in the
+                    // inbox is stored now; one still in flight dies with the
+                    // process (the heuristic reflection was stored synchronously
+                    // above — nothing of value blocks on a detached thread).
+                    drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
                 }
                 clearHistory(&history, allocator);
                 log.bumpEpoch();
@@ -1007,6 +1080,77 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 continue;
             } else if (std.mem.eql(u8, input, "/context")) {
                 try showContext(&history, total_input_tokens, total_output_tokens, w);
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/trace")) {
+                // P2: per-step timing of the last turn, read straight from
+                // the .ziv/traces/*.jsonl the turn-end telemetry wrote —
+                // the data has existed since 2026-11-05, this is its
+                // in-TUI window.
+                if (turn_clock.tracePath().len == 0) {
+                    try std.Io.Writer.print(w, "  本会话尚无 trace（任一回合结束后生成；ZIV_TRACE=0 可关闭落盘）\n\n", .{});
+                } else {
+                    const tpath = turn_clock.tracePath();
+                    var fbuf: [131072]u8 = undefined;
+                    if (std.Io.Dir.cwd().readFile(io, tpath, &fbuf)) |data| {
+                        var lines_it = std.mem.splitScalar(u8, data, '\n');
+                        const header = lines_it.next() orelse "";
+                        var qb: [96]u8 = undefined;
+                        const qtxt = traceHeaderSummary(header, &qb) catch "（表头解析失败）";
+                        try std.Io.Writer.print(w, "  ⏱ 上一回合 {s}\n", .{qtxt});
+                        var step_no: usize = 0;
+                        while (lines_it.next()) |ln| {
+                            if (ln.len == 0) continue;
+                            step_no += 1;
+                            if (step_no > 80) break;
+                            var sb: [96]u8 = undefined;
+                            if (traceStepSummary(ln, &sb)) |s| {
+                                try std.Io.Writer.print(w, "    {d:>3}. {s}\n", .{ step_no, s });
+                            }
+                        }
+                        if (step_no > 80) try std.Io.Writer.print(w, "    …（超 80 步截断；全量见文件）\n", .{});
+                        try std.Io.Writer.print(w, "  文件: {s}\n\n", .{tpath});
+                    } else |_| {
+                        try std.Io.Writer.print(w, "  读取 trace 失败（文件可能已被移动）: {s}\n\n", .{tpath});
+                    }
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/tasks")) {
+                // ②: the task system (TaskCreate/TaskUpdate) had a full
+                // store + render() but no TUI surface at all.
+                const ts = task_store.global();
+                if (ts.count() == 0) {
+                    try std.Io.Writer.print(w, "  任务列表为空（模型用 TaskCreate 建任务后在此查看进度）\n\n", .{});
+                } else {
+                    const rendered = ts.render(allocator) catch {
+                        try std.Io.Writer.print(w, "  任务列表渲染失败\n\n", .{});
+                        try std.Io.File.Writer.flush(&file_writer);
+                        continue;
+                    };
+                    defer allocator.free(rendered);
+                    try std.Io.Writer.print(w, "{s}\n", .{rendered});
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                continue;
+            } else if (std.mem.eql(u8, input, "/last") or std.mem.startsWith(u8, input, "/last ")) {
+                // ③: full output of a recent tool — the one-line preview in
+                // the transcript deliberately truncates; this is the
+                // expansion valve (/last = newest, /last 3 = third newest).
+                var n: usize = 1;
+                if (std.mem.startsWith(u8, input, "/last ")) {
+                    const arg = std.mem.trim(u8, input["/last ".len..], " \t");
+                    n = std.fmt.parseInt(usize, arg, 10) catch 1;
+                }
+                if (LastTools.get(n)) |e| {
+                    try std.Io.Writer.print(w, "  ── {s}（最近第 {d} 条，{d} 字节）──\n", .{ e.name, n, e.output.len });
+                    var at_ls = false;
+                    try writeMarginLines(w, e.output, "  ", &at_ls);
+                    if (!at_ls) try std.Io.Writer.writeAll(w, "\n");
+                    try std.Io.Writer.writeAll(w, "\n");
+                } else {
+                    try std.Io.Writer.print(w, "  无记录（/last=最近一条，/last N=第 N 近，最多保留 {d} 条）\n\n", .{LastTools.N});
+                }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/memory")) {
@@ -1294,20 +1438,74 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // One emergency compaction per turn on ContextOverflow — a second
         // overflow after compacting falls through to the manual hint.
         var overflow_compacted = false;
-        // P5 per-turn write cap (context protection — see the batch loop).
-        var turn_writes: usize = 0;
-        const MAX_TURN_WRITES: usize = 15;
+        // ① Turn summary: tokens accumulate across the turn's generations
+        // and surface ONCE — in the status row the region FREEZES at turn
+        // end — instead of a stat line after every generation.
+        const turn_t0 = util_time.nowMillis();
+        var turn_in: u64 = 0;
+        var turn_out: u64 = 0;
+        // ① Turn timing — same clock (util_time.nowMillis) and same
+        // boundaries everywhere downstream: LLM = per generation
+        // (llm_t0 → accepted response), tools = per batch (batch_t0 →
+        // all results collected), turn = turn_t0 → teardown. Surfaced in
+        // the frozen turn-end status row + ziv.log + .ziv/traces/*.jsonl.
+        var turn_llm_ms: i64 = 0;
+        var turn_llm_calls: u32 = 0;
+        var turn_tool_ms: i64 = 0;
+        var turn_tool_calls: u32 = 0;
 
-        while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
-            // Compaction check + context estimate in one pass.
-            est_ctx = maybeCompact(&history, allocator, w, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+        // The live region (status row + prompt-identical input row) now
+        // spans the WHOLE turn: begun once here, ended once after the
+        // loop. Generations and tool rounds only swap the STATUS text —
+        // the input row never disappears mid-turn (the old per-phase
+        // begin/end flickered the bottom two rows on every iteration).
+        // Transcript prints inside the loop go through `ow` (region-aware);
+        // only the region lifecycle calls below keep `w`.
+        turn_clock.turnStart(turn_t0);
+        lineinput.regionBegin(w, "⏳ 本轮 0.0s · 累计 0.0s · Esc 中断 · Enter 排队");
+        // v0.7.7: context low-water WARNING (Claude-Code parity) — one dim
+        // transcript line at >=80% of the model's ceiling, before the φ
+        // auto-compaction ever fires, so the squeeze is never a surprise.
+        var ctx_warned = false;
+
+        // Per-turn read (hot-reloadable): settings.json agent_loop_limit,
+        // clamped at parse. The hard 50 cut mid-investigation on a
+        // debugging marathon (53 tools / 29 min) motivated the knob +
+        // the 「继续」 prefill below.
+        const max_agent_iters: usize = @max(1, switcher.settings.agent_loop_limit);
+
+        while (agent_iterations < max_agent_iters) : (agent_iterations += 1) {
+            // Compaction check + context estimate in one pass. (v0.7.6:
+            // the old per-turn WRITE cap (15) is gone — the Claude-Code/
+            // Codex model gates on CONTEXT PRESSURE, not write counts:
+            // compaction runs first, and only when the estimate stays
+            // above the guard AFTER compacting does the turn end. Long
+            // multi-file tasks now run to completion inside one turn.)
+            est_ctx = maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+            {
+                const ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
+                const warn_pct = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                if (!ctx_warned and warn_pct >= 0.80) {
+                    ctx_warned = true;
+                    std.Io.Writer.print(ow, "\x1b[2m  [上下文已用 {d}% — 接近自动压缩水位。/compact 可手动提前压缩]\x1b[0m\n", .{@as(u32, @intFromFloat(warn_pct * 100.0))}) catch {};
+                    try std.Io.File.Writer.flush(&file_writer);
+                }
+                const pct = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                if (pct > 0.92) {
+                    const pct100: u32 = @intFromFloat(pct * 100.0);
+                    std.Io.Writer.print(ow, "\x1b[2m  [上下文压力 {d}% — 自动压缩后仍接近上限，本回合到此为止。发送新消息继续；/clear 可立即释放]\x1b[0m\n", .{pct100}) catch {};
+                    try std.Io.File.Writer.flush(&file_writer);
+                    break;
+                }
+            }
 
             // Get provider
             const prov = switcher.getProvider() catch |err| {
+                lineinput.regionEnd(w);
                 if (err == error.MissingApiKey) {
-                    try std.Io.Writer.print(w, "  [No API key for {s} — use /config to set it]\n\n", .{switcher.backendLabel()});
+                    try std.Io.Writer.print(ow, "  [No API key for {s} — use /config to set it]\n\n", .{switcher.backendLabel()});
                 } else {
-                    try std.Io.Writer.print(w, "  [Provider error: {}]\n\n", .{err});
+                    try std.Io.Writer.print(ow, "  [Provider error: {}]\n\n", .{err});
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
@@ -1327,22 +1525,25 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             });
             // Stream the response: text deltas print live as they arrive.
             const llm_t0 = util_time.nowMillis();
-            const response = streamComplete(prov, history.items, .{
+            var had_thinking = false;
+            const first_resp = streamComplete(prov, history.items, .{
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
                 // Declare the tools so the model can actually call them.
                 .tools = reg.toolSpecs(),
-                // Interactive stream: Esc/Ctrl-C must work even when the
-                // gateway stalls silently (no events → the in-stream esc
-                // probe never runs; this flag makes the idle socket wait
-                // itself interruptible).
-                .esc_interrupt = true,
-            }, r, w, &file_writer, allocator) catch |err| {
+                // Interactive stream: the UI loop's cancel flag (P2) —
+                // Esc/Ctrl-C fails the pump's idle wait cross-thread.
+                .cancel_flag = null, // set by streamComplete's StreamJob
+            }, r, w, ow, &file_writer, allocator, &had_thinking) catch |err| {
+                // The region stays up through streamComplete's error
+                // returns — turn-ENDING paths drop it before printing,
+                // turn-CONTINUING paths print above it.
                 if (err == error.EscCancelled) {
                     // Esc: abort this exchange and pull the input back into
                     // the editor (history keeps the user message; no
                     // assistant reply was appended).
-                    try std.Io.Writer.print(w, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
+                    lineinput.regionEnd(w);
+                    try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
                     lineinput.recall_prefill = true;
                     try std.Io.File.Writer.flush(&file_writer);
@@ -1355,11 +1556,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // generation from the same history.
                     if (ttft_retries < 2) {
                         ttft_retries += 1;
-                        try std.Io.Writer.print(w, "\x1b[2m  [网关 {d}s 无响应 — 自动重试 {d}/2…]\x1b[0m\n", .{ @divTrunc(llm_watchdog.currentTtftMs(), 1000), ttft_retries });
+                        std.Io.Writer.print(ow, "\x1b[2m  [网关 {d}s 无响应 — 自动重试 {d}/2…]\x1b[0m\n", .{ @divTrunc(llm_watchdog.currentTtftMs(), 1000), ttft_retries }) catch {};
                         try std.Io.File.Writer.flush(&file_writer);
                         continue;
                     }
-                    try std.Io.Writer.print(w, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合。Esc 可中断，请检查网关或稍后重发]\x1b[0m\n\n", .{});
+                    lineinput.regionEnd(w);
+                    try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合]\x1b[0m\n", .{});
+                    // P3 recoverable give-up: prefill 「继续」 — one Enter
+                    // resumes the task as a fresh turn (proven 2026-11-05:
+                    // a "继续" turn picked the task up cleanly and history
+                    // pairs stay legal — see trace 1793893733712).
+                    try std.Io.Writer.print(ow, "\x1b[2m  [输入区已预填「继续」：网关恢复后 Enter 即接续任务；也可直接改成其他输入]\x1b[0m\n\n", .{});
+                    lineinput.recall_text = "继续";
+                    lineinput.recall_prefill = true;
                     try std.Io.File.Writer.flush(&file_writer);
                     break;
                 }
@@ -1371,11 +1580,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     overflow_compacted = true;
                     applyFactsUpdate(&history, &facts_block, allocator, compactHistoryImpl(&history, allocator, facts_block));
                     log.bumpEpoch();
-                    try std.Io.Writer.print(w, "  [Context overflow — history auto-compacted, retrying]\n", .{});
+                    std.Io.Writer.print(ow, "  [Context overflow — history auto-compacted, retrying]\n", .{}) catch {};
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 }
-                try std.Io.Writer.print(w, "  [LLM error: {}]\n", .{err});
+                lineinput.regionEnd(w);
+                if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic); // monitor: real-429 evidence
+                try std.Io.Writer.print(ow, "  [LLM error: {}]\n", .{err});
                 // Designed error-feedback closure (§四): classified analysis
                 // + numbered fixes with the recommended one marked. The
                 // formatter existed since v0.3 with zero callers.
@@ -1391,21 +1602,88 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             allocator.free(report.analysis);
                             allocator.free(report.fixes);
                         }
-                        try std.Io.Writer.print(w, "  {s}\n", .{report.analysis});
+                        try std.Io.Writer.print(ow, "  {s}\n", .{report.analysis});
                         for (report.fixes) |f| {
-                            try std.Io.Writer.print(w, "    [{d}] {s}{s}\n", .{ f.index, f.description, if (f.is_recommended) " ★" else "" });
+                            try std.Io.Writer.print(ow, "    [{d}] {s}{s}\n", .{ f.index, f.description, if (f.is_recommended) " ★" else "" });
                         }
                     } else |_| {}
                 }
                 if (err == error.ContextOverflow) {
-                    try std.Io.Writer.print(w, "  [Still too long after compaction — try /compact phi or /clear]\n", .{});
-                } else if (err == error.InvalidRequest) {
-                    try std.Io.Writer.print(w, "  [The gateway rejected the request — its reason is on the [ERR] body line above]\n", .{});
+                    try std.Io.Writer.print(ow, "  [Still too long after compaction — try /compact phi or /clear]\n", .{});
                 }
-                try std.Io.Writer.writeAll(w, "\n");
+                // The gateway's own reason, surfaced through the provider's
+                // structured error-detail channel (no more "see the [ERR]
+                // log line above" — the reason belongs IN the interface).
+                if (llm.provider.lastErrorDetail().len > 0) {
+                    var db: [520]u8 = undefined;
+                    const dline = std.fmt.bufPrint(&db, "  \x1b[2m[网关返回: {s}]\x1b[0m\n", .{llm.provider.lastErrorDetail()}) catch "";
+                    try std.Io.Writer.writeAll(ow, dline);
+                }
+                // Point at the persistent trail — the TUI mutes stderr, so
+                // without this hint a session's diagnostics are invisible.
+                if (logger.logFilePath().len > 0) {
+                    var lb: [300]u8 = undefined;
+                    const lline = std.fmt.bufPrint(&lb, "  \x1b[2m[详细日志: {s}，上一会话在同目录 ziv.log.prev]\x1b[0m\n", .{logger.logFilePath()}) catch "";
+                    try std.Io.Writer.writeAll(ow, lline);
+                }
+                try std.Io.Writer.writeAll(ow, "\n");
                 try std.Io.File.Writer.flush(&file_writer);
                 break;
             };
+
+            // Reasoning-budget escalation: a thinking model can spend the
+            // ENTIRE output cap on reasoning_content — zero visible text,
+            // out == max_tokens. Resending at the same cap reproduces the
+            // failure (the old "[…如非预期可重发]" advice was a trap), so
+            // escalate the budget level by level instead.
+            var response = first_resp;
+            var eff_cap = switcher.settings.max_tokens;
+            if (response.content.len == 0 and eff_cap < MAX_OUTPUT_BUDGET and
+                outputBudgetExhausted(response.stop_reason, response.usage.output_tokens, eff_cap))
+            {
+                var esc_after_retry = false;
+                while (eff_cap < MAX_OUTPUT_BUDGET) {
+                    const prev_cap = eff_cap;
+                    eff_cap = @min(eff_cap * 2, MAX_OUTPUT_BUDGET);
+                    logger.info("budget escalation: out={d} == cap {d} with 0 content blocks, retrying at max_tokens={d}", .{ response.usage.output_tokens, prev_cap, eff_cap });
+                    std.Io.Writer.print(ow, "\x1b[2m  [思考耗尽输出预算（out={d} = 上限 {d}，正文 0）— 以 {d} tokens 预算重试…]\x1b[0m\n", .{
+                        response.usage.output_tokens, prev_cap, eff_cap,
+                    }) catch {};
+                    try std.Io.File.Writer.flush(&file_writer);
+                    const next = streamComplete(prov, history.items, .{
+                        .max_tokens = eff_cap,
+                        .temperature = 0.7,
+                        .tools = reg.toolSpecs(),
+                        .cancel_flag = null,
+                    }, r, w, ow, &file_writer, allocator, &had_thinking) catch |err2| {
+                        if (err2 == error.EscCancelled) {
+                            esc_after_retry = true; // the Esc recall below owns the messaging
+                        } else {
+                            logger.info("budget escalation retry failed: {s}", .{@errorName(err2)});
+                            std.Io.Writer.print(ow, "  \x1b[2m[预算重试失败：{s} — 见下方诊断]\x1b[0m\n", .{@errorName(err2)}) catch {};
+                        }
+                        break;
+                    };
+                    // The discarded attempt's tokens were really spent —
+                    // count them before it falls out of the totals.
+                    total_input_tokens += response.usage.input_tokens;
+                    total_output_tokens += response.usage.output_tokens;
+                    turn_in += response.usage.input_tokens;
+                    turn_out += response.usage.output_tokens;
+                    response = next;
+                    if (response.content.len > 0) break; // recovered
+                    if (!outputBudgetExhausted(response.stop_reason, response.usage.output_tokens, eff_cap)) break; // empty but not capped — escalating won't help
+                }
+                if (esc_after_retry) {
+                    // Same recall path as the main Esc branch above.
+                    lineinput.regionEnd(w);
+                    try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
+                    lineinput.recall_text = last_sent;
+                    lineinput.recall_prefill = true;
+                    try std.Io.File.Writer.flush(&file_writer);
+                    break;
+                }
+            }
 
             logger.info("LLM response: stop={s} tokens_in={d} tokens_out={d} blocks={d}", .{
                 @tagName(response.stop_reason),
@@ -1414,9 +1692,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 response.content.len,
             });
 
-            // Track token usage
+            // Track token usage — session totals plus the ① turn summary
+            // (surfaced once, in the frozen turn-end status row).
             total_input_tokens += response.usage.input_tokens;
             total_output_tokens += response.usage.output_tokens;
+            turn_in += response.usage.input_tokens;
+            turn_out += response.usage.output_tokens;
+            // Timing 口径: one window per generation, llm_t0 → accepted
+            // response. The rare budget-escalation retry keeps the same
+            // llm_t0, folding the discarded attempt into this window — a
+            // bounded overcount, simpler than threading a second t0
+            // through the escalation loop.
+            turn_llm_calls += 1;
+            turn_clock.roundDone(turn_llm_calls); // StreamJob ticker mirror
+            turn_llm_ms += util_time.nowMillis() - llm_t0;
 
             // Live decision trace: generation step.
             if (live_trace) |*t| {
@@ -1433,24 +1722,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .tool_use => {},
                     .tool_result => |tr| {
                         const label = if (tr.is_error) "error" else "result";
-                        try std.Io.Writer.print(w, "  [tool {s}: ", .{label});
+                        try std.Io.Writer.print(ow, "  [tool {s}: ", .{label});
                         var at_ls = false;
-                        try writeMarginLines(w, tr.content, "  ", &at_ls);
-                        try std.Io.Writer.writeAll(w, "]\n");
+                        try writeMarginLines(ow, tr.content, "  ", &at_ls);
+                        try std.Io.Writer.writeAll(ow, "]\n");
                     },
                     else => {},
                 }
             }
-            const llm_elapsed_s = @as(f64, @floatFromInt(util_time.nowMillis() - llm_t0)) / 1000.0;
             _ = live_llm_calls.fetchAdd(1, .monotonic); // P3: health-check api-rate signal
-            // Compact dim stat line — in/out is the number user asked about
-            // by name; hist/stop reason carried no decision value.
-            try std.Io.Writer.print(w, "\x1b[2m  [{s} · in {d} → out {d} · {d:.1}s]\x1b[0m\n", .{
-                switcher.modelName(),
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                llm_elapsed_s,
-            });
+            // ① The per-generation stat line is gone: in/out surfaces once,
+            // in the turn-end status row the region freezes below.
             try std.Io.File.Writer.flush(&file_writer);
 
             // Append assistant response to history. The streaming aggregator
@@ -1468,6 +1750,22 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .timestamp = util_time.nowMillis(),
                 });
             } else {
+                // Empty with zero fanfare is the most confusing variant:
+                // name the actual flavor instead of a blanket "resend".
+                // ① budget exhausted (thinking burned the cap — escalation
+                //    already tried up to MAX_OUTPUT_BUDGET);
+                // ② reasoning-only output (no cap hit, still no text);
+                // ③ plain empty (rare).
+                if (outputBudgetExhausted(stop_reason, response.usage.output_tokens, eff_cap)) {
+                    std.Io.Writer.print(ow, "  \x1b[2m[输出预算耗尽：模型生成 {d} tokens（达上限 {d}）但正文为空 — 思考型模型建议 /config 将「最大 tokens」调大（当前 {d}）后重发]\x1b[0m\n", .{
+                        response.usage.output_tokens, eff_cap, switcher.settings.max_tokens,
+                    }) catch {};
+                } else if (had_thinking) {
+                    std.Io.Writer.print(ow, "  \x1b[2m[模型只输出了思考过程（reasoning），未产出正文 — 重发通常可得到正文]\x1b[0m\n", .{}) catch {};
+                } else {
+                    std.Io.Writer.print(ow, "  \x1b[2m[模型返回空响应（0 内容块，stop={s}）— 如非预期可重发]\x1b[0m\n", .{@tagName(stop_reason)}) catch {};
+                }
+                try std.Io.File.Writer.flush(&file_writer);
                 // Ownership never moved to history — release the (empty)
                 // block slice ourselves; zero-length free is a no-op-safe.
                 allocator.free(@constCast(response.content));
@@ -1486,6 +1784,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             result_blocks.clearRetainingCapacity();
 
             var has_tool_use = false;
+            // Esc-cancel / worker-failure markers, hoisted to iteration
+            // scope: the turn-break after the tool-result history append
+            // (below) reads them from outside the `prepared` block.
+            // batch_aborted = end the turn after this batch (Esc OR worker
+            // failure); worker_failed = additionally skip finishToolCall
+            // (no results exist — manual failure results were appended).
+            // A user Esc does NOT skip finishToolCall: the cancelled batch
+            // still yields one result per tool_use id, and those results
+            // are exactly what the model must see on the next turn.
+            var batch_aborted = false;
+            var user_cancelled = false;
+            var worker_failed = false;
             // Phase 1 (serial): permission gate + pre-execution backup for
             // every tool_use; approved calls are collected for phase 2.
             var prepared = std.ArrayList(PreparedCall).empty;
@@ -1507,7 +1817,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                     // Find tool definition
                     const tool_def = reg.findByName(tc.name) orelse {
-                        try std.Io.Writer.print(w, "  [Unknown tool: {s}]\n", .{tc.name});
+                        std.Io.Writer.print(ow, "  [Unknown tool: {s}]\n", .{tc.name}) catch {};
                         // History blocks own every string: the id must be
                         // duped (it borrows the assistant message's copy —
                         // freeing both was a double free) and literals too.
@@ -1539,7 +1849,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                     // Permission check (shared gate; auto mode may delegate
                     // the ambiguous ask case to the LLM classifier).
-                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, &file_writer, &denial_state);
+                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state);
                     if (!approved) {
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = try allocator.dupe(u8, tc.id),
@@ -1610,33 +1920,187 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     for (batches) |b| allocator.free(b.calls);
                     allocator.free(batches);
                 }
+                // P4: tool batches run on a WORKER thread; the UI loop
+                // stays alive underneath — full editing during a long
+                // Bash run, and the status row carries a LIVE clock (the
+                // old static status could not tick because the main
+                // thread WAS the executor). Esc has no effect here (tools
+                // are not cancellable); it is consumed by the editor
+                // pump, never leaked into the next prompt.
                 const batch_t0 = util_time.nowMillis();
-                const results = try orchestration_mod.executeBatches(batches, allocator, io, reg.definitions());
-                defer allocator.free(results);
-
-                var batch_errors: u32 = 0;
-                for (prepared.items, 0..) |p, i| {
-                    window_tools += 1;
-                    // P5 write cap: "写一点就行" turns used to run away into
-                    // 50-iteration file-writing marathons that blew up the
-                    // context (user-side repro: 62 checkpoints in ONE turn).
-                    if (std.mem.eql(u8, p.call.tool_name, "FileWrite") or std.mem.eql(u8, p.call.tool_name, "FileEdit")) {
-                        turn_writes += 1;
+                const ToolJob = struct {
+                    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+                    err: ?anyerror = null,
+                    results: ?[]orchestration_mod.BatchResult = null,
+                    fn run(
+                        self: *@This(),
+                        bts: []const orchestration_mod.ToolCallBatch,
+                        al: std.mem.Allocator,
+                        i_o: std.Io,
+                        defs: []const registry.ToolDefinition,
+                    ) void {
+                        executeBatches(self, bts, al, i_o, defs);
                     }
-                    const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, &file_writer, history.items.len);
-                    if (errored) {
-                        window_errors += 1;
-                        batch_errors += 1;
-                        evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                    fn executeBatches(
+                        self: *@This(),
+                        bts: []const orchestration_mod.ToolCallBatch,
+                        al: std.mem.Allocator,
+                        i_o: std.Io,
+                        defs: []const registry.ToolDefinition,
+                    ) void {
+                        const res = orchestration_mod.executeBatches(bts, al, i_o, defs) catch |e| {
+                            self.err = e;
+                            self.done.store(true, .release);
+                            return;
+                        };
+                        self.results = res;
+                        self.done.store(true, .release);
+                    }
+                    /// Status text with the LIVE turn clock (UI loop side).
+                    fn statusText(t0: i64, llm_rounds: u32, n_calls: usize, first_tool: []const u8, buf: []u8) []const u8 {
+                        const tsum = @as(f64, @floatFromInt(util_time.nowMillis() - t0)) / 1000.0;
+                        // Task progress (②: the task system existed but the
+                        // TUI never surfaced it — "长任务进行到哪" answered
+                        // at a glance). Empty store → segment omitted.
+                        const ts = task_store.global();
+                        var task_seg: [40]u8 = undefined;
+                        const tseg: []const u8 = if (ts.count() > 0)
+                            std.fmt.bufPrint(&task_seg, " · 任务 {d}/{d}", .{ ts.completedCount(), ts.count() }) catch ""
+                        else
+                            "";
+                        return if (n_calls == 1)
+                            std.fmt.bufPrint(buf, "⚙ 工具 {s}{s} · LLM {d}轮 · 回合 {d:.1}s", .{ first_tool, tseg, llm_rounds, tsum }) catch "⚙ 执行工具"
+                        else
+                            std.fmt.bufPrint(buf, "⚙ 执行 {d} 个工具（{s}…）{s} · LLM {d}轮 · 回合 {d:.1}s", .{ n_calls, first_tool, tseg, llm_rounds, tsum }) catch "⚙ 执行工具";
+                    }
+                };
+                var tool_job = ToolJob{};
+                var tool_results: []orchestration_mod.BatchResult = undefined;
+                // batch_aborted/user_cancelled live at iteration scope (see
+                // their declaration above); set by the UI loop (Esc) or the
+                // worker-failure path below. Tool results are still appended
+                // to history so every tool_use id keeps a tool_result.
+                // Interactive tools (AskUserQuestion) read stdin COOKED on
+                // the calling thread — running them inside the worker would
+                // race the UI loop for fd 0. Any batch containing one runs
+                // synchronously (the pre-P4 shape; the y/N permission gate
+                // already behaves this way).
+                var has_interactive = false;
+                for (prepared.items) |p| {
+                    if (std.mem.eql(u8, p.call.tool_name, "AskUserQuestion")) has_interactive = true;
+                }
+                // Fresh cancel slot per batch — a stale `true` from a
+                // previous Esc would silently no-op every tool in this one.
+                cancel_mod.toolBatchReset();
+                const th = if (has_interactive) null else std.Thread.spawn(.{}, ToolJob.run, .{ &tool_job, batches, allocator, io, reg.definitions() }) catch null;
+                {
+                    if (th) |t| {
+                        t.detach();
+                        // UI loop while the tools run: editor + live clock.
+                        var last_status: i64 = 0;
+                        while (!tool_job.done.load(.acquire)) {
+                            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+                            const n = std.c.poll(&pfd, 1, 100);
+                            if (n == 1 and (pfd[0].revents & std.c.POLL.IN) != 0) {
+                                if (lineinput.editorLiveKey(r, w) and !user_cancelled) {
+                                    // Esc/Ctrl-C during tools: cancel the
+                                    // batch. An in-flight Bash is group-
+                                    // killed by its watchdog (this is the
+                                    // only escape from `timeout: 0`); not-
+                                    // yet-started calls short-circuit to
+                                    // "cancelled (not run)". The batch still
+                                    // yields one result per tool_use id.
+                                    user_cancelled = true;
+                                    batch_aborted = true;
+                                    cancel_mod.toolBatchCancel();
+                                    lineinput.regionStatus(w, "⏳ 正在取消工具批次…");
+                                    std.Io.File.Writer.flush(&file_writer) catch {};
+                                }
+                            } else if (n == 0 and !user_cancelled) {
+                                // Quiet slice: drain due cron tasks (health
+                                // check / memory decay) so a long batch no
+                                // longer starves them for the whole turn.
+                                if (cron_ptr) |cp| cp.drainDue();
+                                const now = util_time.nowMillis();
+                                if (now - last_status >= 500) {
+                                    last_status = now;
+                                    var sb: [96]u8 = undefined;
+                                    lineinput.regionStatus(w, ToolJob.statusText(turn_t0, turn_llm_calls, prepared.items.len, prepared.items[0].call.tool_name, &sb));
+                                    std.Io.File.Writer.flush(&file_writer) catch {};
+                                }
+                            }
+                        }
+                        // The slot must not leak a `true` into later batches
+                        // (subagent tool runs its own inner batches).
+                        cancel_mod.toolBatchReset();
+                        if (tool_job.results) |res| {
+                            tool_results = res;
+                        } else {
+                            // The worker failed (alloc etc.). Returning here
+                            // would strand every tool_use id without a
+                            // tool_result — invalid history for strict APIs
+                            // on the next request. Record failure results
+                            // and end the turn gracefully instead.
+                            // tool_results stays undefined — every use below
+                            // is guarded by !worker_failed.
+                            if (tool_job.err) |e| logger.err("tool batch worker failed: {}", .{e});
+                            batch_aborted = true;
+                            worker_failed = true;
+                            for (prepared.items) |p| {
+                                try result_blocks.append(allocator, .{ .tool_result = .{
+                                    .tool_use_id = try allocator.dupe(u8, p.call.tool_use_id),
+                                    .content = try allocator.dupe(u8, "tool batch failed (internal error); not executed"),
+                                    .is_error = true,
+                                } });
+                            }
+                            std.Io.Writer.print(ow, "  [工具批次内部错误 — 本回合结束，结果已按失败记录]\n", .{}) catch {};
+                            try std.Io.File.Writer.flush(&file_writer);
+                        }
+                    } else {
+                        // No thread: synchronous fallback (pre-P4 shape).
+                        tool_results = try orchestration_mod.executeBatches(batches, allocator, io, reg.definitions());
                     }
                 }
 
-                // Live decision trace: execution step for this batch.
-                if (live_trace) |*t| {
-                    const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
-                    var step_buf: [96]u8 = undefined;
-                    const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
-                    traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", @intCast(util_time.nowMillis() - batch_t0), allocator) catch {};
+                // Worker failure is the ONLY path that skips finishToolCall
+                // (results don't exist). A user cancel runs it normally —
+                // the cancelled/partial results must land in history.
+                if (!worker_failed) {
+                    const results = tool_results;
+                    defer allocator.free(results);
+
+                    var batch_errors: u32 = 0;
+                    for (prepared.items, 0..) |p, i| {
+                        window_tools += 1;
+                        const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
+                        if (errored) {
+                            batch_errors += 1;
+                            // expected_stop (timeout kill / user cancel / declined
+                            // question) is deliberate control flow — feeding it to
+                            // the reflection window's error rate diagnosed a
+                            // timeout-driven debugging marathon as "unstable
+                            // environment" and stored that as a cross-session
+                            // "insight" (2026-11-06).
+                            if (!results[i].result.expected_stop) {
+                                window_errors += 1;
+                                evbus.emit(.{ .error_detected = .{ .errors = 1 } }); // P3 event record
+                            }
+                        }
+                    }
+
+                    // Timing 口径: one window per batch, dispatch
+                    // (batch_t0) → all results collected; tools counted
+                    // per call — a parallel batch folds each tool's time
+                    // into the batch window (wall time, not exclusive).
+                    turn_tool_ms += util_time.nowMillis() - batch_t0;
+                    turn_tool_calls += @intCast(prepared.items.len);
+                    // Live decision trace: execution step for this batch.
+                    if (live_trace) |*t| {
+                        const conf = 1.0 - @as(f64, @floatFromInt(batch_errors)) / @as(f64, @floatFromInt(prepared.items.len));
+                        var step_buf: [96]u8 = undefined;
+                        const out_desc = std.fmt.bufPrint(&step_buf, "tools={d} errors={d}", .{ prepared.items.len, batch_errors }) catch "batch";
+                        traceAddStep(t, .tool_execution, conf, "approved batch", out_desc, "permission gate + thread pool", @intCast(util_time.nowMillis() - batch_t0), allocator) catch {};
+                    }
                 }
             }
 
@@ -1650,6 +2114,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     .content = result_slice,
                     .timestamp = util_time.nowMillis(),
                 });
+            }
+
+            // Esc-cancelled or internally-failed batch: the turn stops
+            // HERE, with valid history — the tool results (cancelled /
+            // partial / failure) are already appended, so the model sees
+            // exactly what happened when the conversation resumes.
+            if (batch_aborted) {
+                lineinput.regionEnd(w);
+                if (user_cancelled) {
+                    std.Io.Writer.print(ow, "\n  [Esc — 工具批次已取消，回合结束。取消/部分结果已记录，可直接继续对话]\n\n", .{}) catch {};
+                }
+                try std.Io.File.Writer.flush(&file_writer);
+                break;
             }
 
             // P4 mid-turn injection: messages the user typed + Enter'd
@@ -1673,26 +2150,90 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     window_queries.append(allocator, wq) catch allocator.free(wq);
                 } else |_| {}
                 evbus.emit(.{ .user_query_start = {} });
-                var ib: [128]u8 = undefined;
-                const iline = std.fmt.bufPrint(&ib, "  ↳ 补充已进入本轮对话: {s}\n", .{q[0..@min(q.len, 60)]}) catch "";
-                lineinput.regionPrintLine(w, iline);
+                // Committed-style echo — ONLY when the queue-time echo
+                // didn't already show it (null-w drain queues skip that).
+                if (!lineinput.last_take_echoed) lineinput.regionEchoCommitted(w, q);
                 std.Io.File.Writer.flush(&file_writer) catch {};
-            }
-
-            // P5: write cap reached — end the TURN (not the session) with
-            // an explicit notice. The results so far stay in history; a
-            // fresh user message continues where this stopped.
-            if (turn_writes >= MAX_TURN_WRITES) {
-                try std.Io.Writer.print(w, "\x1b[2m  [本回合写操作已达上限（{d}）— 上下文保护。发送新消息继续。]\x1b[0m\n", .{MAX_TURN_WRITES});
-                try std.Io.File.Writer.flush(&file_writer);
-                break;
             }
 
             try std.Io.File.Writer.flush(&file_writer);
         }
 
-        if (agent_iterations >= MAX_AGENT_ITERATIONS) {
-            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached]\x1b[0m\n", .{MAX_AGENT_ITERATIONS});
+        // Turn over: the live region comes down HERE — one teardown for
+        // every exit path (completion, error break, Esc). Paths that
+        // already ended it before their own message printing arrive with
+        // it down. A still-up region (normal completion) FREEZES: the ①
+        // turn summary becomes the status row's final text, that row
+        // stays as the transcript tail, and the next prompt renders
+        // exactly where the input row was. Zero-usage turns (nothing was
+        // generated) keep the plain regionEnd + spacer.
+        if (lineinput.regionUp()) {
+            region_wr.flushTableBlock();
+            if (turn_in + turn_out > 0) {
+                const turn_s = @as(f64, @floatFromInt(util_time.nowMillis() - turn_t0)) / 1000.0;
+                var sb: [160]u8 = undefined;
+                // Non-empty fallback: regionStatus("") would erase the
+                // region rows instead of freezing a summary.
+                const summary = std.fmt.bufPrint(&sb, "✓ 完成 · in {d} → out {d} · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 总 {d:.1}s", .{ turn_in, turn_out, turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, turn_s }) catch "✓ 完成";
+                lineinput.regionStatus(w, summary);
+                lineinput.regionFreeze(w);
+                // Same numbers into the persistent log — the frozen row
+                // scrolls away; ziv.log is where post-mortems read.
+                logger.info("turn: llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
+            } else {
+                lineinput.regionEnd(w);
+                // Aborted/failed exits (Esc, TTFT give-up, transport error)
+                // arrive with the region already down — the frozen-row
+                // summary above never runs, so the turn's cost was silent
+                // (2026-11-05 23:51 incident: 157.9s spent, TUI showed
+                // nothing). Same breakdown, as a transcript line instead.
+                if (turn_llm_calls > 0 or turn_tool_calls > 0) {
+                    const abort_s = @as(f64, @floatFromInt(util_time.nowMillis() - turn_t0)) / 1000.0;
+                    const ts = task_store.global();
+                    var tseg_b: [48]u8 = undefined;
+                    const undone = ts.count() -| ts.completedCount();
+                    const tseg: []const u8 = if (undone > 0)
+                        std.fmt.bufPrint(&tseg_b, " · 未完任务 {d}（/tasks 查看）", .{undone}) catch ""
+                    else
+                        "";
+                    std.Io.Writer.print(ow, "  \x1b[2m⏱ 中断 · LLM {d}次 {d:.1}s · 工具 {d}个 {d:.1}s · 已进行 {d:.1}s{s} · 逐步耗时见 .ziv/traces/（/trace 直读）\x1b[0m\n", .{ turn_llm_calls, @as(f64, @floatFromInt(turn_llm_ms)) / 1000.0, turn_tool_calls, @as(f64, @floatFromInt(turn_tool_ms)) / 1000.0, abort_s, tseg }) catch {};
+                    logger.info("turn(aborted): llm {d} calls {d}ms · tools {d} calls {d}ms · total {d}ms", .{ turn_llm_calls, turn_llm_ms, turn_tool_calls, turn_tool_ms, util_time.nowMillis() - turn_t0 });
+                }
+                try std.Io.Writer.writeAll(w, "\n");
+            }
+            try std.Io.File.Writer.flush(&file_writer);
+        }
+
+        // ③ Turn telemetry: persist the decision trace (per-step
+        // durations, JSONL) before the next query re-inits it. Default
+        // ON; ZIV_TRACE=0/false opts out. A failed write is a warning —
+        // telemetry must never break a turn.
+        if (live_trace) |*t| {
+            const trace_off = blk: {
+                const v = env.get("ZIV_TRACE") orelse break :blk false;
+                break :blk std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+            };
+            if (!trace_off and t.getSteps().len > 0) {
+                t.complete();
+                if (t.writeJsonlFile(io, ".ziv/traces", allocator)) {
+                    // /trace reads this path back — record it on success only.
+                    var path_b: [160]u8 = undefined;
+                    if (std.fmt.bufPrint(&path_b, ".ziv/traces/{d}.jsonl", .{t.started_at})) |p| {
+                        turn_clock.setTracePath(p);
+                    } else |_| {}
+                } else |e| {
+                    logger.warning("trace persist failed: {}", .{e});
+                }
+            }
+        }
+
+        if (agent_iterations >= max_agent_iters) {
+            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached — 输入区已预填「继续」：Enter 接着跑，也可改发其他指令；上限经 settings.json 的 agent_loop_limit 调整]\x1b[0m\n", .{max_agent_iters});
+            // Same recoverable-giveup shape as the TTFT triple-failure
+            // path: history stays legal, one Enter resumes as a fresh
+            // turn — the marathon's findings are never lost to a stop.
+            lineinput.recall_text = "继续";
+            lineinput.recall_prefill = true;
         }
 
         // T1.3: topic-drift re-anchor — checked after EVERY completed turn
@@ -1704,9 +2245,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         if (shouldReanchor(base, cur)) {
                             const ctx_est = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
                             const eff_budget = injection_mod.effectiveBudget(switcher.settings.memory_budget_tokens, ctx_est);
-                            if (ms.episodic_mem.retrieveRecent(200) catch null) |entries| {
+                            var rows_arena = std.heap.ArenaAllocator.init(allocator);
+                            defer rows_arena.deinit();
+                            if (ms.episodic_mem.retrieveRecentArena(rows_arena.allocator(), 1000) catch null) |entries| {
                                 const ents = entries;
-                                defer ms.episodic_mem.freeEntries(ents);
                                 if (injection_mod.buildMemoryBlockAnchored(allocator, ents, eff_budget, cur) catch null) |nb| {
                                     if (swapMemoryBlockText(&history, allocator, memory_block.?, nb.text)) {
                                         allocator.free(memory_block.?);
@@ -1736,9 +2278,23 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         }
 
         // P4: queue survivors (queued during the FINAL stream, after the
-        // last tool round) auto-send as the next turn.
+        // last tool round) auto-send as the next turn. ALL of them —
+        // joined with '\n' as one multi-line message (mid-turn injection
+        // at the tool rounds drains them as separate messages; here the
+        // single auto_submit slot is the only vehicle). The old take-one
+        // silently dropped every survivor past the first.
         if (lineinput.queuedHas()) {
-            if (lineinput.queuedTake()) |qm| auto_submit = allocator.dupe(u8, qm) catch null;
+            var joined: std.ArrayList(u8) = .empty;
+            while (lineinput.queuedTake()) |qm| {
+                if (joined.items.len > 0) joined.append(allocator, '\n') catch break;
+                joined.appendSlice(allocator, qm) catch break;
+            }
+            if (joined.items.len > 0) {
+                auto_submit = joined.toOwnedSlice(allocator) catch blk: {
+                    joined.deinit(allocator);
+                    break :blk null;
+                };
+            }
         }
 
         try std.Io.Writer.writeAll(w, "\n");
@@ -1817,7 +2373,194 @@ fn isNearDuplicate(accepted: []const extraction_mod.ExtractedFact, content: []co
     return false;
 }
 
-fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), bus: ?*task_mod.EventBus, w: *std.Io.Writer) !void {
+/// LLM-extracted session payload (facts + real entity/relation graph).
+/// All strings owned by the list allocator; deinit frees everything.
+const LlmExtraction = struct {
+    facts: std.ArrayList(extraction_mod.ExtractedFact) = .empty,
+    entities: std.ArrayList(ExtractedEntity) = .empty,
+    relations: std.ArrayList(ExtractedRelation) = .empty,
+
+    fn deinit(self: *LlmExtraction, alloc: std.mem.Allocator) void {
+        for (self.facts.items) |f| alloc.free(f.content);
+        self.facts.deinit(alloc);
+        for (self.entities.items) |e| alloc.free(e.name);
+        self.entities.deinit(alloc);
+        for (self.relations.items) |r| {
+            alloc.free(r.from);
+            alloc.free(r.to);
+            alloc.free(r.relation);
+        }
+        self.relations.deinit(alloc);
+    }
+};
+
+const ExtractedEntity = struct {
+    name: []u8,
+    etype: knowledge_graph.EntityType,
+};
+
+const ExtractedRelation = struct {
+    from: []u8,
+    to: []u8,
+    relation: []u8,
+};
+
+/// One aux LLM call distilling a whole session into structured knowledge —
+/// the primary extraction path. The keyword heuristics in
+/// extractSessionMemories remain as the fallback (gateway down at exit,
+/// unparseable reply, no provider). All strings allocated with `alloc`.
+fn llmExtractSession(alloc: std.mem.Allocator, prov: llm.Provider, messages: []const llm.Message, aux_cap: u32) !LlmExtraction {
+    const transcript = compaction.renderTranscript(alloc, messages) catch return error.ExtractTranscriptFailed;
+    defer alloc.free(transcript);
+    if (transcript.len == 0) return error.ExtractEmptyTranscript;
+    const tr = transcript[0..@min(transcript.len, 24_000)]; // bound the aux call
+
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(alloc);
+    try prompt.appendSlice(alloc,
+        \\Extract durable knowledge from this coding-agent conversation for long-term memory.
+        \\Respond with ONLY a JSON object (no markdown fences, no commentary), exactly this schema:
+        \\{"facts":[{"type":"user_preference|project_context|technical_fact|error_solution|pattern_observed","content":"..."}],"entities":[{"name":"...","type":"technology|person|concept|organization|code_pattern|api_endpoint"}],"relations":[{"from":"entity name","to":"entity name","relation":"short verb phrase"}]}
+        \\Rules: each fact is ONE standalone statement, max 300 chars, in the conversation's dominant language; skip small talk, raw code dumps and transient state; at most 12 facts. Entities are the concrete technologies, files, tools, commands and projects involved (max 15). Relations (max 20) only between listed entities.
+        \\
+    );
+    try prompt.appendSlice(alloc, tr);
+
+    var blocks = try alloc.alloc(llm.ContentBlock, 1);
+    defer alloc.free(blocks);
+    blocks[0] = .{ .text = try alloc.dupe(u8, prompt.items) };
+    defer alloc.free(blocks[0].text);
+    const msgs = [_]llm.Message{
+        .{ .role = .user, .content = blocks, .timestamp = util_time.nowMillis() },
+    };
+    var resp = try prov.complete(&msgs, .{
+        .max_tokens = @min(aux_cap, 2048),
+        .temperature = 0.2,
+    });
+    // Pull the text out before the response DOM arena is freed.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (resp.content) |b| {
+        if (b == .text) text.appendSlice(alloc, b.text) catch break;
+    }
+    resp.free(alloc);
+    if (text.items.len == 0) return error.ExtractEmptyReply;
+    return parseExtractionReply(alloc, text.items);
+}
+
+/// Lenient JSON recovery + field extraction from a model's extraction
+/// reply. Models fence or preface despite instructions — slice to the
+/// outermost braces and parse what's between. All strings duped onto
+/// `alloc`; parse scratch lives in a per-call arena.
+fn parseExtractionReply(alloc: std.mem.Allocator, reply: []const u8) !LlmExtraction {
+    const lbrace = std.mem.indexOfScalar(u8, reply, '{') orelse return error.ExtractNoJson;
+    const rbrace = std.mem.lastIndexOfScalar(u8, reply, '}') orelse return error.ExtractNoJson;
+    if (rbrace <= lbrace) return error.ExtractNoJson;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), reply[lbrace .. rbrace + 1], .{});
+    if (parsed != .object) return error.ExtractBadShape;
+
+    var out = LlmExtraction{};
+    errdefer out.deinit(alloc);
+    if (parsed.object.get("facts")) |fv| {
+        if (fv == .array) {
+            for (fv.array.items[0..@min(fv.array.items.len, 12)]) |item| {
+                if (item != .object) continue;
+                const content_v = item.object.get("content") orelse continue;
+                const type_v = item.object.get("type") orelse continue;
+                if (content_v != .string or type_v != .string) continue;
+                if (content_v.string.len < 8 or content_v.string.len > 600) continue;
+                const ftype = std.meta.stringToEnum(extraction_mod.FactType, type_v.string) orelse .pattern_observed;
+                try out.facts.append(alloc, .{
+                    .content = try alloc.dupe(u8, content_v.string),
+                    .fact_type = ftype,
+                    .importance = 0.85,
+                });
+            }
+        }
+    }
+    if (parsed.object.get("entities")) |ev| {
+        if (ev == .array) {
+            for (ev.array.items[0..@min(ev.array.items.len, 15)]) |item| {
+                if (item != .object) continue;
+                const name_v = item.object.get("name") orelse continue;
+                const type_v = item.object.get("type") orelse continue;
+                if (name_v != .string or type_v != .string) continue;
+                if (name_v.string.len < 1 or name_v.string.len > 96) continue;
+                try out.entities.append(alloc, .{
+                    .name = try alloc.dupe(u8, name_v.string),
+                    .etype = std.meta.stringToEnum(knowledge_graph.EntityType, type_v.string) orelse .concept,
+                });
+            }
+        }
+    }
+    if (parsed.object.get("relations")) |rv| {
+        if (rv == .array) {
+            for (rv.array.items[0..@min(rv.array.items.len, 20)]) |item| {
+                if (item != .object) continue;
+                const from_v = item.object.get("from") orelse continue;
+                const to_v = item.object.get("to") orelse continue;
+                const rel_v = item.object.get("relation") orelse continue;
+                if (from_v != .string or to_v != .string or rel_v != .string) continue;
+                try out.relations.append(alloc, .{
+                    .from = try alloc.dupe(u8, from_v.string),
+                    .to = try alloc.dupe(u8, to_v.string),
+                    .relation = try alloc.dupe(u8, rel_v.string),
+                });
+            }
+        }
+    }
+    return out;
+}
+
+fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), bus: ?*task_mod.EventBus, w: *std.Io.Writer, prov: ?llm.Provider, aux_cap: u32) !void {
+    // ── Primary path: one aux LLM call for structured facts + graph. ──
+    if (prov) |p| {
+        if (llmExtractSession(mem.allocator, p, history.items, aux_cap)) |out_captured| {
+            var out = out_captured; // mutable copy: deinit needs *Self
+            defer out.deinit(mem.allocator);
+            logger.info("llm extraction parsed: {d} facts, {d} entities, {d} relations", .{ out.facts.items.len, out.entities.items.len, out.relations.items.len });
+            var stored: usize = 0;
+            for (out.facts.items) |f| {
+                const now = util_time.nowMillis();
+                mem.store(.{
+                    .id = injection_mod.memoryId(f.content, @tagName(f.fact_type)),
+                    .mem_type = switch (f.fact_type) {
+                        .user_preference => .user,
+                        .project_context, .technical_fact, .error_solution, .pattern_observed => .project,
+                    },
+                    .name = f.content[0..injection_mod.utf8Boundary(f.content, 48)],
+                    .description = @tagName(f.fact_type),
+                    .content = f.content,
+                    .access_count = 0,
+                    .created_at = now,
+                    .updated_at = now,
+                }) catch continue;
+                stored += 1;
+            }
+            if (kg) |g| {
+                for (out.entities.items) |e| {
+                    _ = g.addNode(e.name, e.etype, "llm") catch {};
+                }
+                for (out.relations.items) |r| {
+                    const fid = g.findNodeId(r.from) orelse continue;
+                    const tid = g.findNodeId(r.to) orelse continue;
+                    g.addEdge(fid, tid, r.relation, 1.0) catch {};
+                }
+            }
+            if (stored > 0) {
+                try w.print("  Saved {d} memories (LLM extraction; {d} entities, {d} relations).\n", .{ stored, out.entities.items.len, out.relations.items.len });
+                if (bus) |b| b.emit(.{ .memory_updated = .{ .stored = @intCast(@min(stored, 255)) } });
+            }
+            return;
+        } else |_| {
+            logger.info("llm extraction unavailable; falling back to keyword heuristics", .{});
+        }
+    }
+
+    // ── Fallback path: keyword heuristics (no provider / LLM failed). ──
     var engine = extraction_mod.ExtractionEngine.init(mem.allocator);
     defer engine.deinit();
 
@@ -2118,12 +2861,19 @@ const HealthCtx = struct {
     monitor: *runtime_monitor.RuntimeMonitor,
     bus: *task_mod.EventBus,
     w: *std.Io.Writer,
+    /// Region-aware transcript writer + the flushable File.Writer: the
+    /// monitor line must print ABOVE the live region when the check
+    /// drains mid-turn (2026-11-06 — cron now drains in the turn's UI
+    /// slices too, so the old bare-`w` print would smear the input row).
+    ow: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
     /// Live model context (window re-estimated at check time — the model
     /// can switch mid-session). The first wiring compared against
     /// settings.max_tokens — the RESPONSE cap (4096!) — so every active
     /// session read "context window near limit" as a false positive.
     switcher: *ModelSwitcher,
     llm_calls: *std.atomic.Value(u32),
+    llm_429s: *std.atomic.Value(u32),
     est_tokens: *std.atomic.Value(u32),
     /// Dedup: print only when the failing-rule signature CHANGES — the
     /// same warning every 60s used to stack into noise walls.
@@ -2144,6 +2894,7 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         .memory_entry_count = 0,
         .api_calls_last_minute = calls,
         .api_rate_limit = 60,
+        .api_rate_limited_count = hc.llm_429s.swap(0, .monotonic),
         .db_integrity_ok = true,
         .current_tokens = hc.est_tokens.load(.monotonic),
         // The real context WINDOW for the live model (e.g. glm-5.3 →
@@ -2164,7 +2915,12 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         if (changed) {
             hc.last_warn_count = failures.items.len;
             hc.last_warn_first = failures.items[0].rule_id;
-            std.Io.Writer.print(hc.w, "\x1b[2m  [monitor] {d} runtime warning(s) — {s}\x1b[0m\n", .{ failures.items.len, failures.items[0].message }) catch {};
+            // Through the RegionWriter: lands ABOVE the live region when
+            // the check drains mid-turn (line-atomic), verbatim at the
+            // prompt — a bare write here smeared the persistent input
+            // row whenever the drain raced an active turn.
+            std.Io.Writer.print(hc.ow, "\x1b[2m  [monitor] {d} runtime warning(s) — {s}\x1b[0m\n", .{ failures.items.len, failures.items[0].message }) catch {};
+            std.Io.File.Writer.flush(hc.file_writer) catch {};
         }
         // Events flow regardless (π ring feeds reflection) — only the
         // print is deduped.
@@ -2321,7 +3077,6 @@ fn makeBackgroundProviderInto(alloc: std.mem.Allocator, io: std.Io, backend: llm
     }
     return storage.provider();
 }
-
 
 fn runReflection(
     reflector: *reflection_mod.ReflectionEngine,
@@ -2747,6 +3502,71 @@ fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !void
 
 /// Append one step to the live decision trace (all strings duped; the
 /// trace frees them in deinit).
+/// One compact row from a trace JSONL step line: "phase  Nms". Header
+/// lines (query/total — no "phase" key) return null. Field scanning, not
+/// JSON parsing: /trace stays light and the field order is fixed by
+/// decision_trace.toJsonl.
+fn traceStepSummary(line: []const u8, buf: []u8) ?[]const u8 {
+    const phase_key = "\"phase\":\"";
+    const p0 = std.mem.indexOf(u8, line, phase_key) orelse return null;
+    const p1 = p0 + phase_key.len;
+    const p2 = std.mem.indexOfScalarPos(u8, line, p1, '"') orelse return null;
+    const ms_key = "\"ms\":";
+    const m0 = std.mem.indexOf(u8, line, ms_key) orelse return null;
+    const m1 = m0 + ms_key.len;
+    const m2 = std.mem.indexOfScalarPos(u8, line, m1, ',') orelse line.len;
+    return std.fmt.bufPrint(buf, "{s:<18} {s}ms", .{ line[p1..p2], line[m1..m2] }) catch null;
+}
+
+/// Header row of a trace file: "「query」 · N 步 · 总 X.Ys".
+fn traceHeaderSummary(header: []const u8, buf: []u8) ![]const u8 {
+    const qk = "\"query\":\"";
+    const q0 = std.mem.indexOf(u8, header, qk) orelse return error.BadHeader;
+    const q1 = q0 + qk.len;
+    var q_end = std.mem.indexOf(u8, header, "\",\"steps\":") orelse header.len;
+    if (q_end < q1) q_end = header.len;
+    var query = header[q1..q_end];
+    if (query.len > 24) {
+        query = query[0..24];
+        // Back off to a UTF-8 boundary — a mid-CJK cut would mojibake.
+        while (query.len > 0 and (query[query.len - 1] & 0xC0) == 0x80) query = query[0 .. query.len - 1];
+        if (query.len > 0) query = query[0 .. query.len - 1];
+    }
+    const tk = "\"total_ms\":";
+    const t0 = std.mem.indexOf(u8, header, tk) orelse return error.BadHeader;
+    const t1 = t0 + tk.len;
+    const t2 = std.mem.indexOfScalarPos(u8, header, t1, ',') orelse header.len;
+    const total_ms = std.fmt.parseInt(i64, header[t1..t2], 10) catch 0;
+    const sk = "\"steps\":";
+    const s0 = std.mem.indexOf(u8, header, sk) orelse return error.BadHeader;
+    const s1 = s0 + sk.len;
+    const s2 = std.mem.indexOfScalarPos(u8, header, s1, ',') orelse header.len;
+    return std.fmt.bufPrint(buf, "「{s}」 · {s} 步 · 总 {d}.{d}s", .{ query, header[s1..s2], @divTrunc(total_ms, 1000), @divTrunc(@mod(total_ms, 1000), 100) });
+}
+
+test "trace line summary: step rows parsed, header skipped" {
+    var buf: [96]u8 = undefined;
+    const step_line = "{\"step\":3,\"phase\":\"llm_generation\",\"ts\":1793893800607,\"ms\":66895,\"conf\":0.90,\"in\":\"history + system prompt\",\"out\":\"content blocks\",\"why\":\"tool_use\"}";
+    const s = traceStepSummary(step_line, &buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, s, "llm_generation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "66895ms") != null);
+    // Header rows carry no "phase" key — they must yield null, not garbage.
+    const header_line = "{\"query\":\"继续\",\"steps\":9,\"total_ms\":157941,\"started_at\":1793893733712}";
+    try std.testing.expect(traceStepSummary(header_line, &buf) == null);
+}
+
+test "trace header summary: query, steps, total seconds" {
+    var buf: [96]u8 = undefined;
+    const header = "{\"query\":\"继续任务\",\"steps\":9,\"total_ms\":157941,\"started_at\":1793893733712}";
+    const s = try traceHeaderSummary(header, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, s, "继续任务") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "157.9s") != null);
+    // Long CJK queries truncate on a UTF-8 boundary (no mojibake tail).
+    const long_header = "{\"query\":\"一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十\",\"steps\":2,\"total_ms\":1000,\"started_at\":1}";
+    const s2 = try traceHeaderSummary(long_header, &buf);
+    try std.testing.expect(s2.len <= buf.len);
+}
+
 fn traceAddStep(
     t: *decision_trace.DecisionTrace,
     phase: decision_trace.DecisionPhase,
@@ -2773,9 +3593,22 @@ fn traceAddStep(
 
 /// Streaming aggregation state: prints text deltas live while assembling a
 /// CompleteResponse equivalent owned by the REPL (no DOM arena).
+/// Turn start (P1): the stream tick's status row shows BOTH the current
+/// round's elapsed time and the CUMULATIVE turn time — the old per-
+/// generation timer reset to 0.0s on every round, hiding what the
+/// previous rounds cost. Main-thread only: set by run() right before
+/// regionBegin, read by streamCb's tick on the same thread.
+// Turn timing/round/trace-path state lives in util/turn_clock.zig (R2:
+// three loose globals → one atomic namespaced object, single writer).
+
 const StreamAgg = struct {
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    /// Table-aware transcript writer (the turn loop's RegionWriter). When
+    /// set, whole lines flow through its emitLine — pipe tables buffer and
+    /// render aligned (renderTableBlock) instead of dumping raw markdown.
+    /// Null keeps the legacy raw regionPrintLine path (non-turn callers).
+    tw: ?*std.Io.Writer = null,
     file_writer: *std.Io.File.Writer,
     text: std.ArrayList(u8) = .empty,
     tools: std.ArrayList(llm.provider.ToolUseBlock) = .empty,
@@ -2801,8 +3634,6 @@ const StreamAgg = struct {
     at_line_start: bool = true,
     /// Esc-interrupt: when set, streamCb polls stdin (throttled) so Esc
     /// cancels generation and recalls the input for editing.
-    esc_probe_r: ?*std.Io.Reader = null,
-    last_esc_check: i64 = 0,
     /// Live-region timing: request start (elapsed "等待响应 Ns") and the
     /// last stream event (silence gates when the region appears).
     req_t0: i64 = 0,
@@ -2818,7 +3649,21 @@ const StreamAgg = struct {
     /// Flush one buffered output line above the live region. The buffer is
     /// seeded with the one-space response margin, so items ARE the line.
     fn flushLine(self: *StreamAgg) void {
-        lineinput.regionPrintLine(self.w, self.line_buf.items);
+        if (self.tw) |tw| {
+            // Route whole lines through the RegionWriter so pipe tables
+            // hit isTableRow → renderTableBlock (the 2026-11-06 fix: live
+            // deltas used to regionPrintLine on the RAW writer, so the
+            // table machinery existed but model text never reached it).
+            // A soft-wrapped partial gets a synthetic newline — display-
+            // identical to the terminal's own wrap, and it releases the
+            // RegionWriter's line buffer.
+            if (self.line_buf.items.len > 0 and self.line_buf.items[self.line_buf.items.len - 1] != '\n') {
+                self.line_buf.append(self.alloc, '\n') catch {};
+            }
+            tw.writeAll(self.line_buf.items) catch {};
+        } else {
+            lineinput.regionPrintLine(self.w, self.line_buf.items);
+        }
         self.line_buf.clearRetainingCapacity();
         self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
         self.line_cols = 0;
@@ -2885,27 +3730,9 @@ fn summarize(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!void {
+    // P2: PURE event processing — stdin belongs to the UI loop, which
+    // drains this callback from its mini-loop in streamComplete.
     const self: *StreamAgg = @ptrCast(@alignCast(ctx_opaque.?));
-    // Esc interrupts generation (Claude-Code style): poll stdin at most
-    // every 50 ms — an error return here aborts the provider stream.
-    // Skipped for .live_input: that byte came from the provider's
-    // silent-stall wait, and probing here would drain a same-burst
-    // remainder BEFORE the event's own byte is fed (reordering
-    // "hello…" into "ello…h"). The interrupt path handles ALL silent-
-    // stall input, Esc included.
-    if (self.esc_probe_r != null and event != .live_input and event != .done and event != .error_occurred) {
-        const now = util_time.nowMillis();
-        if (now - self.last_esc_check >= 50) {
-            self.last_esc_check = now;
-            // The pending echo must know whether the stream cursor sits
-            // mid-line before it redraws (\r\x1b[2K would eat a partial
-            // output line).
-            lineinput.stream_at_line_start = self.at_line_start;
-            if (lineinput.escProbe(self.esc_probe_r.?, self.w)) {
-                return error.EscCancelled;
-            }
-        }
-    }
     if (event != .tick) self.last_event_ms = util_time.nowMillis();
     switch (event) {
         .content_delta => |d| {
@@ -2968,17 +3795,17 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
             self.stop_reason = .tool_use;
         },
         .done => |u| {
-            if (u) |uu| self.usage = uu;
+            if (u.usage) |uu| self.usage = uu;
+            // Adopt the wire's stop verdict (max_tokens would previously
+            // vanish here — finish_reason was dropped on the stream path
+            // and every capped truncation read as end_turn). A .tool_use
+            // from the tool_call events outranks anything the final chunk
+            // says.
+            if (u.stop_reason) |sr| {
+                if (self.stop_reason != .tool_use) self.stop_reason = sr;
+            }
         },
         .error_occurred => |e| self.saw_error = e,
-        .live_input => |b| {
-            // Keystroke reported by the provider's silent-stall wait: the
-            // region's input row must echo it even while the gateway
-            // produces nothing. The cursor is parked on the region's input
-            // row by every region operation — redraw is position-safe.
-            lineinput.feedLiveByte(b, self.w);
-            std.Io.File.Writer.flush(self.file_writer) catch {};
-        },
         .tick => {
             // ~100ms of socket silence. After 1.5s of CONTINUOUS silence
             // (15 ticks — content arrival resets the count) flush any
@@ -2991,67 +3818,196 @@ fn streamCb(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!v
                 self.flushLine();
             }
             const now = util_time.nowMillis();
-            const elapsed = now - self.req_t0;
+            // P1: BOTH clocks — this round (req_t0) and the whole turn
+            // (turn_clock). The old status showed only the round clock,
+            // which reset to 0.0s on every generation and hid what the
+            // previous rounds cost.
+            const round_ms = now - self.req_t0;
+            const elapsed = turn_clock.elapsedMs(now);
+            const turn_ms = if (elapsed > 0) elapsed else round_ms;
             const queued = lineinput.queuedCount();
-            var sb: [96]u8 = undefined;
-            const st = if (queued > 0)
-                std.fmt.bufPrint(&sb, "⏳ 等待响应 {d}.{d}s · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
-                    @divTrunc(elapsed, 1000),
-                    @mod(@divTrunc(elapsed, 100), 10),
-                    queued,
-                }) catch ""
+            const ts = task_store.global();
+            var task_seg: [40]u8 = undefined;
+            const tseg: []const u8 = if (ts.count() > 0)
+                std.fmt.bufPrint(&task_seg, " · 任务 {d}/{d}", .{ ts.completedCount(), ts.count() }) catch ""
             else
-                std.fmt.bufPrint(&sb, "⏳ 等待响应 {d}.{d}s · Esc 中断 · Enter 排队", .{
-                    @divTrunc(elapsed, 1000),
-                    @mod(@divTrunc(elapsed, 100), 10),
-                }) catch "";
+                "";
+            var sb: [128]u8 = undefined;
+            const st = if (queued > 0)
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队 · 已排队 {d} 条", .{
+                    turn_clock.roundsDone() + 1,
+                    @divTrunc(round_ms, 1000),
+                    @mod(@divTrunc(round_ms, 100), 10),
+                    @divTrunc(turn_ms, 1000),
+                    @mod(@divTrunc(turn_ms, 100), 10),
+                    tseg,
+                    queued,
+                }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队"
+            else
+                std.fmt.bufPrint(&sb, "⏳ 第{d}轮 {d}.{d}s · 累计 {d}.{d}s{s} · Esc 中断 · Enter 排队", .{
+                    turn_clock.roundsDone() + 1,
+                    @divTrunc(round_ms, 1000),
+                    @mod(@divTrunc(round_ms, 100), 10),
+                    @divTrunc(turn_ms, 1000),
+                    @mod(@divTrunc(turn_ms, 100), 10),
+                    tseg,
+                }) catch "⏳ 等待响应 · Esc 中断 · Enter 排队";
             lineinput.regionStatus(self.w, st);
             std.Io.File.Writer.flush(self.file_writer) catch {};
         },
     }
 }
 
-fn flushLine(self: *StreamAgg) void {
-        lineinput.regionPrintLine(self.w, self.line_buf.items);
-        self.line_buf.clearRetainingCapacity();
-        self.line_buf.append(self.alloc, ' ') catch {}; // margin seed
-        std.Io.File.Writer.flush(self.file_writer) catch {};
+// ── P2: stream pump job ──────────────────────────────────────────────
+// The provider's socket pump runs on a WORKER thread; every event is
+// deep-copied into the lock-free bounded queue (task/mpsc_queue) that
+// the UI loop (main thread, the only terminal writer) drains. Stdin
+// belongs to the UI loop exclusively: keystrokes edit the persistent
+// editor while the network runs in parallel; Esc sets the cancel flag
+// and the pump fails with error.EscCancelled — the same recall path as
+// before, now cross-thread.
+const StreamJob = struct {
+    const Q = mpsc_queue.BoundedMPSC(llm.provider.StreamEvent, 1024);
+    queue: Q,
+    /// Set (release) by the pump thread when prov.stream returns; err is
+    /// written BEFORE it, so an acquire read of done makes err visible.
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err: ?anyerror = null,
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The pump publishes its connection's fd here once connected
+    /// (-1 = none). The UI loop, on cancel, shutdown(2)s it — the pump's
+    /// blocking read fails and the stream unwinds.
+    cancel_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    alloc: std.mem.Allocator,
+
+    /// UI-loop side of cancellation: set the flag and kill the socket.
+    /// The pump's transport error then surfaces (EscCancelled is mapped
+    /// from the killed connection by the provider's error path).
+    fn requestCancel(self: *StreamJob) void {
+        self.cancel.store(true, .release);
+        const fd = self.cancel_fd.load(.acquire);
+        if (fd >= 0) _ = std.c.shutdown(@intCast(fd), llm_watchdog.SHUT_RDWR);
     }
 
+    fn isDone(self: *StreamJob) bool {
+        return self.done.load(.acquire) and self.queue.isEmpty();
+    }
 
-/// Stream the completion, printing deltas live; returns REPL-owned blocks.
+    /// Deep-copy an event's payloads into job-owned storage (provider
+    /// slices are only valid for the callback's duration).
+    fn dupeEvent(self: *StreamJob, ev: llm.provider.StreamEvent) !llm.provider.StreamEvent {
+        return switch (ev) {
+            .content_delta => |d| .{ .content_delta = try self.alloc.dupe(u8, d) },
+            .thinking_delta => |d| .{ .thinking_delta = try self.alloc.dupe(u8, d) },
+            .tool_call => |tc| .{ .tool_call = .{
+                .id = try self.alloc.dupe(u8, tc.id),
+                .name = try self.alloc.dupe(u8, tc.name),
+                .input = try dupeJsonValue(self.alloc, tc.input),
+            } },
+            .done => |u| .{ .done = u },
+            .error_occurred => |e| .{ .error_occurred = e },
+            .tick => .tick,
+        };
+    }
+
+    /// Release a consumed event's job-owned payloads.
+    fn release(self: *StreamJob, ev: llm.provider.StreamEvent) void {
+        switch (ev) {
+            .content_delta => |d| self.alloc.free(@constCast(d)),
+            .thinking_delta => |d| self.alloc.free(@constCast(d)),
+            .tool_call => |tc| {
+                self.alloc.free(tc.id);
+                self.alloc.free(tc.name);
+                freeJsonValue(self.alloc, tc.input);
+            },
+            else => {},
+        }
+    }
+
+    /// Provider callback (pump thread). A full queue backs off 1ms at a
+    /// time — the SSE socket's TCP backpressure equivalent.
+    fn callback(ctx_opaque: ?*anyopaque, event: llm.provider.StreamEvent) anyerror!void {
+        const self: *StreamJob = @ptrCast(@alignCast(ctx_opaque.?));
+        const ev = try self.dupeEvent(event);
+        errdefer self.release(ev);
+        while (!self.queue.push(ev)) {
+            if (self.cancel.load(.acquire)) return error.EscCancelled;
+            util_time.sleepMs(1);
+        }
+    }
+
+    /// Thread entry: run the pump; record the outcome.
+    fn pump(self: *StreamJob, prov: llm.provider.Provider, history: []const llm.Message, opts: llm.provider.CompleteOptions) void {
+        prov.stream(history, opts, @ptrCast(self), callback) catch |e| {
+            self.err = e;
+        };
+        self.done.store(true, .release);
+    }
+};
+
+/// Auto-escalation ceiling for the reasoning-burn retry: doublings from
+/// the default cover deep-thinking turns without letting a runaway retry
+/// burn unbounded tokens.
+const MAX_OUTPUT_BUDGET: u32 = 32_768;
+
+/// True when a response shows the budget-truncation signature: the wire
+/// said max_tokens, OR output landed on the cap (some gateways report
+/// end_turn at the length cap — out==cap is the tell). Reasoning models
+/// burning the whole budget on thinking produce exactly this shape: zero
+/// visible text, out == max_tokens.
+fn outputBudgetExhausted(stop: llm.provider.CompleteResponse.StopReason, out: u32, cap: u32) bool {
+    if (stop == .max_tokens) return true;
+    return cap > 0 and out >= cap;
+}
+
+test "outputBudgetExhausted detects the cap signature" {
+    const SR = llm.provider.CompleteResponse.StopReason;
+    // Wire-honest cap.
+    try std.testing.expect(outputBudgetExhausted(SR.max_tokens, 4096, 4096));
+    // Gateway lies about end_turn but out landed on the cap.
+    try std.testing.expect(outputBudgetExhausted(SR.end_turn, 4096, 4096));
+    // Healthy empty response (no spend) must NOT read as capped.
+    try std.testing.expect(!outputBudgetExhausted(SR.end_turn, 0, 4096));
+    // Normal completion below the cap.
+    try std.testing.expect(!outputBudgetExhausted(SR.end_turn, 3800, 4096));
+    // Zero/absent cap never triggers the out>=cap branch.
+    try std.testing.expect(!outputBudgetExhausted(SR.end_turn, 5000, 0));
+}
+
 fn streamComplete(
     prov: llm.Provider,
     history: []const llm.Message,
     opts: llm.provider.CompleteOptions,
     r: ?*std.Io.Reader,
     w: *std.Io.Writer,
+    /// Transcript writer for model text: the turn loop's RegionWriter
+    /// (table-aware). Null for non-TUI callers.
+    tw: ?*std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     alloc: std.mem.Allocator,
+    had_thinking: *bool,
 ) !llm.provider.CompleteResponse {
     var agg = StreamAgg{
         .alloc = alloc,
         .w = w,
+        .tw = tw,
         .file_writer = file_writer,
-        .esc_probe_r = r,
         .req_t0 = util_time.nowMillis(),
         .last_event_ms = util_time.nowMillis(),
     };
     defer agg.deinit();
     agg.line_buf.append(alloc, ' ') catch {}; // response margin seed
 
-    // Live input region: visible for the WHOLE generation — the input
-    // area must not disappear the moment a message is sent. Dropped on
-    // every exit path (defer); the tool phase re-begins it.
-    lineinput.regionBegin(w, "\x1b[2m⏳ 等待响应 0.0s · Esc 中断 · Enter 排队\x1b[0m");
+    // The live region is owned by the AGENT LOOP (begun once per turn,
+    // ended once after it) — streamComplete only prints INTO it. This
+    // defer flushes any trailing partial response line above the region
+    // on every exit path (flushLine is regionPrintLine-based); the region
+    // itself stays up for the caller to end or keep.
     defer {
-        // Flush a trailing partial line, then drop the region. Typed text
-        // merges into the next prompt — never frozen into the transcript.
         if (agg.line_buf.items.len > 1) {
             agg.line_buf.append(alloc, '\n') catch {};
             agg.flushLine();
         }
-        lineinput.regionEnd(w);
     }
 
     // Keep the terminal RAW for the whole generation: readLine restores
@@ -3068,24 +4024,103 @@ fn streamComplete(
             // Drain bytes that queued during the cooked tool-execution
             // window between two generations: an Esc pressed THERE must
             // not cancel this generation's very first stream event. The
-            // drain loop keeps ordinary typed-ahead bytes (escProbe stashes
-            // them) and drops the stale Esc.
-            while (lineinput.escProbe(r.?, null)) {}
+            // pump keeps ordinary typed-ahead bytes (they edit the
+            // persistent editor) and drops the stale Esc (true return).
+            while (lineinput.editorLiveKey(r.?, null)) {}
         }
     }
     defer if (r != null) esc_guard.restore();
 
-    prov.stream(history, opts, @ptrCast(&agg), streamCb) catch |err| {
-        // Hard transport failure before any event: the saw_error path below
-        // never runs, so free the duped tool strings here — they never
-        // reached history.
+    // P2: the pump runs on a worker thread; THIS thread is the UI loop —
+    // it drains the event queue, keeps the editor interactive (full
+    // editing while the network runs), ticks the status row, and cancels
+    // via the flag on Esc/Ctrl-C.
+    var job = StreamJob{ .alloc = allocator, .queue = .init() };
+    var job_opts = opts;
+    if (r != null) {
+        job_opts.cancel_flag = &job.cancel;
+        job_opts.cancel_fd = &job.cancel_fd;
+    }
+    var cb_err: ?anyerror = null;
+    {
+        const th = std.Thread.spawn(.{}, StreamJob.pump, .{ &job, prov, history, job_opts }) catch null;
+        if (th) |t| {
+            t.detach(); // joined logically below by waiting for done
+            ui: while (true) {
+                // 1) Drain events into the aggregator (pure processing —
+                //    streamCb no longer touches stdin).
+                while (job.queue.pop()) |ev| {
+                    streamCb(@ptrCast(&agg), ev) catch |err| {
+                        cb_err = err;
+                        job.cancel.store(true, .release);
+                        break :ui;
+                    };
+                    job.release(ev);
+                }
+                if (job.isDone()) break :ui;
+                // 2) Stdin: 100ms slice. Bytes edit the persistent editor
+                //    (editorLiveKey drains everything available); a quiet
+                //    slice ticks the status row.
+                if (r) |rr| {
+                    var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+                    const n = std.c.poll(&pfd, 1, 100);
+                    if (n == 1 and (pfd[0].revents & std.c.POLL.IN) != 0) {
+                        if (lineinput.editorLiveKey(rr, w)) {
+                            job.requestCancel();
+                        }
+                    } else if (n == 0) {
+                        // Quiet slice: cron tasks (same starvation fix as
+                        // the tool-phase loop) + the status tick.
+                        if (cron_ptr) |cp| cp.drainDue();
+                        streamCb(@ptrCast(&agg), .tick) catch {};
+                    }
+                } else {
+                    // No reader (non-interactive): wait for the pump.
+                    util_time.sleepMs(50);
+                }
+            }
+            // Wait for the pump to land (cancellation needs it to notice
+            // the flag and exit; the queue may still receive its last
+            // events — drain them without processing on the error path).
+            while (!job.isDone()) {
+                while (job.queue.pop()) |ev| {
+                    if (cb_err == null) {
+                        streamCb(@ptrCast(&agg), ev) catch |err| {
+                            cb_err = err;
+                            job.requestCancel();
+                        };
+                    }
+                    job.release(ev);
+                }
+                util_time.sleepMs(10);
+            }
+        } else {
+            // No thread available: degrade to the synchronous pump (no
+            // live editing — same shape as before P2).
+            prov.stream(history, job_opts, @ptrCast(&agg), streamCb) catch |err| {
+                job.err = err;
+            };
+        }
+    }
+    if (cb_err) |err| {
         for (agg.tools.items) |*tu| {
             alloc.free(tu.id);
             alloc.free(tu.name);
             freeJsonValue(alloc, tu.input);
         }
         return err;
-    };
+    }
+    if (job.err) |err| {
+        // Hard transport failure / Esc cancel / TTFT kill before any
+        // event: the saw_error path below never ran, so free the duped
+        // tool strings here — they never reached history.
+        for (agg.tools.items) |*tu| {
+            alloc.free(tu.id);
+            alloc.free(tu.name);
+            freeJsonValue(alloc, tu.input);
+        }
+        return err;
+    }
     if (agg.saw_error) |e| {
         // These dupes never made it into history — free them here.
         for (agg.tools.items) |*tu| {
@@ -3098,6 +4133,9 @@ fn streamComplete(
 
     var blocks: std.ArrayList(llm.ContentBlock) = .empty;
     errdefer blocks.deinit(alloc);
+    // Reasoning-stream marker out for the caller: a thinking-only response
+    // (reasoning deltas, zero content) gets a distinct diagnosis.
+    had_thinking.* = had_thinking.* or agg.thinking_shown;
     if (agg.text.items.len > 0) {
         const t = try alloc.dupe(u8, agg.text.items);
         try blocks.append(alloc, .{ .text = t });
@@ -3106,17 +4144,14 @@ fn streamComplete(
         try blocks.append(alloc, .{ .tool_use = tu });
     }
 
-    // Explicit teardown in the success path — the tail newline MUST come
-    // AFTER the region is dropped, or it moves the cursor below the
-    // region first and the deferred clear wipes the wrong rows (the
-    // typed ⌨ row survived into the transcript exactly this way). The
-    // defer above still covers every error path.
+    // Success: flush the trailing partial line (region-aware — the region
+    // stays up; the agent loop keeps printing above it or ends it). No
+    // teardown here: the old regionEnd+"\n" was per-generation; the region
+    // is now turn-scoped.
     if (agg.line_buf.items.len > 1) {
         agg.line_buf.append(alloc, '\n') catch {};
         agg.flushLine();
     }
-    lineinput.regionEnd(w);
-    try std.Io.Writer.writeAll(w, "\n");
     return .{
         .content = try blocks.toOwnedSlice(alloc),
         .usage = agg.usage,
@@ -3209,9 +4244,12 @@ fn connectMcpServer(
 }
 
 /// AskUserQuestion execution context: the live REPL reader/writer.
+/// `w` is the REAL writer (region lifecycle); `ow` is the region-aware
+/// transcript writer for the printed lines.
 const AskUserCtx = struct {
     r: *std.Io.Reader,
     w: *std.Io.Writer,
+    ow: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
 };
 
@@ -3221,15 +4259,37 @@ fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.
     const ctx: *AskUserCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.NoAskContext));
     const question = registry.getStringField(input, "question") orelse
         return registry.ToolResult{ .output = "Missing required field: question", .is_error = true };
-    try std.Io.Writer.print(ctx.w, "\n  [model asks] {s}\n  Your answer (Enter to skip): ", .{question});
+    // Interactive prompt/read happens with the turn-scoped region DOWN:
+    // the question + typed answer need the bottom rows and cooked-input
+    // echo, and a direct print with the region up would smear the
+    // persistent input row. The region is re-begun before returning (the
+    // tool phase still owns the screen bottom).
+    lineinput.regionEnd(ctx.w);
+    try std.Io.Writer.print(ctx.ow, "\n  [model asks] {s}\n  Your answer (Enter=skip, Esc=cancel): ", .{question});
     try std.Io.File.Writer.flush(ctx.file_writer);
+    // Cooked-with-echo for the answer read (2026-11-06 session-raw
+    // follow-up): raw mode would leave the user typing blind with Enter
+    // delivered as \r — streamDelimiter waits for \n and blocks forever.
+    // Same guard as the y/N permission gate and the /rewind confirm.
+    var cooked = menu.CookedGuard{};
+    cooked.enter();
+    defer cooked.restore();
     var ans_aw: std.Io.Writer.Allocating = .init(alloc);
     defer ans_aw.deinit();
     _ = std.Io.Reader.streamDelimiter(ctx.r, &ans_aw.writer, '\n') catch {
+        lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
         return registry.ToolResult{ .output = "user input unavailable", .is_error = true };
     };
     ctx.r.toss(1);
     const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
+    // Esc / Ctrl-C in the cooked read arrive as control bytes (ISIG is
+    // off) — a leading one means CANCEL, not an answer; feeding the
+    // model the raw byte used to turn "user pressed Esc" into junk text.
+    if (ans.len > 0 and (ans[0] == 0x1b or ans[0] == 0x03)) {
+        lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
+        return registry.ToolResult{ .output = "user cancelled the question (Esc)", .expected_stop = true };
+    }
+    lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
     return registry.ToolResult{
         .output = try alloc.dupe(u8, if (ans.len > 0) ans else "(no answer given)"),
     };
@@ -3247,6 +4307,9 @@ fn permissionGate(
     alloc: std.mem.Allocator,
     r: *std.Io.Reader,
     w: *std.Io.Writer,
+    /// Region-aware transcript writer: business prints go through it so
+    /// they land above the live region when one is up (verbatim when not).
+    ow: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     denials: *denial_tracker_mod.DenialTracker,
 ) !bool {
@@ -3282,9 +4345,9 @@ fn permissionGate(
     switch (decision) {
         .deny => |d| {
             if (denials.recordDenial()) {
-                try std.Io.Writer.print(w, "  [{d} consecutive denials — the agent is being starved; try /mode, an allow rule, or /config]\n", .{denials.consecutive_denials});
+                std.Io.Writer.print(ow, "  [{d} consecutive denials — the agent is being starved; try /mode, an allow rule, or /config]\n", .{denials.consecutive_denials}) catch {};
             }
-            try std.Io.Writer.print(w, "  [Permission denied: {s}]\n", .{d.message});
+            std.Io.Writer.print(ow, "  [Permission denied: {s}]\n", .{d.message}) catch {};
             try std.Io.File.Writer.flush(file_writer);
             return false;
         },
@@ -3293,28 +4356,42 @@ fn permissionGate(
             return true;
         },
         .ask => |a| {
-            try std.Io.Writer.print(w, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
+            // Interactive y/N happens with the turn region DOWN (the prompt
+            // + cooked-input echo own the bottom rows; a direct print with
+            // the region up smears the persistent input row). Re-begun on
+            // EVERY exit — the tool phase still owns the screen bottom.
+            lineinput.regionEnd(w);
+            try std.Io.Writer.print(ow, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
             try std.Io.File.Writer.flush(file_writer);
 
+            // Cooked-with-echo for the answer read (session is raw now —
+            // without this the user types blind and Enter never terminates
+            // the delimiter read). No-op on non-TTY stdin.
+            var cooked = menu.CookedGuard{};
+            cooked.enter();
+            defer cooked.restore();
             // Allocating answer buffer: the old fixed 64-byte reader turned
             // a long pasted answer into "Cancelled" and left the tail of the
             // line polluting the next read.
             var ans_aw: std.Io.Writer.Allocating = .init(alloc);
             defer ans_aw.deinit();
             _ = std.Io.Reader.streamDelimiter(r, &ans_aw.writer, '\n') catch {
-                try std.Io.Writer.writeAll(w, "\n  [Cancelled]\n");
+                try std.Io.Writer.writeAll(ow, "\n  [Cancelled]\n");
                 try std.Io.File.Writer.flush(file_writer);
+                lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
                 return false;
             };
             r.toss(1);
             const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
             if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
                 _ = denials.recordDenial();
-                try std.Io.Writer.writeAll(w, "  [Denied by user]\n");
+                try std.Io.Writer.writeAll(ow, "  [Denied by user]\n");
                 try std.Io.File.Writer.flush(file_writer);
+                lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
                 return false;
             }
             denials.recordApproval();
+            lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
             return true;
         },
     }
@@ -3341,6 +4418,100 @@ const PreparedCall = struct {
     old_unavailable: bool = false,
 };
 
+/// Ring of recent tool outputs backing /last (③, 2026-11-06): the
+/// transcript shows a one-line preview by design; this answers "它刚才
+/// 到底输出了什么" without re-running anything. 8 slots × 8 KiB.
+const LastTools = struct {
+    const N: usize = 8;
+    const CAP: usize = 8 * 1024;
+    var buf: [N * CAP]u8 = undefined;
+    var lens: [N]usize = @splat(0);
+    var names: [N][32]u8 = undefined;
+    var name_lens: [N]usize = @splat(0);
+    var head: usize = 0; // next write slot; newest lives at (head+N-1)%N
+    var count: usize = 0;
+
+    fn push(name: []const u8, output: []const u8) void {
+        const i = head;
+        lens[i] = @min(output.len, CAP);
+        @memcpy(buf[i * CAP .. i * CAP + lens[i]], output[0..lens[i]]);
+        const nl = @min(name.len, names[i].len);
+        @memcpy(names[i][0..nl], name[0..nl]);
+        name_lens[i] = nl;
+        head = (head + 1) % N;
+        count = @min(count + 1, N);
+    }
+
+    /// n=1 → newest. Null when nothing recorded / out of range.
+    fn get(n: usize) ?struct { name: []const u8, output: []const u8 } {
+        if (n == 0 or n > count) return null;
+        const i = (head + N - n) % N;
+        return .{ .name = names[i][0..name_lens[i]], .output = buf[i * CAP .. i * CAP + lens[i]] };
+    }
+};
+
+/// Full tool output into the transcript, 2-space indented, one line per
+/// print (line-atomic above the live region via RegionWriter; markdown-
+/// table rows still align). Bounded: past 50 lines or LastTools.CAP
+/// bytes a dim tail marker points at /last — the ring keeps its full
+/// 8 KiB regardless of what the transcript showed. The byte cut backs
+/// off to a UTF-8 boundary so a mid-汉字 slice can't mojibake.
+fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
+    const max_lines: usize = 50;
+    var cut = @min(raw.len, LastTools.CAP);
+    while (cut > 0 and cut < raw.len and (raw[cut] & 0xC0) == 0x80) cut -= 1;
+    var rest: []const u8 = raw[0..cut];
+    var shown: usize = 0;
+    while (rest.len > 0 and shown < max_lines) : (shown += 1) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch {};
+        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+    }
+    const total_lines = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
+    // Byte-cap truncation (one huge line) shows no line-count difference —
+    // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
+    // 10 KiB single line printed unmarked).
+    if (shown < total_lines or cut < raw.len) {
+        std.Io.Writer.print(w, "  \x1b[2m…已截断（显示 {d}/{d} 行）· /last 全文\x1b[0m\n", .{ shown, total_lines }) catch {};
+    }
+}
+
+test "printToolBody: verbatim body, cap marker, empty" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    printToolBody(&aw.writer, "one\ntwo\n");
+    try std.testing.expectEqualStrings("  one\n  two\n", aw.written());
+    // 55 lines: 50 shown + cap marker naming the true total.
+    var buf: [300]u8 = undefined;
+    var f = std.Io.Writer.fixed(&buf);
+    var i: usize = 0;
+    while (i < 55) : (i += 1) std.Io.Writer.print(&f, "l{d}\n", .{i}) catch unreachable;
+    aw.clearRetainingCapacity();
+    printToolBody(&aw.writer, f.buffered());
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "  l49\n") != null); // 50th line shown
+    try std.testing.expect(std.mem.indexOf(u8, out, "  l50\n") == null); // 51st not
+    try std.testing.expect(std.mem.indexOf(u8, out, "显示 50/55 行") != null);
+    // Empty output: no body, no marker.
+    aw.clearRetainingCapacity();
+    printToolBody(&aw.writer, "");
+    try std.testing.expectEqualStrings("", aw.written());
+}
+
+test "LastTools: ring order and wrap" {
+    LastTools.head = 0;
+    LastTools.count = 0;
+    LastTools.push("bash", "out-1");
+    LastTools.push("read", "out-2");
+    try std.testing.expectEqualStrings("out-2", LastTools.get(1).?.output);
+    try std.testing.expectEqualStrings("out-1", LastTools.get(2).?.output);
+    try std.testing.expect(LastTools.get(3) == null);
+    for (0..10) |_| LastTools.push("t", "x");
+    try std.testing.expectEqual(@as(usize, LastTools.N), LastTools.count);
+    try std.testing.expectEqualStrings("x", LastTools.get(1).?.output);
+    try std.testing.expect(LastTools.get(LastTools.N + 1) == null);
+}
+
 /// Phase 2 tail: print the outcome, truncate oversized output, record in the
 /// operation log, append the tool_result block. Returns true on tool error.
 fn finishToolCall(
@@ -3350,22 +4521,28 @@ fn finishToolCall(
     log: *op_log.OperationLog,
     result_blocks: *std.ArrayList(llm.ContentBlock),
     w: *std.Io.Writer,
+    ow: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
     history_len: usize,
+    elapsed_ms: i64,
 ) !bool {
-    logger.info("Tool execute: {s}", .{p.call.tool_name});
+    // Wall time from batch dispatch — for a parallel batch this includes
+    // queue wait and overlaps siblings; per-tool exclusive time would
+    // need per-future t0 plumbing the pool doesn't expose.
+    logger.info("Tool execute: {s} ({d}ms)", .{ p.call.tool_name, elapsed_ms });
 
-    // Keep the live region up through the tool phase (between generations
-    // nothing else owns the bottom rows).
-    lineinput.regionBegin(w, "\x1b[2m⚙ 执行工具 · Esc 中断\x1b[0m");
+    // Tool phase: the region is already up (turn-scoped) — just swap the
+    // STATUS text; the input row never flickers between phases anymore.
+    lineinput.regionStatus(w, "⚙ 执行工具 · Esc 中断");
 
     // Colorized code-change preview (TUI-only, shown only on success).
     // Tool output itself stays compact — it feeds LLM history; the diff
-    // never does. Render failures must not break tool flow.
+    // never does. Render failures must not break tool flow. `ow` keeps
+    // every diff line above the live region.
     if (!result.is_error and isFileModifyingTool(p.call.tool_name) and !p.old_unavailable) {
         var diff_arena = std.heap.ArenaAllocator.init(allocator);
         defer diff_arena.deinit();
-        renderCodeDiff(w, diff_arena.allocator(), p.call.input, p.old_content) catch {};
+        renderCodeDiff(ow, diff_arena.allocator(), p.call.input, p.old_content) catch {};
     }
 
     // Truncate large outputs for history — must dupe before freeing
@@ -3373,12 +4550,20 @@ fn finishToolCall(
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    // Result line above the live region (raw output capped at 200 chars,
-    // always at a UTF-8 boundary; embedded newlines are fine —
-    // regionPrintLine is multi-line safe).
-    var disp_cut: usize = @min(raw.len, 200);
-    while (disp_cut > 0 and disp_cut < raw.len and (raw[disp_cut] & 0xC0) == 0x80) disp_cut -= 1;
-    regionPrintF(w, "  [{s}: {s}]\n", .{ p.call.tool_name, raw[0..disp_cut] });
+    // Full-body display (2026-11-06, user call — supersedes the ③ 80-col
+    // one-liner): the preview made every interesting output a /last
+    // round-trip. Bounded at 50 lines / 8 KiB so a runaway grep still
+    // can't flood the screen; past the cap a dim marker points at /last.
+    // Wall time carried live; tool name colored by outcome.
+    LastTools.push(p.call.tool_name, raw);
+    const name_col = if (result.is_error) "\x1b[31m" else "\x1b[36m";
+    std.Io.Writer.print(ow, "  [{s}{s}\x1b[0m · {d}.{d}s]\n", .{
+        name_col,
+        p.call.tool_name,
+        @divTrunc(elapsed_ms, 1000),
+        @divTrunc(@mod(elapsed_ms, 1000), 100),
+    }) catch {};
+    printToolBody(ow, raw);
 
     // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
     // char boundary. A mid-char cut used to poison every later request:
@@ -3413,21 +4598,14 @@ fn finishToolCall(
 
 // ──── Code-change diff preview ────
 
-/// Format one line and print it ABOVE the live region (see
-/// lineinput.regionPrintLine). Oversized formats are skipped — every
-/// caller's line is width-capped upstream.
-fn regionPrintF(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    lineinput.regionPrintLine(w, line);
-}
-
 /// Render a colorized preview of what a file-modifying tool actually
 /// changed: removed lines in red, added in green, dim overflow note —
 /// visually distinct from every other TUI line so edits scan fast.
 /// edit-style tools (old_string/new_string) diff those strings directly;
 /// write-style tools (content) diff the captured pre-write bytes.
 /// `alloc` is a per-call scratch arena — nothing here outlives the print.
+/// `w` is the region-aware transcript writer: every line lands above the
+/// live region during a turn (see lineinput.RegionWriter).
 fn renderCodeDiff(
     w: *std.Io.Writer,
     alloc: std.mem.Allocator,
@@ -3458,7 +4636,7 @@ fn renderCodeDiff(
         const old_rows = std.mem.count(u8, ot, "\n") + 1;
         const new_rows = std.mem.count(u8, new_text, "\n") + 1;
         if (old_rows > DIFF_MAX_DIFFABLE_LINES or new_rows > DIFF_MAX_DIFFABLE_LINES) {
-            regionPrintF(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
+            try std.Io.Writer.print(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
             return;
         }
         const d = try diff_util.computeDiff(alloc, ot, new_text);
@@ -3475,18 +4653,18 @@ fn renderCodeDiff(
     while (i < lines.items.len and i < DIFF_MAX_LINES) : (i += 1) {
         const trunc = try diffTruncLine(alloc, lines.items[i].content, DIFF_MAX_COLS);
         switch (lines.items[i].kind) {
-            .removed => regionPrintF(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
-            .added => regionPrintF(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
+            .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
+            .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
             .equal => {},
         }
     }
     if (i < lines.items.len) {
-        regionPrintF(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
+        try std.Io.Writer.print(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
     } else if (old_text == null and lines.items.len > 0) {
-        regionPrintF(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
+        try std.Io.Writer.print(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
     }
     if (replace_all) {
-        regionPrintF(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
+        try std.Io.Writer.print(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
     }
 }
 
@@ -3587,6 +4765,9 @@ fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, 
 
     applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
     log.bumpEpoch();
+    // Auto-compact fires MID-TURN (region up) as often as between turns —
+    // the region-aware `w` callers pass handles both without overwriting
+    // the input row (verbatim when the region is down).
     std.Io.Writer.print(w, "  [Context auto-compacted: {d} messages remaining]\n", .{history.items.len}) catch {};
     std.Io.File.Writer.flush(file_writer) catch {};
     return estimateHistoryTokens(history.items);
@@ -3606,6 +4787,9 @@ fn compactHistory(
     file_writer: *std.Io.File.Writer,
     total_in: *u64,
     total_out: *u64,
+    /// Optional user focus instructions appended to the summary prompt
+    /// ("/compact focus on X" — Claude-Code parity).
+    focus: []const u8,
 ) !void {
     if (history.items.len <= 2) {
         try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
@@ -3619,10 +4803,15 @@ fn compactHistory(
 
     const before_msgs = history.items.len;
     const before_tokens = estimateHistoryTokens(history.items);
-    try std.Io.Writer.print(w, "  Compacting: summarizing {d} messages (~{d} tokens)…\n", .{ before_msgs - 1, before_tokens });
+    // v0.7.7: keep the most recent messages VERBATIM — only the older
+    // conversation is summarized (Claude-Code parity; the old version
+    // replaced everything, losing the live exchange you just had).
+    const KEEP_RECENT: usize = 4;
+    const summarize_to = if (before_msgs > KEEP_RECENT + 2) before_msgs - KEEP_RECENT else before_msgs;
+    try std.Io.Writer.print(w, "  Compacting: summarizing {d} messages, keeping the last {d} verbatim (~{d} tokens total)…\n", .{ summarize_to - 1, before_msgs - summarize_to, before_tokens });
     std.Io.File.Writer.flush(file_writer) catch {};
 
-    const transcript = compaction.renderTranscript(alloc, history.items[1..]) catch |err| {
+    const transcript = compaction.renderTranscript(alloc, history.items[1..summarize_to]) catch |err| {
         try std.Io.Writer.print(w, "  Compaction failed: {}\n  History untouched — try /compact phi.\n\n", .{err});
         return;
     };
@@ -3630,7 +4819,11 @@ fn compactHistory(
 
     const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
     defer alloc.free(sys_blocks);
-    sys_blocks[0] = .{ .text = compaction.SUMMARY_INSTRUCTION };
+    if (focus.len > 0) {
+        sys_blocks[0] = .{ .text = try alloc.print("{s}\n\nThe user additionally asks to prioritize:\n{s}", .{ compaction.SUMMARY_INSTRUCTION, focus }) };
+    } else {
+        sys_blocks[0] = .{ .text = compaction.SUMMARY_INSTRUCTION };
+    }
     const user_blocks = try alloc.alloc(llm.ContentBlock, 1);
     defer alloc.free(user_blocks);
     user_blocks[0] = .{ .text = transcript };
@@ -3661,7 +4854,34 @@ fn compactHistory(
         return;
     }
 
-    try replaceHistoryWithSummary(history, alloc, summary.items);
+    // Move the kept-recent tail out (clearHistory frees everything),
+    // then rebuild: system + summary + recent tail.
+    {
+        var tail: std.ArrayList(llm.Message) = .empty;
+        defer {
+            // On success the messages moved into history; on the error
+            // paths below they are freed here.
+            for (tail.items) |m| freeMessage(m, alloc);
+            tail.deinit(alloc);
+        }
+        for (history.items[summarize_to..]) |m| {
+            const dupe = dupeMessage(alloc, m) catch {
+                try std.Io.Writer.writeAll(w, "  Compaction failed (copy recent turns).\n  History untouched — try /compact phi.\n\n");
+                return;
+            };
+            tail.append(alloc, dupe) catch {
+                freeMessage(dupe, alloc);
+                try std.Io.Writer.writeAll(w, "  Compaction failed (copy recent turns).\n  History untouched — try /compact phi.\n\n");
+                return;
+            };
+        }
+        try replaceHistoryWithSummary(history, alloc, summary.items);
+        for (tail.items) |m| {
+            try history.append(alloc, m);
+        }
+        // Ownership moved into history: neutralize the defer's cleanup.
+        tail.clearRetainingCapacity();
+    }
     log.bumpEpoch();
 
     const after_tokens = estimateHistoryTokens(history.items);
@@ -3729,8 +4949,24 @@ fn applyFactsUpdate(history: *std.ArrayList(llm.Message), facts: *?[]u8, alloc: 
 /// facts (decisions, paths, constraints) survive truncation in a bounded
 /// "key facts" block instead of being lost with the phi cut.
 const fact_markers = [_][]const u8{
-    "决定", "改用", "换成", "选定", "decision", "switch to", "instead", "let's", "we'll", "use ",
-    "必须", "不要", "禁止", "不能", "must", "never", "always", "require",
+    "决定",
+    "改用",
+    "换成",
+    "选定",
+    "decision",
+    "switch to",
+    "instead",
+    "let's",
+    "we'll",
+    "use ",
+    "必须",
+    "不要",
+    "禁止",
+    "不能",
+    "must",
+    "never",
+    "always",
+    "require",
 };
 const path_hint_bytes = "/";
 
@@ -3832,6 +5068,13 @@ fn compactHistoryImpl(history: *std.ArrayList(llm.Message), alloc: std.mem.Alloc
 
 /// Clear history, keep only system prompt.
 /// Free one history message's content blocks (strings + JSON trees).
+/// Deep-copy one message (blocks + their strings) — used by /compact's
+/// keep-recent-tail path.
+fn dupeMessage(alloc: std.mem.Allocator, msg: llm.Message) !llm.Message {
+    const blocks = try cloneContentBlocks(alloc, msg.content);
+    return .{ .role = msg.role, .content = blocks, .timestamp = msg.timestamp };
+}
+
 fn freeMessage(msg: llm.Message, alloc: std.mem.Allocator) void {
     freeContentBlocks(alloc, msg.content);
 }
@@ -4009,6 +5252,10 @@ fn rewindOperation(
     try std.Io.Writer.writeAll(w, "\n  Select rollback point (or Enter to cancel): ");
     try std.Io.File.Writer.flush(file_writer);
 
+    // Cooked-with-echo (session raw otherwise — same as the confirm below).
+    var cooked_sel = menu.CookedGuard{};
+    cooked_sel.enter();
+    defer cooked_sel.restore();
     var ans_buf: [64]u8 = undefined;
     var ans_writer = std.Io.Writer.fixed(&ans_buf);
     const n = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
@@ -4066,6 +5313,10 @@ fn rewindOperation(
     try std.Io.Writer.writeAll(w, "  Proceed? [y/N]: ");
     try std.Io.File.Writer.flush(file_writer);
 
+    // Cooked-with-echo for the confirm read (session raw otherwise).
+    var cooked = menu.CookedGuard{};
+    cooked.enter();
+    defer cooked.restore();
     var confirm_buf: [16]u8 = undefined;
     var confirm_writer = std.Io.Writer.fixed(&confirm_buf);
     _ = std.Io.Reader.streamDelimiter(r, &confirm_writer, '\n') catch {
@@ -5101,6 +6352,9 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /compact phi      Truncate history to the recent 61.8% (no LLM call)
         \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
         \\  /context          Show current context/token usage
+        \\  /trace            Show the last turn's per-step timing
+        \\  /tasks            Show the task list and progress
+        \\  /last [N]         Show a recent tool's full output (N=1 newest)
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
         \\  /rewind           Rewind files AND conversation to a checkpoint
@@ -5360,8 +6614,7 @@ test "toolArgSummary picks the informative field and caps length" {
     try std.testing.expectEqualStrings("", toolArgSummary(a, "ToolSearch", empty));
 
     // Long command gets the ellipsis cap.
-    const longv = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        "{\"command\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", .{});
+    const longv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"command\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}", .{});
     const out = toolArgSummary(a, "Bash", longv);
     try std.testing.expect(std.mem.endsWith(u8, out, "…)"));
 }
@@ -5440,8 +6693,7 @@ test "renderCodeDiff colors edits and hides unchanged context" {
 
     // old_string carries surrounding context ("a"/"c") that appears on
     // both sides — it must not be echoed as a -/+ pair.
-    const input = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        "{\"path\":\"f.zig\",\"old_string\":\"a\\nb\\nc\",\"new_string\":\"a\\nX\\nc\"}", .{});
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"f.zig\",\"old_string\":\"a\\nb\\nc\",\"new_string\":\"a\\nX\\nc\"}", .{});
     try renderCodeDiff(&aw.writer, a, input, null);
 
     const out = aw.written();
@@ -5452,8 +6704,7 @@ test "renderCodeDiff colors edits and hides unchanged context" {
 
     // Write-style with no prior content → all green + new-file footer.
     aw.writer.end = 0;
-    const wr = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        "{\"path\":\"new.zig\",\"content\":\"line1\\nline2\"}", .{});
+    const wr = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"new.zig\",\"content\":\"line1\\nline2\"}", .{});
     try renderCodeDiff(&aw.writer, a, wr, null);
     const out2 = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out2, "\x1b[32m+ line1\x1b[0m") != null);
@@ -5501,6 +6752,37 @@ test "plan summary, append and remove system blocks (T8)" {
     try std.testing.expectEqual(@as(usize, 1), history.items[0].content.len);
     try std.testing.expectEqualStrings("SYSTEM", history.items[0].content[0].text);
     try std.testing.expect(!removeSystemBlockByText(&history, alloc, summary)); // gone: no-op
+}
+
+test "parseExtractionReply recovers fenced JSON from a prosy reply" {
+    const alloc = std.testing.allocator;
+    const reply =
+        \\Here is the requested knowledge extraction:
+        \\
+        \\```json
+        \\{"facts":[
+        \\  {"type":"user_preference","content":"用户偏好使用中文交流，代码注释保持中文"},
+        \\  {"type":"project_context","content":"ziv 的记忆提取已改为 LLM 主路径，关键词启发式仅作回退"},
+        \\  {"type":"technical_fact","content":"E2E 验证通过 mock 网关在 8792 端口完成"}
+        \\],
+        \\ "entities":[
+        \\  {"name":"ziv","type":"technology"},
+        \\  {"name":"memory-extraction","type":"concept"}
+        \\ ],
+        \\ "relations":[
+        \\  {"from":"ziv","to":"memory-extraction","relation":"implements"}
+        \\ ]}
+        \\```
+        \\
+        \\Hope this helps!
+    ;
+    var out = try parseExtractionReply(alloc, reply);
+    defer out.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), out.facts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), out.entities.items.len);
+    try std.testing.expectEqual(@as(usize, 1), out.relations.items.len);
+    try std.testing.expectEqual(extraction_mod.FactType.user_preference, out.facts.items[0].fact_type);
+    try std.testing.expectEqual(knowledge_graph.EntityType.technology, out.entities.items[0].etype);
 }
 
 test "key facts survive repeated phi compaction (T4.2)" {

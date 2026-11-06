@@ -4,7 +4,7 @@
 const std = @import("std");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
 const logger = @import("../util/log.zig");
-const stream_interrupt = @import("../util/stream_interrupt.zig");
+const time_mod = @import("../util/time.zig");
 const provider = @import("provider.zig");
 const message = @import("message.zig");
 const streaming_mod = @import("streaming.zig");
@@ -65,9 +65,18 @@ pub const ClaudeProvider = struct {
     }
 
     fn stream(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, ctx: ?*anyopaque, cb: *const provider.StreamCallback) anyerror!void {
+        return streamImpl(ptr, messages, opts, ctx, cb, true);
+    }
+
+    /// Keep-alive race retry — see openai.zig streamImpl (same rationale:
+    /// pooled idle conn server-closed, request bytes never consumed, one
+    /// invisible retry on a fresh connection; depth ≤ 1).
+    fn streamImpl(ptr: *anyopaque, messages: []const provider.Message, opts: provider.CompleteOptions, ctx: ?*anyopaque, cb: *const provider.StreamCallback, retry_ok: bool) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const body = try self.buildRequestBody(messages, opts, true);
         defer self.allocator.free(body);
+        // Transport-failure forensics — see the twin comment in openai.zig.
+        const stream_t0 = time_mod.nowMillis();
 
         var sse_parser = streaming_mod.SSEParser.init(self.allocator);
         defer sse_parser.deinit();
@@ -88,26 +97,56 @@ pub const ClaudeProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
+        // P2 cancellation plumbing: publish the connection fd for the UI
+        // loop; Esc/Ctrl-C shutdown(2)s it, failing the BLOCKING reads
+        // below (the pump thread never polls — see CompleteOptions docs).
+        // Clear before return so a pooled-fd shutdown can never hit a
+        // reused connection.
+        if (opts.cancel_fd) |pfd| {
+            if (req.connection) |conn| {
+                pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+            }
+        }
+        defer if (opts.cancel_fd) |pfd| pfd.store(-1, .release);
+        // Ticks for the status row while headers are pending: the UI loop
+        // generates its own; nothing to do here.
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            // A TTFT kill (gateway never sent even the headers) surfaces
+            // here as a transport error — map it so the caller retries.
+            if (wd.ttftKilled()) return error.FirstByteTimeout;
+            if (retry_ok and !wd.idleKilled() and (e == error.HttpConnectionClosing or e == error.ConnectionResetByPeer)) {
+                logger.info("claude: pooled conn dead ({s}, no headers) — retrying once on a fresh connection", .{@errorName(e)});
+                return streamImpl(ptr, messages, opts, ctx, cb, false);
+            }
+            provider.setErrorDetailIfEmpty("claude: request failed: {s}", .{@errorName(e)});
+            return e;
+        };
+        // Headers arrived — the gateway is alive. Lift the watchdog's TTFT
+        // sub-deadline NOW: it used to stay armed for the whole request
+        // (claude.zig never called firstByte), so any request still alive
+        // at 30s got its socket killed mid-stream and retried — the
+        // "every message waits ~100s" pathology. Body silence stays
+        // covered by the in-loop TTFT counter below.
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "Claude stream", &response);
         }
 
-        // Stream: read chunks and parse SSE events incrementally.
-        // TTFT budget: an interactive request with zero body bytes after
-        // currentTtftMs() is treated as dead (the gateway's known
-        // accept-but-never-answer behavior) — kill it here; the REPL
-        // auto-retries instead of waiting out the 180s total watchdog.
-        const ttft_budget_ms: i64 = @intCast(llm_watchdog.currentTtftMs());
-        var ttft_wait_ms: i64 = 0;
+        // Stream: read chunks and parse SSE events incrementally. The
+        // watchdog's TTFT sub-deadline covers never-any-headers (killed at
+        // receiveHead → FirstByteTimeout); body silence is bounded by the
+        // 180s idle watchdog — bumped per chunk below, so a stream that
+        // keeps sending never hits it, however long the turn runs.
         var first_byte_seen = false;
+        var received_bytes: u64 = 0;
         var resp_read_buf: [8192]u8 = undefined;
         const resp_reader = response.reader(&resp_read_buf);
         var chunk_buf: [4096]u8 = undefined;
@@ -116,43 +155,15 @@ pub const ClaudeProvider = struct {
         defer agg.deinit();
 
         while (true) {
-            // Interruptible idle wait: rather than blocking in peekGreedy,
-            // poll the socket (and stdin past the silence threshold) when
-            // nothing is buffered. Esc/Ctrl-C during a gateway stall then
-            // surfaces as EscCancelled — the same cancel/recall path an
-            // in-stream Esc takes — instead of a dead terminal until the
-            // 180s watchdog. Interactive streams only (opts.esc_interrupt).
-            if (opts.esc_interrupt and resp_reader.bufferedLen() == 0) {
-                if (req.connection) |conn| {
-                    var idle_ms: i32 = 0;
-                    wait: while (true) {
-                        const watch = idle_ms >= stream_interrupt.SILENCE_BEFORE_WATCH_MS;
-                        switch (stream_interrupt.waitSlice(conn.stream_reader.stream.socket.handle, watch)) {
-                            .ready => break :wait,
-                            .tick => {
-                                idle_ms += stream_interrupt.POLL_SLICE_MS;
-                                if (!first_byte_seen) {
-                                    ttft_wait_ms += stream_interrupt.POLL_SLICE_MS;
-                                    if (ttft_wait_ms >= ttft_budget_ms) {
-                                        _ = std.c.shutdown(conn.stream_reader.stream.socket.handle, llm_watchdog.SHUT_RDWR);
-                                        logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{ttft_wait_ms});
-                                        return error.FirstByteTimeout;
-                                    }
-                                }
-                                try cb(ctx, .tick);
-                            },
-                            .cancelled => return error.EscCancelled,
-                            // Echo the keystroke through the stream callback
-                            // so the REPL (which owns the screen) renders it.
-                            .input => |b| {
-                                idle_ms = 0;
-                                try cb(ctx, .{ .live_input = b });
-                            },
-                        }
-                    }
-                }
-            }
-            first_byte_seen = true; // buffered or just-read data exists
+            // P2: the pump thread BLOCKS in peekGreedy — correct reader
+            // semantics (a body delivered in the same TCP segment as the
+            // headers lives in the connection buffer, which only a real
+            // read consumes). Cancellation is the UI loop's shutdown(2)
+            // on the published fd; the watchdog's TTFT sub-deadline
+            // (headers) and 180s idle deadline (bumped per chunk here)
+            // bound the block.
+            first_byte_seen = true; // reached only when data exists
+            wd.firstByte(); // data exists: lift TTFT, push the idle deadline
             // Incremental read: take whatever is buffered right now (at least
             // one byte) instead of waiting for the 4 KiB buffer to fill —
             // readSliceShort buffered the whole SSE response before parsing,
@@ -168,6 +179,7 @@ pub const ClaudeProvider = struct {
             const n = @min(avail.len, chunk_buf.len);
             @memcpy(chunk_buf[0..n], avail[0..n]);
             resp_reader.toss(n);
+            received_bytes += n;
 
             _ = try sse_parser.feed(chunk_buf[0..n]);
             const events = sse_parser.drain();
@@ -184,21 +196,37 @@ pub const ClaudeProvider = struct {
                 if (evt.data) |data| {
                     const finished = try agg.feed(data, ctx, cb);
                     if (finished) {
-                        try cb(ctx, .{ .done = agg.usageValue() });
+                        try cb(ctx, .{ .done = .{
+                            .usage = agg.usageValue(),
+                            .stop_reason = agg.stopReasonValue(),
+                        } });
                         return;
                     }
                 }
             }
         }
         if (read_err) |e| {
-            if (llm_watchdog.consumeTtftKill()) return error.FirstByteTimeout;
+            if (wd.ttftKilled()) return error.FirstByteTimeout;
+            const elapsed = @as(f64, @floatFromInt(time_mod.nowMillis() - stream_t0)) / 1000.0;
+            // A kill by OUR idle watchdog (stream went silent) is
+            // attributed to ziv, not the gateway — see openai.zig's
+            // 2026-11-05 note.
+            if (wd.idleKilled()) {
+                provider.setErrorDetailIfEmpty("claude stream: killed by ziv idle watchdog — stream went silent past the deadline (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            } else {
+                provider.setErrorDetailIfEmpty("claude stream: transport error: {s} (HTTP {d}, received {d} bytes over {d:.1}s, model {s})", .{ @errorName(e), @backingInt(response.head.status), received_bytes, elapsed, self.config.model });
+            }
+            logger.err("{s}", .{provider.lastErrorDetail()});
             try cb(ctx, .{ .error_occurred = switch (e) {
                 error.ConnectionResetByPeer, error.BrokenPipe => provider.ProviderError.NetworkTimeout,
                 else => provider.ProviderError.ServerError,
             } });
             return;
         }
-        try cb(ctx, .{ .done = agg.usageValue() });
+        try cb(ctx, .{ .done = .{
+            .usage = agg.usageValue(),
+            .stop_reason = agg.stopReasonValue(),
+        } });
     }
 
     fn countTokens(ptr: *anyopaque, text: []const u8) anyerror!u32 {
@@ -370,6 +398,11 @@ pub const ClaudeProvider = struct {
     }
 
     fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
+        return sendRequestImpl(self, path, body, true);
+    }
+
+    /// Keep-alive race retry — see openai.zig sendRequestImpl.
+    fn sendRequestImpl(self: *Self, path: []const u8, body: []const u8, retry_ok: bool) ![]u8 {
         const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
 
@@ -387,13 +420,24 @@ pub const ClaudeProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
-        const wd = llm_watchdog.arm(&req);
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.arm(&req, &kill_reason);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            if (retry_ok and !wd.ttftKilled() and !wd.idleKilled() and (e == error.HttpConnectionClosing or e == error.ConnectionResetByPeer)) {
+                logger.info("claude: pooled conn dead ({s}, no headers) — retrying once on a fresh connection", .{@errorName(e)});
+                return sendRequestImpl(self, path, body, false);
+            }
+            provider.setErrorDetailIfEmpty("claude: request failed: {s}", .{@errorName(e)});
+            return e;
+        };
+        // Headers arrived — alive; lift the TTFT sub-deadline (a long
+        // non-stream completion must not be killed at 30s mid-body-read).
+        wd.firstByte();
 
         if (response.head.status.class() != .success) {
             return provider.failRequest(self.allocator, "Claude API", &response);

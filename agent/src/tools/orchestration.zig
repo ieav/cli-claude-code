@@ -3,6 +3,8 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const math = @import("../math/mod.zig");
+const cancel = @import("../util/cancel.zig");
+const util_time = @import("../util/time.zig");
 
 pub const ToolCall = struct {
     tool_name: []const u8,
@@ -161,11 +163,23 @@ fn executeToolCall(
     io: std.Io,
     tools_def: []const registry.ToolDefinition,
 ) registry.ToolResult {
+    // Ownership rule: ToolResult.output transfers to history, which FREES
+    // it (freeContentBlocks) — every output must therefore be allocator-
+    // owned. A string literal here would crash /clear and compaction.
+    // (OOM degrade: an empty string is the one literal free() tolerates —
+    // Allocator.free no-ops on zero-length slices.)
+    if (cancel.toolBatchCancelled()) {
+        // User cancelled the batch (Esc): every not-yet-started call
+        // short-circuits to an error result — the tool_use id STILL gets
+        // a tool_result, so history stays API-valid, and the batch
+        // finishes fast instead of running the remaining calls.
+        return .{ .output = allocator.dupe(u8, "cancelled by user (not run)") catch "", .is_error = true };
+    }
     const tool = findTool(tools_def, call.tool_name) orelse
-        return .{ .output = "Tool not found", .is_error = true };
+        return .{ .output = allocator.dupe(u8, "Tool not found") catch "", .is_error = true };
 
     return tool.execute(allocator, call.input, io) catch
-        .{ .output = "Tool execution error", .is_error = true };
+        .{ .output = allocator.dupe(u8, "Tool execution error") catch "", .is_error = true };
 }
 
 test "partitionToolCalls" {
@@ -292,4 +306,69 @@ test "executeBatches preserves order across many calls (wave looping)" {
         try std.testing.expect(!r.result.is_error);
         try std.testing.expect(std.mem.indexOf(u8, r.result.output, "WAVE_OK") != null);
     }
+}
+
+test "executeBatches cancel short-circuits remaining calls (all ids keep results)" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    defer cancel.toolBatchReset(); // never leak a `true` into other tests
+    const io = io_state.io();
+
+    // Two serial Bash calls (Bash is never concurrency-safe → one batch
+    // each): the first hangs with timeout 0, the second must NEVER run.
+    var slow_obj: std.json.ObjectMap = .empty;
+    defer slow_obj.deinit(alloc);
+    try slow_obj.put(alloc, "command", .{ .string = "sleep 30" });
+    try slow_obj.put(alloc, "timeout", .{ .integer = 0 });
+    var ok_obj: std.json.ObjectMap = .empty;
+    defer ok_obj.deinit(alloc);
+    try ok_obj.put(alloc, "command", .{ .string = "printf RAN" });
+
+    const calls = [_]ToolCall{
+        .{ .tool_name = "Bash", .input = .{ .object = slow_obj }, .tool_use_id = "slow" },
+        .{ .tool_name = "Bash", .input = .{ .object = ok_obj }, .tool_use_id = "never" },
+    };
+
+    const batches = try partitionToolCalls(&calls, registry.default_tools, alloc);
+    defer {
+        for (batches) |b| alloc.free(b.calls);
+        alloc.free(batches);
+    }
+
+    // Fire the cancel ~300ms in, while `sleep 30` is mid-flight.
+    const canceller = try std.Thread.spawn(.{}, struct {
+        fn run() void {
+            const t0 = util_time.nowMillis();
+            while (util_time.nowMillis() - t0 < 300) {
+                util_time.sleepMs(10);
+            }
+            cancel.toolBatchCancel();
+        }
+    }.run, .{});
+    canceller.detach();
+
+    const t0 = util_time.nowMillis();
+    const results = try executeBatches(batches, alloc, io, registry.default_tools);
+    defer {
+        // Both outputs are allocator-owned (the history ownership rule).
+        for (results) |r| alloc.free(r.result.output);
+        alloc.free(results);
+    }
+    const elapsed = util_time.nowMillis() - t0;
+
+    // Every call yields a result, in the original order — the invariant
+    // the REPL's history validity depends on (one tool_result per
+    // tool_use id, whatever happened).
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("slow", results[0].tool_use_id);
+    try std.testing.expectEqualStrings("never", results[1].tool_use_id);
+    // First: killed mid-flight by the cancel watchdog.
+    try std.testing.expect(results[0].result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].result.output, "cancelled by user") != null);
+    // Second: short-circuited before starting.
+    try std.testing.expect(results[1].result.is_error);
+    try std.testing.expectEqualStrings("cancelled by user (not run)", results[1].result.output);
+    // Bounded: cancelled at ~300ms, never anywhere near `sleep 30`.
+    try std.testing.expect(elapsed < 10_000);
 }

@@ -51,3 +51,13 @@
 **机制**：`var p = ProviderImpl.init(...); return p.toProvider();` —— 类型擦除指针指向栈上 `p`，函数返回即悬垂。主线程恰好快用完没踩坏；子线程/延迟路径必炸
 **修复模式**：调用方持有存储——`ProviderStorage` union（按 backend 分支）由调用方分配并存活整个使用期，`makeProviderInto(ctx, io, &storage)` 返回的指针绑在存储上。**判别口诀：任何 `toProvider`/类型擦除返回前，问一句"被指对象活多久"**
 **命中次数**：3 处（ziv 反思后台、子代理派发、探针误判连环——它曾是"并发挂死"的头号假凶）
+
+### [资源生命周期 < 功能承诺边界] raw mode 只在提示符窗口持有，回合中编辑器裸奔在 cooked+echo 上
+
+**判别信号**：TUI 输入区出现 **caret 记法字面文本**（`^[[C`、`^R`）——这是 tty 驱动 ECHOCTL 回显的特征，程序自己写 ESC 字节到终端只会被当转义序列吃掉、显示不出 `^[`。看到 caret 记法 = 驱动在回显 = 程序没在 raw 模式 = **查 termios 生命周期，别查按键解析代码**
+**机制**：raw mode 由 `readLine()` 内的 RawGuard 进入、return 时恢复——所有权锚在"读一行"上。而事件循环承诺"回合期间输入框全功能在线"（v0.7.0），编辑器跨过了这个生命周期边界：整个回合 tty 是 cooked+echo，tty 驱动与 TUI 抢键盘职责——驱动实时回显（控制键 caret 记法）、行缓冲不交付（编辑器按不到键）、行编辑吃掉 0x7f/Ctrl-R。中文正常（驱动透传多字节）加剧了"部分键坏部分键好"的迷惑性
+**排查动作**：ziv 运行中另开终端 `stty -a -f /dev/ttysNNN`——`icanon echo echoctl` 即实锤；pty 复现用 `pty.fork()`（subprocess 继承不到控制终端，`/dev/tty` 会报 not configured）
+**修复模式**：**所有权上移**——repl.run 持会话级唯一 RawGuard（defer 恢复 + 信号兜底归最外层 guard，嵌套 guard 不得覆写信号恢复槽）；readLine 只做 tty 检测不再碰 termios；回合中的 y/N 确认读取用 CookedGuard（ICANON+ECHO+ICRNL）临时回 cooked——raw 下 Enter 是 `\r`，streamDelimiter 等 `\n` 会永久阻塞且用户盲打
+**不变量（L3）**：任何"承诺跨阶段可交互"的输入功能，其依赖的终端模式必须覆盖同一时间窗——功能承诺的边界 ≥ 资源持有的边界，否则中间的缝就是两个编辑器打架的战场
+**护栏思路**：新增任何 stdin 读取点前先问"此刻谁持有 termios"；pty 回归测试探针（`/run Bash {"command":"stty -a -f /dev/tty"}` 断言 `-icanon -echo`）
+**命中次数**：1（2026-11-06 回合中输入区乱码 ^[[C/^R，用户两轮上报；同日终端写互斥锁是相邻但独立的机制——输出交错 vs 输入回显）

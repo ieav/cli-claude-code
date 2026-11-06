@@ -114,8 +114,13 @@ pub const ReflectionEngine = struct {
         defer insights_buf.deinit(self.allocator);
 
         if (error_rate > (1.0 - math.constants.PHI)) {
-            // Error rate > 38.2%
-            try insights_buf.appendSlice(self.allocator, "错误率过高。建议减少并发任务或切换到更稳定的模型。");
+            // Error rate > 38.2% — REAL failures only (timeout kills and
+            // user cancels carry expected_stop and never reach this
+            // counter). The old canned advice ("减少并发/换更稳定的模型")
+            // misdiagnosed deliberate timeout-driven debugging as
+            // environment instability and got stored as a cross-session
+            // "insight"; point at the actual outputs instead.
+            try insights_buf.appendSlice(self.allocator, "工具真实失败率过高（超时击杀与用户取消已剔除）。建议回看失败工具的输出定位具体原因。");
             actionable = true;
         } else if (recent_tools_used > recent_queries.len * 3) {
             try insights_buf.appendSlice(self.allocator, "工具调用频繁。可能需要优化提示词以减少不必要的工具调用。");

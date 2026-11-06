@@ -37,6 +37,29 @@ pub const KnowledgeEdge = struct {
 pub const KnowledgeGraph = struct {
     allocator: std.mem.Allocator,
     db: *database.Database,
+    // Prepared-once statements: extraction bursts addNode/addEdge/findNodeId
+    // ~30 statements in one pass; pruneWeakEdges stays ad-hoc (rare).
+    stmt_find_node: database.CachedStatement = .{ .sql =
+        "SELECT id FROM knowledge_nodes WHERE entity = ?1 LIMIT 1"
+    },
+    stmt_insert_node: database.CachedStatement = .{ .sql =
+        // OR IGNORE closes the cross-process race the SELECT-first dedup
+        // cannot (two windows both miss, both insert): the unique
+        // idx_knodes_entity swallows the loser's row.
+        "INSERT OR IGNORE INTO knowledge_nodes (entity, entity_type, properties, source, created_at, updated_at) " ++
+            "VALUES (?1, ?2, NULL, ?3, ?4, ?5)"
+    },
+    stmt_edge_exists: database.CachedStatement = .{ .sql =
+        "SELECT rowid FROM knowledge_edges WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3"
+    },
+    stmt_insert_edge: database.CachedStatement = .{ .sql =
+        // OR IGNORE: the unique idx_kedges_triple arbitrates the
+        // cross-process race the SELECT cannot.
+        "INSERT OR IGNORE INTO knowledge_edges (from_id, to_id, relation, weight) VALUES (?1, ?2, ?3, ?4)"
+    },
+    stmt_count_nodes: database.CachedStatement = .{ .sql =
+        "SELECT COUNT(*) FROM knowledge_nodes"
+    },
 
     const Self = @This();
 
@@ -44,30 +67,34 @@ pub const KnowledgeGraph = struct {
         return .{ .allocator = allocator, .db = db };
     }
 
+    /// Finalize the cached statements. Must run before the Database closes.
+    pub fn deinit(self: *Self) void {
+        self.stmt_find_node.deinit();
+        self.stmt_insert_node.deinit();
+        self.stmt_edge_exists.deinit();
+        self.stmt_insert_edge.deinit();
+        self.stmt_count_nodes.deinit();
+    }
+
+    /// Node id for an exact entity name, or null — wires LLM-extracted
+    /// relations whose endpoint names may predate this session.
+    pub fn findNodeId(self: *Self, entity: []const u8) ?i64 {
+        var find = self.stmt_find_node.acquire(self.allocator, self.db) catch return null;
+        find.bindText(1, entity) catch return null;
+        if (find.step() catch false) return find.columnInt64(0);
+        return null;
+    }
+
     pub fn addNode(self: *Self, entity: []const u8, entity_type: EntityType, source: ?[]const u8) !i64 {
         // Entity dedup: the same entity text reused to return a fresh row
         // every session, so re-extraction grew the graph without bound.
         {
-            var find = try database.Statement.prepare(
-                self.allocator,
-                self.db,
-                "SELECT id FROM knowledge_nodes WHERE entity = ?1 LIMIT 1",
-            );
-            defer find.finalize();
+            var find = try self.stmt_find_node.acquire(self.allocator, self.db);
             try find.bindText(1, entity);
             if (try find.step()) return find.columnInt64(0);
         }
         const now = time_mod.nowMillis();
-        var stmt = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            // OR IGNORE closes the cross-process race the SELECT above
-            // cannot (two windows both miss, both insert): the unique
-            // idx_knodes_entity swallows the loser's row.
-            "INSERT OR IGNORE INTO knowledge_nodes (entity, entity_type, properties, source, created_at, updated_at) " ++
-                "VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
-        );
-        defer stmt.finalize();
+        var stmt = try self.stmt_insert_node.acquire(self.allocator, self.db);
         try stmt.bindText(1, entity);
         try stmt.bindText(2, @tagName(entity_type));
         if (source) |s| try stmt.bindText(3, s);
@@ -76,12 +103,7 @@ pub const KnowledgeGraph = struct {
         if (try stmt.step()) return error.UnexpectedRow;
         // Resolve the id by entity — on a race-lost INSERT OR IGNORE,
         // lastInsertRowId is stale and would hand out the WRONG node.
-        var find = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            "SELECT id FROM knowledge_nodes WHERE entity = ?1 LIMIT 1",
-        );
-        defer find.finalize();
+        var find = try self.stmt_find_node.acquire(self.allocator, self.db);
         try find.bindText(1, entity);
         if (try find.step()) return find.columnInt64(0);
         return error.NodeInsertFailed;
@@ -92,25 +114,13 @@ pub const KnowledgeGraph = struct {
         // full history on every /clear and session end, and an unconditional
         // INSERT re-added the same co_extracted edges once per run — the
         // edge table grew without bound across sessions.
-        var exists = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            "SELECT rowid FROM knowledge_edges WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3",
-        );
-        defer exists.finalize();
+        var exists = try self.stmt_edge_exists.acquire(self.allocator, self.db);
         try exists.bindInt64(1, from_id);
         try exists.bindInt64(2, to_id);
         try exists.bindText(3, relation);
         if (try exists.step()) return; // edge already recorded
 
-        var stmt = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            // OR IGNORE: the unique idx_kedges_triple arbitrates the
-            // cross-process race the SELECT cannot.
-            "INSERT OR IGNORE INTO knowledge_edges (from_id, to_id, relation, weight) VALUES (?1, ?2, ?3, ?4)",
-        );
-        defer stmt.finalize();
+        var stmt = try self.stmt_insert_edge.acquire(self.allocator, self.db);
         try stmt.bindInt64(1, from_id);
         try stmt.bindInt64(2, to_id);
         try stmt.bindText(3, relation);
@@ -135,12 +145,7 @@ pub const KnowledgeGraph = struct {
 
     /// Get node count.
     pub fn nodeCount(self: *Self) !usize {
-        var stmt = try database.Statement.prepare(
-            self.allocator,
-            self.db,
-            "SELECT COUNT(*) FROM knowledge_nodes",
-        );
-        defer stmt.finalize();
+        var stmt = try self.stmt_count_nodes.acquire(self.allocator, self.db);
         if (!try stmt.step()) return error.NoRows;
         return @intCast(stmt.columnInt64(0));
     }
@@ -205,6 +210,7 @@ test "KnowledgeGraph addNode and addEdge" {
     try db.runMigrations();
 
     var kg = KnowledgeGraph.init(std.testing.allocator, &db);
+    defer kg.deinit();
     // Node ids are SQLite AUTOINCREMENT (1-based), not array indexes.
     const zig_id = try kg.addNode("Zig", .technology, "test");
     const claude_id = try kg.addNode("Claude", .technology, "test");

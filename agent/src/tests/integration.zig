@@ -56,6 +56,7 @@ test "EpisodicStore store and touch" {
     try db.runMigrations();
 
     var store = episodic.EpisodicStore.init(std.testing.allocator, &db);
+    defer store.deinit(); // finalize cached stmts
 
     var id: [16]u8 = undefined;
     for (&id, 0..) |*byte, i| byte.* = @intCast(i);
@@ -88,6 +89,7 @@ test "EpisodicStore store with special characters" {
     try db.runMigrations();
 
     var store = episodic.EpisodicStore.init(std.testing.allocator, &db);
+    defer store.deinit(); // finalize cached stmts
 
     var id: [16]u8 = undefined;
     for (&id, 0..) |*byte, i| byte.* = @intCast(i + 100);
@@ -122,6 +124,7 @@ test "KnowledgeGraph addNode returns valid row ID" {
     try db.runMigrations();
 
     var kg = knowledge.KnowledgeGraph.init(std.testing.allocator, &db);
+    defer kg.deinit(); // finalize cached stmts
 
     const id1 = try kg.addNode("Zig", .technology, "test");
     const id2 = try kg.addNode("Rust", .technology, "test");
@@ -139,6 +142,7 @@ test "KnowledgeGraph addNode with SQL-special characters" {
     try db.runMigrations();
 
     var kg = knowledge.KnowledgeGraph.init(std.testing.allocator, &db);
+    defer kg.deinit(); // finalize cached stmts
 
     const id = try kg.addNode("O'Brien's Framework", .concept, "source; DROP TABLE--;--");
     try std.testing.expect(id >= 0);
@@ -160,6 +164,7 @@ test "KnowledgeGraph pruneWeakEdges" {
     try db.runMigrations();
 
     var kg = knowledge.KnowledgeGraph.init(std.testing.allocator, &db);
+    defer kg.deinit(); // finalize cached stmts
 
     const a = try kg.addNode("A", .concept, null);
     const b = try kg.addNode("B", .concept, null);
