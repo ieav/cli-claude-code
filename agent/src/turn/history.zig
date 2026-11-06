@@ -104,13 +104,25 @@ pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocat
     if (!compaction.needsCompaction(current_tokens, ceiling)) return current_tokens;
 
     applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
+    // P2 tier 3 rides the auto path too: the φ-kept window still carries
+    // fat tool_results — slim them (no LLM needed; the emergency path must
+    // work with the gateway down, hence phi+slim instead of full hybrid).
+    const slim = slimToolResults(history.items, alloc);
     log.bumpEpoch();
+    const after_tokens = estimateHistoryTokens(history.items);
+    logger.info("compact: strategy=phi+slim tokens ~{d}->~{d} slimmed={d} ({d}->{d}B)", .{
+        current_tokens, after_tokens, slim.slimmed, slim.bytes_before, slim.bytes_after,
+    });
     // Auto-compact fires MID-TURN (region up) as often as between turns —
     // the region-aware `w` callers pass handles both without overwriting
     // the input row (verbatim when the region is down).
-    std.Io.Writer.print(w, "  [Context auto-compacted: {d} messages remaining]\n", .{history.items.len}) catch {};
+    if (slim.slimmed > 0) {
+        std.Io.Writer.print(w, "  [Context auto-compacted: ~{d} → ~{d} tokens, {d} messages remaining, {d} tool outputs slimmed]\n", .{ current_tokens, after_tokens, history.items.len, slim.slimmed }) catch {};
+    } else {
+        std.Io.Writer.print(w, "  [Context auto-compacted: ~{d} → ~{d} tokens, {d} messages remaining]\n", .{ current_tokens, after_tokens, history.items.len }) catch {};
+    }
     std.Io.File.Writer.flush(file_writer) catch {};
-    return estimateHistoryTokens(history.items);
+    return after_tokens;
 }
 
 /// Force compact history via LLM summary (used by /compact) — Claude-style:
@@ -143,12 +155,16 @@ pub fn compactHistory(
 
     const before_msgs = history.items.len;
     const before_tokens = estimateHistoryTokens(history.items);
-    // v0.7.7: keep the most recent messages VERBATIM — only the older
-    // conversation is summarized (Claude-Code parity; the old version
-    // replaced everything, losing the live exchange you just had).
-    const KEEP_RECENT: usize = 4;
-    const summarize_to = if (before_msgs > KEEP_RECENT + 2) before_msgs - KEEP_RECENT else before_msgs;
-    try std.Io.Writer.print(w, "  Compacting: summarizing {d} messages, keeping the last {d} verbatim (~{d} tokens total)…\n", .{ summarize_to - 1, before_msgs - summarize_to, before_tokens });
+    // P2 hybrid (design D4): three tiers — the OLD segment is summarized,
+    // the last HYBRID_KEEP_ROUNDS user-anchored rounds stay VERBATIM
+    // (round-anchored split: a tool exchange never crosses the boundary),
+    // then oversized tool_results in the kept window are slimmed (tier 3).
+    const summarize_to = compaction.hybridSplit(history.items, compaction.HYBRID_KEEP_ROUNDS);
+    if (summarize_to <= 1) {
+        try std.Io.Writer.print(w, "  Nothing to compact — the last {d} rounds stay verbatim and there is no older segment.\n\n", .{compaction.HYBRID_KEEP_ROUNDS});
+        return;
+    }
+    try std.Io.Writer.print(w, "  Compacting (hybrid): summarizing {d} messages, keeping the last {d} verbatim (~{d} tokens total)…\n", .{ summarize_to - 1, before_msgs - summarize_to, before_tokens });
     std.Io.File.Writer.flush(file_writer) catch {};
 
     const transcript = compaction.renderTranscript(alloc, history.items[1..summarize_to]) catch |err| {
@@ -194,40 +210,116 @@ pub fn compactHistory(
         return;
     }
 
-    // Move the kept-recent tail out (clearHistory frees everything),
-    // then rebuild: system + summary + recent tail.
-    {
-        var tail: std.ArrayList(llm.Message) = .empty;
-        defer {
-            // On success the messages moved into history; on the error
-            // paths below they are freed here.
-            for (tail.items) |m| freeMessage(m, alloc);
-            tail.deinit(alloc);
-        }
-        for (history.items[summarize_to..]) |m| {
-            const dupe = dupeMessage(alloc, m) catch {
-                try std.Io.Writer.writeAll(w, "  Compaction failed (copy recent turns).\n  History untouched — try /compact phi.\n\n");
-                return;
-            };
-            tail.append(alloc, dupe) catch {
-                freeMessage(dupe, alloc);
-                try std.Io.Writer.writeAll(w, "  Compaction failed (copy recent turns).\n  History untouched — try /compact phi.\n\n");
-                return;
-            };
-        }
-        try replaceHistoryWithSummary(history, alloc, summary.items);
-        for (tail.items) |m| {
-            try history.append(alloc, m);
-        }
-        // Ownership moved into history: neutralize the defer's cleanup.
-        tail.clearRetainingCapacity();
-    }
+    // Rebuild via the shared hybrid surgery: system + summary + verbatim
+    // tail + tier-3 tool-result slimming.
+    const slim = applyHybridLayout(history, alloc, summarize_to, summary.items) catch {
+        try std.Io.Writer.writeAll(w, "  Compaction failed (rebuild layout).\n  History untouched — try /compact phi.\n\n");
+        return;
+    };
     log.bumpEpoch();
 
     const after_tokens = estimateHistoryTokens(history.items);
-    try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} → ~{d} tokens | summary call {d} in / {d} out)\n\n", .{
-        before_msgs, history.items.len, before_tokens, after_tokens, usage.input_tokens, usage.output_tokens,
+    logger.info("compact: strategy=hybrid msgs {d}->{d} tokens ~{d}->~{d} slimmed={d} ({d}->{d}B)", .{
+        before_msgs, history.items.len, before_tokens, after_tokens, slim.slimmed, slim.bytes_before, slim.bytes_after,
     });
+    if (slim.slimmed > 0) {
+        try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} → ~{d} tokens | {d} tool outputs slimmed {d} KiB → {d} KiB | summary call {d} in / {d} out)\n\n", .{
+            before_msgs,          history.items.len,
+            before_tokens,        after_tokens,
+            slim.slimmed,         slim.bytes_before / 1024,
+            slim.bytes_after / 1024, usage.input_tokens,
+            usage.output_tokens,
+        });
+    } else {
+        try std.Io.Writer.print(w, "  Compacted: {d} → {d} messages (~{d} → ~{d} tokens | summary call {d} in / {d} out)\n\n", .{
+            before_msgs, history.items.len, before_tokens, after_tokens, usage.input_tokens, usage.output_tokens,
+        });
+    }
+}
+
+/// Tier-3 of the hybrid strategy (P2): oversized tool_results are slimmed
+/// IN HISTORY to a 1 KiB head + byte-count marker. The display layer (/last
+/// ring, previews) holds its own full copies — this surgery only saves
+/// request tokens. Idempotent: a slimmed result sits far below the
+/// threshold, so repeated passes never touch it again.
+pub const SlimStats = struct {
+    slimmed: usize = 0,
+    bytes_before: usize = 0,
+    bytes_after: usize = 0,
+};
+
+pub fn slimToolResults(messages: []llm.Message, alloc: std.mem.Allocator) SlimStats {
+    var stats: SlimStats = .{};
+    for (messages) |*msg| {
+        // Fast path: nothing oversized in this message → skip the rebuild.
+        var has_fat = false;
+        for (msg.content) |b| {
+            if (b == .tool_result and b.tool_result.content.len > compaction.TOOL_SLIM_THRESHOLD) {
+                has_fat = true;
+                break;
+            }
+        }
+        if (!has_fat) continue;
+        // Message.content is a []const slice — rebuild it with the slimmed
+        // blocks (the established swap pattern; see swapMemoryBlockText).
+        const old = msg.content;
+        const nb = alloc.alloc(llm.ContentBlock, old.len) catch continue;
+        for (old, 0..) |b, bi| {
+            if (b == .tool_result and b.tool_result.content.len > compaction.TOOL_SLIM_THRESHOLD) {
+                var mbuf: [64]u8 = undefined;
+                const marker = compaction.toolSlimMarker(&mbuf, b.tool_result.content.len);
+                const head = @min(b.tool_result.content.len, compaction.TOOL_SLIM_HEAD);
+                if (marker.len > 0) {
+                    if (alloc.alloc(u8, head + marker.len)) |owned| {
+                        @memcpy(owned[0..head], b.tool_result.content[0..head]);
+                        @memcpy(owned[head..], marker);
+                        stats.bytes_before += b.tool_result.content.len;
+                        stats.bytes_after += owned.len;
+                        stats.slimmed += 1;
+                        alloc.free(@constCast(b.tool_result.content));
+                        nb[bi] = .{ .tool_result = .{
+                            .tool_use_id = b.tool_result.tool_use_id,
+                            .content = owned,
+                            .is_error = b.tool_result.is_error,
+                        } };
+                        continue;
+                    } else |_| {}
+                }
+            }
+            nb[bi] = b;
+        }
+        alloc.free(@constCast(old));
+        msg.content = nb;
+    }
+    return stats;
+}
+
+/// Hybrid surgery (pure, no LLM): rebuild history as
+/// [system prompt (kept — clearHistory preserves index 0)] +
+/// [summary-as-user-message] + [verbatim tail from summarize_to], then slim
+/// oversized tool_results everywhere. The tail is duped out before the
+/// clear, so on error the history is left untouched. Unit-testable with a
+/// fake summary.
+pub fn applyHybridLayout(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, summarize_to: usize, summary: []const u8) !SlimStats {
+    if (summarize_to <= 1 or summarize_to > history.items.len) return error.BadHybridBounds;
+    var tail: std.ArrayList(llm.Message) = .empty;
+    defer {
+        // On success the messages moved into history; on the error paths
+        // below they are freed here.
+        for (tail.items) |m| freeMessage(m, alloc);
+        tail.deinit(alloc);
+    }
+    for (history.items[summarize_to..]) |m| {
+        const dupe = try dupeMessage(alloc, m);
+        try tail.append(alloc, dupe);
+    }
+    try replaceHistoryWithSummary(history, alloc, summary);
+    for (tail.items) |m| {
+        try history.append(alloc, m);
+    }
+    // Ownership moved into history: neutralize the defer's cleanup.
+    tail.clearRetainingCapacity();
+    return slimToolResults(history.items, alloc);
 }
 
 /// Replace everything after the system prompt with a single user message
@@ -982,3 +1074,87 @@ test "swapMemoryBlockText replaces by identity, preserves siblings" {
     try std.testing.expectEqualStrings("NEW-MEMORY", history.items[0].content[1].text);
 }
 
+
+test "hybrid layout: 20 rounds keep last 5 verbatim, slim tool results, <40% tokens" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+
+    // [system] + 20 × ([user text] [assistant text] [user tool_result 5 KiB])
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+    }
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var ub: [64]u8 = undefined;
+        const ut = try std.fmt.bufPrint(&ub, "user question round {d} about topic {d}", .{ round, round * 7 });
+        const ubb = try alloc.alloc(llm.ContentBlock, 1);
+        ubb[0] = .{ .text = try alloc.dupe(u8, ut) };
+        try history.append(alloc, .{ .role = .user, .content = ubb, .timestamp = 0 });
+
+        var ab: [64]u8 = undefined;
+        const at = try std.fmt.bufPrint(&ab, "assistant answer round {d}", .{round});
+        const abb = try alloc.alloc(llm.ContentBlock, 1);
+        abb[0] = .{ .text = try alloc.dupe(u8, at) };
+        try history.append(alloc, .{ .role = .assistant, .content = abb, .timestamp = 0 });
+
+        const fat = try alloc.alloc(u8, 5 * 1024);
+        @memset(fat, 'x');
+        const trb = try alloc.alloc(llm.ContentBlock, 1);
+        trb[0] = .{ .tool_result = .{
+            .tool_use_id = try alloc.dupe(u8, "id"),
+            .content = fat,
+        } };
+        try history.append(alloc, .{ .role = .user, .content = trb, .timestamp = 0 });
+    }
+    const before_tokens = estimateHistoryTokens(history.items);
+    const before_msgs = history.items.len;
+    try std.testing.expectEqual(@as(usize, 61), before_msgs);
+
+    // The layout (not the LLM call) is what the acceptance locks.
+    const split = compaction.hybridSplit(history.items, compaction.HYBRID_KEEP_ROUNDS);
+    try std.testing.expectEqual(@as(usize, 46), split); // round 15 opens the tail (last 5 of rounds 0..19)
+    const slim = try applyHybridLayout(&history, alloc, split, "SUMMARY: rounds 0-15 condensed.");
+
+    // Tier 2: the last five rounds stay verbatim.
+    for ([_][]const u8{ "round 15", "round 16", "round 17", "round 18", "round 19" }) |frag| {
+        var found = false;
+        for (history.items) |m| for (m.content) |b| {
+            if (b == .text and std.mem.indexOf(u8, b.text, frag) != null) found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // Old rounds survive ONLY inside the summary message — the exact old
+    // phrasings must be gone from any text block.
+    var has_summary = false;
+    for (history.items) |m| for (m.content) |b| {
+        if (b != .text) continue;
+        if (std.mem.indexOf(u8, b.text, "SUMMARY: rounds 0-15") != null) has_summary = true;
+        if (std.mem.indexOf(u8, b.text, "user question round") != null)
+            try std.testing.expect(std.mem.indexOf(u8, b.text, "round 15") != null or
+                std.mem.indexOf(u8, b.text, "round 16") != null or
+                std.mem.indexOf(u8, b.text, "round 17") != null or
+                std.mem.indexOf(u8, b.text, "round 18") != null or
+                std.mem.indexOf(u8, b.text, "round 19") != null);
+    };
+    try std.testing.expect(has_summary);
+
+    // Tier 3: every remaining tool_result carries the slim marker.
+    try std.testing.expectEqual(@as(usize, 5), slim.slimmed);
+    for (history.items) |m| for (m.content) |b| {
+        if (b == .tool_result) {
+            try std.testing.expect(b.tool_result.content.len < 2 * 1024);
+            try std.testing.expect(std.mem.indexOf(u8, b.tool_result.content, "5120") != null);
+        }
+    };
+
+    // Acceptance: total tokens < 40% of before, message count shrank.
+    const after_tokens = estimateHistoryTokens(history.items);
+    try std.testing.expect(after_tokens * 10 < before_tokens * 4);
+    try std.testing.expect(history.items.len < before_msgs);
+}

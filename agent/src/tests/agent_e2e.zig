@@ -291,3 +291,98 @@ test "agent dispatch E2E stall: watchdog kills, retry fails, dispatch still retu
     try std.testing.expect(elapsed < 30_000);
     alloc.free(result.output);
 }
+
+// ── P2 hybrid compaction E2E ─────────────────────────────────────────
+
+test "hybrid compact E2E: mock gateway summarizes, layout is three-tier" {
+    const alloc = std.heap.smp_allocator;
+    var server = MockServer{ .mode = .happy };
+    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
+    th.detach();
+    const port = try waitReady(&server);
+    defer server.running.store(false, .release);
+
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const turn_history = @import("../turn/history.zig");
+    const model_switcher = @import("../session/model_switcher.zig");
+    const config_mod = @import("../config.zig");
+    const op_log = @import("../checkpoint/op_log.zig");
+
+    var settings = config_mod.Settings{};
+    settings.default_model = "gpt-mock-e2e"; // gpt- prefix → openai backend
+    settings.api_keys.openai = "test-key";
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{port});
+    var switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer switcher.deinit();
+
+    // [system] + 12 × ([user] [assistant] [user tool_result 5 KiB]).
+    var history: std.ArrayList(@import("../llm/mod.zig").Message) = .empty;
+    {
+        const llm = @import("../llm/mod.zig");
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        var round: usize = 0;
+        while (round < 12) : (round += 1) {
+            var ub: [64]u8 = undefined;
+            const ut = try std.fmt.bufPrint(&ub, "user question round {d}", .{round});
+            const ubb = try alloc.alloc(llm.ContentBlock, 1);
+            ubb[0] = .{ .text = try alloc.dupe(u8, ut) };
+            try history.append(alloc, .{ .role = .user, .content = ubb, .timestamp = 0 });
+            const abb = try alloc.alloc(llm.ContentBlock, 1);
+            abb[0] = .{ .text = try alloc.dupe(u8, "assistant answer") };
+            try history.append(alloc, .{ .role = .assistant, .content = abb, .timestamp = 0 });
+            const fat = try alloc.alloc(u8, 5 * 1024);
+            @memset(fat, 'x');
+            const trb = try alloc.alloc(llm.ContentBlock, 1);
+            trb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "t0"), .content = fat } };
+            try history.append(alloc, .{ .role = .user, .content = trb, .timestamp = 0 });
+        }
+    }
+    defer {
+        for (history.items) |m| turn_history.freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    const before_tokens = turn_history.estimateHistoryTokens(history.items);
+
+    var log = op_log.OperationLog.init(alloc);
+    defer log.deinit();
+    const null_file = try std.Io.Dir.cwd().openFile(io, "/dev/null", .{ .mode = .write_only });
+    defer null_file.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var fw = std.Io.File.Writer.initStreaming(null_file, io, &wbuf);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var total_in: u64 = 0;
+    var total_out: u64 = 0;
+
+    try turn_history.compactHistory(&history, &switcher, &log, alloc, &aw.writer, &fw, &total_in, &total_out, "");
+
+    // Exactly one summary call hit the mock gateway.
+    try std.testing.expectEqual(@as(u32, 1), server.served.load(.monotonic));
+    // Three-tier layout: system kept, summary present, last 5 rounds verbatim.
+    try std.testing.expect(history.items[0].role == .system);
+    var has_summary = false;
+    for (history.items) |m| for (m.content) |b| {
+        if (b == .text and std.mem.indexOf(u8, b.text, "Here is a summary") != null) has_summary = true;
+    };
+    try std.testing.expect(has_summary);
+    var kept_rounds: usize = 0;
+    for (history.items) |m| for (m.content) |b| {
+        if (b == .text and std.mem.indexOf(u8, b.text, "user question round") != null) kept_rounds += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 5), kept_rounds);
+    // Tier 3: kept tool results carry the slim marker; tokens dropped hard.
+    var slim_markers: usize = 0;
+    for (history.items) |m| for (m.content) |b| {
+        if (b == .tool_result and std.mem.indexOf(u8, b.tool_result.content, "字节") != null) slim_markers += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 5), slim_markers);
+    const after_tokens = turn_history.estimateHistoryTokens(history.items);
+    try std.testing.expect(after_tokens * 10 < before_tokens * 4);
+    try std.testing.expect(total_in + total_out > 0); // usage accounted
+    alloc.free(settings.api_keys.openai_base_url.?);
+}

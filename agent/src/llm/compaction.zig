@@ -1,13 +1,20 @@
-/// Message compaction — two strategies for freeing context window:
+/// Message compaction — three strategies for freeing context window:
 ///   - `phi_condense` (truncation): drop the oldest messages down to the φ
 ///     target, keeping the system prompt. Pure math + history surgery, no
-///     LLM call — lives in repl.zig (compactHistoryImpl, maybeCompact,
-///     /compact phi).
+///     LLM call — lives in turn/history.zig (compactHistoryImpl,
+///     maybeCompact, /compact phi).
 ///   - `summarize` (Claude-style): the LLM summarizes the conversation and
 ///     the summary replaces the history, so context is condensed instead of
 ///     dropped. This module provides the summary instruction and transcript
-///     renderer; the LLM call and history surgery live in repl.zig (/compact).
-/// Both strategies share the φ threshold math below.
+///     renderer; the LLM call and history surgery live in turn/history.zig
+///     (/compact).
+///   - `hybrid` (P2, design D4): three tiers — the OLD segment is LLM-
+///     summarized, the most recent K ROUNDS stay verbatim (round-anchored,
+///     never split mid-exchange), and oversized tool_results in the kept
+///     window are slimmed to a head + byte-count marker. The summary is no
+///     longer all-or-nothing. Bounds math lives here (hybridSplit); the
+///     surgery is applyHybridLayout in turn/history.zig.
+/// All strategies share the φ threshold math below.
 const std = @import("std");
 const provider = @import("provider.zig");
 const math_mod = @import("../math/mod.zig");
@@ -15,8 +22,68 @@ const math_mod = @import("../math/mod.zig");
 pub const CompactionStrategy = enum {
     summarize,
     phi_condense,
+    /// Auto-compaction flavor since P2: φ truncation PLUS tier-3 tool-result
+    /// slimming over the kept window (no LLM dependency — the emergency path
+    /// must work with the gateway down).
+    phi_slim,
     hybrid,
+
+    pub fn label(self: CompactionStrategy) []const u8 {
+        return switch (self) {
+            .summarize => "summarize",
+            .phi_condense => "phi",
+            .phi_slim => "phi+slim",
+            .hybrid => "hybrid",
+        };
+    }
 };
+
+/// Hybrid tier-2: how many trailing ROUNDS stay verbatim (a round is
+/// user-anchored: the user message plus every assistant/tool message up to
+/// the next user message). Roadmap acceptance: 20-round conversation keeps
+/// the last 5 rounds.
+pub const HYBRID_KEEP_ROUNDS: usize = 5;
+
+/// Tier-3: a tool_result larger than this is slimmed IN HISTORY to
+/// TOOL_SLIM_HEAD bytes + a byte-count marker. The display layer (/last)
+/// keeps full text independently — this saves request tokens only.
+pub const TOOL_SLIM_THRESHOLD: usize = 4 * 1024;
+pub const TOOL_SLIM_HEAD: usize = 1024;
+
+/// Marker appended to a slimmed tool_result: `[截断，完整输出 N 字节]`.
+pub fn toolSlimMarker(buf: []u8, original_bytes: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "\n[截断，完整输出 {d} 字节]\n", .{original_bytes}) catch "";
+}
+
+/// Round-anchored three-tier split for the hybrid strategy.
+/// Returns `summarize_to`: messages [1, summarize_to) form the LLM-summarized
+/// old segment, [summarize_to, len) is the verbatim tail holding exactly
+/// `keep_rounds` user-anchored rounds (or the whole conversation when there
+/// are fewer — then 1 is returned: nothing to summarize).
+/// A round anchor is a user message whose first block is TEXT: tool results
+/// ride on user-role messages (Anthropic convention), and they belong to the
+/// round that called the tool — the boundary therefore never separates a
+/// tool_result from its tool_use across tiers.
+pub fn hybridSplit(messages: []const provider.Message, keep_rounds: usize) usize {
+    if (messages.len <= 1) return 1;
+    // Index of the message that starts the keep_rounds-th-from-last round.
+    var rounds_seen: usize = 0;
+    var i = messages.len;
+    while (i > 0) {
+        i -= 1;
+        const m = messages[i];
+        if (m.role != .user) continue;
+        if (m.content.len == 0 or m.content[0] != .text) continue; // tool-result message
+        rounds_seen += 1;
+        if (rounds_seen == keep_rounds) {
+            // A bare user message at index 0 would mean index 0 is not the
+            // system prompt — still summarize from 1, never drop the head.
+            return @max(i, 1);
+        }
+    }
+    // Fewer rounds than keep_rounds: keep everything verbatim.
+    return 1;
+}
 
 pub const CompactionResult = union(enum) {
     compacted: struct {
@@ -100,6 +167,52 @@ test "needsCompaction" {
 test "condensationTarget" {
     try std.testing.expectEqual(@as(usize, 61), condensationTarget(100));
     try std.testing.expectEqual(@as(usize, 618), condensationTarget(1000));
+}
+
+test "hybridSplit locks the three-tier boundaries" {
+    const alloc = std.testing.allocator;
+    // 20 rounds, 3 messages each: [sys] then per round (user-text, assistant,
+    // user-tool_result). sys occupies index 0; round r's user msg sits at
+    // 1 + 3r. Keeping the last 5 rounds must split exactly on round 16's
+    // user message: 1 + 3*15 = 46.
+    const text_blocks = try alloc.alloc(provider.ContentBlock, 1);
+    defer alloc.free(text_blocks);
+    text_blocks[0] = .{ .text = "x" };
+    const tr_blocks = try alloc.alloc(provider.ContentBlock, 1);
+    defer {
+        alloc.free(@constCast(tr_blocks[0].tool_result.tool_use_id));
+        alloc.free(@constCast(tr_blocks[0].tool_result.content));
+        alloc.free(tr_blocks);
+    }
+    tr_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = @constCast(try alloc.dupe(u8, "t0")),
+        .content = @constCast(try alloc.dupe(u8, "r")),
+    } };
+    var msgs: [61]provider.Message = undefined;
+    msgs[0] = .{ .role = .system, .content = text_blocks, .timestamp = 0 };
+    for (1..61) |i| {
+        msgs[i] = .{
+            .role = if (i % 3 == 1) .user else if (i % 3 == 2) .assistant else .user,
+            .content = if (i % 3 == 0) tr_blocks else text_blocks,
+            .timestamp = 0,
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 46), hybridSplit(&msgs, 5));
+
+    // ≤ keep_rounds rounds: nothing to summarize.
+    try std.testing.expectEqual(@as(usize, 1), hybridSplit(msgs[0..1], 5));
+    try std.testing.expectEqual(@as(usize, 1), hybridSplit(msgs[0..13], 5)); // 4 rounds
+    // Round anchor must NOT be a tool-result user message: cutting before
+    // round 20's text user message leaves round 19's tool message as the
+    // last user-role message — the split still lands on a TEXT user message.
+    try std.testing.expectEqual(@as(usize, 43), hybridSplit(msgs[0..58], 5));
+}
+
+test "toolSlimMarker carries the original byte count" {
+    var buf: [64]u8 = undefined;
+    const m = toolSlimMarker(&buf, 16384);
+    try std.testing.expect(std.mem.indexOf(u8, m, "16384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "截断") != null);
 }
 
 test "renderTranscript labels roles and includes tool activity" {
