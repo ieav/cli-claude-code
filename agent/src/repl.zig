@@ -689,7 +689,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         if (allocator.dupe(u8, input)) |q| {
             window_queries.append(allocator, q) catch allocator.free(q);
             evbus.emit(.{ .user_query_start = {} }); // P3 event record
-            if (window_queries.items.len > 20) {
+            if (window_queries.items.len > 256) {
                 allocator.free(window_queries.orderedRemove(0));
             }
         } else |_| {}

@@ -844,7 +844,20 @@ pub fn runReflection(
     bus: ?*task_mod.EventBus,
 ) void {
     const reflect_t0 = util_time.nowMillis();
-    const reflection = reflector.reflect(window_queries.items, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
+    // P5 经验回放：窗口 >20 条时 π-均匀采样——反思看见会话全史（早期
+    // 决策重回视野），而非只盯最近 20 条。
+    var sampled: ?[]const []const u8 = null;
+    defer if (sampled) |s| alloc.free(@constCast(s));
+    const reflect_window: []const []const u8 = blk: {
+        if (window_queries.items.len > 20) {
+            if (reflection_mod.piSample(alloc, window_queries.items, 20)) |s| {
+                sampled = s;
+                break :blk s;
+            } else |_| {}
+        }
+        break :blk window_queries.items;
+    };
+    const reflection = reflector.reflect(reflect_window, window_tools.*, window_errors.*, .on_query_complete) catch return orelse return;
 
     // Gate: only ACTIONABLE windows pay the LLM round trip (and the print
     // and the stored row). A clean session is routine — it used to be
@@ -885,7 +898,7 @@ pub fn runReflection(
         }
         var qs_extra: [16][]const u8 = undefined;
         var n_extra: usize = 0;
-        for (window_queries.items) |q| {
+        for (reflect_window) |q| {
             if (n_extra >= 15) break;
             qs_extra[n_extra] = q;
             n_extra += 1;

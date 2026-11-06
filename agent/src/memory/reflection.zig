@@ -196,6 +196,32 @@ pub const ReflectionEngine = struct {
     }
 };
 
+/// P5 经验回放：π-均匀采样——把全史窗口（可能数百条查询）压成 k 条
+/// 跨度样本：第 j 个槽落在 j·n/k 处，槽内偏移由 j·π 的小数部分抖动
+/// （确定性、零随机源）。反思由此看见会话早期，不再只盯最近 20 条。
+pub fn piSample(alloc: std.mem.Allocator, queries: []const []const u8, k: usize) ![]const []const u8 {
+    if (queries.len <= k) return queries;
+    const out = try alloc.alloc([]const u8, k);
+    errdefer alloc.free(out);
+    var filled: usize = 0;
+    var last_idx: ?usize = null;
+    for (0..k) |j| {
+        const slot_len = @as(f64, @floatFromInt(queries.len)) / @as(f64, @floatFromInt(k));
+        const pi_x = @as(f64, @floatFromInt(j)) * math.constants.PI;
+        const pi_frac = pi_x - @floor(pi_x);
+        const pos = @as(f64, @floatFromInt(j)) * slot_len + pi_frac * (slot_len - 1);
+        var idx: usize = @intFromFloat(@max(0, @min(@as(f64, @floatFromInt(queries.len - 1)), pos)));
+        if (last_idx) |li| {
+            if (idx <= li) idx = li + 1;
+        }
+        if (idx >= queries.len) break;
+        out[filled] = queries[idx];
+        filled += 1;
+        last_idx = idx;
+    }
+    return out[0..filled];
+}
+
 test "ReflectionEngine shouldReflect triggers every N queries" {
     var engine = ReflectionEngine.init(std.testing.allocator);
     defer engine.deinit();
@@ -245,4 +271,44 @@ test "reflect classifies actionable vs routine windows" {
     const r4 = (try engine.reflect(&mediocre, 5, 1, .on_query_complete)).?;
     try std.testing.expect(r4.actionable);
     try std.testing.expect(r4.quality_score < 0.62);
+}
+
+
+test "piSample spans the full window deterministically (replay, not recency)" {
+    const alloc = std.testing.allocator;
+    // 100 distinct queries; a recency-only window would never see q000-q079.
+    var buf: [100][16]u8 = undefined;
+    var all: [100][]const u8 = undefined;
+    for (0..100) |i| {
+        all[i] = try std.fmt.bufPrint(&buf[i], "q{d:0>3}", .{i});
+    }
+    const s1 = try piSample(alloc, &all, 20);
+    defer alloc.free(@constCast(s1));
+    try std.testing.expectEqual(@as(usize, 20), s1.len);
+    // First decile AND last decile both represented — the whole history
+    // is in play.
+    var has_early = false;
+    var has_late = false;
+    for (s1) |q| {
+        const n = std.fmt.parseInt(u16, q[1..], 10) catch continue;
+        if (n < 10) has_early = true;
+        if (n >= 90) has_late = true;
+    }
+    try std.testing.expect(has_early);
+    try std.testing.expect(has_late);
+    // Strictly increasing (no duplicates, no ordering surprises).
+    var prev: i32 = -1;
+    for (s1) |q| {
+        const n = std.fmt.parseInt(i32, q[1..], 10) catch continue;
+        try std.testing.expect(n > prev);
+        prev = n;
+    }
+    // Deterministic: same input, same output.
+    const s2 = try piSample(alloc, &all, 20);
+    defer alloc.free(@constCast(s2));
+    try std.testing.expectEqualSlices([]const u8, s1, s2);
+    // Short window passes through untouched (no sampling below k).
+    const short = all[0..5];
+    const s3 = try piSample(alloc, short, 20);
+    try std.testing.expectEqualSlices([]const u8, short, s3);
 }
