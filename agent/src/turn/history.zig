@@ -95,6 +95,24 @@ pub fn estimateTextTokens(text: []const u8) u32 {
 /// token estimate AFTER any compaction — callers reuse it instead of
 /// re-scanning the whole history (the loop used to run the same O(n)
 /// estimate twice per iteration).
+/// Default verbatim-tail rounds for the auto ladder (matches /compact).
+pub const HYBRID_KEEP: usize = compaction.HYBRID_KEEP_ROUNDS;
+
+/// P2.5 上下文压力梯子（提炼优先，2026-11-07 用户定纲）：
+/// 信息先经 LLM 提炼存续（摘要套摘要滚动压缩），截断只在提炼不可用
+/// 时兜底。纯决策，矩阵可单测。
+pub const PressureLevel = enum { ok, extract, emergency };
+
+pub fn pressureLadder(est_tokens: u32, ceiling: u32) PressureLevel {
+    if (ceiling == 0) return .emergency;
+    const e: f64 = @floatFromInt(est_tokens);
+    const c: f64 = @floatFromInt(ceiling);
+    const pct = e / c;
+    if (pct <= math_mod.constants.PHI) return .ok; // ≤61.8%：不动
+    if (pct <= 0.92) return .extract; // 提炼（保信息）
+    return .emergency; // 收窄保留窗（keep=2）再提炼
+}
+
 /// What an auto-compaction pass did — repl turns this into a decision-trace
 /// step (roadmap P2 observability: before/after tokens land in /diagnose).
 pub const CompactEvent = struct {
@@ -152,6 +170,25 @@ pub fn compactHistory(
     /// ("/compact focus on X" — Claude-Code parity).
     focus: []const u8,
 ) !void {
+    return compactHistoryKeep(history, switcher, log, alloc, w, file_writer, total_in, total_out, focus, compaction.HYBRID_KEEP_ROUNDS);
+}
+
+/// Hybrid compaction with an explicit verbatim-tail size. The auto
+/// pressure ladder calls this directly: keep=5 normally, keep=2 under
+/// emergency pressure — the tail is what can't shrink, so shrinking it is
+/// the last lever before information loss.
+pub fn compactHistoryKeep(
+    history: *std.ArrayList(llm.Message),
+    switcher: *ModelSwitcher,
+    log: *op_log.OperationLog,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+    total_in: *u64,
+    total_out: *u64,
+    focus: []const u8,
+    keep_rounds: usize,
+) !void {
     if (history.items.len <= 2) {
         try std.Io.Writer.writeAll(w, "  Nothing to compact.\n\n");
         return;
@@ -168,7 +205,7 @@ pub fn compactHistory(
     // the last HYBRID_KEEP_ROUNDS user-anchored rounds stay VERBATIM
     // (round-anchored split: a tool exchange never crosses the boundary),
     // then oversized tool_results in the kept window are slimmed (tier 3).
-    const summarize_to = compaction.hybridSplit(history.items, compaction.HYBRID_KEEP_ROUNDS);
+    const summarize_to = compaction.hybridSplit(history.items, keep_rounds);
     if (summarize_to <= 1) {
         try std.Io.Writer.print(w, "  Nothing to compact — the last {d} rounds stay verbatim and there is no older segment.\n\n", .{compaction.HYBRID_KEEP_ROUNDS});
         return;
@@ -1224,4 +1261,59 @@ test "maybeCompact auto path: phi cut + tier-3 slimming fire together" {
     // Facts block landed in history[0] (decisions/paths distilled from cut).
     // (No fact-marker text in this fixture → block may be absent; the phi
     // cut itself is already asserted via ev.compacted.)
+}
+
+
+test "pressure ladder + rolling compaction converge: information compresses forever, never blows up" {
+    const alloc = std.testing.allocator;
+    // 模拟马拉松：反复「长 10 轮(含 5KiB 工具结果) → 压缩」，每次压缩
+    // 用假摘要（LLM 调用是 compactHistoryKeep 的事，这里锁的是布局
+    // 不变量）。不变量：任意轮数后 token 有上界（摘要≤300 + 近5轮
+    // 原文有界——工具结果经瘦身每条 ≤~1.1KiB）。
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+    }
+    var cycle: usize = 0;
+    var worst: u32 = 0;
+    while (cycle < 12) : (cycle += 1) {
+        // 长出 10 轮，每轮 user 文本 + 5KiB 工具结果。
+        var r: usize = 0;
+        while (r < 10) : (r += 1) {
+            const ub = try alloc.alloc(llm.ContentBlock, 1);
+            ub[0] = .{ .text = try alloc.dupe(u8, "user turn padding text for convergence invariant check") };
+            try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
+            const fat = try alloc.alloc(u8, 5 * 1024);
+            @memset(fat, 'x');
+            const tb = try alloc.alloc(llm.ContentBlock, 1);
+            tb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "id"), .content = fat } };
+            try history.append(alloc, .{ .role = .user, .content = tb, .timestamp = 0 });
+        }
+        // 压力梯子触发：>61.8% 即提炼。手工执行布局（等价
+        // compactHistoryKeep 的成功路径）：摘要块 + 近5轮 + 全量瘦身。
+        const split = compaction.hybridSplit(history.items, compaction.HYBRID_KEEP_ROUNDS);
+        _ = try applyHybridLayout(&history, alloc, split, "SUMMARY: everything before, condensed.");
+        // 上界断言：压后必须显著低于 10 轮的裸体量（摘要 + 5 轮瘦身）。
+        const est = estimateHistoryTokens(history.items);
+        worst = @max(worst, est);
+        // 12 轮循环后，history 恒 = system + summary + ≤11 条消息；
+        // 瘦身后每条工具结果 ≤ ~1.1KiB ⇒ est 应稳定在 ~4K 以下。
+        try std.testing.expect(est < 4200);
+        try std.testing.expect(history.items.len <= 13);
+    }
+    // 有界性：最坏值不随循环数增长（第 1 轮与第 12 轮同界）。
+    const last = estimateHistoryTokens(history.items);
+    try std.testing.expect(worst < 4200);
+    try std.testing.expect(last < 4200);
+    // 梯子矩阵。
+    try std.testing.expect(pressureLadder(500, 1000) == .ok);
+    try std.testing.expect(pressureLadder(700, 1000) == .extract);
+    try std.testing.expect(pressureLadder(950, 1000) == .emergency);
+    try std.testing.expect(pressureLadder(10, 0) == .emergency);
 }

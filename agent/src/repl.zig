@@ -771,6 +771,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // P4 auto-fix ladder budget: transient-error backoff retries this
         // turn (429 / network class; TTFT has its own counter above).
         var auto_fix_retries: u8 = 0;
+        // P2.5 提炼优先梯子预算：每回合最多 2 次 LLM 深压，防压缩→膨胀
+        // →再压缩循环烧钱；预算尽或 LLM 不可用 → φ 截断兜底。
+        var deep_compacts: u8 = 0;
         var result_blocks = std.ArrayList(llm.ContentBlock).empty;
         defer result_blocks.deinit(allocator);
         // One emergency compaction per turn on ContextOverflow — a second
@@ -819,31 +822,81 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // compaction runs first, and only when the estimate stays
             // above the guard AFTER compacting does the turn end. Long
             // multi-file tasks now run to completion inside one turn.)
-            const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
-            est_ctx = cmp_ev.tokens;
-            // P2 observability: the compaction event itself lands in the
-            // live decision trace with its token numbers (/diagnose chain).
-            if (cmp_ev.compacted) {
-                if (live_trace) |*t| {
-                    var tb: [96]u8 = undefined;
-                    const desc = std.fmt.bufPrint(&tb, "phi+slim ~{d} -> ~{d} tok", .{ cmp_ev.before_tokens, cmp_ev.tokens }) catch "phi+slim";
-                    traceAddStep(t, .context_assembly, 0.8, "context pressure", desc, "auto-compaction", 0, allocator) catch {};
-                }
-            }
+            // P2.5 提炼优先压力梯子（2026-11-07 定纲：信息先提炼存续，
+            // 截断只兜底，回合尽量不断——"任务能一直往下执行，信息能一直
+            // 压缩"）。收敛性由 turn/history.zig 的滚动压缩不变量测试锁定。
+            //   ≤61.8%   不动
+            //   >61.8%   LLM 深压（摘要+近5轮原文+瘦身）——信息以摘要滚动存续
+            //   不可用    φ 截断 + 瘦身（maybeCompact 旧路径，有损兜底）
+            //   仍 >92%  收窄保留窗（keep=2）再深压；再不行 φ 硬砍
+            //   仍 >92%  病态（单条消息/系统提示自身超窗）——唯一断点
             {
                 const ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
-                const warn_pct = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
-                if (!ctx_warned and warn_pct >= 0.80) {
-                    ctx_warned = true;
-                    std.Io.Writer.print(ow, "\x1b[2m  [上下文已用 {d}% — 接近自动压缩水位。/compact 可手动提前压缩]\x1b[0m\n", .{@as(u32, @intFromFloat(warn_pct * 100.0))}) catch {};
-                    try std.Io.File.Writer.flush(&file_writer);
-                }
-                const pct = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
-                if (pct > 0.92) {
-                    const pct100: u32 = @intFromFloat(pct * 100.0);
-                    std.Io.Writer.print(ow, "\x1b[2m  [上下文压力 {d}% — 自动压缩后仍接近上限，本回合到此为止。发送新消息继续；/clear 可立即释放]\x1b[0m\n", .{pct100}) catch {};
-                    try std.Io.File.Writer.flush(&file_writer);
-                    break;
+                const level = turn_history.pressureLadder(est_ctx, ceiling);
+
+                // 提炼可用性：开关开 + provider 可达 + full 档（flash/本地
+                // 档不付摘要往返）+ 预算未尽 + 历史够长（hybrid 无从下刀
+                // 的短史走 φ）。
+                const prov_ok = switcher.getProvider() catch null;
+                const deep_ok = switcher.settings.auto_deep_compact and prov_ok != null and
+                    llm.provider.capabilityTier(switcher.modelName(), switcher.backend) == .full and
+                    deep_compacts < 2 and history.items.len > 8;
+
+                if (level != .ok) {
+                    if (deep_ok and level == .extract) {
+                        deep_compacts += 1;
+                        const before_pct = est_ctx * 100 / ceiling;
+                        std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 自动提炼压缩（LLM 摘要 + 近5轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
+                        try std.Io.File.Writer.flush(&file_writer);
+                        turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", turn_history.HYBRID_KEEP) catch {};
+                        est_ctx = turn_history.estimateHistoryTokens(history.items);
+                        if (live_trace) |*t| {
+                            var tb: [96]u8 = undefined;
+                            const desc = std.fmt.bufPrint(&tb, "deep ~{d}% -> ~{d}%", .{ before_pct, est_ctx * 100 / ceiling }) catch "deep compact";
+                            traceAddStep(t, .context_assembly, 0.85, "context pressure", desc, "llm extraction", 0, allocator) catch {};
+                        }
+                    } else if (deep_ok and level == .emergency) {
+                        // 收窄保留窗再提炼：keep=2 是信息保全的最后一级。
+                        deep_compacts += 1;
+                        const before_pct = est_ctx * 100 / ceiling;
+                        std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 紧急提炼（摘要 + 近2轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
+                        try std.Io.File.Writer.flush(&file_writer);
+                        turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", 2) catch {};
+                        est_ctx = turn_history.estimateHistoryTokens(history.items);
+                        if (live_trace) |*t| {
+                            var tb: [96]u8 = undefined;
+                            const desc = std.fmt.bufPrint(&tb, "emergency keep=2 ~{d}% -> ~{d}%", .{ before_pct, est_ctx * 100 / ceiling }) catch "emergency compact";
+                            traceAddStep(t, .context_assembly, 0.9, "context pressure", desc, "llm extraction (narrow)", 0, allocator) catch {};
+                        }
+                    }
+
+                    // 提炼不可用/没压够 → φ 截断 + 瘦身（有损兜底）。
+                    if (turn_history.pressureLadder(est_ctx, ceiling) != .ok) {
+                        const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+                        est_ctx = cmp_ev.tokens;
+                        if (cmp_ev.compacted) {
+                            if (live_trace) |*t| {
+                                var tb: [96]u8 = undefined;
+                                const desc = std.fmt.bufPrint(&tb, "phi+slim ~{d} -> ~{d} tok", .{ cmp_ev.before_tokens, cmp_ev.tokens }) catch "phi+slim";
+                                traceAddStep(t, .context_assembly, 0.8, "context pressure", desc, "auto-compaction", 0, allocator) catch {};
+                            }
+                        }
+                    }
+
+                    // 唯一断点：一切手段后仍 >92% —— 病态情形（单条消息或
+                    // 系统提示自身超窗，压缩无从下手）。
+                    const pct_final = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                    if (pct_final > 0.92) {
+                        const pct100: u32 = @intFromFloat(pct_final * 100.0);
+                        std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 提炼与截断均已用尽仍超窗（单条消息/系统提示过大？）。本回合到此为止，发送新消息继续；/clear 可立即释放]\x1b[0m\n", .{pct100}) catch {};
+                        try std.Io.File.Writer.flush(&file_writer);
+                        break;
+                    }
+                    if (!ctx_warned) {
+                        ctx_warned = true;
+                        std.Io.Writer.print(ow, "\x1b[2m  [上下文已压缩至 {d}% — 继续本回合]\x1b[0m\n", .{est_ctx * 100 / ceiling}) catch {};
+                        try std.Io.File.Writer.flush(&file_writer);
+                    }
                 }
             }
 

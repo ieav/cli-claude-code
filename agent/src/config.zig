@@ -48,6 +48,10 @@ pub const Settings = struct {
     /// P4: automatic error recovery (429/timeout backoff retries, overflow
     /// auto-compact). Off → every error goes straight to the selector.
     auto_fix: bool = true,
+    /// P2.5: automatic DEEP compaction under context pressure — LLM
+    /// extraction (summary + recent rounds verbatim) before any φ
+    /// truncation. Off → pressure falls straight to the lossy φ path.
+    auto_deep_compact: bool = true,
     /// Agent-loop iterations per turn (LLM rounds). A systematic
     /// debugging marathon legitimately needs more than 50 — reaching the
     /// cap now prefills 「继续」 instead of a bare stop; raise via
@@ -192,6 +196,9 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     }
     if (json_helpers.getBool(value, "auto_fix")) |af| {
         settings.auto_fix = af;
+    }
+    if (json_helpers.getBool(value, "auto_deep_compact")) |adc| {
+        settings.auto_deep_compact = adc;
     }
     if (json_helpers.getInt(value, "subagent_concurrency")) |sc| {
         if (sc >= 1 and sc <= 8) {
@@ -383,6 +390,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     buf.print(allocator, "  \"memory_budget_tokens\": {d},\n", .{settings.memory_budget_tokens}) catch {};
     buf.print(allocator, "  \"subagent_concurrency\": {d},\n", .{settings.subagent_concurrency}) catch {};
     buf.print(allocator, "  \"auto_fix\": {},\n", .{settings.auto_fix}) catch {};
+    buf.print(allocator, "  \"auto_deep_compact\": {},\n", .{settings.auto_deep_compact}) catch {};
     buf.print(allocator, "  \"agent_loop_limit\": {d},\n", .{settings.agent_loop_limit}) catch {};
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
