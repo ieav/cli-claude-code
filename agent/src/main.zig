@@ -30,6 +30,7 @@ test {
     _ = @import("turn/ask.zig");
     _ = @import("turn/tools.zig");
     _ = @import("turn/history.zig");
+    _ = @import("session/memory_ops.zig");
     _ = @import("llm/message.zig");
     _ = @import("llm/mod.zig");
     _ = @import("llm/ollama.zig");
