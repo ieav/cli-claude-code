@@ -941,10 +941,17 @@ pub fn runReflection(
         }
         var qs_extra: [16][]const u8 = undefined;
         var n_extra: usize = 0;
-        for (reflect_window) |q| {
-            if (n_extra >= 15) break;
-            qs_extra[n_extra] = q;
-            n_extra += 1;
+        // Fill from the TAIL: the π sample is oldest→newest, and the LLM
+        // reflection prompt must keep the NEWEST turns — taking the head
+        // of a full-history sample would hand it the early session and
+        // drop everything recent (P5② review fix).
+        {
+            var qi = reflect_window.len;
+            while (qi > 0 and n_extra < 15) {
+                qi -= 1;
+                qs_extra[n_extra] = reflect_window[qi];
+                n_extra += 1;
+            }
         }
         if (events_blurb) |eb| {
             qs_extra[n_extra] = eb;
