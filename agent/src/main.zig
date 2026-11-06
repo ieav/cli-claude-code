@@ -35,6 +35,7 @@ test {
     _ = @import("session/model_switcher.zig");
     _ = @import("commands/history_cmds.zig");
     _ = @import("session/input_history.zig");
+    _ = @import("session/session_store.zig");
     _ = @import("commands/dispatch.zig");
     _ = @import("llm/message.zig");
     _ = @import("llm/mod.zig");

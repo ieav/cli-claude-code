@@ -38,8 +38,9 @@ class ZivSession:
     owns the controlling terminal — plain subprocess leaves /dev/tty
     'not configured' inside the child)."""
 
-    def __init__(self):
-        self.dir = tempfile.mkdtemp(prefix="ziv-pty-")
+    def __init__(self, reuse_dir=None):
+        self._owns_dir = reuse_dir is None
+        self.dir = reuse_dir or tempfile.mkdtemp(prefix="ziv-pty-")
         os.makedirs(os.path.join(self.dir, ".ziv"), exist_ok=True)
         # Deterministic, hermetic: project-level bypass so FileWrite/Bash
         # never hit the permission gate regardless of global settings.
@@ -54,6 +55,12 @@ class ZivSession:
             # real gateway calls from the suite.
             env["HOME"] = self.dir
             env.pop("ZIV_CRON_SCALE", None)
+            # Hermetic gateway: inherited OPENAI_*/ANTHROPIC_* would point
+            # the child at the user's REAL gateway (S7/S8 messages would
+            # hang to the 180s watchdog instead of failing fast).
+            for k in list(env):
+                if k.startswith(("OPENAI_", "ANTHROPIC_", "OLLAMA_")):
+                    env.pop(k)
             os.execve(BIN, [BIN], env)
         self.buf = b""
 
@@ -115,7 +122,8 @@ class ZivSession:
             os.close(self.master)
         except OSError:
             pass
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if self._owns_dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def quit_and_wait(z: ZivSession) -> None:
@@ -267,6 +275,101 @@ def s6_command_smoke():
         z.close()
 
 
+def s7_clean_resume():
+    """/quit → restart → /resume restores the conversation with context
+    continuity (roadmap P3 acceptance, clean-exit half). A plain message is
+    persisted even though the hermetic HOME has no gateway — the user
+    message lands in history before the provider error ends the turn."""
+    d = tempfile.mkdtemp(prefix="ziv-p3-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            z.send("resume-marker-alpha first turn\n")
+            z.read_until("No API key", 20)  # turn end: user msg already in history
+            z.clear_buf()
+            z.read_until("ziv[", 10)  # fresh prompt paint = loop-top flush done
+            z.send("/stats\n")
+            out = z.read_until("Messages:", 10)
+            m = re.search(r"History tokens: ~(\d+)", out)
+            if not m:
+                raise Fail("no History tokens in /stats")
+            tokens_before = int(m.group(1))
+            quit_and_wait(z)
+        finally:
+            z.close()
+        z2 = ZivSession(reuse_dir=d)
+        try:
+            z2.wait_prompt()
+            z2.send("/resume\n")
+            out = z2.read_until("resume-marker-alpha", 10)
+            z2.send("\r")  # select the first (only) entry
+            z2.read_until("已恢复会话", 10)
+            z2.drain(1.0)  # let the post-resume prompt paint settle
+            z2.clear_buf()
+            z2.send("/stats\n")
+            out = z2.read_until("Messages:", 10)
+            m2 = re.search(r"History tokens: ~(\d+)", out)
+            if not m2:
+                raise Fail("no History tokens after resume")
+            tokens_after = int(m2.group(1))
+            # Same messages restored → the token estimate must carry over
+            # intact (the in-process Messages counter does not count
+            # restored turns — History tokens is the state-equality check).
+            if tokens_after < tokens_before:
+                raise Fail(f"resume lost history: ~{tokens_before} -> ~{tokens_after} tokens")
+            quit_and_wait(z2)
+            return f"restart+resume restored history intact (~{tokens_after} tokens) ✓"
+        finally:
+            z2.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def s8_crash_resume():
+    """SIGKILL mid-session → restart shows the crash hint → /resume restores
+    (roadmap P3 acceptance, crash half). The flush at the last turn boundary
+    is all that survives; that is exactly what must come back."""
+    d = tempfile.mkdtemp(prefix="ziv-p3-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            z.send("crash-marker-beta the process will die\n")
+            z.read_until("No API key", 20)  # turn end
+            z.clear_buf()
+            z.read_until("ziv[", 10)  # fresh prompt = loop-top flush committed
+        finally:
+            try:
+                os.kill(z.pid, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(z.pid, 0)
+            except ChildProcessError:
+                pass
+            try:
+                os.close(z.master)
+            except OSError:
+                pass
+        z2 = ZivSession(reuse_dir=d)
+        try:
+            z2.wait_prompt()
+            out = z2.read_until("未正常退出的会话", 10)
+            if "crash-marker-beta" not in out:
+                raise Fail("crash hint did not carry the session first line")
+            z2.send("/resume\n")
+            z2.read_until("crash-marker-beta", 10)
+            z2.send("\r")
+            z2.read_until("已恢复会话", 10)
+            quit_and_wait(z2)
+            return "crash hint + resume restored the killed session ✓"
+        finally:
+            z2.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -274,6 +377,8 @@ SCENARIOS = [
     ("S4 confirm-reads", s4_confirm_reads),
     ("S5 pipe-holder-reap", s5_pipe_holder_reaped),
     ("S6 command-smoke", s6_command_smoke),
+    ("S7 clean-resume", s7_clean_resume),
+    ("S8 crash-resume", s8_crash_resume),
 ]
 
 

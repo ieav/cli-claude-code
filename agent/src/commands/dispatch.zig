@@ -24,6 +24,8 @@ const config_menu = @import("config_menu.zig");
 const history_cmds = @import("history_cmds.zig");
 const turn_ask = @import("../turn/ask.zig");
 const turn_history = @import("../turn/history.zig");
+const session_store_mod = @import("../session/session_store.zig");
+const menu = @import("../util/menu.zig");
 const turn_tools = @import("../turn/tools.zig");
 const registry = @import("../tools/registry.zig");
 const op_log = @import("../checkpoint/op_log.zig");
@@ -87,6 +89,7 @@ pub const ReplCtx = struct {
     denial_state: *denial_tracker_mod.DenialTracker,
     window_queries: *std.ArrayList([]u8),
     window_tools: *u32,
+    sessions: ?*session_store_mod.SessionStore,
     window_errors: *u32,
     prompt: []const u8,
 };
@@ -119,6 +122,10 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // session — say so instead of dropping silently.
             if (lineinput.queuedHas()) {
                 try std.Io.Writer.print(ctx.w, "\x1b[2m  [{d} 条排队消息未发送，已丢弃]\x1b[0m\n", .{lineinput.queuedCount()});
+            }
+            if (ctx.sessions) |st| {
+                st.flush(ctx.history.items);
+                st.markExit(true);
             }
             try std.Io.Writer.writeAll(ctx.w, "Goodbye!\n");
             try std.Io.File.Writer.flush(ctx.file_writer);
@@ -363,6 +370,9 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.eql(u8, input, "/clear") or std.mem.eql(u8, input, "/reset") or std.mem.eql(u8, input, "/new")) {
+            // P3: /clear starts a FRESH session row — the old conversation
+            // stays resumable instead of being overwritten by the new one.
+            if (ctx.sessions) |st| st.rotate(".", ctx.switcher.modelName(), ctx.current_mode.*);
             // Reflect BEFORE the window is orphaned: /quit and Ctrl-D
             // both reflect first; /clear used to skip it, leaking the
             // cleared conversation's queries into the next one's
@@ -645,6 +655,93 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 );
             }
             try std.Io.Writer.writeAll(ctx.w, "\n");
+            try std.Io.File.Writer.flush(ctx.file_writer);
+            return .handled;
+        } else if (std.mem.eql(u8, input, "/resume") or std.mem.startsWith(u8, input, "/resume ")) {
+            const st = ctx.sessions orelse {
+                try std.Io.Writer.writeAll(ctx.w, "  Session store unavailable (.ziv/sessions.db not writable).\n\n");
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            };
+            var pick: ?i64 = null;
+            const arg = std.mem.trim(u8, input["/resume".len..], " \t");
+            if (arg.len > 0) {
+                pick = std.fmt.parseInt(i64, arg, 10) catch null;
+                if (pick == null) {
+                    try std.Io.Writer.writeAll(ctx.w, "  Usage: /resume [会话编号]\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                }
+            }
+            const list = session_store_mod.listRecent(allocator, &st.db, 8) catch &[_]session_store_mod.SessionInfo{};
+            {
+                defer for (list) |*s2| session_store_mod.freeInfo(allocator, s2.*);
+                if (pick == null) {
+                    if (list.len == 0) {
+                        try std.Io.Writer.writeAll(ctx.w, "  还没有可恢复的会话。\n\n");
+                        try std.Io.File.Writer.flush(ctx.file_writer);
+                        return .handled;
+                    }
+                    var labels: std.ArrayList([]const u8) = .empty;
+                    defer labels.deinit(allocator);
+                    for (list) |s2| {
+                        const when = util_time.formatIso(allocator, s2.started_at) catch " ?";
+                        const line = std.fmt.allocPrint(allocator, "#{d} · {s} · {d} 轮 · {s}{s}", .{
+                            s2.id,
+                            when,
+                            s2.rounds,
+                            s2.first_line orelse "(无消息)",
+                            if (s2.ended_at == null) " · 未正常退出" else "",
+                        }) catch continue;
+                        allocator.free(when);
+                        labels.append(allocator, line) catch allocator.free(line);
+                    }
+                    const sel = (menu.select(ctx.w, ctx.r, ctx.file_writer, "恢复会话（当前对话将被替换；q 取消）:", labels.items, 0) catch null) orelse {
+                        for (labels.items) |l| allocator.free(@constCast(l));
+                        return .handled;
+                    };
+                    for (labels.items) |l| allocator.free(@constCast(l));
+                    pick = list[sel].id;
+                }
+            }
+            const id = pick.?;
+            const meta = session_store_mod.metaOf(allocator, &st.db, id) catch {
+                try std.Io.Writer.print(ctx.w, "  会话 #{d} 不存在。/resume 查看列表。\n\n", .{id});
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            };
+            defer {
+                allocator.free(meta.model);
+                allocator.free(meta.permission_mode);
+            }
+            const msgs = session_store_mod.loadMessages(allocator, &st.db, id) catch {
+                try std.Io.Writer.writeAll(ctx.w, "  读取会话消息失败。\n\n");
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            };
+            // Replace the live conversation: clear frees the current one,
+            // then the loaded heap-owned messages move in.
+            turn_history.clearHistory(ctx.history, allocator);
+            var moved: usize = 0;
+            for (msgs) |m| {
+                ctx.history.append(allocator, m) catch {
+                    session_store_mod.freeMessage(m, allocator);
+                    continue;
+                };
+                moved += 1;
+            }
+            allocator.free(msgs);
+            ctx.switcher.switchModel(meta.model) catch {
+                std.Io.Writer.print(ctx.w, "  (模型 {s} 切换失败，保持当前模型)\n", .{meta.model}) catch {};
+            };
+            if (std.meta.stringToEnum(auth.PermissionMode, meta.permission_mode)) |m2| {
+                ctx.current_mode.* = m2;
+            }
+            st.adopt(id, moved);
+            const est = turn_history.estimateHistoryTokens(ctx.history.items);
+            try std.Io.Writer.print(ctx.w, "  已恢复会话 #{d}：{d} 条消息（~{d} tokens · 模型 {s} · 模式 {s}）。继续对话即可。\n\n", .{
+                id, moved, est, meta.model, meta.permission_mode,
+            });
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.eql(u8, input, "/version")) {

@@ -18,6 +18,7 @@ const config_menu = @import("commands/config_menu.zig");
 const history_cmds = @import("commands/history_cmds.zig");
 const dispatch_mod = @import("commands/dispatch.zig");
 const input_history_mod = @import("session/input_history.zig");
+const session_store = @import("session/session_store.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
 const json_tree = @import("util/json_tree.zig");
@@ -170,6 +171,35 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         break :blk db;
     };
     defer if (mem_db) |*db| db.deinit();
+    // P3 session persistence: every turn boundary flushes new history into
+    // .ziv/sessions.db; /resume brings a past conversation (blocks, model,
+    // mode) back. Best-effort — the REPL runs fine without it.
+    const sess_store: ?*session_store.SessionStore = blk: {
+        const store = session_store.SessionStore.open(allocator, ".ziv/sessions.db", ".", switcher.modelName(), current_mode) orelse break :blk null;
+        break :blk store;
+    };
+    defer if (sess_store) |st| {
+        st.flush(history.items);
+        st.markExit(false); // no-op when /quit/EOF already marked clean
+        st.close();
+    };
+    // Crash recovery hint: a session row with no exit mark means the last
+    // process died mid-conversation — surface it before the first prompt.
+    if (sess_store) |st| {
+        if (session_store.lastUncleanSession(allocator, &st.db, st.session_id) catch null) |unc| {
+            defer {
+                allocator.free(unc.model);
+                allocator.free(unc.permission_mode);
+                if (unc.first_line) |f| allocator.free(f);
+            }
+            if (unc.id != st.session_id) {
+                std.Io.Writer.print(w, "  [检测到未正常退出的会话 #{d}（{s}…）— /resume 可恢复]\n\n", .{
+                    unc.id, unc.first_line orelse "(无消息)",
+                }) catch {};
+                std.Io.File.Writer.flush(&file_writer) catch {};
+            }
+        }
+    }
     var mem_sys: ?memory_mod.MemorySystem = if (mem_db != null)
         memory_mod.MemorySystem.init(allocator, &mem_db.?)
     else
@@ -465,6 +495,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var auto_submit: ?[]u8 = null;
 
     while (true) {
+        // Turn boundary: persist whatever the finished turn appended (one
+        // transaction per turn — roadmap P3 "每轮结束原子追加").
+        if (sess_store) |st| st.flush(history.items);
+
         // Hot-reload: a settings file changed on disk since the last prompt
         // (external edit) → reload everything and resync the live permission
         // mode. Own saves refresh the baseline, so this never fires for them.
@@ -563,6 +597,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // above — nothing of value blocks on a detached thread).
                 memory_ops.drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
             }
+            if (sess_store) |st| {
+                st.flush(history.items);
+                st.markExit(true);
+            }
             try std.Io.Writer.writeAll(w, "\nGoodbye!\n");
             try std.Io.File.Writer.flush(&file_writer);
             return;
@@ -612,6 +650,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .denial_state = &denial_state,
         .window_queries = &window_queries,
         .window_tools = &window_tools,
+        .sessions = sess_store,
         .window_errors = &window_errors,
         .prompt = prompt,
         };
