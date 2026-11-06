@@ -586,6 +586,29 @@ pub fn memoryDecayTask(opaque_ctx: ?*anyopaque) anyerror!void {
     }
 }
 
+/// P5 π 图谱扫描：孤立节点/断边检测，结果缓存给 /knowledge。跑在
+/// cron 主线程契约下（与衰减/健康任务同）。
+pub var last_graph_scan: ?knowledge_graph.KnowledgeGraph.GraphHealth = null;
+pub var last_graph_scan_at: i64 = 0;
+
+pub fn runGraphScan(kg: ?*knowledge_graph.KnowledgeGraph) void {
+    const g = kg orelse return;
+    if (last_graph_scan) |*h| h.deinit(allocator);
+    last_graph_scan = g.scanHealth(allocator);
+    last_graph_scan_at = util_time.nowMillis();
+    const h = last_graph_scan.?;
+    logger.info("graph scan: {d} nodes / {d} edges / {d} orphans / {d} broken", .{
+        h.total_nodes, h.total_edges, h.orphan_nodes, h.broken_edges,
+    });
+}
+
+pub const GraphScanCtx = struct { kg: ?*knowledge_graph.KnowledgeGraph };
+
+pub fn graphScanTask(opaque_ctx: ?*anyopaque) anyerror!void {
+    const c: *GraphScanCtx = @ptrCast(@alignCast(opaque_ctx orelse return));
+    runGraphScan(c.kg);
+}
+
 pub const HealthCtx = struct {
     monitor: *runtime_monitor.RuntimeMonitor,
     bus: *task_mod.EventBus,

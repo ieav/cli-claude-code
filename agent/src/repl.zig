@@ -229,6 +229,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // Test hook: ZIV_CRON_SCALE=60 compresses the timeline (81.5min → ~82s)
     // so scheduled maintenance is observable in a smoke run.
     var cron_scale: u64 = 1;
+    // π hours ≈ 3.14h — the roadmap's π-period graph scan cadence.
+    const graph_scan_interval_ms: i64 = @intFromFloat(math_mod.constants.PI * 60.0 * 60.0 * 1000.0);
     if (env.get("ZIV_CRON_SCALE")) |v| {
         if (std.fmt.parseInt(u64, v, 10)) |s| {
             if (s >= 1) cron_scale = s;
@@ -267,6 +269,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .enabled = std.atomic.Value(bool).init(true),
         .task_fn = memory_ops.healthCheckTask,
         .ctx = @ptrCast(&health_ctx),
+    }) catch {};
+    // P5 π 周期图谱扫描：启动即扫一次（/knowledge 立即有数据），此后
+    // 每 π 小时刷新孤立节点/断边报告。
+    var graph_scan_ctx = memory_ops.GraphScanCtx{ .kg = if (kgraph) |*g| g else null };
+    memory_ops.runGraphScan(if (kgraph) |*g| g else null);
+    cron.addTask(.{
+        .name = "graph_scan",
+        .interval_ms = graph_scan_interval_ms,
+        .last_run = std.atomic.Value(i64).init(0),
+        .enabled = std.atomic.Value(bool).init(true),
+        .task_fn = memory_ops.graphScanTask,
+        .ctx = @ptrCast(&graph_scan_ctx),
     }) catch {};
     cron.start() catch logger.warning("cron: scheduler unavailable", .{});
 
@@ -1651,6 +1665,14 @@ pub fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !
     if (total == 0) {
         try std.Io.Writer.writeAll(w, "  Knowledge graph is empty — nodes are added when sessions extract memories.\n\n");
         return;
+    }
+    // P5: π 图谱扫描报告（孤立节点/断边）。
+    if (memory_ops.last_graph_scan) |h| {
+        if (h.orphan_nodes > 0 or h.broken_edges > 0) {
+            try std.Io.Writer.print(w, "  \x1b[2m[图谱扫描: {d} 孤立节点 / {d} 断边 — 提取链路自查]\x1b[0m\n", .{ h.orphan_nodes, h.broken_edges });
+        } else {
+            try std.Io.Writer.print(w, "  \x1b[2m[图谱扫描: 健康（{d} 节点 / {d} 边全连通）]\x1b[0m\n", .{ h.total_nodes, h.total_edges });
+        }
     }
     const rows = g.recentNodes(5) catch {
         try std.Io.Writer.writeAll(w, "  (failed to read knowledge graph)\n\n");

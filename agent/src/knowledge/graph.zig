@@ -194,6 +194,72 @@ pub const KnowledgeGraph = struct {
         if (r.source) |s| self.allocator.free(s);
     }
 
+    /// P5 π 周期扫描：孤立节点（零度）与断边（端点缺失——不该发生，
+    /// 出现即提取链路有 bug）。结果缓存在 last_scan（/knowledge 直接读），
+    /// cron 每 π 小时刷一次。
+    pub const GraphHealth = struct {
+        orphan_nodes: usize = 0,
+        broken_edges: usize = 0,
+        total_nodes: usize = 0,
+        total_edges: usize = 0,
+        /// 前几个孤立实体名（诊断用，调用方负责释放）。
+        orphan_samples: [][]u8 = &.{},
+        pub fn deinit(self: *GraphHealth, alloc: std.mem.Allocator) void {
+            for (self.orphan_samples) |s| alloc.free(s);
+            if (self.orphan_samples.len > 0) alloc.free(self.orphan_samples);
+        }
+    };
+
+    pub fn scanHealth(self: *Self, alloc: std.mem.Allocator) GraphHealth {
+        var health = GraphHealth{ .total_nodes = self.nodeCount() catch 0 };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // One allocator end-to-end: the list grows and toOwnedSlice's on
+        // the SAME caller allocator (arena-grown buffers handed to another
+        // allocator remap-corrupt).
+        var samples: std.ArrayList([]u8) = .empty;
+        defer samples.deinit(alloc);
+
+        {
+            // Orphans: nodes touched by no edge on either side.
+            const sql = "SELECT n.id, n.entity FROM knowledge_nodes n " ++
+                "WHERE NOT EXISTS (SELECT 1 FROM knowledge_edges e WHERE e.from_id = n.id) " ++
+                "AND NOT EXISTS (SELECT 1 FROM knowledge_edges e WHERE e.to_id = n.id)";
+            var st = database.Statement.prepare(a, self.db, sql) catch return health;
+            defer st.finalize();
+            while (st.step() catch false) {
+                health.orphan_nodes += 1;
+                if (samples.items.len < 5) {
+                    const dup = alloc.dupe(u8, st.columnText(1)) catch continue;
+                    samples.append(alloc, dup) catch alloc.free(dup);
+                }
+            }
+        }
+        {
+            const sql = "SELECT COUNT(*) FROM knowledge_edges e " ++
+                "WHERE NOT EXISTS (SELECT 1 FROM knowledge_nodes n WHERE n.id = e.from_id) " ++
+                "OR NOT EXISTS (SELECT 1 FROM knowledge_nodes n WHERE n.id = e.to_id)";
+            var st = database.Statement.prepare(a, self.db, sql) catch {
+                health.orphan_samples = samples.toOwnedSlice(alloc) catch &.{};
+                return health;
+            };
+            defer st.finalize();
+            if (st.step() catch false) health.broken_edges = @intCast(st.columnInt64(0));
+        }
+        {
+            const st2 = database.Statement.prepare(a, self.db, "SELECT COUNT(*) FROM knowledge_edges") catch {
+                health.orphan_samples = samples.toOwnedSlice(alloc) catch &.{};
+                return health;
+            };
+            defer st2.finalize();
+            if (st2.step() catch false) health.total_edges = @intCast(st2.columnInt64(0));
+        }
+        health.orphan_samples = samples.toOwnedSlice(alloc) catch &.{};
+        return health;
+    }
+
     pub fn freeNodeRows(self: *Self, rows: []NodeRow) void {
         for (rows) |r| self.freeNodeRow(r);
         self.allocator.free(rows);
@@ -224,4 +290,31 @@ test "KnowledgeGraph addNode and addEdge" {
     const pruned = try kg.pruneWeakEdges(1.0);
     try std.testing.expectEqual(@as(usize, 1), pruned);
     try std.testing.expectEqual(@as(usize, 3), try kg.nodeCount());
+}
+
+test "scanHealth finds orphan nodes and reports clean graphs" {
+    const alloc = std.testing.allocator;
+    var tmp: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&tmp, "/tmp/zage_scan_{d}.db", .{time_mod.nowMillis()}) catch return;
+    defer _ = fs_ops.deleteFile(path);
+    var db = try database.Database.init(alloc, path);
+    defer db.deinit();
+    try db.runMigrations();
+    var kg = KnowledgeGraph.init(alloc, &db);
+    defer kg.deinit();
+
+    // Two connected nodes + one orphan.
+    const a = try kg.addNode("Zig", .technology, null);
+    const b = try kg.addNode("Claude", .technology, null);
+    _ = try kg.addNode("Lonely", .concept, null);
+    _ = try kg.addEdge(a, b, "used_by", 0.9);
+
+    var h = kg.scanHealth(alloc);
+    defer h.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), h.total_nodes);
+    try std.testing.expectEqual(@as(usize, 1), h.total_edges);
+    try std.testing.expectEqual(@as(usize, 1), h.orphan_nodes);
+    try std.testing.expectEqual(@as(usize, 0), h.broken_edges);
+    try std.testing.expectEqual(@as(usize, 1), h.orphan_samples.len);
+    try std.testing.expectEqualStrings("Lonely", h.orphan_samples[0]);
 }
