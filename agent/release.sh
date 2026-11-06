@@ -58,8 +58,17 @@ done
 [ "$fail" = 0 ] || exit 1
 
 # ── tar.gz per target (standard CLI-tool release form)
+# 可复现打包（2026-11-07 修）：bsdtar 无 --mtime/--sort，改为三件事——
+#   ① 打包前把待归档文件 mtime 钉到固定 epoch（SOURCE_DATE_EPOCH 风格）
+#   ② COPYFILE_DISABLE=1 防止 macOS AppleDouble（._*）混入
+#   ③ gzip -n 去掉 gzip 头里的时间戳
+# 同源码重跑 → tar.gz 逐字节相同（binaries 本就确定性构建，实测
+# 00:41/00:59 两轮 sha 一致）。.pkg 的 pkgbuild 嵌构建时刻，Apple
+# 工具链无确定性开关——已知残留，SHA256SUMS 每次随 pkg 变动属预期。
+EPOCH_TS="202001010000"
 for t in "${targets[@]}"; do
-  tar -czf "$OUT/ziv-$VERSION-$t.tar.gz" -C "$OUT" "ziv-$t"
+  touch -t "$EPOCH_TS" "$OUT/ziv-$t"
+  COPYFILE_DISABLE=1 tar -cf - -C "$OUT" "ziv-$t" | gzip -n > "$OUT/ziv-$VERSION-$t.tar.gz"
 done
 
 # ── macOS .pkg installer (universal arm64+x86_64, installs to /usr/local/bin/ziv)
