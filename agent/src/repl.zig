@@ -491,7 +491,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         // T8: sync the plan anchor with .ziv/plan.md (fingerprint-gated;
         // also covers the very first prompt — the file may predate us).
-        refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
+        turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
 
         // T3.2: land any background-reflection insights that completed
         // since the last prompt (SQLite writes and printing stay on this
@@ -1032,7 +1032,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const plan_arg = std.mem.trim(u8, input[5..], " \t");
                 if (std.mem.eql(u8, plan_arg, "off")) {
                     std.Io.Dir.cwd().deleteFile(io, ".ziv/plan.md") catch {};
-                    refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
+                    turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
                     try std.Io.Writer.writeAll(w, "  计划已停用（.ziv/plan.md 已删除，system 锚点已移除）\n\n");
                 } else if (plan_arg.len == 0) {
                     if (plan_raw_last) |pr| {
@@ -1050,7 +1050,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             try std.Io.File.Writer.flush(&file_writer);
                             continue;
                         };
-                        refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
+                        turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
                         try std.Io.Writer.writeAll(w, "  计划已创建并锚定到 system prompt（每轮自动同步勾选进度）\n\n");
                     }
                 }
@@ -2064,9 +2064,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // (cheap: ≤3 hash embeddings + one cosine), fires at most once.
         if (!mem_block_rebuilt and memory_block != null) {
             if (mem_sys) |*ms| {
-                if (topicVectorOfLastUserTurns(&history, allocator)) |cur| {
+                if (turn_history.topicVectorOfLastUserTurns(&history, allocator)) |cur| {
                     if (mem_topic_baseline) |base| {
-                        if (shouldReanchor(base, cur)) {
+                        if (turn_history.shouldReanchor(base, cur)) {
                             const ctx_est = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
                             const eff_budget = injection_mod.effectiveBudget(switcher.settings.memory_budget_tokens, ctx_est);
                             var rows_arena = std.heap.ArenaAllocator.init(allocator);
@@ -2074,7 +2074,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             if (ms.episodic_mem.retrieveRecentArena(rows_arena.allocator(), 1000) catch null) |entries| {
                                 const ents = entries;
                                 if (injection_mod.buildMemoryBlockAnchored(allocator, ents, eff_budget, cur) catch null) |nb| {
-                                    if (swapMemoryBlockText(&history, allocator, memory_block.?, nb.text)) {
+                                    if (turn_history.swapMemoryBlockText(&history, allocator, memory_block.?, nb.text)) {
                                         allocator.free(memory_block.?);
                                         memory_block = nb.text;
                                         mem_block_rebuilt = true;
@@ -2363,201 +2363,6 @@ fn reapplySystemPromptIfNeeded(
     history.items[0].content = nb;
 }
 
-/// φ drift gate (T1.3): live-topic cosine below 1/PHI_INVERSE (≈0.618)
-/// means the session's ranking anchor no longer matches the conversation.
-fn shouldReanchor(baseline: []const f32, current: []const f32) bool {
-    const drift_threshold: f32 = @floatCast(1.0 / math_mod.constants.PHI_INVERSE);
-    return embedding_mod.cosine(baseline, current) < drift_threshold;
-}
-
-/// First text block of a message's content (user turns may carry tool
-/// blocks; the typed text is what defines the topic).
-fn firstTextOf(blocks: []const llm.ContentBlock) ?[]const u8 {
-    for (blocks) |b| switch (b) {
-        .text => |t| return t,
-        else => {},
-    };
-    return null;
-}
-
-/// Mean embedding of the last ≤3 user turns — the "live topic" vector.
-/// Null before any non-empty user turn. Caller frees the result.
-fn topicVectorOfLastUserTurns(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) ?[]f32 {
-    var texts: [3][]const u8 = undefined;
-    var n: usize = 0;
-    var i = history.items.len;
-    while (i > 0 and n < texts.len) {
-        i -= 1;
-        const m = history.items[i];
-        if (m.role != .user) continue;
-        if (firstTextOf(m.content)) |t| {
-            if (t.len > 0) {
-                texts[n] = t;
-                n += 1;
-            }
-        }
-    }
-    if (n == 0) return null;
-    const sum = alloc.alloc(f32, embedding_mod.DIMS) catch return null;
-    var owned = false; // handed to caller on success
-    defer if (!owned) alloc.free(sum);
-    @memset(sum, 0);
-    var count: usize = 0;
-    for (texts[0..n]) |t| {
-        const ev = embedding_mod.embed(alloc, t) catch continue;
-        defer alloc.free(ev);
-        for (sum, 0..) |*sv, k| sv.* += ev[k];
-        count += 1;
-    }
-    if (count == 0) return null;
-    owned = true;
-    const inv = 1.0 / @as(f32, @floatFromInt(count));
-    for (sum) |*sv| sv.* *= inv;
-    return sum;
-}
-
-/// Replace the memory block's text inside history[0] (rebuild the block
-/// slice like reapplySystemPromptIfNeeded does — content slices are const).
-/// Identified by the OLD text slice identity; returns false without
-/// touching history when no block matches (caller frees the new text).
-pub fn swapMemoryBlockText(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, old_text: []const u8, new_text: []const u8) bool {
-    if (history.items.len == 0) return false;
-    const old = history.items[0].content;
-    const nb = alloc.alloc(llm.ContentBlock, old.len) catch return false;
-    var hit = false;
-    for (old, 0..) |b, bi| {
-        if (!hit) switch (b) {
-            .text => |t| if (t.ptr == old_text.ptr and t.len == old_text.len) {
-                nb[bi] = .{ .text = new_text };
-                hit = true;
-                continue;
-            },
-            else => {},
-        };
-        nb[bi] = b;
-    }
-    if (!hit) {
-        alloc.free(nb);
-        return false;
-    }
-    alloc.free(@constCast(old));
-    history.items[0].content = nb;
-    return true;
-}
-
-/// T8: append one block to history[0]'s system content (rebuild + grow,
-/// same ownership pattern as the swap above).
-pub fn appendSystemBlock(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, text: []const u8) bool {
-    if (history.items.len == 0) return false;
-    const old = history.items[0].content;
-    const nb = alloc.alloc(llm.ContentBlock, old.len + 1) catch return false;
-    @memcpy(nb[0..old.len], old);
-    nb[old.len] = .{ .text = text };
-    alloc.free(@constCast(old));
-    history.items[0].content = nb;
-    return true;
-}
-
-/// T8: drop the block whose text slice matches (rebuild + shrink).
-fn removeSystemBlockByText(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, text: []const u8) bool {
-    if (history.items.len == 0) return false;
-    const old = history.items[0].content;
-    var hit: ?usize = null;
-    for (old, 0..) |b, i| switch (b) {
-        .text => |t| if (t.ptr == text.ptr and t.len == text.len) {
-            hit = i;
-            break;
-        },
-        else => {},
-    };
-    const idx = hit orelse return false;
-    const nb = alloc.alloc(llm.ContentBlock, old.len - 1) catch return false;
-    @memcpy(nb[0..idx], old[0..idx]);
-    @memcpy(nb[idx..], old[idx + 1 ..]);
-    alloc.free(@constCast(old));
-    history.items[0].content = nb;
-    return true;
-}
-
-/// T8: read .ziv/plan.md (≤8 KiB). Null when absent/unreadable.
-fn readPlanFile(alloc: std.mem.Allocator, io: std.Io) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, ".ziv/plan.md", alloc, .limited(8 * 1024)) catch null;
-}
-
-/// T8: the plan's system-prompt summary — trimmed non-empty lines under
-/// its own ~150-token budget (independent of the memory block's).
-fn planSummaryText(alloc: std.mem.Allocator, raw: []const u8) ?[]u8 {
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    aw.writer.writeAll("Active plan (.ziv/plan.md):\n") catch return null;
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    while (lines.next()) |ln| {
-        const t = std.mem.trim(u8, ln, " \t\r");
-        if (t.len == 0) continue;
-        aw.writer.print("- {s}\n", .{t}) catch return null;
-        if (tokens_mod.estimateTokens(aw.written()) > 150) break;
-    }
-    if (aw.written().len == 0) return null;
-    return alloc.dupe(u8, aw.written()) catch null;
-}
-
-/// T8: keep the plan anchor block in sync with .ziv/plan.md — call at
-/// every prompt. Content fingerprint (not mtime) decides, so a touch
-/// never churns the prompt; removing the file removes the block.
-fn refreshPlanAnchor(
-    history: *std.ArrayList(llm.Message),
-    plan_block: *?[]u8,
-    plan_raw: *?[]u8,
-    alloc: std.mem.Allocator,
-    io: std.Io,
-) void {
-    const raw = readPlanFile(alloc, io) orelse {
-        if (plan_block.*) |pb| {
-            if (removeSystemBlockByText(history, alloc, pb)) {
-                alloc.free(pb);
-                plan_block.* = null;
-            }
-        }
-        if (plan_raw.*) |pr| {
-            alloc.free(pr);
-            plan_raw.* = null;
-        }
-        return;
-    };
-    const changed = if (plan_raw.*) |pr| !std.mem.eql(u8, pr, raw) else true;
-    if (!changed) {
-        alloc.free(raw);
-        return;
-    }
-    if (plan_raw.*) |pr| alloc.free(pr);
-    plan_raw.* = raw;
-    const summary = planSummaryText(alloc, raw) orelse {
-        if (plan_block.*) |pb| {
-            if (removeSystemBlockByText(history, alloc, pb)) {
-                alloc.free(pb);
-                plan_block.* = null;
-            }
-        }
-        return;
-    };
-    const old = plan_block.*;
-    plan_block.* = null;
-    if (old) |pb| {
-        const swapped = swapMemoryBlockText(history, alloc, pb, summary);
-        if (!swapped) _ = removeSystemBlockByText(history, alloc, pb);
-        alloc.free(pb);
-        if (swapped) {
-            plan_block.* = summary;
-            return;
-        }
-    }
-    if (appendSystemBlock(history, alloc, summary)) {
-        plan_block.* = summary;
-    } else alloc.free(summary);
-}
-
-
-
 fn printHelp(w: *std.Io.Writer) !void {
     try std.Io.Writer.writeAll(w,
         \\Available commands:
@@ -2615,158 +2420,4 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  /run Bash {"command":"ls"}
         \\
     );
-}
-
-test "plan summary, append and remove system blocks (T8)" {
-    const alloc = std.testing.allocator;
-    const raw = "# 计划：完成迁移\n\n- [x] 分析旧表\n- [ ] 写迁移脚本\n";
-    const summary = planSummaryText(alloc, raw).?;
-    defer alloc.free(summary);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "Active plan") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "分析旧表") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "写迁移脚本") != null);
-
-    var history: std.ArrayList(llm.Message) = .empty;
-    defer {
-        alloc.free(@constCast(history.items[0].content));
-        history.deinit(alloc);
-    }
-    const blocks = try alloc.alloc(llm.ContentBlock, 1);
-    blocks[0] = .{ .text = "SYSTEM" };
-    try history.append(alloc, .{ .role = .system, .content = blocks, .timestamp = 0 });
-
-    try std.testing.expect(appendSystemBlock(&history, alloc, summary));
-    try std.testing.expectEqual(@as(usize, 2), history.items[0].content.len);
-    try std.testing.expectEqualStrings(summary, history.items[0].content[1].text);
-    try std.testing.expect(removeSystemBlockByText(&history, alloc, summary));
-    try std.testing.expectEqual(@as(usize, 1), history.items[0].content.len);
-    try std.testing.expectEqualStrings("SYSTEM", history.items[0].content[0].text);
-    try std.testing.expect(!removeSystemBlockByText(&history, alloc, summary)); // gone: no-op
-}
-
-test "key facts survive repeated phi compaction (T4.2)" {
-    const alloc = std.testing.allocator;
-    var history: std.ArrayList(llm.Message) = .empty;
-    defer {
-        for (history.items) |m| turn_history.freeContentBlocks(alloc, m.content);
-        history.deinit(alloc);
-    }
-    const appendTurn = struct {
-        fn f(a: std.mem.Allocator, h: *std.ArrayList(llm.Message), text: []const u8) !void {
-            const b = try a.alloc(llm.ContentBlock, 1);
-            b[0] = .{ .text = try a.dupe(u8, text) }; // HEAP: blocks free their text
-            try h.append(a, .{ .role = .user, .content = b, .timestamp = 0 });
-        }
-    }.f;
-
-    // Index 0 is always kept as the system prompt — the DECISION must sit
-    // at index 1 so phi actually drops it (that's the point of the test).
-    try appendTurn(alloc, &history, "SYSTEM-PROMPT");
-    try appendTurn(alloc, &history, "我们决定使用 sqlite WAL 模式，数据库文件是 data/app.db，不要改成 delete 模式");
-    // Filler turns so phi actually drops the head.
-    for (0..40) |i| {
-        var tb: [64]u8 = undefined;
-        const t = try std.fmt.bufPrint(&tb, "regular exchange number {d} nothing worth keeping", .{i});
-        try appendTurn(alloc, &history, t);
-    }
-    // NOTE: the facts block lives in history[0]'s blocks — its text is
-    // freed by the message cleanup below, so NO separate facts defer.
-    var facts: ?[]u8 = null;
-
-    var rounds: usize = 0;
-    while (rounds < 3) : (rounds += 1) {
-        // replenish filler so each round actually compacts again
-        for (0..20) |i| {
-            var tb: [64]u8 = undefined;
-            const t = try std.fmt.bufPrint(&tb, "later padding {d} for the round", .{i});
-            try appendTurn(alloc, &history, t);
-        }
-        turn_history.applyFactsUpdate(&history, &facts, alloc, turn_history.compactHistoryImpl(&history, alloc, facts));
-    }
-    const f = facts orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, f, "sqlite WAL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, f, "data/app.db") != null);
-    // And the block is anchored in history[0].
-    var anchored = false;
-    for (history.items[0].content) |b| switch (b) {
-        .text => |t| if (std.mem.indexOf(u8, t, "sqlite WAL") != null) {
-            anchored = true;
-        },
-        else => {},
-    };
-    try std.testing.expect(anchored);
-}
-
-test "shouldReanchor: phi gate on topic drift (T1.3)" {
-    const alloc = std.testing.allocator;
-    // Same text → cosine 1 → no re-anchor.
-    const a = try embedding_mod.embed(alloc, "deploy the payment service with docker");
-    defer alloc.free(a);
-    const a2 = try embedding_mod.embed(alloc, "deploy the payment service with docker");
-    defer alloc.free(a2);
-    try std.testing.expect(!shouldReanchor(a, a2));
-    // Disjoint token sets → cosine 0 < 0.618 → re-anchor.
-    const b = try embedding_mod.embed(alloc, "xray yankee zulu whiskey tango");
-    defer alloc.free(b);
-    try std.testing.expect(shouldReanchor(a, b));
-}
-
-test "topicVectorOfLastUserTurns means last 3 user turns, ignores others" {
-    const alloc = std.testing.allocator;
-    var history: std.ArrayList(llm.Message) = .empty;
-    defer {
-        for (history.items) |m| alloc.free(@constCast(m.content));
-        history.deinit(alloc);
-    }
-    const mkMsg = struct {
-        fn f(a: std.mem.Allocator, h: *std.ArrayList(llm.Message), role: @TypeOf(h.items[0].role), text: []const u8) !void {
-            const blocks = try a.alloc(llm.ContentBlock, 1);
-            blocks[0] = .{ .text = text };
-            try h.append(a, .{ .role = role, .content = blocks, .timestamp = 0 });
-        }
-    }.f;
-    try mkMsg(alloc, &history, .user, "alpha bravo charlie");
-    try mkMsg(alloc, &history, .assistant, "irrelevant assistant text");
-    try mkMsg(alloc, &history, .user, "delta echo foxtrot");
-    const v = topicVectorOfLastUserTurns(&history, alloc).?;
-    defer alloc.free(v);
-    try std.testing.expectEqual(embedding_mod.DIMS, v.len);
-    // Assistant-only history → null.
-    var h2: std.ArrayList(llm.Message) = .empty;
-    defer {
-        for (h2.items) |m| alloc.free(@constCast(m.content));
-        h2.deinit(alloc);
-    }
-    try mkMsg(alloc, &h2, .assistant, "only assistant");
-    try std.testing.expect(topicVectorOfLastUserTurns(&h2, alloc) == null);
-}
-
-test "swapMemoryBlockText replaces by identity, preserves siblings" {
-    const alloc = std.testing.allocator;
-    // swapMemoryBlockText TAKES OWNERSHIP of the old content slice — no
-    // defer-free here; the swap frees it and installs a new one that the
-    // history teardown below releases.
-    const blocks = try alloc.alloc(llm.ContentBlock, 3);
-    blocks[0] = .{ .text = "SYSTEM" };
-    blocks[1] = .{ .text = "OLD-MEMORY" };
-    blocks[2] = .{ .text = "SKILLS" };
-    var history: std.ArrayList(llm.Message) = .empty;
-    defer {
-        alloc.free(@constCast(history.items[0].content));
-        history.deinit(alloc);
-    }
-    try history.append(alloc, .{ .role = .system, .content = blocks, .timestamp = 0 });
-
-    const new_text = try alloc.dupe(u8, "NEW-MEMORY");
-    defer alloc.free(new_text);
-    try std.testing.expect(swapMemoryBlockText(&history, alloc, "OLD-MEMORY", new_text));
-    const cur = history.items[0].content;
-    try std.testing.expectEqual(@as(usize, 3), cur.len);
-    try std.testing.expectEqualStrings("SYSTEM", cur[0].text);
-    try std.testing.expectEqualStrings("NEW-MEMORY", cur[1].text);
-    try std.testing.expectEqualStrings("SKILLS", cur[2].text);
-    // Stale pointer → no match, history untouched (and the candidate not
-    // consumed — caller keeps ownership).
-    try std.testing.expect(!swapMemoryBlockText(&history, alloc, "OLD-MEMORY", new_text));
-    try std.testing.expectEqualStrings("NEW-MEMORY", history.items[0].content[1].text);
 }
