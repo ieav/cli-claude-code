@@ -103,6 +103,12 @@ pub const SessionStore = struct {
     /// logged and swallowed — losing a persistence write must never kill
     /// the conversation.
     pub fn flush(self: *SessionStore, history: []const llm.Message) void {
+        // A bare system prompt is not a conversation: rows without user
+        // turns never persist anything, so abandoned startup rows stay
+        // message-less (and adopt() deletes them instead of leaving
+        // "#N · 0 轮" noise in every listing).
+        if (history.len == 0) return;
+        if (history.len == 1 and history[0].role == .system) return;
         if (self.persisted >= history.len) return;
         self.db.exec("BEGIN") catch return;
         var ok = true;
@@ -189,6 +195,18 @@ pub const SessionStore = struct {
     pub fn adopt(self: *SessionStore, session_id: i64, persisted: usize) void {
         self.markExit(true);
         self.exit_marked = false;
+        // The startup row the user abandoned by resuming: if nothing ever
+        // flushed into it, DELETE it — a perpetual "#N · 0 轮 · (无消息)"
+        // entry in every later listing is pure noise.
+        const cleanup = std.fmt.allocPrint(self.alloc,
+            "DELETE FROM ziv_sessions WHERE id={d} AND NOT EXISTS " ++
+                "(SELECT 1 FROM ziv_session_messages WHERE session_id={d})",
+            .{ self.session_id, self.session_id },
+        ) catch null;
+        if (cleanup) |q| {
+            defer self.alloc.free(q);
+            self.db.exec(q) catch {};
+        }
         self.session_id = session_id;
         self.persisted = persisted;
         self.exit_marked = false;

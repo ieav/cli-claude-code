@@ -673,9 +673,30 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                     return .handled;
                 }
             }
-            const list = session_store_mod.listRecent(allocator, &st.db, 8) catch &[_]session_store_mod.SessionInfo{};
+            // Owned full slice + visible count: excluded infos are freed
+            // immediately, but the ARRAY must be freed with its original
+            // length (shrinking a slice breaks allocator size checks).
+            const list_full = session_store_mod.listRecent(allocator, &st.db, 9) catch null;
+            var n_vis: usize = 0;
+            if (list_full) |lf| {
+                for (lf) |s2| {
+                    if (s2.id == st.session_id) {
+                        // The live process's OWN startup row must not be
+                        // offered — it sits first (newest) with 0 rounds and
+                        // traps the default selection.
+                        session_store_mod.freeInfo(allocator, s2);
+                        continue;
+                    }
+                    lf[n_vis] = s2;
+                    n_vis += 1;
+                }
+            }
+            const list: []session_store_mod.SessionInfo = if (list_full) |lf| lf[0..n_vis] else &[_]session_store_mod.SessionInfo{};
+            defer {
+                for (list) |*s2| session_store_mod.freeInfo(allocator, s2.*);
+                if (list_full) |lf| allocator.free(lf);
+            }
             {
-                defer for (list) |*s2| session_store_mod.freeInfo(allocator, s2.*);
                 if (pick == null) {
                     if (list.len == 0) {
                         try std.Io.Writer.writeAll(ctx.w, "  还没有可恢复的会话。\n\n");
@@ -705,6 +726,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 }
             }
             const id = pick.?;
+            if (id == st.session_id) {
+                try std.Io.Writer.writeAll(ctx.w, "  那是当前会话自身的行。/resume 选择其它会话。\n\n");
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
             const meta = session_store_mod.metaOf(allocator, &st.db, id) catch {
                 try std.Io.Writer.print(ctx.w, "  会话 #{d} 不存在。/resume 查看列表。\n\n", .{id});
                 try std.Io.File.Writer.flush(ctx.file_writer);
@@ -720,10 +746,19 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 return .handled;
             };
             // Replace the live conversation: clear frees the current one,
-            // then the loaded heap-owned messages move in.
+            // then the loaded heap-owned messages move in. The persisted
+            // SYSTEM message is skipped — the live one (built by THIS
+            // process, carrying the CURRENT skills/memory/plan anchor
+            // blocks) stays; restoring the old one would duplicate it and
+            // free history[0] out from under the live anchor pointers.
+            const db_rows = msgs.len;
             turn_history.clearHistory(ctx.history, allocator);
             var moved: usize = 0;
-            for (msgs) |m| {
+            for (msgs, 0..) |m, mi| {
+                if (mi == 0 and m.role == .system) {
+                    session_store_mod.freeMessage(m, allocator);
+                    continue;
+                }
                 ctx.history.append(allocator, m) catch {
                     session_store_mod.freeMessage(m, allocator);
                     continue;
@@ -737,7 +772,13 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             if (std.meta.stringToEnum(auth.PermissionMode, meta.permission_mode)) |m2| {
                 ctx.current_mode.* = m2;
             }
-            st.adopt(id, moved);
+            // persisted = DB row count (NOT appended count — the skipped
+            // system row still occupies seq 0): the next flush must insert
+            // AFTER the last restored row, not REPLACE it.
+            if (moved == 0) {
+                try std.Io.Writer.print(ctx.w, "  会话 #{d} 没有可恢复的消息（仅系统提示符）。\n\n", .{id});
+            }
+            st.adopt(id, db_rows);
             const est = turn_history.estimateHistoryTokens(ctx.history.items);
             try std.Io.Writer.print(ctx.w, "  已恢复会话 #{d}：{d} 条消息（~{d} tokens · 模型 {s} · 模式 {s}）。继续对话即可。\n\n", .{
                 id, moved, est, meta.model, meta.permission_mode,

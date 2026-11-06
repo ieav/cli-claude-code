@@ -303,7 +303,10 @@ def s7_clean_resume():
             z2.wait_prompt()
             z2.send("/resume\n")
             out = z2.read_until("resume-marker-alpha", 10)
-            z2.send("\r")  # select the first (only) entry
+            # The live process's own empty startup row must not appear.
+            if "0 轮" in out:
+                raise Fail("live empty session row leaked into the resume list")
+            z2.send("\r")  # first (and only) listed entry = the marked one
             z2.read_until("已恢复会话", 10)
             z2.drain(1.0)  # let the post-resume prompt paint settle
             z2.clear_buf()
@@ -316,8 +319,14 @@ def s7_clean_resume():
             # Same messages restored → the token estimate must carry over
             # intact (the in-process Messages counter does not count
             # restored turns — History tokens is the state-equality check).
-            if tokens_after < tokens_before:
+            # TWO-SIDED: content came back, and no double-system inflation
+            # (restoring the old system prompt alongside the live one used to
+            # roughly DOUBLE the estimate — caught live: 331+335 -> 662).
+            # Tolerances absorb the date/time drift between prompt builds.
+            if tokens_after < tokens_before - 40:
                 raise Fail(f"resume lost history: ~{tokens_before} -> ~{tokens_after} tokens")
+            if tokens_after > tokens_before + 120:
+                raise Fail(f"resume inflated history (double system?): ~{tokens_before} -> ~{tokens_after} tokens")
             quit_and_wait(z2)
             return f"restart+resume restored history intact (~{tokens_after} tokens) ✓"
         finally:
