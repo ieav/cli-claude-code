@@ -10,6 +10,8 @@ const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
 const lineinput = @import("util/lineinput.zig");
 const stream_mod = @import("turn/stream.zig");
+const turn_ask = @import("turn/ask.zig");
+const turn_tools = @import("turn/tools.zig");
 const json_tree = @import("util/json_tree.zig");
 const slash_cmds = @import("util/slash_commands.zig");
 const runtime_registry = @import("tools/runtime_registry.zig");
@@ -75,10 +77,7 @@ const MAX_CONTEXT_TOKENS: u32 = 128_000;
 /// v0.7.5 (user call): show the WHOLE diff — no folding. The cap only
 /// guards pathological sizes (a 1000-line generated blob would flood the
 /// screen past any usefulness).
-const DIFF_MAX_LINES: usize = 1000;
-const DIFF_MAX_COLS: usize = 110;
-const DIFF_MAX_DIFFABLE_LINES: usize = 800;
-const DIFF_READ_CAP: usize = 1024 * 1024;
+const DIFF_READ_CAP: usize = 1024 * 1024; // diff-size consts moved to turn/tools.zig
 
 /// Baseline fingerprint of all settings files, refreshed by (a) startup,
 /// (b) every own-save (autoSaveSettings, /mode, model picker). When a prompt
@@ -86,7 +85,7 @@ const DIFF_READ_CAP: usize = 1024 * 1024;
 var settings_fp_baseline: u64 = 0;
 
 /// Active model state — holds the current model name and the provider instance.
-const ModelSwitcher = struct {
+pub const ModelSwitcher = struct {
     model_name_buf: [64]u8 = undefined,
     model_name_len: usize = 0,
     backend: llm.BackendType,
@@ -552,10 +551,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // the user" actually asks (it used to return "(Awaiting user response)"
     // and the model kept going on a fabricated answer). Attached before any
     // defs cache is built.
-    var ask_ctx = AskUserCtx{ .r = r, .w = w, .ow = ow, .file_writer = &file_writer };
+    var ask_ctx = turn_ask.AskUserCtx{ .r = r, .w = w, .ow = ow, .file_writer = &file_writer };
     for (reg.entries.items) |*entry| {
         if (std.mem.eql(u8, entry.def.name, "AskUserQuestion")) {
-            entry.def.execute_ctx_fn = askUserExecute;
+            entry.def.execute_ctx_fn = turn_ask.askUserExecute;
             entry.def.execute_ctx = @ptrCast(&ask_ctx);
         }
     }
@@ -920,11 +919,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     try std.Io.File.Writer.flush(&file_writer);
                     continue;
                 };
-                if (!try permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state)) continue;
+                if (!try turn_ask.permissionGate(run_tool, parsed, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state)) continue;
 
                 // Backup file before modification (for /run commands)
                 var run_snap_id: ?[16]u8 = null;
-                if (isFileModifyingTool(tool_name)) {
+                if (turn_tools.isFileModifyingTool(tool_name)) {
                     if (registry.getStringField(parsed, "path")) |fp| {
                         var sid: [16]u8 = undefined;
                         const ts = util_time.nowMillis();
@@ -948,7 +947,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                 // Same /last ring as agent-loop calls (finishToolCall) —
                 // the expansion valve must cover manual /run too.
-                LastTools.push(tool_name, result.output);
+                turn_tools.LastTools.push(tool_name, result.output);
 
                 if (result.is_error) {
                     try std.Io.Writer.print(w, "  ERROR: {s}\n\n", .{result.output});
@@ -1144,14 +1143,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     const arg = std.mem.trim(u8, input["/last ".len..], " \t");
                     n = std.fmt.parseInt(usize, arg, 10) catch 1;
                 }
-                if (LastTools.get(n)) |e| {
+                if (turn_tools.LastTools.get(n)) |e| {
                     try std.Io.Writer.print(w, "  ── {s}（最近第 {d} 条，{d} 字节）──\n", .{ e.name, n, e.output.len });
                     var at_ls = false;
                     try writeMarginLines(w, e.output, "  ", &at_ls);
                     if (!at_ls) try std.Io.Writer.writeAll(w, "\n");
                     try std.Io.Writer.writeAll(w, "\n");
                 } else {
-                    try std.Io.Writer.print(w, "  无记录（/last=最近一条，/last N=第 N 近，最多保留 {d} 条）\n\n", .{LastTools.N});
+                    try std.Io.Writer.print(w, "  无记录（/last=最近一条，/last N=第 N 近，最多保留 {d} 条）\n\n", .{turn_tools.LastTools.N});
                 }
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
@@ -1800,7 +1799,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             var worker_failed = false;
             // Phase 1 (serial): permission gate + pre-execution backup for
             // every tool_use; approved calls are collected for phase 2.
-            var prepared = std.ArrayList(PreparedCall).empty;
+            var prepared = std.ArrayList(turn_tools.PreparedCall).empty;
             var total_calls: u32 = 0;
             defer {
                 for (prepared.items) |pc| {
@@ -1833,7 +1832,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                     // Backup file before modification (for rollback support)
                     var snap_id: ?[16]u8 = null;
-                    if (isFileModifyingTool(tc.name)) {
+                    if (turn_tools.isFileModifyingTool(tc.name)) {
                         if (registry.getStringField(tc.input, "path")) |fp| {
                             var sid: [16]u8 = undefined;
                             const ts = util_time.nowMillis();
@@ -1851,7 +1850,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                     // Permission check (shared gate; auto mode may delegate
                     // the ambiguous ask case to the LLM classifier).
-                    const approved = try permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state);
+                    const approved = try turn_ask.permissionGate(tool_def, tc.input, current_mode, &switcher, allocator, r, w, ow, &file_writer, &denial_state);
                     if (!approved) {
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = try allocator.dupe(u8, tc.id),
@@ -1866,7 +1865,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // when the old content is already gone.
                     var old_content: ?[]u8 = null;
                     var old_unavailable = false;
-                    if (isFileModifyingTool(tc.name) and
+                    if (turn_tools.isFileModifyingTool(tc.name) and
                         registry.getStringField(tc.input, "old_string") == null and
                         registry.getStringField(tc.input, "content") != null)
                     {
@@ -2074,7 +2073,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     var batch_errors: u32 = 0;
                     for (prepared.items, 0..) |p, i| {
                         window_tools += 1;
-                        const errored = try finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
+                        const errored = try turn_tools.finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
                         if (errored) {
                             batch_errors += 1;
                             // expected_stop (timeout kill / user cancel / declined
@@ -3639,483 +3638,6 @@ fn connectMcpServer(
     try std.Io.Writer.print(w, "  {s} connected: {d} tools available as mcp__{s}__*\n\n", .{ entry.name, sess.tool_names.items.len, entry.name });
     try std.Io.File.Writer.flush(file_writer);
 }
-
-/// AskUserQuestion execution context: the live REPL reader/writer.
-/// `w` is the REAL writer (region lifecycle); `ow` is the region-aware
-/// transcript writer for the printed lines.
-const AskUserCtx = struct {
-    r: *std.Io.Reader,
-    w: *std.Io.Writer,
-    ow: *std.Io.Writer,
-    file_writer: *std.Io.File.Writer,
-};
-
-/// Real AskUserQuestion body — prompt the user and return their answer.
-fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
-    _ = io;
-    const ctx: *AskUserCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.NoAskContext));
-    const question = registry.getStringField(input, "question") orelse
-        return registry.ToolResult{ .output = "Missing required field: question", .is_error = true };
-    // Interactive prompt/read happens with the turn-scoped region DOWN:
-    // the question + typed answer need the bottom rows and cooked-input
-    // echo, and a direct print with the region up would smear the
-    // persistent input row. The region is re-begun before returning (the
-    // tool phase still owns the screen bottom).
-    lineinput.regionEnd(ctx.w);
-    try std.Io.Writer.print(ctx.ow, "\n  [model asks] {s}\n  Your answer (Enter=skip, Esc=cancel): ", .{question});
-    try std.Io.File.Writer.flush(ctx.file_writer);
-    // Cooked-with-echo for the answer read (2026-11-06 session-raw
-    // follow-up): raw mode would leave the user typing blind with Enter
-    // delivered as \r — streamDelimiter waits for \n and blocks forever.
-    // Same guard as the y/N permission gate and the /rewind confirm.
-    var cooked = menu.CookedGuard{};
-    cooked.enter();
-    defer cooked.restore();
-    var ans_aw: std.Io.Writer.Allocating = .init(alloc);
-    defer ans_aw.deinit();
-    _ = std.Io.Reader.streamDelimiter(ctx.r, &ans_aw.writer, '\n') catch {
-        lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-        return registry.ToolResult{ .output = "user input unavailable", .is_error = true };
-    };
-    ctx.r.toss(1);
-    const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
-    // Esc / Ctrl-C in the cooked read arrive as control bytes (ISIG is
-    // off) — a leading one means CANCEL, not an answer; feeding the
-    // model the raw byte used to turn "user pressed Esc" into junk text.
-    if (ans.len > 0 and (ans[0] == 0x1b or ans[0] == 0x03)) {
-        lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-        return registry.ToolResult{ .output = "user cancelled the question (Esc)", .expected_stop = true };
-    }
-    lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-    return registry.ToolResult{
-        .output = try alloc.dupe(u8, if (ans.len > 0) ans else "(no answer given)"),
-    };
-}
-
-/// Shared permission gate for the agent loop and /run.
-/// deny → prints and returns false; allow → true; ask → interactive y/N,
-/// except in auto mode where a reachable LLM classifier decides (with the
-/// rule-based fallback of "allow" on classifier failure).
-fn permissionGate(
-    tool_def: *const registry.ToolDefinition,
-    input: std.json.Value,
-    mode: auth.PermissionMode,
-    switcher: *ModelSwitcher,
-    alloc: std.mem.Allocator,
-    r: *std.Io.Reader,
-    w: *std.Io.Writer,
-    /// Region-aware transcript writer: business prints go through it so
-    /// they land above the live region when one is up (verbatim when not).
-    ow: *std.Io.Writer,
-    file_writer: *std.Io.File.Writer,
-    denials: *denial_tracker_mod.DenialTracker,
-) !bool {
-    const perm_ctx = registry.PermissionContext{
-        .mode = mode,
-        .allow_rules = switcher.settings.allow_rules,
-        .deny_rules = switcher.settings.deny_rules,
-        .ask_rules = switcher.settings.ask_rules,
-        .provider = switcher.getProvider() catch null,
-        .allocator = alloc,
-        .model_name = switcher.modelName(),
-    };
-    var decision = auth.checkToolPermission(tool_def, input, &perm_ctx);
-
-    // Auto mode: delegate ambiguous (ask) calls to the LLM classifier.
-    if (mode == .auto and decision == .ask) {
-        if (switcher.getProvider() catch null) |p| {
-            var lc = classifier_mod.LLMClassifier.init(alloc, p, switcher.modelName());
-            // Fail CLOSED: on classifier error fall back to asking the user
-            // (fail-open silently allowed writes when the LLM was down).
-            const cr = lc.classify(tool_def, input) catch classifier_mod.ClassifierResult{ .block = .{ .reason = "classifier unavailable — confirm manually" } };
-            decision = switch (cr) {
-                .allow => .{ .allow = {} },
-                .block => |b| .{ .deny = .{ .message = b.reason } },
-            };
-            logger.info("classifier(auto): {s} -> {s}", .{ tool_def.name, switch (cr) {
-                .allow => "allow",
-                .block => "block",
-            } });
-        }
-    }
-
-    switch (decision) {
-        .deny => |d| {
-            if (denials.recordDenial()) {
-                std.Io.Writer.print(ow, "  [{d} consecutive denials — the agent is being starved; try /mode, an allow rule, or /config]\n", .{denials.consecutive_denials}) catch {};
-            }
-            std.Io.Writer.print(ow, "  [Permission denied: {s}]\n", .{d.message}) catch {};
-            try std.Io.File.Writer.flush(file_writer);
-            return false;
-        },
-        .allow => {
-            denials.recordApproval();
-            return true;
-        },
-        .ask => |a| {
-            // Interactive y/N happens with the turn region DOWN (the prompt
-            // + cooked-input echo own the bottom rows; a direct print with
-            // the region up smears the persistent input row). Re-begun on
-            // EVERY exit — the tool phase still owns the screen bottom.
-            lineinput.regionEnd(w);
-            try std.Io.Writer.print(ow, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
-            try std.Io.File.Writer.flush(file_writer);
-
-            // Cooked-with-echo for the answer read (session is raw now —
-            // without this the user types blind and Enter never terminates
-            // the delimiter read). No-op on non-TTY stdin.
-            var cooked = menu.CookedGuard{};
-            cooked.enter();
-            defer cooked.restore();
-            // Allocating answer buffer: the old fixed 64-byte reader turned
-            // a long pasted answer into "Cancelled" and left the tail of the
-            // line polluting the next read.
-            var ans_aw: std.Io.Writer.Allocating = .init(alloc);
-            defer ans_aw.deinit();
-            _ = std.Io.Reader.streamDelimiter(r, &ans_aw.writer, '\n') catch {
-                try std.Io.Writer.writeAll(ow, "\n  [Cancelled]\n");
-                try std.Io.File.Writer.flush(file_writer);
-                lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
-                return false;
-            };
-            r.toss(1);
-            const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
-            if (!std.mem.eql(u8, ans, "y") and !std.mem.eql(u8, ans, "Y")) {
-                _ = denials.recordDenial();
-                try std.Io.Writer.writeAll(ow, "  [Denied by user]\n");
-                try std.Io.File.Writer.flush(file_writer);
-                lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
-                return false;
-            }
-            denials.recordApproval();
-            lineinput.regionBegin(w, "⚙ 执行工具 · Esc 中断");
-            return true;
-        },
-    }
-}
-
-fn isFileModifyingTool(tool_name: []const u8) bool {
-    return std.mem.eql(u8, tool_name, "FileWrite") or
-        std.mem.eql(u8, tool_name, "FileEdit") or
-        std.mem.eql(u8, tool_name, "Write") or
-        std.mem.eql(u8, tool_name, "Edit");
-}
-
-/// Execute a single tool call and record result.
-/// A tool_use that passed the permission gate in phase 1 and is queued for
-/// execution (possibly in parallel) in phase 2.
-const PreparedCall = struct {
-    call: orchestration_mod.ToolCall,
-    snap_id: ?[16]u8,
-    /// File bytes captured BEFORE a write-style tool runs — the diff
-    /// preview is rendered after execution, when it's too late to read.
-    old_content: ?[]u8 = null,
-    /// Prior content exists but can't be shown (oversized / unreadable) —
-    /// skip the preview rather than mislabel the overwrite as a new file.
-    old_unavailable: bool = false,
-};
-
-/// Ring of recent tool outputs backing /last (③, 2026-11-06): the
-/// transcript shows a one-line preview by design; this answers "它刚才
-/// 到底输出了什么" without re-running anything. 8 slots × 8 KiB.
-const LastTools = struct {
-    const N: usize = 8;
-    const CAP: usize = 8 * 1024;
-    var buf: [N * CAP]u8 = undefined;
-    var lens: [N]usize = @splat(0);
-    var names: [N][32]u8 = undefined;
-    var name_lens: [N]usize = @splat(0);
-    var head: usize = 0; // next write slot; newest lives at (head+N-1)%N
-    var count: usize = 0;
-
-    fn push(name: []const u8, output: []const u8) void {
-        const i = head;
-        lens[i] = @min(output.len, CAP);
-        @memcpy(buf[i * CAP .. i * CAP + lens[i]], output[0..lens[i]]);
-        const nl = @min(name.len, names[i].len);
-        @memcpy(names[i][0..nl], name[0..nl]);
-        name_lens[i] = nl;
-        head = (head + 1) % N;
-        count = @min(count + 1, N);
-    }
-
-    /// n=1 → newest. Null when nothing recorded / out of range.
-    fn get(n: usize) ?struct { name: []const u8, output: []const u8 } {
-        if (n == 0 or n > count) return null;
-        const i = (head + N - n) % N;
-        return .{ .name = names[i][0..name_lens[i]], .output = buf[i * CAP .. i * CAP + lens[i]] };
-    }
-};
-
-/// Full tool output into the transcript, 2-space indented, one line per
-/// print (line-atomic above the live region via RegionWriter; markdown-
-/// table rows still align). Bounded: past 50 lines or LastTools.CAP
-/// bytes a dim tail marker points at /last — the ring keeps its full
-/// 8 KiB regardless of what the transcript showed. The byte cut backs
-/// off to a UTF-8 boundary so a mid-汉字 slice can't mojibake.
-fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
-    const max_lines: usize = 50;
-    var cut = @min(raw.len, LastTools.CAP);
-    while (cut > 0 and cut < raw.len and (raw[cut] & 0xC0) == 0x80) cut -= 1;
-    var rest: []const u8 = raw[0..cut];
-    var shown: usize = 0;
-    while (rest.len > 0 and shown < max_lines) : (shown += 1) {
-        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch {};
-        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
-    }
-    const total_lines = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
-    // Byte-cap truncation (one huge line) shows no line-count difference —
-    // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
-    // 10 KiB single line printed unmarked).
-    if (shown < total_lines or cut < raw.len) {
-        std.Io.Writer.print(w, "  \x1b[2m…已截断（显示 {d}/{d} 行）· /last 全文\x1b[0m\n", .{ shown, total_lines }) catch {};
-    }
-}
-
-test "printToolBody: verbatim body, cap marker, empty" {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
-    printToolBody(&aw.writer, "one\ntwo\n");
-    try std.testing.expectEqualStrings("  one\n  two\n", aw.written());
-    // 55 lines: 50 shown + cap marker naming the true total.
-    var buf: [300]u8 = undefined;
-    var f = std.Io.Writer.fixed(&buf);
-    var i: usize = 0;
-    while (i < 55) : (i += 1) std.Io.Writer.print(&f, "l{d}\n", .{i}) catch unreachable;
-    aw.clearRetainingCapacity();
-    printToolBody(&aw.writer, f.buffered());
-    const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "  l49\n") != null); // 50th line shown
-    try std.testing.expect(std.mem.indexOf(u8, out, "  l50\n") == null); // 51st not
-    try std.testing.expect(std.mem.indexOf(u8, out, "显示 50/55 行") != null);
-    // Empty output: no body, no marker.
-    aw.clearRetainingCapacity();
-    printToolBody(&aw.writer, "");
-    try std.testing.expectEqualStrings("", aw.written());
-}
-
-test "LastTools: ring order and wrap" {
-    LastTools.head = 0;
-    LastTools.count = 0;
-    LastTools.push("bash", "out-1");
-    LastTools.push("read", "out-2");
-    try std.testing.expectEqualStrings("out-2", LastTools.get(1).?.output);
-    try std.testing.expectEqualStrings("out-1", LastTools.get(2).?.output);
-    try std.testing.expect(LastTools.get(3) == null);
-    for (0..10) |_| LastTools.push("t", "x");
-    try std.testing.expectEqual(@as(usize, LastTools.N), LastTools.count);
-    try std.testing.expectEqualStrings("x", LastTools.get(1).?.output);
-    try std.testing.expect(LastTools.get(LastTools.N + 1) == null);
-}
-
-/// Phase 2 tail: print the outcome, truncate oversized output, record in the
-/// operation log, append the tool_result block. Returns true on tool error.
-fn finishToolCall(
-    p: PreparedCall,
-    result: registry.ToolResult,
-    alloc: std.mem.Allocator,
-    log: *op_log.OperationLog,
-    result_blocks: *std.ArrayList(llm.ContentBlock),
-    w: *std.Io.Writer,
-    ow: *std.Io.Writer,
-    file_writer: *std.Io.File.Writer,
-    history_len: usize,
-    elapsed_ms: i64,
-) !bool {
-    // Wall time from batch dispatch — for a parallel batch this includes
-    // queue wait and overlaps siblings; per-tool exclusive time would
-    // need per-future t0 plumbing the pool doesn't expose.
-    logger.info("Tool execute: {s} ({d}ms)", .{ p.call.tool_name, elapsed_ms });
-
-    // Tool phase: the region is already up (turn-scoped) — just swap the
-    // STATUS text; the input row never flickers between phases anymore.
-    lineinput.regionStatus(w, "⚙ 执行工具 · Esc 中断");
-
-    // Colorized code-change preview (TUI-only, shown only on success).
-    // Tool output itself stays compact — it feeds LLM history; the diff
-    // never does. Render failures must not break tool flow. `ow` keeps
-    // every diff line above the live region.
-    if (!result.is_error and isFileModifyingTool(p.call.tool_name) and !p.old_unavailable) {
-        var diff_arena = std.heap.ArenaAllocator.init(allocator);
-        defer diff_arena.deinit();
-        renderCodeDiff(ow, diff_arena.allocator(), p.call.input, p.old_content) catch {};
-    }
-
-    // Truncate large outputs for history — must dupe before freeing
-    const max_result = 4096;
-    const raw = result.output;
-    const truncated = raw.len > max_result;
-
-    // Full-body display (2026-11-06, user call — supersedes the ③ 80-col
-    // one-liner): the preview made every interesting output a /last
-    // round-trip. Bounded at 50 lines / 8 KiB so a runaway grep still
-    // can't flood the screen; past the cap a dim marker points at /last.
-    // Wall time carried live; tool name colored by outcome.
-    LastTools.push(p.call.tool_name, raw);
-    const name_col = if (result.is_error) "\x1b[31m" else "\x1b[36m";
-    std.Io.Writer.print(ow, "  [{s}{s}\x1b[0m · {d}.{d}s]\n", .{
-        name_col,
-        p.call.tool_name,
-        @divTrunc(elapsed_ms, 1000),
-        @divTrunc(@mod(elapsed_ms, 1000), 100),
-    }) catch {};
-    printToolBody(ow, raw);
-
-    // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
-    // char boundary. A mid-char cut used to poison every later request:
-    // the gateway's JSON parser rejected the whole session with
-    // "Invalid UTF-8 middle byte" (tool outputs full of CJK comments hit
-    // the 4096th byte mid-汉字 all the time).
-    var hist_cut: usize = max_result;
-    while (hist_cut > 0 and hist_cut < raw.len and (raw[hist_cut] & 0xC0) == 0x80) hist_cut -= 1;
-    const content_for_history: []const u8 = if (truncated)
-        try alloc.dupe(u8, raw[0..hist_cut])
-    else
-        raw; // ownership transfers, no dupe needed
-
-    try result_blocks.append(alloc, .{
-        .tool_result = .{
-            // Duped: p.call.tool_use_id borrows the assistant message's id —
-            // history must own its own copy or clearHistory double-frees.
-            .tool_use_id = try alloc.dupe(u8, p.call.tool_use_id),
-            .content = content_for_history,
-            .is_error = result.is_error,
-        },
-    });
-    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null, history_len) catch {};
-    if (truncated) {
-        // History owns the dupe; the original (error or not) is spent.
-        alloc.free(result.output);
-    }
-    // If not truncated, content_for_history == result.output; ownership moved into history
-    try std.Io.File.Writer.flush(file_writer);
-    return result.is_error;
-}
-
-// ──── Code-change diff preview ────
-
-/// Render a colorized preview of what a file-modifying tool actually
-/// changed: removed lines in red, added in green, dim overflow note —
-/// visually distinct from every other TUI line so edits scan fast.
-/// edit-style tools (old_string/new_string) diff those strings directly;
-/// write-style tools (content) diff the captured pre-write bytes.
-/// `alloc` is a per-call scratch arena — nothing here outlives the print.
-/// `w` is the region-aware transcript writer: every line lands above the
-/// live region during a turn (see lineinput.RegionWriter).
-fn renderCodeDiff(
-    w: *std.Io.Writer,
-    alloc: std.mem.Allocator,
-    input: std.json.Value,
-    old_content: ?[]const u8,
-) !void {
-    const red = "\x1b[31m";
-    const green = "\x1b[32m";
-    const dim = "\x1b[2m";
-    const reset = "\x1b[0m";
-
-    var old_text: ?[]const u8 = null; // null → brand-new content
-    var new_text: []const u8 = "";
-    var replace_all = false;
-    if (registry.getStringField(input, "old_string")) |old_s| {
-        old_text = old_s;
-        new_text = registry.getStringField(input, "new_string") orelse "";
-        replace_all = registry.getBool(input, "replaceAll") orelse false;
-    } else if (registry.getStringField(input, "content")) |content| {
-        new_text = content;
-        if (old_content) |oc| old_text = oc;
-    } else return; // nothing diffable on this input
-
-    var lines: std.ArrayList(diff_util.DiffLine) = .empty;
-    if (old_text) |ot| {
-        // computeDiff hides lines common to both sides — an old_string
-        // that carries surrounding context would otherwise echo it twice.
-        const old_rows = std.mem.count(u8, ot, "\n") + 1;
-        const new_rows = std.mem.count(u8, new_text, "\n") + 1;
-        if (old_rows > DIFF_MAX_DIFFABLE_LINES or new_rows > DIFF_MAX_DIFFABLE_LINES) {
-            try std.Io.Writer.print(w, "  " ++ dim ++ "（{d} 行 → {d} 行，改动过大不展开 diff）" ++ reset ++ "\n", .{ old_rows, new_rows });
-            return;
-        }
-        const d = try diff_util.computeDiff(alloc, ot, new_text);
-        for (d) |dl| {
-            if (dl.kind != .equal) try lines.append(alloc, dl);
-        }
-    } else {
-        for (try diffSplitLines(alloc, new_text)) |l| {
-            try lines.append(alloc, .{ .kind = .added, .content = l });
-        }
-    }
-
-    var i: usize = 0;
-    while (i < lines.items.len and i < DIFF_MAX_LINES) : (i += 1) {
-        const trunc = try diffTruncLine(alloc, lines.items[i].content, DIFF_MAX_COLS);
-        switch (lines.items[i].kind) {
-            .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
-            .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
-            .equal => {},
-        }
-    }
-    if (i < lines.items.len) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "…（还有 {d} 行未显示）" ++ reset ++ "\n", .{lines.items.len - i});
-    } else if (old_text == null and lines.items.len > 0) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "（新文件 · {d} 行）" ++ reset ++ "\n", .{lines.items.len});
-    }
-    if (replace_all) {
-        try std.Io.Writer.print(w, "  " ++ dim ++ "（replaceAll：所有匹配处同样替换）" ++ reset ++ "\n", .{});
-    }
-}
-
-/// Split text into lines for diff display. splitSequence yields one
-/// artifact empty element for a trailing "\n" — drop it (it would render
-/// a dangling "+ "/"- " row after every normal file edit).
-fn diffSplitLines(alloc: std.mem.Allocator, text: []const u8) ![][]const u8 {
-    var lines: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitSequence(u8, text, "\n");
-    while (it.next()) |line| try lines.append(alloc, line);
-    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
-        _ = lines.pop();
-    }
-    return lines.toOwnedSlice(alloc);
-}
-
-/// Truncate one diff line to `max_cols` DISPLAY columns (CJK counts 2),
-/// never cutting mid-UTF-8; tabs expand to 4 spaces so code indent stays
-/// readable; other control bytes are stripped. Append "…" when cut.
-fn diffTruncLine(alloc: std.mem.Allocator, s: []const u8, max_cols: usize) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var col: usize = 0;
-    var i: usize = 0;
-    var cut = false;
-    while (i < s.len) {
-        const c = s[i];
-        var piece: []const u8 = undefined;
-        var cw: usize = undefined;
-        if (c == '\t') {
-            piece = "    ";
-            cw = 4;
-            i += 1;
-        } else if (c < 0x20) {
-            i += 1;
-            continue;
-        } else {
-            var j = i + 1;
-            while (j < s.len and (s[j] & 0xC0) == 0x80) j += 1;
-            piece = s[i..j];
-            cw = if (c >= 0xE0) 2 else 1;
-            i = j;
-        }
-        if (col + cw > max_cols - 1) { // keep one column for the ellipsis
-            cut = true;
-            break;
-        }
-        try out.appendSlice(alloc, piece);
-        col += cw;
-    }
-    if (cut) try out.appendSlice(alloc, "…");
-    return out.toOwnedSlice(alloc);
-}
-
-// ──── Conversation management helpers ────
 
 /// Estimate total tokens across all history messages.
 fn estimateHistoryTokens(history: []const llm.Message) u32 {
@@ -6017,90 +5539,6 @@ test "writeMarginLines keeps the margin across chunk splits" {
     var ls3 = false;
     try writeMarginLines(w, "x\n", "  ", &ls3);
     try std.testing.expectEqualStrings("x\n", aw.written());
-}
-
-test "diffSplitLines drops only the artifact trailing empty" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const two = try diffSplitLines(a, "a\nb\n");
-    try std.testing.expectEqual(@as(usize, 2), two.len);
-    try std.testing.expectEqualStrings("b", two[1]);
-
-    const no_nl = try diffSplitLines(a, "x");
-    try std.testing.expectEqual(@as(usize, 1), no_nl.len);
-
-    // "a\n\n" has a REAL blank line — only the split artifact goes.
-    const blank = try diffSplitLines(a, "a\n\n");
-    try std.testing.expectEqual(@as(usize, 2), blank.len);
-    try std.testing.expectEqualStrings("", blank[1]);
-
-    const empty = try diffSplitLines(a, "");
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
-}
-
-test "diffTruncLine caps display width CJK-aware, expands tabs" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const short = try diffTruncLine(a, "const x = 1;", DIFF_MAX_COLS);
-    try std.testing.expectEqualStrings("const x = 1;", short);
-
-    // CJK chars are 2 columns: cap 6 → 2 chars + ellipsis.
-    const cjk = try diffTruncLine(a, "中文注释内容", 6);
-    try std.testing.expectEqualStrings("中文…", cjk);
-
-    // Never cuts mid-UTF-8: "中" needs 2 cols but only 1 is left.
-    const boundary = try diffTruncLine(a, "ab中", 3);
-    try std.testing.expectEqualStrings("ab…", boundary);
-
-    const tab = try diffTruncLine(a, "\tfoo", DIFF_MAX_COLS);
-    try std.testing.expectEqualStrings("    foo", tab);
-}
-
-test "renderCodeDiff colors edits and hides unchanged context" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
-
-    // old_string carries surrounding context ("a"/"c") that appears on
-    // both sides — it must not be echoed as a -/+ pair.
-    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"f.zig\",\"old_string\":\"a\\nb\\nc\",\"new_string\":\"a\\nX\\nc\"}", .{});
-    try renderCodeDiff(&aw.writer, a, input, null);
-
-    const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[31m- b\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[32m+ X\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "- a") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "- c") == null);
-
-    // Write-style with no prior content → all green + new-file footer.
-    aw.writer.end = 0;
-    const wr = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"new.zig\",\"content\":\"line1\\nline2\"}", .{});
-    try renderCodeDiff(&aw.writer, a, wr, null);
-    const out2 = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out2, "\x1b[32m+ line1\x1b[0m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out2, "新文件 · 2 行") != null);
-
-    // Oversized input: summary line only, no per-line diff.
-    aw.writer.end = 0;
-    var big_old: std.ArrayList(u8) = .empty;
-    var big_new: std.ArrayList(u8) = .empty;
-    for (0..DIFF_MAX_DIFFABLE_LINES + 1) |_| {
-        try big_old.appendSlice(a, "old line\n");
-        try big_new.appendSlice(a, "new line\n");
-    }
-    var big_obj: std.json.ObjectMap = .empty;
-    try big_obj.put(a, "old_string", .{ .string = big_old.items });
-    try big_obj.put(a, "new_string", .{ .string = big_new.items });
-    try renderCodeDiff(&aw.writer, a, .{ .object = big_obj }, null);
-    const out3 = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out3, "改动过大不展开 diff") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out3, "\x1b[31m- old line") == null);
 }
 
 test "plan summary, append and remove system blocks (T8)" {
