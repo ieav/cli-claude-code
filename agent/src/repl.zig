@@ -15,6 +15,8 @@ const turn_tools = @import("turn/tools.zig");
 const turn_history = @import("turn/history.zig");
 const memory_ops = @import("session/memory_ops.zig");
 const config_menu = @import("commands/config_menu.zig");
+const history_cmds = @import("commands/history_cmds.zig");
+const input_history_mod = @import("session/input_history.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
 const json_tree = @import("util/json_tree.zig");
@@ -74,7 +76,7 @@ var cron_ptr: ?*task_mod.CronScheduler = null;
 
 // Agent-loop cap lives in settings.agent_loop_limit (default 50, clamp
 // 1..200) — see the turn loop's max_agent_iters.
-const MAX_CONTEXT_TOKENS: u32 = 128_000;
+pub const MAX_CONTEXT_TOKENS: u32 = 128_000;
 
 /// Code-change diff preview (TUI) — see renderCodeDiff. Cap one edit's
 /// block at 15 rows × 110 display columns so a big rewrite can't flood
@@ -448,7 +450,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // Cross-session: ↑-recall survives restarts. Without this a fresh ziv
     // shows no history (the magenta recall styling silently did nothing)
     // until the user submits a new line — reported as "feature broken".
-    loadInputHistory(allocator, io, &input_history);
+    input_history_mod.loadInputHistory(allocator, io, &input_history);
 
     try std.Io.Writer.writeAll(w,
         \\Type your message (or /help for commands):
@@ -571,7 +573,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
         const input = std.mem.trim(u8, line, " \t\r\n");
         if (input.len == 0) continue;
-        if (!from_auto_queue) saveInputHistory(allocator, &input_history);
+        if (!from_auto_queue) input_history_mod.saveInputHistory(allocator, &input_history);
 
         var skill_injected = false;
         // ──── Meta commands ────
@@ -901,7 +903,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/context")) {
-                try showContext(&history, total_input_tokens, total_output_tokens, w);
+                try history_cmds.showContext(&history, total_input_tokens, total_output_tokens, w);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/trace")) {
@@ -1005,7 +1007,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             } else if (std.mem.eql(u8, input, "/undo")) {
                 // Only invalidate older rewind points when something was
                 // actually removed — a no-op undo must not rewrite history.
-                if (try undoLastExchange(&history, allocator, w) > 0) {
+                if (try history_cmds.undoLastExchange(&history, allocator, w) > 0) {
                     log.bumpEpoch();
                 }
                 try std.Io.File.Writer.flush(&file_writer);
@@ -1023,7 +1025,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/rewind")) {
-                try rewindOperation(&rollback_engine, &history, w, r, &file_writer, allocator, io);
+                try history_cmds.rewindOperation(&rollback_engine, &history, w, r, &file_writer, allocator, io);
                 try std.Io.File.Writer.flush(&file_writer);
                 continue;
             } else if (std.mem.eql(u8, input, "/plan") or std.mem.startsWith(u8, input, "/plan ")) {
@@ -2325,418 +2327,6 @@ fn connectMcpServer(
     try std.Io.File.Writer.flush(file_writer);
 }
 
-/// Show current context usage.
-fn showContext(history: *std.ArrayList(llm.Message), total_in: u64, total_out: u64, w: *std.Io.Writer) !void {
-    const est = turn_history.estimateHistoryTokens(history.items);
-    const pct = @as(f64, @floatFromInt(est)) / @as(f64, @floatFromInt(MAX_CONTEXT_TOKENS)) * 100.0;
-
-    // Count by role
-    var counts = [_]usize{ 0, 0, 0, 0 }; // system, user, assistant, tool
-    for (history.items) |msg| {
-        switch (msg.role) {
-            .system => counts[0] += 1,
-            .user => counts[1] += 1,
-            .assistant => counts[2] += 1,
-            .tool => counts[3] += 1,
-        }
-    }
-
-    const threshold = compaction.condensationTarget(MAX_CONTEXT_TOKENS);
-    try std.Io.Writer.print(w, "\n  Context: {d} / {d} tokens ({d:.1}%)\n", .{ est, MAX_CONTEXT_TOKENS, pct });
-    try std.Io.Writer.print(w, "  Messages: {d} system, {d} user, {d} assistant, {d} tool\n", .{
-        counts[0], counts[1], counts[2], counts[3],
-    });
-    try std.Io.Writer.print(w, "  Compaction threshold: {d} tokens (61.8%)\n", .{threshold});
-    try std.Io.Writer.print(w, "  Session total: {d} in / {d} out tokens\n\n", .{ total_in, total_out });
-}
-
-/// Undo last exchange (remove last assistant + any tool results).
-/// Returns how many messages were actually removed — callers must only
-/// bumpEpoch on a non-zero result (a no-op undo used to invalidate every
-/// older rollback point's dialogue rewind).
-fn undoLastExchange(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer) !usize {
-    // Need at least system prompt + one user message + one assistant message
-    if (history.items.len < 3) {
-        try std.Io.Writer.writeAll(w, "  Nothing to undo.\n\n");
-        return 0;
-    }
-
-    var removed: usize = 0;
-
-    // Remove trailing assistant message
-    if (history.items.len > 0) {
-        const last = history.items[history.items.len - 1];
-        if (last.role == .assistant) {
-            const msg = history.pop().?;
-            turn_history.freeMessage(msg, alloc);
-            removed += 1;
-        }
-    }
-
-    // Remove trailing tool-result user message (from agent loop)
-    if (history.items.len > 0) {
-        const last = history.items[history.items.len - 1];
-        if (last.role == .user) {
-            // Check if it contains tool_result blocks (agent loop feedback)
-            var has_tool_result = false;
-            for (last.content) |block| {
-                if (block == .tool_result) {
-                    has_tool_result = true;
-                    break;
-                }
-            }
-            if (has_tool_result) {
-                const msg = history.pop().?;
-                turn_history.freeMessage(msg, alloc);
-                removed += 1;
-            }
-        }
-    }
-
-    // Remove trailing user message (the original prompt)
-    if (history.items.len > 1) {
-        const last = history.items[history.items.len - 1];
-        if (last.role == .user) {
-            const msg = history.pop().?;
-            turn_history.freeMessage(msg, alloc);
-            removed += 1;
-        }
-    }
-
-    // Removing the results message above can strand the assistant tool_use
-    // it answered — a dangling tool_calls gets the next request 400'd.
-    const len_before_repair = history.items.len;
-    turn_history.repairToolPairing(history, alloc);
-    removed += len_before_repair - history.items.len;
-
-    if (removed == 0) {
-        try std.Io.Writer.writeAll(w, "  Nothing to undo.\n\n");
-    } else {
-        try std.Io.Writer.print(w, "  Undone: removed {d} message(s). History now has {d} messages.\n\n", .{ removed, history.items.len });
-    }
-    return removed;
-}
-
-/// Rewind: show rollback points and restore files to a previous checkpoint.
-/// Claude-style: the conversation is rewound too — every message newer than
-/// the checkpoint's timestamp is dropped, so files AND dialogue return to
-/// that moment (the system prompt always survives).
-fn rewindOperation(
-    engine: *rollback_mod.RollbackEngine,
-    history: *std.ArrayList(llm.Message),
-    w: *std.Io.Writer,
-    r: *std.Io.Reader,
-    file_writer: *std.Io.File.Writer,
-    alloc: std.mem.Allocator,
-    io: std.Io,
-) !void {
-    const rollback_points = engine.listRollbackPoints() catch {
-        try std.Io.Writer.writeAll(w, "  Error listing rollback points.\n\n");
-        return;
-    };
-    defer alloc.free(rollback_points);
-
-    if (rollback_points.len == 0) {
-        try std.Io.Writer.writeAll(w, "  No rollback points available.\n");
-        try std.Io.Writer.writeAll(w, "  Rollback requires file-modifying tools (FileWrite, FileEdit) to have been executed.\n\n");
-        return;
-    }
-
-    try std.Io.Writer.print(w, "  Rollback points ({d}):\n", .{rollback_points.len});
-    try std.Io.Writer.writeAll(w, "    [0] Session start (undo all file changes)\n");
-    for (rollback_points, 0..) |rp, i| {
-        try std.Io.Writer.print(w, "    [{d}] {s} (files: {d})\n", .{ i + 1, rp.tool_name, rp.files_affected });
-    }
-    try std.Io.Writer.writeAll(w, "\n  Select rollback point (or Enter to cancel): ");
-    try std.Io.File.Writer.flush(file_writer);
-
-    // Cooked-with-echo (session raw otherwise — same as the confirm below).
-    var cooked_sel = menu.CookedGuard{};
-    cooked_sel.enter();
-    defer cooked_sel.restore();
-    var ans_buf: [64]u8 = undefined;
-    var ans_writer = std.Io.Writer.fixed(&ans_buf);
-    const n = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
-        try std.Io.Writer.writeAll(w, "\n");
-        return;
-    };
-    r.toss(1);
-    const ans = std.mem.trim(u8, ans_buf[0..n], " \t\r\n");
-    if (ans.len == 0) {
-        try std.Io.Writer.writeAll(w, "  Cancelled.\n\n");
-        return;
-    }
-
-    const idx = std.fmt.parseInt(usize, ans, 10) catch {
-        try std.Io.Writer.writeAll(w, "  Invalid selection.\n\n");
-        return;
-    };
-    if (idx > rollback_points.len) {
-        try std.Io.Writer.writeAll(w, "  Invalid selection.\n\n");
-        return;
-    }
-
-    // [0] rolls everything back to the session start state.
-    const target_op_id = if (idx == 0)
-        rollback_mod.session_start_op_id
-    else
-        rollback_points[idx - 1].op_id;
-    // Rewind boundary for the conversation: the message count at the moment
-    // the op was recorded (index-precise — ms timestamps cannot split
-    // messages inside one fast tool turn). Session start keeps only the
-    // system prompt. A stale epoch (history rewritten by compact/clear/undo
-    // since the point) invalidates the index — files rewind, dialogue does
-    // not, instead of deleting innocent post-rewrite messages.
-    const point_epoch: u64 = if (idx == 0) engine.op_log.epoch else rollback_points[idx - 1].epoch;
-    const epoch_valid = point_epoch == engine.op_log.epoch;
-    const truncate_to: usize = if (idx == 0) 1 else rollback_points[idx - 1].history_len;
-
-    // Preview first
-    const preview = engine.previewRollback(target_op_id) catch {
-        try std.Io.Writer.writeAll(w, "  Error previewing rollback.\n\n");
-        return;
-    };
-
-    const messages_to_drop: usize = if (epoch_valid and history.items.len > truncate_to) history.items.len - truncate_to else 0;
-
-    try std.Io.Writer.print(w, "\n  Rollback preview:\n", .{});
-    try std.Io.Writer.print(w, "    Files to restore: {d}\n", .{preview.files_to_restore});
-    try std.Io.Writer.print(w, "    Files to delete:  {d}\n", .{preview.files_to_delete});
-    try std.Io.Writer.print(w, "    Operations to undo: {d}\n", .{preview.operations_to_undo});
-    if (epoch_valid) {
-        try std.Io.Writer.print(w, "    Messages to drop: {d} (conversation rewinds with the files)\n", .{messages_to_drop});
-    } else {
-        try std.Io.Writer.writeAll(w, "    Messages to drop: 0 (history was compacted/cleared since this point — files rewind only)\n");
-    }
-    try std.Io.Writer.writeAll(w, "  Proceed? [y/N]: ");
-    try std.Io.File.Writer.flush(file_writer);
-
-    // Cooked-with-echo for the confirm read (session raw otherwise).
-    var cooked = menu.CookedGuard{};
-    cooked.enter();
-    defer cooked.restore();
-    var confirm_buf: [16]u8 = undefined;
-    var confirm_writer = std.Io.Writer.fixed(&confirm_buf);
-    _ = std.Io.Reader.streamDelimiter(r, &confirm_writer, '\n') catch {
-        try std.Io.Writer.writeAll(w, "\n");
-        return;
-    };
-    r.toss(1);
-    const confirm = std.mem.trim(u8, confirm_buf[0..confirm_writer.end], " \t\r\n");
-    if (!std.mem.eql(u8, confirm, "y") and !std.mem.eql(u8, confirm, "Y")) {
-        try std.Io.Writer.writeAll(w, "  Cancelled.\n\n");
-        return;
-    }
-
-    // Execute rollback
-    const result = engine.rollbackTo(target_op_id, io) catch |err| {
-        try std.Io.Writer.print(w, "  Rollback failed: {}\n\n", .{err});
-        return;
-    };
-
-    try std.Io.Writer.print(w, "  Rollback complete:\n", .{});
-    for (result.restored_files) |fp| {
-        try std.Io.Writer.print(w, "    Restored: {s}\n", .{fp});
-    }
-    for (result.deleted_files) |fp| {
-        try std.Io.Writer.print(w, "    Deleted:  {s}\n", .{fp});
-    }
-    for (result.errors) |e| {
-        try std.Io.Writer.print(w, "    Error: {s}: {s}\n", .{ e.file_path, e.message });
-    }
-    // Conversation rewind: pop messages down to the checkpoint length
-    // (system prompt at index 0 always survives). Skipped on stale epoch.
-    var dropped: usize = 0;
-    while (epoch_valid and history.items.len > @max(truncate_to, 1)) {
-        const msg = history.orderedRemove(history.items.len - 1);
-        turn_history.freeMessage(msg, alloc);
-        dropped += 1;
-    }
-    // The recorded history_len can fall between a tool_use and its results —
-    // trim the stranded pair end so the next request stays wire-valid.
-    const len_before_repair = history.items.len;
-    turn_history.repairToolPairing(history, alloc);
-    dropped += len_before_repair - history.items.len;
-
-    try std.Io.Writer.print(w, "  ({d} restored, {d} deleted, {d} errors, {d} messages rewound)\n\n", .{
-        result.restored_files.len,
-        result.deleted_files.len,
-        result.errors.len,
-        dropped,
-    });
-
-    engine.freeResult(result);
-}
-
-/// Cross-session input history for the line editor: `.ziv/input_history` in
-/// the working directory, newest last, capped at INPUT_HISTORY_MAX entries.
-/// Whole-file rewrite on every commit (≤ ~50 KB) — no append mode needed and
-/// rotation comes for free.
-const INPUT_HISTORY_FILE = ".ziv/input_history";
-/// Cross-process mutex for history saves. Locked via createFile's atomic
-/// flock (blocking); its inode never changes — locking the history file
-/// itself would be voided by the tmp+rename swap that replaces it.
-const INPUT_HISTORY_LOCK = ".ziv/input_history.lock";
-const INPUT_HISTORY_MAX: usize = 500;
-
-fn loadInputHistory(alloc: std.mem.Allocator, io: std.Io, history: *std.ArrayList([]u8)) void {
-    const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, INPUT_HISTORY_FILE, alloc, std.Io.Limit.limited(256 * 1024)) catch return;
-    defer alloc.free(contents);
-    // Collect first, keep the TAIL: breaking early on an oversized file would
-    // recall the OLDEST entries and silently drop the newest ones.
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(alloc);
-    var it = std.mem.splitScalar(u8, contents, '\n');
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        lines.append(alloc, line) catch return;
-    }
-    const start = if (lines.items.len > INPUT_HISTORY_MAX) lines.items.len - INPUT_HISTORY_MAX else 0;
-    for (lines.items[start..]) |line| {
-        if (history.items.len > 0 and std.mem.eql(u8, history.items[history.items.len - 1], line)) continue;
-        const owned = alloc.dupe(u8, line) catch return;
-        history.append(alloc, owned) catch {
-            alloc.free(owned);
-            return;
-        };
-    }
-}
-
-/// Merge this session's entries with whatever another concurrent window has
-/// written since our startup snapshot. Pure function over line lists
-/// (borrowed slices); returns the tail-capped merge, caller owns the result.
-fn mergeInputHistory(alloc: std.mem.Allocator, file_lines: []const []const u8, session: []const []const u8) ![]const []const u8 {
-    var merged: std.ArrayList([]const u8) = .empty;
-    errdefer merged.deinit(alloc);
-    try merged.appendSlice(alloc, file_lines);
-    for (session, 0..) |line, i| {
-        // Consecutive duplicates collapse (matches the pre-concurrency
-        // save behavior).
-        if (merged.items.len > 0 and std.mem.eql(u8, merged.items[merged.items.len - 1], line)) continue;
-        // Present elsewhere: a startup-loaded echo — skip. The FINAL session
-        // line is the just-typed command: move it to the tail so a re-typed
-        // old command recalls last, exactly like the single-window behavior
-        // this merge replaced (a global skip used to strand it mid-file).
-        const is_final = i + 1 == session.len;
-        var found: ?usize = null;
-        for (merged.items, 0..) |m, mi| {
-            if (std.mem.eql(u8, m, line)) {
-                found = mi;
-                break;
-            }
-        }
-        if (found) |mi| {
-            if (is_final) {
-                const moved = merged.orderedRemove(mi);
-                try merged.append(alloc, moved);
-            }
-            continue;
-        }
-        try merged.append(alloc, line);
-    }
-    const start = if (merged.items.len > INPUT_HISTORY_MAX) merged.items.len - INPUT_HISTORY_MAX else 0;
-    const tail = try alloc.dupe([]const u8, merged.items[start..]);
-    merged.deinit(alloc);
-    return tail;
-}
-
-/// Persist the in-memory input history (the line editor already appended the
-/// just-committed line, with consecutive-duplicate suppression). Concurrent
-/// windows in the same directory MERGE instead of last-writer-wins, and the
-/// write is tmp+rename atomic so a parallel reader never sees a half file.
-fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8)) void {
-    if (history.items.len == 0) return;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
-    // Session tail (single-line entries only — the file is one entry per
-    // line; multi-line pastes stay session-only, up-arrow recall works).
-    var session: std.ArrayList([]const u8) = .empty;
-    defer session.deinit(alloc);
-    const start = if (history.items.len > INPUT_HISTORY_MAX) history.items.len - INPUT_HISTORY_MAX else 0;
-    for (history.items[start..]) |line| {
-        if (std.mem.indexOfScalar(u8, line, '\n') != null) continue;
-        session.append(alloc, line) catch return;
-    }
-
-    // What's on disk right now (another window may have written since our
-    // startup snapshot): merge, keeping their entries and ours. The whole
-    // read-merge-write runs under a cross-process flock — two windows
-    // committing in the same millisecond used to last-writer-wins anyway.
-    // flock goes through libc directly (blocking), NOT via the Io vtable:
-    // createFile's embedded .lock under std.Io.Threaded failed silently and
-    // the losing window skipped its save entirely.
-    var io_state = std.Io.Threaded.init(alloc, .{});
-    defer io_state.deinit();
-    var lock_file = std.Io.Dir.cwd().createFile(io_state.io(), INPUT_HISTORY_LOCK, .{
-        .read = true,
-        .truncate = false,
-    }) catch blk: {
-        // No lock file, no lock — but the history still deserves a save.
-        break :blk null;
-    };
-    defer if (lock_file) |*lf| lf.close(io_state.io());
-    var contents_owned: ?[]u8 = null;
-    defer if (contents_owned) |c| alloc.free(c);
-    var history_locked = false;
-    defer if (history_locked) {
-        _ = std.c.flock(lock_file.?.handle, std.posix.LOCK.UN);
-    };
-    if (lock_file != null) {
-        // Bounded acquisition: a suspended (Ctrl-Z'd) holder never releases,
-        // and a blocking LOCK.EX on the Enter path would freeze this prompt
-        // forever. Retry briefly, then degrade to a lockless save — same
-        // semantics as the no-lock-file fallback.
-        var tries: usize = 0;
-        while (tries < 5) : (tries += 1) {
-            if (std.c.flock(lock_file.?.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0) {
-                history_locked = true;
-                break;
-            }
-            var req: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&req, null);
-        }
-        if (!history_locked) {
-            logger.warning("input history lock busy — saving without lock", .{});
-            lock_file.?.close(io_state.io());
-            lock_file = null;
-        }
-    }
-    var file_lines: std.ArrayList([]const u8) = .empty;
-    defer file_lines.deinit(alloc);
-    if (std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io_state.io(), INPUT_HISTORY_FILE, alloc, std.Io.Limit.limited(256 * 1024))) |contents| {
-        // OWNERSHIP: file_lines borrows slices into `contents`, so it must
-        // outlive the if-block — a defer inside the block freed it on block
-        // exit and merge then read freed memory (0xAA garbage entries).
-        contents_owned = contents;
-        var it = std.mem.splitScalar(u8, contents, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            file_lines.append(alloc, line) catch break;
-        }
-    } else |_| {}
-
-    const merged = mergeInputHistory(alloc, file_lines.items, session.items) catch return;
-    defer alloc.free(merged);
-    for (merged) |line| {
-        buf.appendSlice(alloc, line) catch return;
-        buf.append(alloc, '\n') catch return;
-    }
-
-    fs_ops.ensureDir(".ziv") catch return;
-    var tmp_buf: [128]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp{d}", .{ INPUT_HISTORY_FILE, std.c.getpid() }) catch return;
-    fs_ops.writeFile(tmp, buf.items) catch
-        return logger.warning("input history save failed", .{});
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), INPUT_HISTORY_FILE, io_state.io()) catch {
-        // Rename failed — fall back to a plain write so the history is at
-        // least saved, not silently dropped.
-        fs_ops.writeFile(INPUT_HISTORY_FILE, buf.items) catch
-            logger.warning("input history save failed", .{});
-    };
-}
-
-
 /// True when both slice-optionals are null or hold equal bytes.
 fn sameOptSlice(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
@@ -3027,51 +2617,6 @@ fn printHelp(w: *std.Io.Writer) !void {
     );
 }
 
-test "undoLastExchange strips a stranded assistant tool_use" {
-    // [sys, user, assistant(tool_use), user(tool_results), assistant(final)]
-    // — undo drops the last two, which used to strand the tool_use: the next
-    // request carried tool_calls with no tool responses (a 400 on strict
-    // gateways).
-    const alloc = std.testing.allocator;
-    var history: std.ArrayList(llm.Message) = .empty;
-    defer history.deinit(alloc);
-
-    const sys_blocks = try alloc.alloc(llm.ContentBlock, 1);
-    sys_blocks[0] = .{ .text = try alloc.dupe(u8, "sys") };
-    try history.append(alloc, .{ .role = .system, .content = sys_blocks, .timestamp = 0 });
-
-    const q = try alloc.alloc(llm.ContentBlock, 1);
-    q[0] = .{ .text = try alloc.dupe(u8, "run ls") };
-    try history.append(alloc, .{ .role = .user, .content = q, .timestamp = 0 });
-
-    const tu = try alloc.alloc(llm.ContentBlock, 1);
-    tu[0] = .{ .tool_use = .{ .id = try alloc.dupe(u8, "call_1"), .name = try alloc.dupe(u8, "Bash"), .input = .null } };
-    try history.append(alloc, .{ .role = .assistant, .content = tu, .timestamp = 0 });
-
-    const tr = try alloc.alloc(llm.ContentBlock, 1);
-    tr[0] = .{ .tool_result = .{
-        .tool_use_id = try alloc.dupe(u8, "call_1"),
-        .content = try alloc.dupe(u8, "file_a"),
-    } };
-    try history.append(alloc, .{ .role = .user, .content = tr, .timestamp = 0 });
-
-    const fin = try alloc.alloc(llm.ContentBlock, 1);
-    fin[0] = .{ .text = try alloc.dupe(u8, "done") };
-    try history.append(alloc, .{ .role = .assistant, .content = fin, .timestamp = 0 });
-
-    var out_buf: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out_buf);
-    _ = try undoLastExchange(&history, alloc, &w);
-
-    // The tool_use message must be gone too — history ends at the prompt.
-    try std.testing.expectEqual(@as(usize, 2), history.items.len);
-    try std.testing.expect(history.items[1].role == .user);
-
-    turn_history.clearHistory(&history, alloc);
-    alloc.free(history.items[0].content[0].text);
-    alloc.free(@constCast(history.items[0].content));
-}
-
 test "plan summary, append and remove system blocks (T8)" {
     const alloc = std.testing.allocator;
     const raw = "# 计划：完成迁移\n\n- [x] 分析旧表\n- [ ] 写迁移脚本\n";
@@ -3224,52 +2769,4 @@ test "swapMemoryBlockText replaces by identity, preserves siblings" {
     // consumed — caller keeps ownership).
     try std.testing.expect(!swapMemoryBlockText(&history, alloc, "OLD-MEMORY", new_text));
     try std.testing.expectEqualStrings("NEW-MEMORY", history.items[0].content[1].text);
-}
-
-test "mergeInputHistory unions concurrent windows and caps the tail" {
-    const alloc = std.testing.allocator;
-    // Window B wrote entries after our startup snapshot of [a, b].
-    const file = [_][]const u8{ "a", "b", "B1", "B2" };
-    const session = [_][]const u8{ "a", "b", "mine" };
-    const merged = try mergeInputHistory(alloc, &file, &session);
-    defer alloc.free(merged);
-    // Their new entries survive, ours appended, no duplicates.
-    try std.testing.expectEqual(@as(usize, 5), merged.len);
-    try std.testing.expectEqualStrings("B1", merged[2]);
-    try std.testing.expectEqualStrings("B2", merged[3]);
-    try std.testing.expectEqualStrings("mine", merged[4]);
-
-    // Re-typed old command (final session line) moves to the TAIL — the
-    // global-skip used to strand it mid-file, regressing single-window
-    // recall order.
-    const f2 = [_][]const u8{ "a", "b", "c" };
-    const s2 = [_][]const u8{ "a", "b", "c", "a" };
-    const m3 = try mergeInputHistory(alloc, &f2, &s2);
-    defer alloc.free(m3);
-    try std.testing.expectEqual(@as(usize, 3), m3.len);
-    try std.testing.expectEqualStrings("a", m3[2]); // moved to tail
-
-    // Consecutive duplicates collapse.
-    const f3 = [_][]const u8{"x"};
-    const m4 = try mergeInputHistory(alloc, &f3, &f3);
-    defer alloc.free(m4);
-    try std.testing.expectEqual(@as(usize, 1), m4.len);
-
-    // Tail cap: 10 file + 495 fresh session entries → exactly 500, oldest dropped.
-    var big_file: [10][]const u8 = undefined;
-    for (&big_file, 0..) |*e, i| e.* = if (i % 2 == 0) "old-even" else "old-odd";
-    var names: [495][]const u8 = undefined;
-    var name_bufs: [495][16]u8 = undefined;
-    var big_sess: std.ArrayList([]const u8) = .empty;
-    defer big_sess.deinit(alloc);
-    var n: usize = 0;
-    while (n < 495) : (n += 1) {
-        names[n] = try std.fmt.bufPrint(&name_bufs[n], "fresh{d}", .{n});
-        try big_sess.append(alloc, names[n]);
-    }
-    const m5 = try mergeInputHistory(alloc, &big_file, big_sess.items);
-    defer alloc.free(m5);
-    try std.testing.expectEqual(@as(usize, 500), m5.len);
-    try std.testing.expectEqualStrings("old-odd", m5[0]); // 5 oldest file lines dropped
-    try std.testing.expectEqualStrings("fresh494", m5[499]);
 }

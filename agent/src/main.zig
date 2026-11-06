@@ -32,6 +32,9 @@ test {
     _ = @import("turn/history.zig");
     _ = @import("session/memory_ops.zig");
     _ = @import("commands/config_menu.zig");
+    _ = @import("session/model_switcher.zig");
+    _ = @import("commands/history_cmds.zig");
+    _ = @import("session/input_history.zig");
     _ = @import("llm/message.zig");
     _ = @import("llm/mod.zig");
     _ = @import("llm/ollama.zig");
