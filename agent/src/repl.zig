@@ -56,6 +56,13 @@ const runtime_rules = @import("runtime/rules.zig");
 const error_handler = @import("runtime/error_handler.zig");
 const allocator = std.heap.smp_allocator;
 
+/// The REPL's cron scheduler, for mid-turn UI slices (same pattern as
+/// lineinput.setSessionGuard): drainDue used to run ONLY at the loop
+/// top, so a marathon turn starved health checks and memory decay for
+/// its entire duration. Both turn-phase UI loops (streaming + tools)
+/// now drain due tasks on their quiet 100ms slices.
+var cron_ptr: ?*task_mod.CronScheduler = null;
+
 // Agent-loop cap lives in settings.agent_loop_limit (default 50, clamp
 // 1..200) — see the turn loop's max_agent_iters.
 const MAX_CONTEXT_TOKENS: u32 = 128_000;
@@ -376,6 +383,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .monitor = &monitor,
         .bus = &evbus,
         .w = w,
+        .ow = ow,
+        .file_writer = &file_writer,
         .switcher = &switcher,
         .llm_calls = &live_llm_calls,
         .llm_429s = &live_llm_429s,
@@ -383,6 +392,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     };
     var cron = task_mod.CronScheduler.init(allocator);
     defer cron.deinit();
+    cron_ptr = &cron;
+    defer cron_ptr = null;
     if (mem_db != null) {
         cron.addTask(.{
             .name = "memory_decay",
@@ -763,6 +774,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // process (the heuristic reflection was stored synchronously
                     // above — nothing of value blocks on a detached thread).
                     drainReflectionInbox(allocator, if (mem_sys) |*ms| ms else null, &evbus, w);
+                }
+                // Visibility: queued-but-unsent messages die with the
+                // session — say so instead of dropping silently.
+                if (lineinput.queuedHas()) {
+                    try std.Io.Writer.print(w, "\x1b[2m  [{d} 条排队消息未发送，已丢弃]\x1b[0m\n", .{lineinput.queuedCount()});
                 }
                 try std.Io.Writer.writeAll(w, "Goodbye!\n");
                 try std.Io.File.Writer.flush(&file_writer);
@@ -2001,6 +2017,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                     std.Io.File.Writer.flush(&file_writer) catch {};
                                 }
                             } else if (n == 0 and !user_cancelled) {
+                                // Quiet slice: drain due cron tasks (health
+                                // check / memory decay) so a long batch no
+                                // longer starves them for the whole turn.
+                                if (cron_ptr) |cp| cp.drainDue();
                                 const now = util_time.nowMillis();
                                 if (now - last_status >= 500) {
                                     last_status = now;
@@ -2250,9 +2270,23 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         }
 
         // P4: queue survivors (queued during the FINAL stream, after the
-        // last tool round) auto-send as the next turn.
+        // last tool round) auto-send as the next turn. ALL of them —
+        // joined with '\n' as one multi-line message (mid-turn injection
+        // at the tool rounds drains them as separate messages; here the
+        // single auto_submit slot is the only vehicle). The old take-one
+        // silently dropped every survivor past the first.
         if (lineinput.queuedHas()) {
-            if (lineinput.queuedTake()) |qm| auto_submit = allocator.dupe(u8, qm) catch null;
+            var joined: std.ArrayList(u8) = .empty;
+            while (lineinput.queuedTake()) |qm| {
+                if (joined.items.len > 0) joined.append(allocator, '\n') catch break;
+                joined.appendSlice(allocator, qm) catch break;
+            }
+            if (joined.items.len > 0) {
+                auto_submit = joined.toOwnedSlice(allocator) catch blk: {
+                    joined.deinit(allocator);
+                    break :blk null;
+                };
+            }
         }
 
         try std.Io.Writer.writeAll(w, "\n");
@@ -2819,6 +2853,12 @@ const HealthCtx = struct {
     monitor: *runtime_monitor.RuntimeMonitor,
     bus: *task_mod.EventBus,
     w: *std.Io.Writer,
+    /// Region-aware transcript writer + the flushable File.Writer: the
+    /// monitor line must print ABOVE the live region when the check
+    /// drains mid-turn (2026-11-06 — cron now drains in the turn's UI
+    /// slices too, so the old bare-`w` print would smear the input row).
+    ow: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
     /// Live model context (window re-estimated at check time — the model
     /// can switch mid-session). The first wiring compared against
     /// settings.max_tokens — the RESPONSE cap (4096!) — so every active
@@ -2867,7 +2907,12 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         if (changed) {
             hc.last_warn_count = failures.items.len;
             hc.last_warn_first = failures.items[0].rule_id;
-            std.Io.Writer.print(hc.w, "\x1b[2m  [monitor] {d} runtime warning(s) — {s}\x1b[0m\n", .{ failures.items.len, failures.items[0].message }) catch {};
+            // Through the RegionWriter: lands ABOVE the live region when
+            // the check drains mid-turn (line-atomic), verbatim at the
+            // prompt — a bare write here smeared the persistent input
+            // row whenever the drain raced an active turn.
+            std.Io.Writer.print(hc.ow, "\x1b[2m  [monitor] {d} runtime warning(s) — {s}\x1b[0m\n", .{ failures.items.len, failures.items[0].message }) catch {};
+            std.Io.File.Writer.flush(hc.file_writer) catch {};
         }
         // Events flow regardless (π ring feeds reflection) — only the
         // print is deduped.
@@ -4016,6 +4061,9 @@ fn streamComplete(
                             job.requestCancel();
                         }
                     } else if (n == 0) {
+                        // Quiet slice: cron tasks (same starvation fix as
+                        // the tool-phase loop) + the status tick.
+                        if (cron_ptr) |cp| cp.drainDue();
                         streamCb(@ptrCast(&agg), .tick) catch {};
                     }
                 } else {
@@ -4209,7 +4257,7 @@ fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.
     // persistent input row. The region is re-begun before returning (the
     // tool phase still owns the screen bottom).
     lineinput.regionEnd(ctx.w);
-    try std.Io.Writer.print(ctx.ow, "\n  [model asks] {s}\n  Your answer (Enter to skip): ", .{question});
+    try std.Io.Writer.print(ctx.ow, "\n  [model asks] {s}\n  Your answer (Enter=skip, Esc=cancel): ", .{question});
     try std.Io.File.Writer.flush(ctx.file_writer);
     // Cooked-with-echo for the answer read (2026-11-06 session-raw
     // follow-up): raw mode would leave the user typing blind with Enter
@@ -4226,6 +4274,13 @@ fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.
     };
     ctx.r.toss(1);
     const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
+    // Esc / Ctrl-C in the cooked read arrive as control bytes (ISIG is
+    // off) — a leading one means CANCEL, not an answer; feeding the
+    // model the raw byte used to turn "user pressed Esc" into junk text.
+    if (ans.len > 0 and (ans[0] == 0x1b or ans[0] == 0x03)) {
+        lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
+        return registry.ToolResult{ .output = "user cancelled the question (Esc)" };
+    }
     lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
     return registry.ToolResult{
         .output = try alloc.dupe(u8, if (ans.len > 0) ans else "(no answer given)"),
