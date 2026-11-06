@@ -172,7 +172,8 @@ P0(安全网) → P1(结构) → P2(上下文) → P3(恢复) ∥ P4(交互) →
 | P2 | ✅ 完成（2026-11-06，`de3fd07` + 闭环复查 `28e8da6`）：hybrid 三段式（老段 LLM 摘要 + 最近 5 轮原文 + 工具结果瘦身）落地 llm/compaction.zig + turn/history.zig；/compact 升级 hybrid、自动路径 phi+slim（溢出应急路径复查补瘦身）；压缩事件进 decision-trace。套件 330 pass / 5 skip |
 | P3 | ✅ 完成（2026-11-06，`eebf4ea` + 闭环复查 `301a3a5`）：session/session_store.zig 持久化 .ziv/sessions.db（四块型无损往返）；/resume 列表+选择+恢复 history/模型/模式；崩溃检测启动提示；/clear 轮转。复查修掉：双系统消息（三点位 token 实锤）、恢复列表混入活行、空壳行噪音（flush 门+adopt 清删）。验收 S7/S8 |
 | P4 | ✅ 完成（2026-11-06，`057fa7e`）：turn/error_recovery.zig——退避策略（429/网络类 1s/2s×2）+ 四选项交互选择器（重试/压缩后重试/换模型/忽略）+ selectorEligible 排除矩阵；/config 挂 auto_fix 开关。验收 S9：死网关注入 → 退避×2 → 选择器 → 重试真实生效。套件 335 pass / 5 skip + pty 九场景 |
-| P5–P7 | 待开始 |
+| P5 | ✅ 完成（2026-11-06，`58c7b58`/`a6bb458`/`152353f`/`693caf5` 四子项）：①嵌入离线对比（RoPE 实现并测试锁定其 cosine 中立性→不翻格式；stem-lite MRR 胜出接线）②经验回放（窗口 20→256 + piSample π 抖动全史采样喂反思与 LLM 提示）③π 图谱扫描（孤立节点/断边检测，cron π 小时 + /knowledge 报告）④洞察质量门（启发式入库前 LLM yes/no 校验，误诊零入库，e2e 双态）。套件 341 pass / 5 skip |
+| P6–P7 | 待开始 |
 
 > P0 红灯基线：修复前二进制（会话 raw 改造前）在 S1/S3 失败——套件对终端
 > 模式回归有判别力。注意 S5「会话退出清场」原设计场景在无 LLM 的 pty 环境
