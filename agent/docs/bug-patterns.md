@@ -61,3 +61,20 @@
 **不变量（L3）**：任何"承诺跨阶段可交互"的输入功能，其依赖的终端模式必须覆盖同一时间窗——功能承诺的边界 ≥ 资源持有的边界，否则中间的缝就是两个编辑器打架的战场
 **护栏思路**：新增任何 stdin 读取点前先问"此刻谁持有 termios"；pty 回归测试探针（`/run Bash {"command":"stty -a -f /dev/tty"}` 断言 `-icanon -echo`）
 **命中次数**：1（2026-11-06 回合中输入区乱码 ^[[C/^R，用户两轮上报；同日终端写互斥锁是相邻但独立的机制——输出交错 vs 输入回显）
+
+### [机制] history 内容块塞字符串字面量 → 延迟到 free 才炸 bus error
+
+**判别信号**：测试在清理 defer 处 bus error（地址落在 rodata 段、
+memsetSmallPowerOf2 栈帧），业务断言全绿；地址低 12 位跨运行稳定
+**触发条件**：测试夹具（或任何代码路径）把 `.{ .text = "LITERAL" }`、
+`.tool_use_id = "t0"` 这类**字面量**直接塞进 `llm.ContentBlock`——
+history 的所有权纪律是"块内一切字符串堆分配"，freeContentBlocks
+无差别 free，字面量指针不是堆 → 崩
+**机制**：崩溃点（free/defer）与污染点（构造）相距整个测试体，
+栈帧指向 freeContentBlocks 而非夹具——方向性极强地误导排查
+**排查动作**：见 `.text =>`/`.tool_result` free 崩溃先查夹具里
+所有 ContentBlock 字面量；`rg '\.text = "' 测试代码`
+**不变量（L3）**：进 history 的 ContentBlock 字符串一律
+`try alloc.dupe(u8, ...)`——2026-11-06 P2 验收测试连踩两次
+（"SYSTEM" 与 "t0"）
+**命中次数**：2（2026-11-06 P2 单测夹具、P2 e2e 夹具）
