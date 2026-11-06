@@ -6,6 +6,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const file_cache = @import("../util/file_cache.zig");
+const code_index = @import("../knowledge/code_index.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = getStringField(input, "path") orelse
@@ -29,6 +30,13 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         const msg = alloc.print("Failed to read '{s}': {}", .{ path, err }) catch "read failed";
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
+
+    // P6: deposit the successful read into the code index (before the raw
+    // buffer is freed) — literal Grep queries then serve from .ziv/index.db
+    // instead of spawning rg. Best-effort: index failure never fails the read.
+    if (st) |s| {
+        code_index.upsertFile(alloc, io, path, @intCast(s.mtime.nanoseconds), @intCast(s.size), contents);
+    }
 
     // Format with line numbers — one allocating writer for the whole pass
     // (the old loop allocated and freed one string per line).
@@ -67,6 +75,7 @@ fn sleepMs(ms: u32) void {
 }
 
 test "FileRead formats with line numbers and caches repeats" {
+    defer code_index.closeGlobal(); // the read deposits into the lazily-opened index
     const alloc = std.testing.allocator;
     var io_state = std.Io.Threaded.init(alloc, .{});
     defer io_state.deinit();

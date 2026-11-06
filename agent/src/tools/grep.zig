@@ -2,12 +2,37 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const ripgrep = @import("../util/ripgrep.zig");
+const code_index = @import("../knowledge/code_index.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const pattern = registry.getStringField(input, "pattern") orelse
         return registry.ToolResult{ .output = "Missing required field: pattern", .is_error = true };
     const path = registry.getStringField(input, "path") orelse ".";
     const max_results: u32 = @intCast(registry.getIntField(input, "maxResults") orelse 100);
+
+    // P6 dual-path: a PLAIN LITERAL pattern can be served by the code
+    // index (FTS is keyword, not regex) — no rg spawn at all. Any stale hit
+    // (file changed since it was indexed) forces the real scan below.
+    if (code_index.isLiteralPattern(pattern)) {
+        const r = code_index.queryLiteral(alloc, io, pattern, path, max_results);
+        var served = r.stats.served_from_index;
+        defer {
+            for (r.matches) |*m| code_index.freeMatch(alloc, m.*);
+            if (r.matches.len > 0) alloc.free(r.matches);
+        }
+        if (served) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(alloc);
+            for (r.matches) |m| {
+                const line = alloc.print("{s}:{d}: {s}\n", .{ m.path, m.lineno, m.body }) catch continue;
+                defer alloc.free(line);
+                out.appendSlice(alloc, line) catch continue;
+            }
+            out.appendSlice(alloc, "\x1b[2m[…索引命中 — .ziv/index.db]\x1b[0m\n") catch {};
+            return registry.ToolResult{ .output = try out.toOwnedSlice(alloc) };
+        }
+        _ = &served;
+    }
 
     const search_result = ripgrep.search(alloc, pattern, path, io) catch |err| switch (err) {
         error.NoSearchBackend => return registry.ToolResult{

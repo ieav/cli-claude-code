@@ -2,6 +2,7 @@
 /// Safe tools execute in parallel, unsafe tools execute serially.
 const std = @import("std");
 const registry = @import("registry.zig");
+const code_index = @import("../knowledge/code_index.zig");
 const math = @import("../math/mod.zig");
 const cancel = @import("../util/cancel.zig");
 const util_time = @import("../util/time.zig");
@@ -208,6 +209,7 @@ test "partitionToolCalls" {
 }
 
 test "executeBatches runs safe batch in parallel with ordered results" {
+    defer code_index.closeGlobal(); // FileRead in the batch opens the global index lazily
     const alloc = std.testing.allocator;
     var io_state = std.Io.Threaded.init(alloc, .{});
     defer io_state.deinit();
@@ -258,6 +260,7 @@ test "executeBatches runs safe batch in parallel with ordered results" {
 }
 
 test "executeBatches preserves order across many calls (wave looping)" {
+    defer code_index.closeGlobal(); // FileRead in the batch opens the global index lazily
     const alloc = std.testing.allocator;
     var io_state = std.Io.Threaded.init(alloc, .{});
     defer io_state.deinit();
@@ -309,6 +312,7 @@ test "executeBatches preserves order across many calls (wave looping)" {
 }
 
 test "executeBatches cancel short-circuits remaining calls (all ids keep results)" {
+    defer code_index.closeGlobal(); // FileRead in the batch opens the global index lazily
     const alloc = std.testing.allocator;
     var io_state = std.Io.Threaded.init(alloc, .{});
     defer io_state.deinit();

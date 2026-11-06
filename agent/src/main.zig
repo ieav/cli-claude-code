@@ -22,6 +22,7 @@ pub const integration_tests = @import("tests/integration.zig");
 // collect tests from x's submodules (pub consts stay lazily analyzed).
 test {
     _ = @import("knowledge/graph.zig");
+    _ = @import("knowledge/code_index.zig");
     _ = @import("knowledge/search.zig");
     _ = @import("llm/claude.zig");
     _ = @import("llm/compaction.zig");

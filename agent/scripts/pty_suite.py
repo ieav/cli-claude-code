@@ -412,6 +412,42 @@ def s9_error_selector():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s10_code_index():
+    """P6 dual-path: FileRead deposits a file into .ziv/index.db, a LITERAL
+    Grep is then served from the index (marker line, no rg spawn), and a
+    regex pattern still goes to the real scan (no index marker)."""
+    d = tempfile.mkdtemp(prefix="ziv-p6-")
+    try:
+        marker_file = os.path.join(d, "indexed_file.zig")
+        with open(marker_file, "w") as f:
+            f.write("const UNIQUE_ZIV_TOKEN_77 = 42;\n")
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            # 1. FileRead deposits the file into the code index.
+            z.send(f'/run FileRead {{"path":"{marker_file}"}}\n')
+            z.read_until("UNIQUE_ZIV_TOKEN_77", 15)
+            # 2. Literal Grep — must serve from the index.
+            z.send('/run Grep {"pattern":"UNIQUE_ZIV_TOKEN_77","path":"."}\n')
+            out = z.read_until("索引命中", 15)
+            if marker_file not in out:
+                raise Fail("index hit did not carry the file path")
+            # 3. Regex pattern — real scan, no index marker in THIS response.
+            z.clear_buf()
+            z.send('/run Grep {"pattern":"UNIQUE_ZIV.*77","path":"."}\n')
+            out2 = z.read_until("UNIQUE_ZIV_TOKEN_77", 15)
+            # The marker line may appear from the match itself; the INDEX
+            # tag must NOT be in this second response.
+            if "索引命中" in out2:
+                raise Fail("regex query was served from the index (must real-scan)")
+            quit_and_wait(z)
+            return "FileRead→index→literal Grep served, regex real-scans ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -422,6 +458,7 @@ SCENARIOS = [
     ("S7 clean-resume", s7_clean_resume),
     ("S8 crash-resume", s8_crash_resume),
     ("S9 error-selector", s9_error_selector),
+    ("S10 code-index", s10_code_index),
 ]
 
 
