@@ -1661,11 +1661,6 @@ pub fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !
         return;
     }
     const g: *knowledge_graph.KnowledgeGraph = kg.?;
-    const total = g.nodeCount() catch 0;
-    if (total == 0) {
-        try std.Io.Writer.writeAll(w, "  Knowledge graph is empty — nodes are added when sessions extract memories.\n\n");
-        return;
-    }
     // P5: π 图谱扫描报告（孤立节点/断边）。
     if (memory_ops.last_graph_scan) |h| {
         if (h.orphan_nodes > 0 or h.broken_edges > 0) {
@@ -1673,6 +1668,11 @@ pub fn printKnowledge(kg: ?*knowledge_graph.KnowledgeGraph, w: *std.Io.Writer) !
         } else {
             try std.Io.Writer.print(w, "  \x1b[2m[图谱扫描: 健康（{d} 节点 / {d} 边全连通）]\x1b[0m\n", .{ h.total_nodes, h.total_edges });
         }
+    }
+    const total = g.nodeCount() catch 0;
+    if (total == 0) {
+        try std.Io.Writer.writeAll(w, "  Knowledge graph is empty — nodes are added when sessions extract memories.\n\n");
+        return;
     }
     const rows = g.recentNodes(5) catch {
         try std.Io.Writer.writeAll(w, "  (failed to read knowledge graph)\n\n");
