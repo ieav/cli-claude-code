@@ -47,6 +47,7 @@ pub fn runConfigMenu(
         var b6: [64]u8 = undefined;
         var b7: [64]u8 = undefined;
         var b8: [96]u8 = undefined;
+        var b9: [64]u8 = undefined;
         const items = [_][]const u8{
             "API Keys",
             try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
@@ -57,6 +58,7 @@ pub fn runConfigMenu(
             try_std_fmt(&b4, "检查点: {s}", .{if (switcher.settings.checkpointing_enabled) "开" else "关"}),
             try_std_fmt(&b5, "系统提示词: {s}", .{if (switcher.settings.system_prompt != null) "(自定义)" else "(默认)"}),
             try_std_fmt(&b8, "自动错误修复: {s}", .{if (switcher.settings.auto_fix) "开（429/超时退避重试）" else "关（直接出选择器）"}),
+            try_std_fmt(&b9, "回合工具轮上限: {d}", .{switcher.settings.agent_loop_limit}),
             "退出",
         };
         const picked = (menu.select(w, r, file_writer, "=== Ziv 配置 ===", &items, 0) catch break) orelse break;
@@ -134,7 +136,20 @@ pub fn runConfigMenu(
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
                 try std.Io.Writer.print(w, "  自动错误修复: {s}\n", .{if (switcher.settings.auto_fix) "开" else "关"});
             },
-            9 => break,
+            9 => {
+                var lbuf: [32]u8 = undefined;
+                const lval = menu.readLine(r, w, file_writer, "  回合工具轮上限 (1-200，50=默认，200=最宽): ", &lbuf) catch continue;
+                if (lval.len == 0) continue;
+                const lv = std.fmt.parseInt(u32, lval, 10) catch {
+                    try std.Io.Writer.writeAll(w, "  无效数字\n");
+                    continue;
+                };
+                if (lv >= 1 and lv <= 200) {
+                    switcher.settings.agent_loop_limit = lv;
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                } else try std.Io.Writer.writeAll(w, "  超出范围（1-200）\n");
+            },
+            10 => break,
             else => {},
         }
     }
