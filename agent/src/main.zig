@@ -213,8 +213,13 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    // Start REPL
+    // Start REPL. Every exit path (/quit, EOF, double Ctrl-C) unwinds to
+    // here — run registered shutdown handlers (bash tool group-kill and
+    // anything else registered via util/cleanup.zig) on the way out. The
+    // registry existed but runAll() was never wired, so nothing ever ran.
     const repl = @import("repl.zig");
+    const cleanup = @import("util/cleanup.zig");
+    defer cleanup.runAll();
     try repl.run(io, stdin_file, stdout_file);
 }
 

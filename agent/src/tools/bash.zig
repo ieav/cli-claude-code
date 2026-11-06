@@ -9,11 +9,63 @@ const std = @import("std");
 const registry = @import("registry.zig");
 const util_time = @import("../util/time.zig");
 const cancel = @import("../util/cancel.zig");
+const cleanup = @import("../util/cleanup.zig");
 
 /// Hard ceiling for one command; explicit timeouts clamp to this.
 const MAX_TIMEOUT_S: i64 = 300;
 /// Applied when the caller does not specify a timeout.
 const DEFAULT_TIMEOUT_S: i64 = 30;
+/// Grace for the pipe readers after the shell is reaped: an in-group
+/// descendant holding the write-end gets group-killed; if EOF STILL
+/// hasn't arrived by the end of this window the readers are forced off
+/// the pipe (2026-11-06: /tmp/ziv_check_mpmc_queue held the write-end
+/// forever and the tool call never returned).
+const PIPE_EOF_GRACE_MS: i64 = 1000;
+
+/// Live tool groups (spawn → reap window), so ziv's EXIT can group-kill
+/// them: a session death mid-Bash used to orphan the whole tree (the
+/// mpmc_serial ×4 incident burned ~4 cores for 1h14m after the owning
+/// ziv died — the groups stayed running, reparented to launchd).
+/// Lock-free fixed slots; the races are benign (worst case a sweep
+/// re-kills an ESRCH pid). A descendant that setsid's out of BOTH the
+/// group and the ppid tree stays unreachable — documented limit.
+const ActiveGroups = struct {
+    const N = 16;
+    var slots: [N]std.atomic.Value(i32) = @splat(std.atomic.Value(i32).init(0));
+
+    fn put(pid: i32) void {
+        for (&slots) |*s| {
+            if (s.cmpxchgStrong(0, pid, .acq_rel, .monotonic) == null) return;
+        }
+    }
+
+    fn take(pid: i32) void {
+        for (&slots) |*s| {
+            if (s.load(.acquire) == pid) {
+                s.store(0, .release);
+                return;
+            }
+        }
+    }
+
+    fn killAll() void {
+        for (&slots) |*s| {
+            const pid = s.load(.acquire);
+            if (pid > 0) {
+                _ = std.c.kill(-pid, .KILL);
+                _ = std.c.kill(pid, .KILL);
+            }
+        }
+    }
+};
+
+var cleanup_registered = false;
+
+fn ensureCleanupRegistered() void {
+    if (cleanup_registered) return;
+    cleanup_registered = true;
+    cleanup.register("bash-tool-groups", ActiveGroups.killAll) catch {};
+}
 /// Output capture ceiling per stream. finishToolCall truncates tool results
 /// to 4 KiB for history anyway — 256 KiB headroom is plenty for display
 /// while a runaway producer (`yes`, `cat /dev/zero`) cannot OOM us.
@@ -56,6 +108,11 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = "Failed to execute: no child pid", .is_error = true };
     };
 
+    // Register the group so a ziv exit mid-command can kill it (see
+    // ActiveGroups); deregistered right after the reap below.
+    ensureCleanupRegistered();
+    ActiveGroups.put(pid);
+
     // Drain both pipes on their own threads so a full pipe can never block
     // the child; the main thread blocks in waitpid until exit or group kill.
     var out_reader = PipeReader{ .alloc = alloc, .io = io, .file = child.stdout.? };
@@ -78,8 +135,26 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     var status: c_int = 0;
     _ = std.c.waitpid(pid, &status, 0);
+    ActiveGroups.take(pid);
     watch.done.store(true, .release);
     if (watch_thread) |t| t.join();
+
+    // Shell reaped. Readers normally hit EOF at once; a descendant that
+    // outlived the shell while holding the pipe WRITE-end (a backgrounded
+    // child, still in-group) blocks the joins forever — kill the surviving
+    // group (the holder dies → EOF), grace-wait, then force the readers
+    // off the pipe and flag the truncation in the result.
+    var pipe_forced = false;
+    if (!readersDone(&out_reader, &err_reader)) {
+        _ = std.c.kill(-pid, .KILL); // ESRCH when nothing survives — fine
+        const t0 = util_time.nowMillis();
+        while (!readersDone(&out_reader, &err_reader) and util_time.nowMillis() - t0 < PIPE_EOF_GRACE_MS) sleepMs(25);
+        if (!readersDone(&out_reader, &err_reader)) {
+            out_reader.stop.store(true, .release);
+            err_reader.stop.store(true, .release);
+            pipe_forced = true;
+        }
+    }
 
     if (out_thread) |t| t.join();
     if (err_thread) |t| t.join();
@@ -116,6 +191,9 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         if (out.items.len > 0) out.append(alloc, '\n') catch {};
         out.appendSlice(alloc, err_reader.buf.items) catch {};
     }
+    if (pipe_forced) {
+        out.appendSlice(alloc, "\n[ziv] 输出管道被存活子进程占住，已强制断开（输出可能不完整）") catch {};
+    }
 
     // POSIX wait status: bits 0-6 = signal (0 = exited), 8-15 = exit code.
     const exit_code: u8 = @intCast((status >> 8) & 0xff);
@@ -126,34 +204,51 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     };
 }
 
-/// Drains one pipe into a growable buffer until EOF or the capture cap.
+/// Drains one pipe into a growable buffer until EOF, the capture cap, or
+/// a force-stop. Reads are POLL-GATED (200ms cadence) so the main thread
+/// can break a reader off a pipe whose write-end is held forever by an
+/// escaped descendant — a blocking read here was unbreakable.
 const PipeReader = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
     buf: std.ArrayList(u8) = .empty,
     truncated: bool = false,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *PipeReader) void {
+        defer self.done.store(true, .release);
         var rbuf: [8192]u8 = undefined;
         var fr = self.file.reader(self.io, &rbuf);
         const r = &fr.interface;
-        while (true) {
+        const fd: i32 = self.file.handle;
+        while (!self.stop.load(.acquire)) {
+            // Readiness first: EOF arrives as POLLHUP instantly, a quiet
+            // pipe costs at most one 200ms poll per loop, and a stop is
+            // honored within the same cadence.
+            var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+            const n = std.c.poll(&pfd, 1, 200);
+            if (n != 1 or (pfd[0].revents & (std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR)) == 0) continue;
             const chunk = r.peekGreedy(1) catch break; // EOF / error
             if (chunk.len == 0) break;
             if (self.buf.items.len >= OUTPUT_LIMIT) {
                 self.truncated = true;
                 break;
             }
-            const n = @min(chunk.len, OUTPUT_LIMIT - self.buf.items.len);
-            self.buf.appendSlice(self.alloc, chunk[0..n]) catch {
+            const n2 = @min(chunk.len, OUTPUT_LIMIT - self.buf.items.len);
+            self.buf.appendSlice(self.alloc, chunk[0..n2]) catch {
                 self.truncated = true;
                 break;
             };
-            r.toss(n);
+            r.toss(n2);
         }
     }
 };
+
+fn readersDone(a: *PipeReader, b: *PipeReader) bool {
+    return a.done.load(.acquire) and b.done.load(.acquire);
+}
 
 /// Polls until the child exits, the deadline passes, or the user cancels
 /// the tool batch — whichever comes first — then, on the latter two, kills
@@ -326,4 +421,39 @@ test "bash pre-cancelled batch never spawns" {
     defer std.testing.allocator.free(result.output); // allocated: the ownership rule for history
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("cancelled by user (not run)", result.output);
+}
+
+test "bash does not wait for an in-group pipe holder outliving the shell" {
+    // Regression (2026-11-06): sh exits immediately, a backgrounded
+    // in-group child holds the pipe write-end for 30s. The old join
+    // blocked on its EOF the full 30s — with a never-exiting holder
+    // (ziv_check_mpmc_queue) it blocked FOREVER. Now: group-kill → EOF
+    // within the grace window.
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30 & exit 0" });
+    const t0 = util_time.nowMillis();
+    const result = try execute(std.testing.allocator, .{ .object = obj }, io_state.io());
+    defer std.testing.allocator.free(result.output);
+    const elapsed = util_time.nowMillis() - t0;
+    // Killed inside the ~1s grace, not the holder's 30s lifetime
+    // (10s slack for slow machines).
+    try std.testing.expect(elapsed < 10_000);
+    // And the holder itself is dead — no orphan left burning CPU.
+    sleepMs(200);
+    const probe = std.process.run(std.testing.allocator, io_state.io(), .{
+        .argv = &.{ "/bin/sh", "-c", "pgrep -f '^sleep 30$' || true" },
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } },
+    }) catch return error.ProbeFailed;
+    defer std.testing.allocator.free(probe.stdout);
+    defer std.testing.allocator.free(probe.stderr);
+    try std.testing.expectEqual(@as(usize, 0), probe.stdout.len);
+}
+
+test "ActiveGroups killAll on a bogus pid is a harmless no-op" {
+    ActiveGroups.put(999_999);
+    ActiveGroups.killAll(); // ESRCH swallowed
+    ActiveGroups.take(999_999);
 }
