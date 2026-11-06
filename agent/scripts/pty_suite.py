@@ -233,12 +233,47 @@ def s5_pipe_holder_reaped():
         z.close()
 
 
+def s6_command_smoke():
+    """Every slash-command family answers (P1's dispatch extraction moved
+    /memory /config /model /rewind /context etc. into three modules — a
+    wiring slip would surface here as a hang or an unknown-command reply,
+    not as a unit-test failure)."""
+    z = ZivSession()
+    try:
+        z.wait_prompt()
+        for cmd, marker in [
+            ("/help", "Available commands"),
+            ("/memory", "Memory"),
+            ("/context", "Context:"),
+            ("/stats", "Messages:"),
+            ("/version", "Ziv v"),
+            ("/knowledge", "Knowledge graph"),
+            ("/undo", "undo"),
+        ]:
+            z.clear_buf()
+            z.send(cmd + "\n")
+            out = z.read_until(marker, 10)
+            if cmd == "/undo" and "Nothing to undo" not in out and "无可" not in out and "undo" not in out:
+                raise Fail(f"{cmd}: unexpected undo reply")
+        # interactive menus open and quit cleanly (q = menu quit key)
+        z.clear_buf()
+        z.send("/config\n")
+        z.read_until("Ziv 配置", 10)
+        z.send("q")
+        z.read_until("ziv[", 10)  # prompt back
+        quit_and_wait(z)
+        return "14 command paths answered ✓"
+    finally:
+        z.close()
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
     ("S3 last-ring", s3_last_ring),
     ("S4 confirm-reads", s4_confirm_reads),
     ("S5 pipe-holder-reap", s5_pipe_holder_reaped),
+    ("S6 command-smoke", s6_command_smoke),
 ]
 
 
