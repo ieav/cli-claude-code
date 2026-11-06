@@ -46,7 +46,11 @@ pub fn backoffPlan(err: anyerror, auto_fix_on: bool, retries_used: u8) ?Backoff 
 /// purpose, or nothing can be retried (nothing sent).
 pub fn selectorEligible(err: anyerror) bool {
     return switch (err) {
-        error.EscCancelled, error.MissingApiKey, error.FirstByteTimeout => false,
+        // EscCancelled: the user stopped this on purpose; MissingApiKey:
+        // a config problem no retry/model choice fixes mid-turn. TTFT
+        // give-ups DO offer the selector (2026-11-07): a sustained
+        // no-first-byte outage is exactly when 换模型 matters.
+        error.EscCancelled, error.MissingApiKey => false,
         else => true,
     };
 }
@@ -93,4 +97,6 @@ test "selectorEligible excludes deliberate cancels and config problems" {
     try std.testing.expect(!selectorEligible(error.MissingApiKey));
     try std.testing.expect(selectorEligible(error.RateLimit));
     try std.testing.expect(selectorEligible(error.NetworkTimeout));
+    // TTFT give-up now reaches the selector (sustained-outage 换模型 path).
+    try std.testing.expect(selectorEligible(error.FirstByteTimeout));
 }

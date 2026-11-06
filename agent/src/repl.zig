@@ -952,26 +952,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 if (err == error.FirstByteTimeout) {
                     // Gateway accepted the request but produced nothing
-                    // within the TTFT budget. Nothing was shown or stored
-                    // yet, so a retry is invisible-safe: re-run this
-                    // generation from the same history.
+                    // within the (body-scaled) TTFT budget. Nothing was
+                    // shown or stored yet, so a retry is invisible-safe:
+                    // re-run this generation from the same history.
                     if (ttft_retries < 2) {
                         ttft_retries += 1;
-                        std.Io.Writer.print(ow, "\x1b[2m  [网关 {d}s 无响应 — 自动重试 {d}/2…]\x1b[0m\n", .{ @divTrunc(llm_watchdog.currentTtftMs(), 1000), ttft_retries }) catch {};
+                        // 2026-11-07: back off between TTFT retries (1s/2s)
+                        // — an instant retry hammers a gateway that is
+                        // already struggling, and each re-send re-bills the
+                        // full input.
+                        const backoff_s: u32 = @intCast(ttft_retries);
+                        std.Io.Writer.print(ow, "\x1b[2m  [网关 {d}s 无响应 — 退避 {d}s 后自动重试 {d}/2…]\x1b[0m\n", .{ @divTrunc(llm_watchdog.currentTtftMs(), 1000), backoff_s, ttft_retries }) catch {};
                         try std.Io.File.Writer.flush(&file_writer);
+                        util_time.sleepMs(backoff_s * 1000);
                         continue;
                     }
                     lineinput.regionEnd(w);
-                    try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应 — 放弃本回合]\x1b[0m\n", .{});
-                    // P3 recoverable give-up: prefill 「继续」 — one Enter
-                    // resumes the task as a fresh turn (proven 2026-11-05:
-                    // a "继续" turn picked the task up cleanly and history
-                    // pairs stay legal — see trace 1793893733712).
-                    try std.Io.Writer.print(ow, "\x1b[2m  [输入区已预填「继续」：网关恢复后 Enter 即接续任务；也可直接改成其他输入]\x1b[0m\n\n", .{});
-                    lineinput.recall_text = "继续";
-                    lineinput.recall_prefill = true;
+                    // 2026-11-07: three dead first-bytes = sustained outage,
+                    // not a blip — fall into the SHARED error path below
+                    // (classified report + P4 selector: 换模型 is exactly
+                    // what a dead gateway needs; ignore keeps the 「继续」
+                    // prefill semantics).
+                    try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应]\x1b[0m\n", .{});
                     try std.Io.File.Writer.flush(&file_writer);
-                    break;
                 }
                 logger.err("LLM call failed: {}", .{err});
                 // Context overflow: compact once and retry instead of

@@ -98,7 +98,7 @@ pub const ClaudeProvider = struct {
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.arm(&req, &kill_reason);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -421,7 +421,7 @@ pub const ClaudeProvider = struct {
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.arm(&req, &kill_reason);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));

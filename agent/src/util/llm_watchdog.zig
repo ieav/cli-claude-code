@@ -127,13 +127,31 @@ pub const Guard = struct {
 /// state) when there is no connection or the thread cannot spawn — a
 /// missing watchdog must never break the request itself.
 pub fn arm(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8)) Guard {
+    return armForBody(req, kill_reason, 0);
+}
+
+/// Body-scaled TTFT (2026-11-07): big prompts legitimately take longer to
+/// first byte — the gateway is still PROCESSING, not stuck. A fixed 30 s
+/// budget killed in-flight requests and the retry re-billed the whole
+/// input (observed live: 3× input cost for one answer on a 25K-token
+/// prompt). Scale: +1 s per ~1K tokens (≈4 KB of JSON body), capped.
+/// Pure budget math (unit-tested): base TTFT + ~1 s per 1K tokens of
+/// request body (≈4 B/token in JSON), total capped at 120 s.
+pub fn ttftBudgetFor(body_len: usize) u64 {
+    // Under ~1K tokens (4 KB) the prompt processes fast — no scale needed.
+    if (body_len < 4096) return currentTtftMs();
+    const scale_ms: u64 = @min(@as(u64, body_len) / 4, 90_000);
+    return @min(currentTtftMs() + scale_ms, 120_000);
+}
+
+pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8), body_len: usize) Guard {
     const conn = req.connection orelse return .{ .state = null, .kill_reason = kill_reason };
     const s = std.heap.smp_allocator.create(State) catch return .{ .state = null, .kill_reason = kill_reason };
     s.* = .{
         .fd = conn.stream_reader.stream.socket.handle,
         .done = std.atomic.Value(bool).init(false),
         .timeout_ms = currentTimeoutMs(),
-        .ttft_ms = currentTtftMs(),
+        .ttft_ms = ttftBudgetFor(body_len),
         .first_byte = std.atomic.Value(bool).init(false),
         .last_activity_ms = std.atomic.Value(i64).init(time_mod.nowMillis()),
         .kill_reason = kill_reason,
@@ -252,4 +270,16 @@ test "idle watchdog: live streams never hit the deadline, silence does" {
     try std.testing.expectEqual(@as(?KillReason, .idle), killDecision(false, 180_000, 180_000, t));
     // Wall clock stepped backwards: negative idle must not become a kill.
     try std.testing.expectEqual(@as(?KillReason, null), killDecision(true, -5_000, 30_000, t));
+}
+
+
+test "ttftBudgetFor scales with body size and caps at 120s" {
+    // Tiny body (chat ping): base budget unchanged.
+    try std.testing.expectEqual(currentTtftMs(), ttftBudgetFor(200));
+    // 100 KB body ≈ 25K tokens → +25s over base.
+    const base = currentTtftMs();
+    const big = ttftBudgetFor(100 * 1024);
+    try std.testing.expect(big >= base + 24_000 and big <= base + 26_000);
+    // 1 MB body → capped at 120s total.
+    try std.testing.expectEqual(@as(u64, 120_000), ttftBudgetFor(1024 * 1024));
 }
