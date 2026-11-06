@@ -706,6 +706,47 @@ fn regionRows() usize {
 /// one status row + the editor block's rows.
 var last_block_rows: usize = 0;
 
+/// Serializes every terminal-mutating sequence across threads. During a
+/// turn the UI thread repaints the pinned rows (keystrokes via
+/// renderPendingLine, the 500ms status tick via regionStatus) WHILE the
+/// tool/stream worker prints transcript lines (regionPrintLine through
+/// RegionWriter). Each print is a multi-step escape dance sharing ONE
+/// DECSC cursor slot (`\x1b8` restore flow → write → `\x1b7` save flow →
+/// park); a status/keystroke paint interleaved between the write and the
+/// save stores the PARKED input-row position as the transcript flow, and
+/// every later transcript line then lands ON the input block — the
+/// "long turn corrupts the input area" bug. One lock per whole
+/// operation; public fns hold it, internal *Locked fns assume it.
+var tty_mu: std.Io.Mutex = .init;
+
+/// std.Io.Mutex's lock/unlock take the Io instance; the terminal paths
+/// here only ever see *std.Io.Writer, so repl.run injects its Io once at
+/// startup. Null (unit tests, pre-init) degrades to NO locking — those
+/// callers are single-threaded by construction.
+var tty_io: ?std.Io = null;
+
+pub fn setIo(io: std.Io) void {
+    tty_io = io;
+}
+
+fn ttyLock() void {
+    const io = tty_io orelse return;
+    tty_mu.lockUncancelable(io);
+}
+
+fn ttyUnlock() void {
+    const io = tty_io orelse return;
+    tty_mu.unlock(io);
+}
+
+/// Push the real writer's buffered bytes OUT before releasing tty_mu.
+/// Every locked op then leaves the buffer empty, so the REPL's legacy
+/// call-site flushes (outside any lock) can never race a half-written
+/// escape sequence — on an empty buffer they are harmless no-ops.
+fn flushReal(w: *std.Io.Writer) void {
+    std.Io.Writer.flush(w) catch {};
+}
+
 /// (Re)apply the scroll-region bounds and paint all pinned rows fresh.
 /// The transcript FLOW position (where the conversation prints) is the
 /// cursor position at arm time — preserved across the DECSTBM change by
@@ -830,8 +871,11 @@ pub fn regionUp() bool {
 /// Show the region with the given status: split the screen and pin the
 /// two rows. The cursor ends on the input row after its text.
 pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
     pendingStatusSet(status);
     regionApply(w);
+    flushReal(w);
 }
 
 /// Print one complete output line into the TRANSCRIPT area: park at the
@@ -839,6 +883,13 @@ pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
 /// the region; the pinned rows are untouched). Region down = plain
 /// passthrough at the cursor.
 pub fn regionPrintLine(w: *std.Io.Writer, line: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
+    regionPrintLineLocked(w, line);
+    flushReal(w);
+}
+
+fn regionPrintLineLocked(w: *std.Io.Writer, line: []const u8) void {
     if (!pending_shown) {
         std.Io.Writer.writeAll(w, line) catch {};
         if (line.len == 0 or line[line.len - 1] != '\n') {
@@ -874,8 +925,15 @@ fn parkCursor(w: *std.Io.Writer) void {
 /// when its text changed is handled by regionStatus; here both rows get
 /// refreshed (the draft changed).
 pub fn renderPendingLine(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
+    renderPendingLineLocked(w);
+    flushReal(w);
+}
+
+fn renderPendingLineLocked(w: *std.Io.Writer) void {
     if (liveDraft().len == 0 and pending_status_len == 0) {
-        if (pending_shown) regionEnd(w);
+        if (pending_shown) regionEndLocked(w);
         return;
     }
     if (!pending_shown) {
@@ -897,6 +955,13 @@ pub fn renderPendingLine(w: *std.Io.Writer) void {
 /// prints exactly there. Typed draft text is NOT frozen into the
 /// transcript (the persistent editor keeps it for the next prompt).
 pub fn regionEnd(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
+    regionEndLocked(w);
+    flushReal(w);
+}
+
+fn regionEndLocked(w: *std.Io.Writer) void {
     if (!pending_shown) {
         pendingStatusSet("");
         return;
@@ -928,12 +993,15 @@ pub fn regionEnd(w: *std.Io.Writer) void {
 /// stays visible directly above the next prompt; the in/out numbers the
 /// user tracks are never lost.
 pub fn regionFreeze(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
     if (pending_shown and pending_status_len > 0) {
         var buf: [128]u8 = undefined;
         const summary = std.fmt.bufPrint(&buf, "\x1b[2m{s}\x1b[0m\n", .{pending_status_buf[0..pending_status_len]}) catch "";
-        regionPrintLine(w, summary);
+        regionPrintLineLocked(w, summary);
     }
-    regionEnd(w);
+    regionEndLocked(w);
+    flushReal(w);
 }
 
 /// Paint the status row (absolute) and park the cursor back on the
@@ -949,13 +1017,17 @@ fn paintStatusRow(w: *std.Io.Writer) void {
 
 /// Refresh the status row only (tick path); the region stays put.
 pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
+    ttyLock();
+    defer ttyUnlock();
     pendingStatusSet(status);
     if (!pending_shown) return;
     if (termHeight() != region_h) {
         regionApply(w);
+        flushReal(w);
         return;
     }
     paintStatusRow(w);
+    flushReal(w);
 }
 
 /// ── Region-aware transcript writer (the P0-b mechanism) ────────────
@@ -1151,6 +1223,12 @@ pub const RegionWriter = struct {
     /// are held back and flushed as one ALIGNED block when the table
     /// ends (see renderTableBlock).
     fn feed(self: *RegionWriter, bytes: []const u8) void {
+        ttyLock();
+        defer ttyUnlock();
+        self.feedLocked(bytes);
+    }
+
+    fn feedLocked(self: *RegionWriter, bytes: []const u8) void {
         var rest = bytes;
         while (rest.len > 0) {
             const nl = std.mem.indexOfScalar(u8, rest, '\n');
@@ -1178,26 +1256,33 @@ pub const RegionWriter = struct {
         if (self.table_alloc) |alloc| {
             if (isTableRow(body)) {
                 const dup = alloc.dupe(u8, body) catch {
-                    self.flushTableBlock();
-                    regionPrintLine(self.real, raw);
+                    self.flushTableBlockLocked();
+                    regionPrintLineLocked(self.real, raw);
                     return;
                 };
                 self.table_rows.append(alloc, dup) catch {
                     alloc.free(dup);
-                    self.flushTableBlock();
-                    regionPrintLine(self.real, raw);
+                    self.flushTableBlockLocked();
+                    regionPrintLineLocked(self.real, raw);
                     return;
                 };
-                if (self.table_rows.items.len >= 64) self.flushTableBlock(); // safety
+                if (self.table_rows.items.len >= 64) self.flushTableBlockLocked(); // safety
                 return;
             }
         }
-        self.flushTableBlock();
-        regionPrintLine(self.real, raw);
+        self.flushTableBlockLocked();
+        regionPrintLineLocked(self.real, raw);
     }
 
     /// Emit the buffered table (if any) as one aligned block.
     pub fn flushTableBlock(self: *RegionWriter) void {
+        ttyLock();
+        defer ttyUnlock();
+        self.flushTableBlockLocked();
+        flushReal(self.real);
+    }
+
+    fn flushTableBlockLocked(self: *RegionWriter) void {
         if (self.table_rows.items.len == 0) return;
         const alloc = self.table_alloc orelse {
             self.table_rows.clearRetainingCapacity();
@@ -1206,11 +1291,11 @@ pub const RegionWriter = struct {
         var out: std.ArrayList(u8) = .empty;
         renderTableBlock(alloc, self.table_rows.items, currentTermWidth(), &out) catch {
             out.deinit(alloc);
-            for (self.table_rows.items) |r| regionPrintLine(self.real, r);
+            for (self.table_rows.items) |r| regionPrintLineLocked(self.real, r);
             self.clearTableRows();
             return;
         };
-        regionPrintLine(self.real, out.items);
+        regionPrintLineLocked(self.real, out.items);
         out.deinit(alloc);
         self.clearTableRows();
     }
@@ -1227,19 +1312,22 @@ pub const RegionWriter = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self = fromIface(w);
+        ttyLock();
+        defer ttyUnlock();
         var consumed: usize = 0;
         if (regionUp()) {
-            for (data[0 .. data.len - 1]) |s| self.feed(s);
+            for (data[0 .. data.len - 1]) |s| self.feedLocked(s);
             var i: usize = 0;
-            while (i < splat) : (i += 1) self.feed(data[data.len - 1]);
+            while (i < splat) : (i += 1) self.feedLocked(data[data.len - 1]);
             for (data[0 .. data.len - 1]) |s| consumed += s.len;
             consumed += data[data.len - 1].len * splat;
+            flushReal(self.real);
             return consumed;
         }
         // Region down: verbatim passthrough. Buffered table rows and a
         // partial line buffered while the region was up go out first so
         // ordering is preserved.
-        self.flushTableBlock();
+        self.flushTableBlockLocked();
         if (self.line_len > 0) {
             std.Io.Writer.writeAll(self.real, self.line[0..self.line_len]) catch return error.WriteFailed;
             self.line_len = 0;
@@ -1262,9 +1350,11 @@ pub const RegionWriter = struct {
     /// File.Writer explicitly at every print site, exactly as before.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self = fromIface(w);
-        self.flushTableBlock();
+        ttyLock();
+        defer ttyUnlock();
+        self.flushTableBlockLocked();
         if (self.line_len > 0 and regionUp()) {
-            regionPrintLine(self.real, self.line[0..self.line_len]);
+            regionPrintLineLocked(self.real, self.line[0..self.line_len]);
             self.line_len = 0;
         }
     }
@@ -1538,8 +1628,12 @@ fn liveQueueSubmit(ed: *Editor, w: ?*std.Io.Writer) bool {
         std.Io.Writer.writeAll(&f, line[0..cut]) catch {};
         if (cut < line.len) std.Io.Writer.writeAll(&f, "…") catch {};
         std.Io.Writer.writeAll(&f, "\x1b[0m\x1b[2m ↳ 已排队\x1b[0m\n") catch {};
-        regionPrintLine(ww, f.buffered());
-
+        // Echo + status repaint under ONE hold (review ① 2026-11-06): the
+        // old shape called locked regionPrintLine, released, then painted
+        // the status row UNLOCKED — the exact DECSC-clobber interleave the
+        // tty mutex exists to kill, reachable on every mid-turn Enter.
+        ttyLock();
+        regionPrintLineLocked(ww, f.buffered());
         var sb: [96]u8 = undefined;
         const st = std.fmt.bufPrint(&sb, "↳ 已排队 {d} 条 · 本轮生效或回合后自动发送", .{queuedCount()}) catch "";
         pendingStatusSet(st);
@@ -1550,6 +1644,8 @@ fn liveQueueSubmit(ed: *Editor, w: ?*std.Io.Writer) bool {
                 paintStatusRow(ww);
             }
         }
+        flushReal(ww);
+        ttyUnlock();
     }
     return true;
 }
@@ -2297,6 +2393,23 @@ fn drainRestOfLine(r: *std.Io.Reader) void {
 /// allocator-owned slice (caller frees — it may exceed 4 KiB after a paste),
 /// or null on EOF / Ctrl-D / double Ctrl-C on an empty line. `history`
 /// receives committed non-empty lines and drives up/down navigation.
+/// fd 0 is a terminal? (Raw mode itself is owned by the SESSION guard in
+/// repl.run — scoping it per-prompt left every mid-turn keystroke to the
+/// cooked line discipline, which echoed control keys as ^[[C/^R garbage
+/// and line-buffered input the editor never saw until Enter.)
+fn stdinIsTty() bool {
+    var t: std.c.termios = undefined;
+    return std.c.tcgetattr(0, &t) == 0;
+}
+
+/// The session RawGuard (repl.run), for Ctrl-Z's manual suspend: restore
+/// cooked while stopped, re-enter raw on resume. Null in tests/pipe mode.
+var session_guard: ?*menu.RawGuard = null;
+
+pub fn setSessionGuard(g: *menu.RawGuard) void {
+    session_guard = g;
+}
+
 pub fn readLine(
     w: *std.Io.Writer,
     r: *std.Io.Reader,
@@ -2305,11 +2418,7 @@ pub fn readLine(
     history: *std.ArrayList([]u8),
     alloc: std.mem.Allocator,
 ) !?[]u8 {
-    var guard = menu.RawGuard{};
-    guard.enterNoSig();
-    defer guard.restore();
-
-    if (!guard.active and !force_editor) {
+    if (!stdinIsTty() and !force_editor) {
         // Non-TTY: behave exactly like the old reader, except an overlong
         // line is truncated instead of being mistaken for EOF — the old
         // path returned null (Goodbye!) and left the tail of the long line
@@ -2723,16 +2832,18 @@ pub fn readLine(
                 // Ctrl-Z: ISIG is off in raw mode, so suspend manually —
                 // restore the terminal, stop with the default disposition,
                 // then re-enter raw mode once the shell resumes us.
-                if (guard.active) {
-                    guard.restore();
-                    const dfl_tstp: std.posix.Sigaction = .{
-                        .handler = .{ .handler = @ptrFromInt(0) },
-                        .mask = std.posix.sigemptyset(),
-                        .flags = 0,
-                    };
-                    std.posix.sigaction(.TSTP, &dfl_tstp, null);
-                    std.posix.raise(.TSTP) catch {};
-                    guard.enterNoSig();
+                if (session_guard) |g| {
+                    if (g.active) {
+                        g.restore();
+                        const dfl_tstp: std.posix.Sigaction = .{
+                            .handler = .{ .handler = @ptrFromInt(0) },
+                            .mask = std.posix.sigemptyset(),
+                            .flags = 0,
+                        };
+                        std.posix.sigaction(.TSTP, &dfl_tstp, null);
+                        std.posix.raise(.TSTP) catch {};
+                        g.enterNoSig();
+                    }
                 }
             },
             0x04 => { // Ctrl-D: EOF on empty line, delete-forward otherwise

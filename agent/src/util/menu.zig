@@ -65,6 +65,7 @@ pub fn readKey(r: *std.Io.Reader) !Key {
 pub const RawGuard = struct {
     orig: std.c.termios = undefined,
     active: bool = false,
+    installed_signal: bool = false,
 
     pub fn enter(self: *RawGuard) void {
         self.enterImpl(false);
@@ -93,17 +94,48 @@ pub const RawGuard = struct {
         if (std.c.tcsetattr(0, .NOW, &raw) == 0) self.active = true;
         // Crash/kill-safety: without a handler a SIGINT/SIGSEGV in raw mode
         // left the terminal echo-less and unusable after the process died.
-        if (self.active) installSignalRestore(&self.orig);
+        // NESTING (session guard + menu/confirm guards since 2026-11-06):
+        // only the OUTERMOST guard owns the signal-restore slot — a nested
+        // guard's orig is already raw, and on its crash-restore the process
+        // would die leaving the terminal raw.
+        if (self.active and signal_saved == null) {
+            installSignalRestore(&self.orig);
+            self.installed_signal = true;
+        }
     }
 
     pub fn restore(self: *RawGuard) void {
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
-        if (self.active) removeSignalRestore();
+        if (self.installed_signal) removeSignalRestore();
     }
 };
 
-/// Saved terminal settings for the signal handler (single guard at a time —
-/// menus never nest raw mode).
+/// Temporary COOKED-with-echo mode for one confirmation read (y/N gates,
+/// /rewind confirm) inside a session that is otherwise raw the whole way
+/// (see repl.run's session RawGuard). Raw mode delivers Enter as \r with
+/// no echo — a streamDelimiter(.., '\n') read would block forever and the
+/// user would type blind. Enter/restore is a no-op on non-TTY stdin.
+pub const CookedGuard = struct {
+    orig: std.c.termios = undefined,
+    active: bool = false,
+
+    pub fn enter(self: *CookedGuard) void {
+        if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
+        var cooked = self.orig;
+        cooked.lflag.ICANON = true; // driver line-edits (backspace works)
+        cooked.lflag.ECHO = true; // the user sees what they type
+        cooked.iflag.ICRNL = true; // Enter becomes \n — ends the read
+        if (std.c.tcsetattr(0, .NOW, &cooked) == 0) self.active = true;
+    }
+
+    pub fn restore(self: *CookedGuard) void {
+        if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
+    }
+};
+
+/// Saved terminal settings for the signal handler. One slot, owned by the
+/// OUTERMOST active guard (session guard in repl.run since 2026-11-06);
+/// nested menu/confirm guards never overwrite it.
 var signal_saved: ?std.c.termios = null;
 
 fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {

@@ -56,7 +56,8 @@ const runtime_rules = @import("runtime/rules.zig");
 const error_handler = @import("runtime/error_handler.zig");
 const allocator = std.heap.smp_allocator;
 
-const MAX_AGENT_ITERATIONS: usize = 50;
+// Agent-loop cap lives in settings.agent_loop_limit (default 50, clamp
+// 1..200) — see the turn loop's max_agent_iters.
 const MAX_CONTEXT_TOKENS: u32 = 128_000;
 
 /// Code-change diff preview (TUI) — see renderCodeDiff. Cap one edit's
@@ -261,6 +262,20 @@ const ModelSwitcher = struct {
 };
 
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
+    // Terminal-write serialization needs the Io instance (std.Io.Mutex
+    // lock/unlock take it) — inject before any region call below.
+    lineinput.setIo(io);
+    // SESSION-scoped raw mode (2026-11-06): raw used to be entered per
+    // readLine call, so the tty sat in cooked+echo for every entire TURN —
+    // the line discipline echoed mid-turn keystrokes as ^[[C/^R garbage
+    // and line-buffered input away from the editor. One guard for the
+    // whole session; every exit path restores via defer, crashes via the
+    // guard's INT/TERM signal restore. Mid-turn y/N gates temporarily go
+    // cooked (menu.CookedGuard) around their reads.
+    var tty_guard = menu.RawGuard{};
+    tty_guard.enterNoSig();
+    defer tty_guard.restore();
+    lineinput.setSessionGuard(&tty_guard); // Ctrl-Z manual suspend needs it
     // Writer setup
     var write_buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.Writer.initStreaming(stdout_file, io, &write_buf);
@@ -346,6 +361,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     monitor.setEventBus(&evbus);
     // Live stats the health check reads (updated in the main loop below).
     var live_llm_calls = std.atomic.Value(u32).init(0);
+    var live_llm_429s = std.atomic.Value(u32).init(0); // real 429s → monitor rule
     var live_est_tokens = std.atomic.Value(u32).init(0);
     // Test hook: ZIV_CRON_SCALE=60 compresses the timeline (81.5min → ~82s)
     // so scheduled maintenance is observable in a smoke run.
@@ -362,6 +378,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .w = w,
         .switcher = &switcher,
         .llm_calls = &live_llm_calls,
+        .llm_429s = &live_llm_429s,
         .est_tokens = &live_est_tokens,
     };
     var cron = task_mod.CronScheduler.init(allocator);
@@ -911,6 +928,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     continue;
                 };
 
+                // Same /last ring as agent-loop calls (finishToolCall) —
+                // the expansion valve must cover manual /run too.
+                LastTools.push(tool_name, result.output);
+
                 if (result.is_error) {
                     try std.Io.Writer.print(w, "  ERROR: {s}\n\n", .{result.output});
                 } else {
@@ -1431,7 +1452,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // auto-compaction ever fires, so the squeeze is never a surprise.
         var ctx_warned = false;
 
-        while (agent_iterations < MAX_AGENT_ITERATIONS) : (agent_iterations += 1) {
+        // Per-turn read (hot-reloadable): settings.json agent_loop_limit,
+        // clamped at parse. The hard 50 cut mid-investigation on a
+        // debugging marathon (53 tools / 29 min) motivated the knob +
+        // the 「继续」 prefill below.
+        const max_agent_iters: usize = @max(1, switcher.settings.agent_loop_limit);
+
+        while (agent_iterations < max_agent_iters) : (agent_iterations += 1) {
             // Compaction check + context estimate in one pass. (v0.7.6:
             // the old per-turn WRITE cap (15) is gone — the Claude-Code/
             // Codex model gates on CONTEXT PRESSURE, not write counts:
@@ -1542,6 +1569,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     continue;
                 }
                 lineinput.regionEnd(w);
+                if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic); // monitor: real-429 evidence
                 try std.Io.Writer.print(ow, "  [LLM error: {}]\n", .{err});
                 // Designed error-feedback closure (§四): classified analysis
                 // + numbered fixes with the recommended one marked. The
@@ -2171,8 +2199,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
         }
 
-        if (agent_iterations >= MAX_AGENT_ITERATIONS) {
-            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached]\x1b[0m\n", .{MAX_AGENT_ITERATIONS});
+        if (agent_iterations >= max_agent_iters) {
+            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached — 输入区已预填「继续」：Enter 接着跑，也可改发其他指令；上限经 settings.json 的 agent_loop_limit 调整]\x1b[0m\n", .{max_agent_iters});
+            // Same recoverable-giveup shape as the TTFT triple-failure
+            // path: history stays legal, one Enter resumes as a fresh
+            // turn — the marathon's findings are never lost to a stop.
+            lineinput.recall_text = "继续";
+            lineinput.recall_prefill = true;
         }
 
         // T1.3: topic-drift re-anchor — checked after EVERY completed turn
@@ -2792,6 +2825,7 @@ const HealthCtx = struct {
     /// session read "context window near limit" as a false positive.
     switcher: *ModelSwitcher,
     llm_calls: *std.atomic.Value(u32),
+    llm_429s: *std.atomic.Value(u32),
     est_tokens: *std.atomic.Value(u32),
     /// Dedup: print only when the failing-rule signature CHANGES — the
     /// same warning every 60s used to stack into noise walls.
@@ -2812,6 +2846,7 @@ fn healthCheckTask(opaque_ctx: ?*anyopaque) anyerror!void {
         .memory_entry_count = 0,
         .api_calls_last_minute = calls,
         .api_rate_limit = 60,
+        .api_rate_limited_count = hc.llm_429s.swap(0, .monotonic),
         .db_integrity_ok = true,
         .current_tokens = hc.est_tokens.load(.monotonic),
         // The real context WINDOW for the live model (e.g. glm-5.3 →
@@ -4259,6 +4294,12 @@ fn permissionGate(
             try std.Io.Writer.print(ow, "  Tool {s}: {s}. Allow? [y/N]: ", .{ tool_def.name, a.message });
             try std.Io.File.Writer.flush(file_writer);
 
+            // Cooked-with-echo for the answer read (session is raw now —
+            // without this the user types blind and Enter never terminates
+            // the delimiter read). No-op on non-TTY stdin.
+            var cooked = menu.CookedGuard{};
+            cooked.enter();
+            defer cooked.restore();
             // Allocating answer buffer: the old fixed 64-byte reader turned
             // a long pasted answer into "Cancelled" and left the tail of the
             // line polluting the next read.
@@ -4339,48 +4380,52 @@ const LastTools = struct {
     }
 };
 
-const LinePreview = struct { slice: []const u8, clipped: bool };
-
-/// First non-empty line of `s`, width-clipped to ≤80 display cols at a
-/// rune boundary — the /last-aware one-line tool preview (③). Borrowed
-/// slice into `s`; `clipped` flags a width cut.
-fn firstLineClipped(s: []const u8) LinePreview {
-    const max_cols: usize = 80;
-    var rest = s;
-    while (rest.len > 0) {
+/// Full tool output into the transcript, 2-space indented, one line per
+/// print (line-atomic above the live region via RegionWriter; markdown-
+/// table rows still align). Bounded: past 50 lines or LastTools.CAP
+/// bytes a dim tail marker points at /last — the ring keeps its full
+/// 8 KiB regardless of what the transcript showed. The byte cut backs
+/// off to a UTF-8 boundary so a mid-汉字 slice can't mojibake.
+fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
+    const max_lines: usize = 50;
+    var cut = @min(raw.len, LastTools.CAP);
+    while (cut > 0 and cut < raw.len and (raw[cut] & 0xC0) == 0x80) cut -= 1;
+    var rest: []const u8 = raw[0..cut];
+    var shown: usize = 0;
+    while (rest.len > 0 and shown < max_lines) : (shown += 1) {
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        const line = std.mem.trim(u8, rest[0..nl], " \t\r");
-        if (line.len > 0) {
-            var cols: usize = 0;
-            var i: usize = 0;
-            while (i < line.len) {
-                const b = line[i];
-                const w: usize = if (b < 0x80) 1 else if (b >= 0xE0) 2 else if (b >= 0xC0) 1 else 0;
-                if (cols + w > max_cols) return .{ .slice = line[0..i], .clipped = true };
-                cols += w;
-                i += 1;
-            }
-            return .{ .slice = line, .clipped = false };
-        }
+        std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch {};
         rest = if (nl < rest.len) rest[nl + 1 ..] else "";
     }
-    return .{ .slice = "", .clipped = false };
+    const total_lines = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
+    // Byte-cap truncation (one huge line) shows no line-count difference —
+    // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
+    // 10 KiB single line printed unmarked).
+    if (shown < total_lines or cut < raw.len) {
+        std.Io.Writer.print(w, "  \x1b[2m…已截断（显示 {d}/{d} 行）· /last 全文\x1b[0m\n", .{ shown, total_lines }) catch {};
+    }
 }
 
-test "firstLineClipped: blank-skip, width clip, empty" {
-    const r1 = firstLineClipped("\n\n  line one  \nline two\n");
-    try std.testing.expectEqualStrings("line one", r1.slice);
-    try std.testing.expect(!r1.clipped);
-    var long: [88]u8 = undefined;
-    @memset(&long, 'x');
-    const r2 = firstLineClipped(&long);
-    try std.testing.expectEqual(@as(usize, 80), r2.slice.len);
-    try std.testing.expect(r2.clipped);
-    // Short CJK line passes uncut, at a rune boundary.
-    const r3 = firstLineClipped("节奏表\nsecond");
-    try std.testing.expectEqualStrings("节奏表", r3.slice);
-    const r4 = firstLineClipped("\n \n");
-    try std.testing.expectEqualStrings("", r4.slice);
+test "printToolBody: verbatim body, cap marker, empty" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    printToolBody(&aw.writer, "one\ntwo\n");
+    try std.testing.expectEqualStrings("  one\n  two\n", aw.written());
+    // 55 lines: 50 shown + cap marker naming the true total.
+    var buf: [300]u8 = undefined;
+    var f = std.Io.Writer.fixed(&buf);
+    var i: usize = 0;
+    while (i < 55) : (i += 1) std.Io.Writer.print(&f, "l{d}\n", .{i}) catch unreachable;
+    aw.clearRetainingCapacity();
+    printToolBody(&aw.writer, f.buffered());
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "  l49\n") != null); // 50th line shown
+    try std.testing.expect(std.mem.indexOf(u8, out, "  l50\n") == null); // 51st not
+    try std.testing.expect(std.mem.indexOf(u8, out, "显示 50/55 行") != null);
+    // Empty output: no body, no marker.
+    aw.clearRetainingCapacity();
+    printToolBody(&aw.writer, "");
+    try std.testing.expectEqualStrings("", aw.written());
 }
 
 test "LastTools: ring order and wrap" {
@@ -4435,21 +4480,20 @@ fn finishToolCall(
     const raw = result.output;
     const truncated = raw.len > max_result;
 
-    // Density fix (③, 2026-11-06): ONE line per tool — first non-empty
-    // line of the output, width-clipped; multi-line dumps used to flood
-    // the transcript. Full output lives in /last. Wall time carried live
-    // (batch dispatch → collection); tool name colored by outcome.
+    // Full-body display (2026-11-06, user call — supersedes the ③ 80-col
+    // one-liner): the preview made every interesting output a /last
+    // round-trip. Bounded at 50 lines / 8 KiB so a runaway grep still
+    // can't flood the screen; past the cap a dim marker points at /last.
+    // Wall time carried live; tool name colored by outcome.
     LastTools.push(p.call.tool_name, raw);
-    const preview = firstLineClipped(raw);
     const name_col = if (result.is_error) "\x1b[31m" else "\x1b[36m";
-    std.Io.Writer.print(ow, "  [{s}{s}\x1b[0m · {d}.{d}s: {s}{s}]\n", .{
+    std.Io.Writer.print(ow, "  [{s}{s}\x1b[0m · {d}.{d}s]\n", .{
         name_col,
         p.call.tool_name,
         @divTrunc(elapsed_ms, 1000),
         @divTrunc(@mod(elapsed_ms, 1000), 100),
-        preview.slice,
-        if (preview.clipped or preview.slice.len < raw.len) " \x1b[2m…（/last 全文）\x1b[0m" else "",
     }) catch {};
+    printToolBody(ow, raw);
 
     // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
     // char boundary. A mid-char cut used to poison every later request:
@@ -5195,6 +5239,10 @@ fn rewindOperation(
     try std.Io.Writer.writeAll(w, "  Proceed? [y/N]: ");
     try std.Io.File.Writer.flush(file_writer);
 
+    // Cooked-with-echo for the confirm read (session raw otherwise).
+    var cooked = menu.CookedGuard{};
+    cooked.enter();
+    defer cooked.restore();
     var confirm_buf: [16]u8 = undefined;
     var confirm_writer = std.Io.Writer.fixed(&confirm_buf);
     _ = std.Io.Reader.streamDelimiter(r, &confirm_writer, '\n') catch {
