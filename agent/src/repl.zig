@@ -4211,6 +4211,13 @@ fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: std.
     lineinput.regionEnd(ctx.w);
     try std.Io.Writer.print(ctx.ow, "\n  [model asks] {s}\n  Your answer (Enter to skip): ", .{question});
     try std.Io.File.Writer.flush(ctx.file_writer);
+    // Cooked-with-echo for the answer read (2026-11-06 session-raw
+    // follow-up): raw mode would leave the user typing blind with Enter
+    // delivered as \r — streamDelimiter waits for \n and blocks forever.
+    // Same guard as the y/N permission gate and the /rewind confirm.
+    var cooked = menu.CookedGuard{};
+    cooked.enter();
+    defer cooked.restore();
     var ans_aw: std.Io.Writer.Allocating = .init(alloc);
     defer ans_aw.deinit();
     _ = std.Io.Reader.streamDelimiter(ctx.r, &ans_aw.writer, '\n') catch {
@@ -5182,6 +5189,10 @@ fn rewindOperation(
     try std.Io.Writer.writeAll(w, "\n  Select rollback point (or Enter to cancel): ");
     try std.Io.File.Writer.flush(file_writer);
 
+    // Cooked-with-echo (session raw otherwise — same as the confirm below).
+    var cooked_sel = menu.CookedGuard{};
+    cooked_sel.enter();
+    defer cooked_sel.restore();
     var ans_buf: [64]u8 = undefined;
     var ans_writer = std.Io.Writer.fixed(&ans_buf);
     const n = std.Io.Reader.streamDelimiter(r, &ans_writer, '\n') catch {
