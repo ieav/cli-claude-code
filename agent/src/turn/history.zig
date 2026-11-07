@@ -363,63 +363,85 @@ pub fn slimToolResults(messages: []llm.Message, alloc: std.mem.Allocator) SlimSt
     return stats;
 }
 
-/// 每个用户回合内只保留最近 K 条 tool_result 的内容，更早的替换成
-/// 单行标记（tool_use 原样保留——API 要求 use/result 配对完整）。
-/// 修「马拉松回合被当一个 round 整体保留」的口子（hybridSplit 按 user
-/// 文本消息锚定，单回合 50 次工具调用全算一个 round）：留存从
-/// 50×体量 降到 K×体量 + (N-K)×标记行。/last 环不受影响（独立全文）。
+/// 每个用户回合内只保留最近 K 次工具交换的实质内容（2026-11-09 扩展
+/// 到双侧）：
+///   - tool_result.content → 单行标记（/last 环独立全文不受影响）
+///   - tool_use.input → 占位对象 {"_folded":true,"orig_bytes":N}
+/// id/name 全部保留——API 的 use/result 配对完整性不破。
+/// 取证背景：会话 1 的 assistant 侧 tool_use 参数占 878 KiB（Bash 命令
+/// 串 485 KiB + FileWrite 整文件正文 393 KiB），而旧压缩只剪 user 侧
+/// result——压完仍半窗的直接原因。
 pub const FOLD_KEEP_PER_ROUND: usize = 8;
 
 pub const FoldStats = struct { folded: usize = 0, bytes_before: usize = 0 };
 
+const RoundCounters = struct {
+    results: usize = 0,
+    uses: usize = 0,
+};
+
 pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) FoldStats {
-    // 第一遍：数每个 round 的 tool_result 总数。
-    var round_total: std.ArrayList(usize) = .empty;
+    // 第一遍：数每个 round 的 result/use 总数。
+    var round_total: std.ArrayList(RoundCounters) = .empty;
     defer round_total.deinit(alloc);
-    var cur: usize = 0;
     for (messages) |*m| {
         const starts_round = m.role == .user and m.content.len > 0 and m.content[0] == .text;
         if (starts_round) {
-            round_total.append(alloc, 0) catch break;
-            cur = round_total.items.len - 1;
+            round_total.append(alloc, .{}) catch break;
         }
         if (round_total.items.len == 0) continue; // 系统提示段（无 round 上下文）不动
-        for (m.content) |b| {
-            if (b == .tool_result) round_total.items[cur] += 1;
-        }
+        const cur = &round_total.items[round_total.items.len - 1];
+        for (m.content) |b| switch (b) {
+            .tool_result => cur.results += 1,
+            .tool_use => cur.uses += 1,
+            else => {},
+        };
     }
-    // 第二遍：重建含超额 tool_result 的消息（沿 slimToolResults 的换法）。
+    // 第二遍：重建含超额块的消息（result 标记化 / use 参数占位化）。
     var stats: FoldStats = .{};
-    var round_idx: usize = 0; // 已进入的 round 计数
-    var seen_in_round: usize = 0;
+    var round_idx: usize = 0;
+    var seen_res: usize = 0;
+    var seen_use: usize = 0;
     for (messages) |*m| {
         const starts_round = m.role == .user and m.content.len > 0 and m.content[0] == .text;
         if (starts_round) {
             round_idx += 1;
-            seen_in_round = 0;
+            seen_res = 0;
+            seen_use = 0;
         }
         if (round_idx == 0 or round_idx > round_total.items.len) continue;
-        // 本消息是否含「该 round 内序号 < 总数-K」的 tool_result。
-        var n_before: usize = 0;
+        const totals = round_total.items[round_idx - 1];
+
+        // 先扫本消息有没有要折的块（决定是否重建）。
+        var res_n: usize = 0;
+        var use_n: usize = 0;
         var has_fold = false;
-        for (m.content) |b| {
-            if (b != .tool_result) continue;
-            const ordinal = seen_in_round + n_before;
-            const total = round_total.items[round_idx - 1];
-            if (total > FOLD_KEEP_PER_ROUND and ordinal + FOLD_KEEP_PER_ROUND < total) has_fold = true;
-            n_before += 1;
-        }
-        seen_in_round += n_before;
+        for (m.content) |b| switch (b) {
+            .tool_result => {
+                if (totals.results > FOLD_KEEP_PER_ROUND and seen_res + res_n + FOLD_KEEP_PER_ROUND < totals.results) has_fold = true;
+                res_n += 1;
+            },
+            .tool_use => {
+                if (totals.uses > FOLD_KEEP_PER_ROUND and seen_use + use_n + FOLD_KEEP_PER_ROUND < totals.uses) has_fold = true;
+                use_n += 1;
+            },
+            else => {},
+        };
+        const msg_res_base = seen_res;
+        const msg_use_base = seen_use;
+        seen_res += res_n;
+        seen_use += use_n;
         if (!has_fold) continue;
 
         const old = m.content;
         const nb = alloc.alloc(llm.ContentBlock, old.len) catch continue;
         var bi: usize = 0;
-        var ord: usize = seen_in_round - n_before;
-        for (old) |b| {
-            if (b == .tool_result) {
-                const total = round_total.items[round_idx - 1];
-                if (total > FOLD_KEEP_PER_ROUND and ord + FOLD_KEEP_PER_ROUND < total) {
+        var rord = msg_res_base;
+        var uord = msg_use_base;
+        for (old) |b| switch (b) {
+            .tool_result => {
+                rord += 1;
+                if (totals.results > FOLD_KEEP_PER_ROUND and rord - 1 + FOLD_KEEP_PER_ROUND < totals.results) {
                     var mbuf: [96]u8 = undefined;
                     const marker = std.fmt.bufPrint(&mbuf, "[工具输出已并入摘要（原 {d} B）· /last 查全文]", .{b.tool_result.content.len}) catch "[folded]";
                     if (alloc.dupe(u8, marker)) |owned| {
@@ -431,21 +453,50 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
                             .is_error = b.tool_result.is_error,
                         } };
                         bi += 1;
-                        ord += 1;
-                        // 旧 content 归 history 所有：释放防漏。
-                        alloc.free(@constCast(b.tool_result.content));
+                        alloc.free(@constCast(b.tool_result.content)); // history 所有：防漏
                         continue;
                     } else |_| {}
                 }
-                ord += 1;
-            }
-            nb[bi] = b;
-            bi += 1;
-        }
+                nb[bi] = b;
+                bi += 1;
+            },
+            .tool_use => {
+                uord += 1;
+                if (totals.uses > FOLD_KEEP_PER_ROUND and uord - 1 + FOLD_KEEP_PER_ROUND < totals.uses) {
+                    if (foldedInput(alloc, b.tool_use.input)) |ph| {
+                        stats.folded += 1;
+                        stats.bytes_before += compaction.jsonValueSize(b.tool_use.input);
+                        nb[bi] = .{ .tool_use = .{
+                            .id = b.tool_use.id,
+                            .name = b.tool_use.name,
+                            .input = ph,
+                        } };
+                        bi += 1;
+                        continue; // 旧 input 在响应 DOM 里（会话级 arena 约定，不单独释放）
+                    }
+                }
+                nb[bi] = b;
+                bi += 1;
+            },
+            else => {
+                nb[bi] = b;
+                bi += 1;
+            },
+        };
         alloc.free(@constCast(old));
         m.content = nb[0..bi];
     }
     return stats;
+}
+
+/// tool_use 参数的折叠占位：{"_folded":true,"orig_bytes":N}——结构合法
+/// （对象），网关不校验 input 与 result 的一致性，配对由 id 保证。
+fn foldedInput(alloc: std.mem.Allocator, orig: std.json.Value) ?std.json.Value {
+    var map: std.json.ObjectMap = .empty;
+    map.put(alloc, "_folded", .{ .bool = true }) catch return null;
+    const n = compaction.jsonValueSize(orig);
+    map.put(alloc, "_orig_bytes", .{ .integer = @intCast(@min(n, std.math.maxInt(i64))) }) catch {};
+    return .{ .object = map };
 }
 
 /// Hybrid surgery (pure, no LLM): rebuild history as
@@ -1417,6 +1468,61 @@ test "foldOldToolResults: marathon round keeps only the last K results (pairing 
     }
     try std.testing.expectEqual(@as(usize, 4), folded_markers);
     try std.testing.expectEqual(@as(usize, 8), kept_full);
+}
+
+test "foldOldToolResults: marathon tool_use ARGUMENTS folded too (2026-11-09)" {
+    // 取证：会话 1 的 tool_use 参数（Bash 命令/FileWrite 正文）占 878 KiB
+    // ——旧压缩只剪 result 侧。现在 use.input 超出保留窗的换成占位对象。
+    // 全程 arena：fold 的产物与输入同源，不逐块释放（避开 freeJsonValue
+    // 对树内 key 的所有权假设）。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var history: std.ArrayList(llm.Message) = .empty;
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = "SYSTEM" };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .text = "write these files" };
+        try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
+    }
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var input: std.json.ObjectMap = .empty;
+        try input.put(alloc, try alloc.dupe(u8, "path"), .{ .string = "f.zig" });
+        const big_body = try alloc.alloc(u8, 4096);
+        @memset(big_body, 'x');
+        try input.put(alloc, try alloc.dupe(u8, "content"), .{ .string = big_body });
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .tool_use = .{ .id = "u1", .name = "FileWrite", .input = .{ .object = input } } };
+        try history.append(alloc, .{ .role = .assistant, .content = ub, .timestamp = 0 });
+        const rb = try alloc.alloc(llm.ContentBlock, 1);
+        rb[0] = .{ .tool_result = .{ .tool_use_id = "u1", .content = try alloc.dupe(u8, "Wrote 4096 bytes") } };
+        try history.append(alloc, .{ .role = .user, .content = rb, .timestamp = 0 });
+    }
+    _ = foldOldToolResults(history.items, alloc);
+    var folded_inputs: usize = 0;
+    var kept_inputs: usize = 0;
+    for (history.items[2..]) |m| {
+        if (m.role != .assistant) continue;
+        for (m.content) |b| {
+            if (b != .tool_use) continue;
+            if (b.tool_use.input == .object and b.tool_use.input.object.get("_folded") != null) {
+                folded_inputs += 1;
+                try std.testing.expect(b.tool_use.input.object.get("_orig_bytes") != null);
+            } else kept_inputs += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), folded_inputs); // 10 - 8
+    try std.testing.expectEqual(@as(usize, 8), kept_inputs);
+    // id/name 原样——配对完整性。
+    for (history.items[2..]) |m| {
+        if (m.role != .assistant) continue;
+        for (m.content) |b| {
+            if (b == .tool_use) try std.testing.expect(std.mem.eql(u8, b.tool_use.name, "FileWrite"));
+        }
+    }
 }
 
 test "pressure ladder + rolling compaction converge: information compresses forever, never blows up" {

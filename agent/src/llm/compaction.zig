@@ -44,6 +44,13 @@ pub const CompactionStrategy = enum {
 /// the last 5 rounds.
 pub const HYBRID_KEEP_ROUNDS: usize = 5;
 
+/// 2026-11-09（用户报「/compact 后仍 49%」取证后的硬上界）：保留窗的
+/// token 帽——5 个回合若超此体量则从尾部截短；回合数不足（单回合
+/// 马拉松：几百次工具调用全在一个 round 里）时以此为兜底切出保留
+/// 窗，旧段照样进摘要。原先「rounds < keep → 保留全部」对单回合
+/// 马拉松等于压缩罢工。
+pub const KEEP_TAIL_TOKEN_CAP: u32 = 12_000;
+
 /// Tier-3: a tool_result larger than this is slimmed IN HISTORY to
 /// TOOL_SLIM_HEAD bytes + a byte-count marker. The display layer (/last)
 /// keeps full text independently — this saves request tokens only.
@@ -70,21 +77,64 @@ pub fn hybridSplit(messages: []const provider.Message, keep_rounds: usize) usize
     if (messages.len <= 1) return 1;
     // Index of the message that starts the keep_rounds-th-from-last round.
     var rounds_seen: usize = 0;
+    var acc: u32 = 0;
+    var capped_start: ?usize = null; // token 帽先到时的锚点（i+1 起保留）
     var i = messages.len;
-    while (i > 0) {
+    while (i > 1) {
         i -= 1;
         const m = messages[i];
-        if (m.role != .user) continue;
-        if (m.content.len == 0 or m.content[0] != .text) continue; // tool-result message
-        rounds_seen += 1;
-        if (rounds_seen == keep_rounds) {
-            // A bare user message at index 0 would mean index 0 is not the
-            // system prompt — still summarize from 1, never drop the head.
-            return @max(i, 1);
+        acc += messageTokens(m);
+        if (acc > KEEP_TAIL_TOKEN_CAP and capped_start == null) {
+            capped_start = @min(i + 1, messages.len - 1);
+        }
+        if (m.role == .user and m.content.len > 0 and m.content[0] == .text) {
+            rounds_seen += 1;
+            if (rounds_seen == keep_rounds) {
+                // A bare user message at index 0 would mean index 0 is not the
+                // system prompt — still summarize from 1, never drop the head.
+                const round_start = @max(i, 1);
+                // 回合锚与 token 帽取更小保留窗者（帽先到 = 肥回合截短）。
+                if (capped_start) |cs| return @max(round_start, cs);
+                return round_start;
+            }
         }
     }
-    // Fewer rounds than keep_rounds: keep everything verbatim.
+    // 回合数不足（单回合马拉松：几百次工具调用全在一个 round）——原先
+    // 这里返回 1 = 压缩罢工。现在 token 帽兜底切窗，旧段照样进摘要；
+    // 从未超帽的小历史整体保留（确实无需压缩）。
+    if (capped_start) |cs| return cs;
     return 1;
+}
+
+fn messageTokens(m: provider.Message) u32 {
+    var acc2: u32 = 0;
+    for (m.content) |b| switch (b) {
+        // 字节/3 ≈ token 粗估（对 CJK 偏保守，帽子控制足够）。
+        .text => |t| acc2 += 64 + @as(u32, @intCast(t.len / 3)),
+        .tool_result => |tr| acc2 += 64 + @as(u32, @intCast(tr.content.len / 3)),
+        .tool_use => |tu| acc2 += 64 + @as(u32, @intCast(jsonValueSize(tu.input) / 3)),
+        else => acc2 += 16,
+    };
+    return acc2;
+}
+
+/// JSON Value 的字节量粗估（object/array 深度遍历，字符串按原文）。
+pub fn jsonValueSize(v: std.json.Value) usize {
+    return switch (v) {
+        .string => |s| s.len + 2,
+        .object => |o| blk: {
+            var n: usize = 8;
+            var it = o.iterator();
+            while (it.next()) |e| n += e.key_ptr.len + jsonValueSize(e.value_ptr.*) + 4;
+            break :blk n;
+        },
+        .array => |a| blk: {
+            var n: usize = 4;
+            for (a.items) |it| n += jsonValueSize(it) + 2;
+            break :blk n;
+        },
+        else => 8,
+    };
 }
 
 pub const CompactionResult = union(enum) {
@@ -203,13 +253,41 @@ test "hybridSplit locks the three-tier boundaries" {
     }
     try std.testing.expectEqual(@as(usize, 46), hybridSplit(&msgs, 5));
 
-    // ≤ keep_rounds rounds: nothing to summarize.
+    // ≤ keep_rounds rounds 且不超 token 帽：保留全部（确实小）。
     try std.testing.expectEqual(@as(usize, 1), hybridSplit(msgs[0..1], 5));
     try std.testing.expectEqual(@as(usize, 1), hybridSplit(msgs[0..13], 5)); // 4 rounds
     // Round anchor must NOT be a tool-result user message: cutting before
     // round 20's text user message leaves round 19's tool message as the
     // last user-role message — the split still lands on a TEXT user message.
     try std.testing.expectEqual(@as(usize, 43), hybridSplit(msgs[0..58], 5));
+}
+
+test "hybridSplit: fat single-round marathon no longer refuses to compact (2026-11-09)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // 单回合马拉松：sys + user + N 条大 result（每条 ~6KB → token 超 12K 帽）。
+    // 旧行为：rounds(1) < 5 → 返回 1 = 压缩罢工。新行为：token 帽兜底
+    // 切窗，返回 >1 的锚点（旧段可进摘要）。
+    const text_blocks = try alloc.alloc(provider.ContentBlock, 1);
+    text_blocks[0] = .{ .text = "marathon" };
+    const fat = try alloc.alloc(u8, 6 * 1024);
+    @memset(fat, 'x');
+    var msgs: std.ArrayList(provider.Message) = .empty;
+    try msgs.append(alloc, .{ .role = .system, .content = text_blocks, .timestamp = 0 });
+    try msgs.append(alloc, .{ .role = .user, .content = text_blocks, .timestamp = 0 });
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const tb = try alloc.alloc(provider.ContentBlock, 1);
+        tb[0] = .{ .tool_result = .{ .tool_use_id = "t", .content = fat } };
+        try msgs.append(alloc, .{ .role = .user, .content = tb, .timestamp = 0 });
+    }
+    const split = hybridSplit(msgs.items, 5);
+    try std.testing.expect(split > 1); // 不再罢工
+    try std.testing.expect(split < msgs.items.len); // 保留窗非空
+    // 保留窗体量有界：帽 12K tokens × 3B/token = 36KB，12 条 6KB = 72KB
+    // 全量必超帽——锚点应切在尾部一段。
+    try std.testing.expect(msgs.items.len - split < 12);
 }
 
 test "toolSlimMarker carries the original byte count" {
