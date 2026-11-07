@@ -138,11 +138,21 @@ const ExtractedRelation = struct {
 /// the primary extraction path. The keyword heuristics in
 /// extractSessionMemories remain as the fallback (gateway down at exit,
 /// unparseable reply, no provider). All strings allocated with `alloc`.
+/// 从 from 起回退到 UTF-8 序列边界（不切断多字节字符）。
+fn transcriptBackoff(s: []const u8, from: usize) []const u8 {
+    var i = @min(from, s.len);
+    while (i > 0 and i < s.len and (s[i] & 0xC0) == 0x80) i -= 1;
+    return s[i..];
+}
+
 fn llmExtractSession(alloc: std.mem.Allocator, prov: llm.Provider, messages: []const llm.Message, aux_cap: u32) !LlmExtraction {
     const transcript = compaction.renderTranscript(alloc, messages) catch return error.ExtractTranscriptFailed;
     defer alloc.free(transcript);
     if (transcript.len == 0) return error.ExtractEmptyTranscript;
-    const tr = transcript[0..@min(transcript.len, 24_000)]; // bound the aux call
+    // 超长取尾部（2026-11-10：原取头部——马拉松会话的开头是最不具
+    // 记忆价值的部分；最近的对话才是「本会话学到了什么」）。UTF-8
+    // 边界回退，不切断多字节字符。
+    const tr = if (transcript.len > 24_000) transcriptBackoff(transcript, transcript.len - 24_000) else transcript;
 
     var prompt: std.ArrayList(u8) = .empty;
     defer prompt.deinit(alloc);
@@ -752,10 +762,21 @@ pub fn insightPassesGate(alloc: std.mem.Allocator, prov: llm.Provider, insight: 
     return null;
 }
 
-/// 退出期提取的兜底时限：网关慢是常态（实测 29.6s 一次），/quit 不能
-/// 无界等 LLM。超时 → 关键词启发式兜底（毫秒级），LLM 线程被放弃
-/// （随进程消亡——与后台反思同一放弃契约：泄漏优于悬垂释放）。
-pub const EXIT_EXTRACT_DEADLINE_MS: i64 = 20_000;
+/// 退出期提取的兜底时限（2026-11-10 由 20s 收紧到 8s：提取是辅助价值，
+/// 退出延迟是每次都付的成本——实测网关正常 2-5s 完成，拖过 8s 的多为
+/// 网络停顿，等满 20s 后照样降级启发式，纯浪费）。超时 → 关键词启发式
+/// 兜底（毫秒级），LLM 线程被放弃（随进程消亡——与后台反思同一放弃
+/// 契约：泄漏优于悬垂释放）。ZIV_EXIT_EXTRACT_MS 环境变量可覆盖；
+/// 0 = 完全跳过 LLM 等待（直接启发式，退出零等待）。
+pub const EXIT_EXTRACT_DEADLINE_MS: i64 = 8_000;
+
+pub fn exitExtractDeadlineMs() i64 {
+    if (env.get("ZIV_EXIT_EXTRACT_MS")) |v| {
+        const n = std.fmt.parseInt(i64, v, 10) catch return EXIT_EXTRACT_DEADLINE_MS;
+        return @max(0, n);
+    }
+    return EXIT_EXTRACT_DEADLINE_MS;
+}
 
 const ExitExtractSlot = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0), // 0=running 1=done 2=failed
@@ -838,7 +859,9 @@ pub fn extractSessionMemoriesBounded(
     th.detach();
 
     const t0 = util_time.nowMillis();
-    while (util_time.nowMillis() - t0 < deadline_ms) {
+    // ZIV_EXIT_EXTRACT_MS=0：完全不等（LLM 线程照跑但随进程放弃），
+    // 立即启发式兜底——退出零等待档。
+    while (deadline_ms > 0 and util_time.nowMillis() - t0 < deadline_ms) {
         const s = slot.state.load(.acquire);
         if (s != 0) {
             // 线程已收尾自己的 provider/io；结果字符串独立可接手。
