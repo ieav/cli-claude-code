@@ -77,16 +77,22 @@ pub const LastTools = struct {
 /// off to a UTF-8 boundary so a mid-汉字 slice can't mojibake.
 /// P3c Ctrl+O 工具输出详细/简要（默认详细=今日行为；Claude Code 同键
 /// 语义）。简要态只出前 3 行 + 折叠标记。只影响后续输出——已打印内容
-/// 终端无法回溯折叠（CC 同此限制）。
-pub var verbose_output: bool = true;
+/// 终端无法回溯折叠（CC 同此限制）。Atomic、relaxed 即可：UI 线程写、
+/// 工具线程池读，只需无撕裂，无需顺序保证（2026-11-07 审查 B 项加固）。
+pub var verbose_output = std.atomic.Value(bool).init(true);
 
 /// P4c 鼠标点击的转写侧锚点：最近一次被折叠的工具输出全文（固定缓冲，
 /// 无分配器依赖——printToolBody 本身不带 alloc）。点击转写区 → 下方
 /// 吐这份全文（行无关语义，精确无簿记；详见 2026-11-07 修订设计）。
-var last_folded_buf: [8192]u8 = undefined;
+/// 缓冲长度直接引用 LastTools.CAP——两处口径编译期绑定，不会漂移
+/// （2026-11-07 审查 A 项加固）。
+var last_folded_buf: [LastTools.CAP]u8 = undefined;
 var last_folded_len: usize = 0;
+/// 原文超 CAP 时折叠副本只存了前段——转储必须标注，否则静默丢尾。
+var last_folded_trunc: bool = false;
 
 fn noteFolded(raw: []const u8) void {
+    last_folded_trunc = raw.len > last_folded_buf.len;
     const n = @min(raw.len, last_folded_buf.len);
     @memcpy(last_folded_buf[0..n], raw[0..n]);
     last_folded_len = n;
@@ -103,12 +109,21 @@ pub fn dumpLastFolded(w: *std.Io.Writer) void {
         std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch break;
         rest = if (nl < rest.len) rest[nl + 1 ..] else "";
     }
+    // 存了没展开的（>50 行）和存的时候就截掉的（>CAP）都明示，杜绝
+    // 静默丢尾。/last 环形缓冲同 CAP，拿不到比这里更多的字节。
+    const hidden = std.mem.count(u8, rest, "\n") + @intFromBool(rest.len > 0 and rest[rest.len - 1] != '\n');
+    if (last_folded_trunc) {
+        std.Io.Writer.print(w, "  \x1b[2m…（原文超 {d} KiB，折叠副本仅存前段）\x1b[0m\n", .{LastTools.CAP / 1024}) catch {};
+    }
+    if (hidden > 0) {
+        std.Io.Writer.print(w, "  \x1b[2m… +{d} 行未展开\x1b[0m\n", .{hidden}) catch {};
+    }
     std.Io.Writer.writeAll(w, "\n") catch {};
 }
 
 pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
     const max_lines: usize = 50;
-    if (!verbose_output) {
+    if (!verbose_output.load(.monotonic)) {
         // Brief mode: first 3 lines + fold marker (long single lines fold
         // by bytes instead).
         var it = std.mem.splitScalar(u8, raw[0..@min(raw.len, LastTools.CAP)], '\n');
@@ -187,6 +202,37 @@ test "LastTools: ring order and wrap" {
     try std.testing.expectEqual(@as(usize, LastTools.N), LastTools.count);
     try std.testing.expectEqualStrings("x", LastTools.get(1).?.output);
     try std.testing.expect(LastTools.get(LastTools.N + 1) == null);
+}
+
+test "noteFolded/dumpLastFolded: byte-cap and line-cap truncation are marked" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    // Case 1: raw past CAP — capture keeps the head, dump must say so.
+    const big = try std.testing.allocator.alloc(u8, LastTools.CAP + 64);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x'); // single huge line: no line-based marker expected
+    noteFolded(big);
+    try std.testing.expect(last_folded_trunc);
+    dumpLastFolded(&aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "仅存前段") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "未展开") == null);
+
+    // Case 2: within CAP but past the dump's 50 lines — count the hidden tail.
+    aw.clearRetainingCapacity();
+    var many: std.ArrayListUnmanaged(u8) = .empty;
+    defer many.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 55) : (i += 1) {
+        try many.print(std.testing.allocator, "l{d}\n", .{i});
+    }
+    noteFolded(many.items);
+    try std.testing.expect(!last_folded_trunc);
+    dumpLastFolded(&aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "l49\n") != null); // 50th shown
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "l50\n") == null); // 51st not
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "+5 行未展开") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "仅存前段") == null);
 }
 
 /// Phase 2 tail: print the outcome, truncate oversized output, record in the

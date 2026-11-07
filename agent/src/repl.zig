@@ -112,10 +112,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     defer tty_guard.restore();
     lineinput.setSessionGuard(&tty_guard);
     // P3c: Ctrl+O toggles tool-output verbosity (prompt AND mid-turn).
+    // P4c: click in the transcript area dumps the newest folded tool body.
+    lineinput.on_transcript_click = turn_tools.dumpLastFolded;
     lineinput.on_verbose_toggle = struct {
         fn cb() []const u8 {
-            turn_tools.verbose_output = !turn_tools.verbose_output;
-            return if (turn_tools.verbose_output)
+            const next = !turn_tools.verbose_output.load(.monotonic);
+            turn_tools.verbose_output.store(next, .monotonic);
+            return if (next)
                 "\x1b[2m[工具输出: 详细（Ctrl+O 切简要）]\x1b[0m"
             else
                 "\x1b[2m[工具输出: 简要——长输出只出前 3 行（Ctrl+O 切详细）]\x1b[0m";
