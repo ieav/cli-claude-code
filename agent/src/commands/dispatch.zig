@@ -108,7 +108,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // used to lose the whole session's learnings.
             if (ctx.mem_sys.*) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemories(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.switcher.getProvider() catch null, ctx.switcher.settings.max_tokens) catch {};
+                memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.EXIT_EXTRACT_DEADLINE_MS);
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (ctx.mem_sys.* != null and ctx.window_queries.items.len > 0) {
@@ -383,7 +383,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // used to lose the whole session's learnings.
             if (ctx.mem_sys.*) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemories(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.switcher.getProvider() catch null, ctx.switcher.settings.max_tokens) catch {};
+                memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.EXIT_EXTRACT_DEADLINE_MS);
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (ctx.mem_sys.* != null and ctx.window_queries.items.len > 0) {

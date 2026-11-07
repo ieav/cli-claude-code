@@ -244,14 +244,15 @@ fn parseExtractionReply(alloc: std.mem.Allocator, reply: []const u8) !LlmExtract
     return out;
 }
 
-pub fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), bus: ?*task_mod.EventBus, w: *std.Io.Writer, prov: ?llm.Provider, aux_cap: u32) !void {
-    // ── Primary path: one aux LLM call for structured facts + graph. ──
-    if (prov) |p| {
-        if (llmExtractSession(mem.allocator, p, history.items, aux_cap)) |out_captured| {
-            var out = out_captured; // mutable copy: deinit needs *Self
-            defer out.deinit(mem.allocator);
-            logger.info("llm extraction parsed: {d} facts, {d} entities, {d} relations", .{ out.facts.items.len, out.entities.items.len, out.relations.items.len });
-            var stored: usize = 0;
+/// Store an LLM extraction (facts + graph). Split out so the bounded
+/// exit path can run the LLM call off-thread and apply on the main thread
+/// (sqlite is THREADSAFE=0 — DB writes never leave main).
+fn applyLlmExtraction(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, bus: ?*task_mod.EventBus, w: *std.Io.Writer, out_in: LlmExtraction) !void {
+    {
+        var out = out_in; // mutable copy: deinit needs *Self
+        defer out.deinit(mem.allocator);
+        logger.info("llm extraction parsed: {d} facts, {d} entities, {d} relations", .{ out.facts.items.len, out.entities.items.len, out.relations.items.len });
+        var stored: usize = 0;
             for (out.facts.items) |f| {
                 const now = util_time.nowMillis();
                 mem.store(.{
@@ -279,11 +280,18 @@ pub fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_gra
                     g.addEdge(fid, tid, r.relation, 1.0) catch {};
                 }
             }
-            if (stored > 0) {
-                try w.print("  Saved {d} memories (LLM extraction; {d} entities, {d} relations).\n", .{ stored, out.entities.items.len, out.relations.items.len });
-                if (bus) |b| b.emit(.{ .memory_updated = .{ .stored = @intCast(@min(stored, 255)) } });
-            }
-            return;
+        if (stored > 0) {
+            try w.print("  Saved {d} memories (LLM extraction; {d} entities, {d} relations).\n", .{ stored, out.entities.items.len, out.relations.items.len });
+            if (bus) |b| b.emit(.{ .memory_updated = .{ .stored = @intCast(@min(stored, 255)) } });
+        }
+    }
+}
+
+pub fn extractSessionMemories(mem: *memory_mod.MemorySystem, kg: ?*knowledge_graph.KnowledgeGraph, history: *std.ArrayList(llm.Message), bus: ?*task_mod.EventBus, w: *std.Io.Writer, prov: ?llm.Provider, aux_cap: u32) !void {
+    // ── Primary path: one aux LLM call for structured facts + graph. ──
+    if (prov) |p| {
+        if (llmExtractSession(mem.allocator, p, history.items, aux_cap)) |out_captured| {
+            return applyLlmExtraction(mem, kg, bus, w, out_captured);
         } else |_| {
             logger.info("llm extraction unavailable; falling back to keyword heuristics", .{});
         }
@@ -742,6 +750,107 @@ pub fn insightPassesGate(alloc: std.mem.Allocator, prov: llm.Provider, insight: 
         return parseInsightVerdict(b.text);
     }
     return null;
+}
+
+/// 退出期提取的兜底时限：网关慢是常态（实测 29.6s 一次），/quit 不能
+/// 无界等 LLM。超时 → 关键词启发式兜底（毫秒级），LLM 线程被放弃
+/// （随进程消亡——与后台反思同一放弃契约：泄漏优于悬垂释放）。
+pub const EXIT_EXTRACT_DEADLINE_MS: i64 = 20_000;
+
+const ExitExtractSlot = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0), // 0=running 1=done 2=failed
+    cfg: ?BackgroundLlmConfig = null,
+    history: []const llm.Message = &.{},
+    out: ?LlmExtraction = null,
+    alloc: std.mem.Allocator,
+    aux_cap: u32 = 0,
+};
+
+/// LLM 提取跑在分离线程：自建 io + 自建 provider（被放弃的线程绝不碰
+/// 活对象——同 reflectWorker 的生命周期契约），结果字符串由 slot.alloc
+/// 单独持有，与 provider/io 生命周期无关，主线程可安全接手。
+fn exitExtractWorker(slot: *ExitExtractSlot) void {
+    var io_state = std.Io.Threaded.init(slot.alloc, .{});
+    defer io_state.deinit();
+    var storage: BgProviderStorage = undefined;
+    const c = slot.cfg.?;
+    const prov = makeBackgroundProviderInto(slot.alloc, io_state.io(), c.backend, c.model, c.api_key, c.base_url, c.ollama_host, &storage) orelse {
+        slot.state.store(2, .release);
+        return;
+    };
+    defer prov.deinit();
+    if (llmExtractSession(slot.alloc, prov, slot.history, slot.aux_cap)) |out| {
+        slot.out = out;
+        slot.state.store(1, .release);
+    } else |_| {
+        slot.state.store(2, .release);
+    }
+}
+
+/// 有界退出提取：主线程等 ≤ deadline——LLM 完成 → 主线程落库（sqlite
+/// THREADSAFE=0，DB 写永不出主线程）；超时/失败 → 关键词启发式兜底。
+/// cfg 所有权移入 slot：成功/失败由主线程 deinit，超时随进程泄漏。
+pub fn extractSessionMemoriesBounded(
+    mem: *memory_mod.MemorySystem,
+    kg: ?*knowledge_graph.KnowledgeGraph,
+    history: *std.ArrayList(llm.Message),
+    bus: ?*task_mod.EventBus,
+    w: *std.Io.Writer,
+    file_writer: ?*std.Io.File.Writer,
+    alloc: std.mem.Allocator,
+    cfg: ?BackgroundLlmConfig,
+    aux_cap: u32,
+    deadline_ms: i64,
+) void {
+    const c = cfg orelse {
+        extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
+        return;
+    };
+    std.Io.Writer.print(w, "  [正在提取本会话记忆…（≤{d}s，网关慢时自动降级为关键词提取）]\n", .{@divTrunc(deadline_ms, 1000)}) catch {};
+    if (file_writer) |fw| std.Io.File.Writer.flush(fw) catch {};
+
+    const slot = alloc.create(ExitExtractSlot) catch {
+        var cc = c;
+        cc.deinit(alloc);
+        extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
+        return;
+    };
+    slot.* = .{ .cfg = c, .history = history.items, .alloc = alloc, .aux_cap = aux_cap };
+    const th = std.Thread.spawn(.{}, exitExtractWorker, .{slot}) catch {
+        // 罕见（OOM）：不等了，启发式兜底；slot.cfg 由本线程收尾。
+        if (slot.cfg) |cc| {
+            var c2 = cc;
+            c2.deinit(alloc);
+        }
+        alloc.destroy(slot);
+        extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
+        return;
+    };
+    th.detach();
+
+    const t0 = util_time.nowMillis();
+    while (util_time.nowMillis() - t0 < deadline_ms) {
+        const s = slot.state.load(.acquire);
+        if (s != 0) {
+            // 线程已收尾自己的 provider/io；结果字符串独立可接手。
+            if (s == 1) {
+                applyLlmExtraction(mem, kg, bus, w, slot.out.?) catch {};
+            } else {
+                extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
+            }
+            if (slot.cfg) |cc| {
+                var c2 = cc;
+                c2.deinit(alloc);
+            }
+            alloc.destroy(slot);
+            return;
+        }
+        util_time.sleepMs(100);
+    }
+    // 超时：放弃线程（cfg/slot 随进程泄漏——进程即将退出，释放反而悬垂）。
+    std.Io.Writer.print(w, "  [提取超时 — 已降级为关键词启发式，慢网关的部分放弃]\n", .{}) catch {};
+    if (file_writer) |fw| std.Io.File.Writer.flush(fw) catch {};
+    extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
 }
 
 const ReflectOutcome = struct {

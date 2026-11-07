@@ -607,7 +607,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Extract first, reflect last — see the /quit path note.
             if (mem_sys) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, switcher.getProvider() catch null, switcher.settings.max_tokens) catch {};
+                memory_ops.extractSessionMemoriesBounded(ms, if (kgraph) |*g| g else null, &history, &evbus, w, &file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, &switcher), switcher.settings.max_tokens, memory_ops.EXIT_EXTRACT_DEADLINE_MS);
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {

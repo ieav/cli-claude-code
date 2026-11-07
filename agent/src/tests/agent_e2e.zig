@@ -472,3 +472,85 @@ test "P5 quality gate: mock curator says no → misdiagnosis never stored" {
 test "P5 quality gate: mock curator says yes → insight stored" {
     try runReflectionWithMockGate(.gate_yes, true);
 }
+
+// ── P2.6 bounded exit extraction E2E ─────────────────────────────────
+
+test "bounded exit extraction: stalled gateway falls back within deadline" {
+    const alloc = std.heap.smp_allocator;
+    var server = MockServer{ .mode = .stall };
+    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
+    th.detach();
+    const port = try waitReady(&server);
+    defer server.running.store(false, .release);
+
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const memory_ops = @import("../session/memory_ops.zig");
+    const memory_mod = @import("../memory/mod.zig");
+    const model_switcher = @import("../session/model_switcher.zig");
+    const config_mod = @import("../config.zig");
+    const llm = @import("../llm/mod.zig");
+    const fs_ops = @import("../util/fs_ops.zig");
+    const database_mod = @import("../storage/database.zig");
+    const time_mod2 = @import("../util/time.zig");
+
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&pbuf, "/tmp/ziv_bex_{d}.db", .{time_mod2.nowMillis()});
+    defer _ = fs_ops.deleteFile(db_path);
+    var db = try database_mod.Database.init(alloc, db_path);
+    defer db.deinit();
+    try db.runMigrations();
+    var mem = memory_mod.MemorySystem.init(alloc, &db);
+    defer mem.deinit();
+
+    var settings = config_mod.Settings{};
+    settings.default_model = "gpt-mock-e2e";
+    settings.api_keys.openai = "test-key";
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{port});
+    var switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer switcher.deinit();
+
+    // Keyword-rich history: the heuristic fallback must find the 决定-line.
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| {
+            for (m.content) |b| switch (b) {
+                .text => |t| alloc.free(t),
+                else => {},
+            };
+            alloc.free(@constCast(m.content));
+        }
+        history.deinit(alloc);
+    }
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = b, .timestamp = 0 });
+        const b2 = try alloc.alloc(llm.ContentBlock, 1);
+        b2[0] = .{ .text = try alloc.dupe(u8, "我们决定使用 sqlite WAL 模式，数据库文件是 /data/app.db，不要改成 delete 模式") };
+        try history.append(alloc, .{ .role = .user, .content = b2, .timestamp = 1 });
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const cfg = memory_ops.backgroundLlmConfig(alloc, &switcher);
+    const t0 = time_mod2.nowMillis();
+    memory_ops.extractSessionMemoriesBounded(&mem, null, &history, null, &aw.writer, null, alloc, cfg, 16384, 1500);
+    const elapsed = time_mod2.nowMillis() - t0;
+
+    // The whole call must land just past the 1.5s deadline (+heuristic run),
+    // nowhere near the stalled gateway's forever.
+    try std.testing.expect(elapsed < 5_000);
+    try std.testing.expect(elapsed >= 1_400);
+    // Heuristic fallback stored the decision fact.
+    const ents = try mem.episodic_mem.retrieveRecent(5);
+    defer mem.episodic_mem.freeEntries(ents);
+    try std.testing.expect(ents.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, ents[0].content, "WAL") != null or std.mem.indexOf(u8, ents[0].content, "决定") != null);
+    // The user-visible notice landed.
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "正在提取本会话记忆") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "降级") != null);
+    alloc.free(settings.api_keys.openai_base_url.?);
+}
