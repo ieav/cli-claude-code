@@ -289,8 +289,12 @@ pub fn isTty() bool {
     return std.c.isatty(0) == 1 and std.c.isatty(1) == 1;
 }
 
-/// Read one line of text (cooked mode restored first) — for entering values
-/// after a menu selection.
+/// Read one line of text — for entering values after a menu selection.
+/// Runs in SESSION-RAW no-echo mode, so it owns its own minimal line
+/// editing: echo each printable byte, backspace edits, Esc/Ctrl-C cancel
+/// (empty return = every caller's "no change, back to menu" path), escape
+/// sequences swallowed, other control bytes dropped. Invariant: only
+/// printable bytes ever enter the value buffer.
 pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, prompt: []const u8, buf: []u8) ![]const u8 {
     try w.print("{s}", .{prompt});
     try std.Io.File.Writer.flush(file_writer);
@@ -312,6 +316,8 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
                 const a2 = r.peekGreedy(1) catch break;
                 if (a2.len > 0 and a2[0] == '\n') r.toss(1);
             }
+            std.Io.Writer.writeAll(w, "\n") catch {};
+            std.Io.File.Writer.flush(file_writer) catch {};
             break;
         }
         if (c == 0x1b) {
@@ -321,9 +327,32 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
             std.Io.File.Writer.flush(file_writer) catch {};
             return buf[0..0];
         }
+        if (c == 0x7f or c == 0x08) { // backspace: edit, never data
+            r.toss(1);
+            if (n > 0) {
+                n -= 1;
+                std.Io.Writer.writeAll(w, "\x08 \x08") catch {};
+                std.Io.File.Writer.flush(file_writer) catch {};
+            }
+            continue;
+        }
+        if (c == 0x03) { // Ctrl-C in session-raw (ISIG off): cancel, not data
+            r.toss(1);
+            std.Io.Writer.writeAll(w, "\n  [已取消]\n") catch {};
+            std.Io.File.Writer.flush(file_writer) catch {};
+            return buf[0..0];
+        }
+        if (c < 0x20) { // other control bytes (Tab etc.) never enter the value
+            r.toss(1);
+            continue;
+        }
         if (n < buf.len) {
             buf[n] = c;
             n += 1;
+            // Echo: this read runs in session-raw NO-ECHO mode — without
+            // it the user types blind (same defect family as the Esc hole).
+            std.Io.Writer.print(w, "{c}", .{c}) catch {};
+            std.Io.File.Writer.flush(file_writer) catch {};
         }
         r.toss(1);
     }
@@ -402,6 +431,21 @@ test "readLine: lone Esc cancels, escape sequences are swallowed" {
     var b4: [16]u8 = undefined;
     const v4 = try readLine(&r4, &aw.writer, &fw, "> ", &b4);
     try std.testing.expectEqualStrings("8", v4);
+
+    // Backspace edits (never data); Tab dropped; typed chars echoed.
+    // "19"⌫ → "1"; Tab dropped; "2"⌫ → "1"; "8" → "18".
+    aw.clearRetainingCapacity();
+    var r5 = std.Io.Reader.fixed("19\x7f\t2\x088\r");
+    var b5: [16]u8 = undefined;
+    const v5 = try readLine(&r5, &aw.writer, &fw, "> ", &b5);
+    try std.testing.expectEqualStrings("18", v5);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x08 \x08") != null);
+    // Ctrl-C in session-raw (ISIG off) cancels like Esc.
+    aw.clearRetainingCapacity();
+    var r6 = std.Io.Reader.fixed("12\x03");
+    var b6: [16]u8 = undefined;
+    const v6 = try readLine(&r6, &aw.writer, &fw, "> ", &b6);
+    try std.testing.expectEqual(@as(usize, 0), v6.len);
 }
 
 test "parseKey mappings" {
