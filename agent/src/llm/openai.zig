@@ -549,6 +549,7 @@ pub const OpenAIProvider = struct {
             break :blk .{
                 .input_tokens = @intCast(pt.?.integer),
                 .output_tokens = @intCast(ct.?.integer),
+                .cached_tokens = cachedOf(u),
             };
         } else .{ .input_tokens = 0, .output_tokens = 0 };
 
@@ -558,6 +559,15 @@ pub const OpenAIProvider = struct {
             .stop_reason = stop_reason,
             .dom_arena = arena,
         };
+    }
+
+    /// prompt_tokens_details.cached_tokens（M3.1 观测）。缺失/畸形一律 0。
+    fn cachedOf(u: std.json.Value) u32 {
+        const d = u.object.get("prompt_tokens_details") orelse return 0;
+        if (d != .object) return 0;
+        const c = d.object.get("cached_tokens") orelse return 0;
+        if (c != .integer or c.integer < 0) return 0;
+        return @intCast(c.integer);
     }
 
     /// Accumulates streamed tool_calls fragments (the name arrives in the
@@ -644,6 +654,7 @@ pub const OpenAIProvider = struct {
                         self.usage = .{
                             .input_tokens = @intCast(pt.?.integer),
                             .output_tokens = @intCast(ct.?.integer),
+                            .cached_tokens = cachedOf(u),
                         };
                     }
                 }

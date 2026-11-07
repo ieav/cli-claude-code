@@ -96,6 +96,10 @@ pub const CompleteResponse = struct {
 pub const Usage = struct {
     input_tokens: u32,
     output_tokens: u32,
+    /// 网关前缀缓存命中（OpenAI 兼容 `prompt_tokens_details.cached_tokens`；
+    /// 0 = 未命中/网关不报）。M3.1 观测：/stats 显示命中率，前缀稳定性
+    /// 调优的效果由此可判。
+    cached_tokens: u32 = 0,
 };
 
 /// A streaming event delivered through StreamCallback.

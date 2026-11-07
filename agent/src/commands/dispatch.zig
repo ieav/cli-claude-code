@@ -84,6 +84,7 @@ pub const ReplCtx = struct {
     plan_raw_last: *?[]u8,
     total_input_tokens: *u64,
     total_output_tokens: *u64,
+    total_cached_tokens: *u64,
     live_trace: *?decision_trace.DecisionTrace,
     reflector: *reflection_mod.ReflectionEngine,
     reg: *runtime_registry.RuntimeRegistry,
@@ -601,6 +602,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             try std.Io.Writer.print(ctx.w, "  Code context: {d} snippets (last turn, from .ziv/index.db)\n", .{session_store_mod_code.last_injected});
             // P5 T3.3 前缀稳定代理指标：压缩触发越少，网关前缀缓存越稳。
             try std.Io.Writer.print(ctx.w, "  Compaction: {d} passes, ~{d} tokens reclaimed (onset 75%)\n", .{ turn_history.compacts_done, turn_history.tokens_reclaimed });
+            // M3.1 直接指标：网关前缀缓存命中率（网关不报则恒 0%）。
+            if (ctx.total_input_tokens.* > 0) {
+                const hit_pct = ctx.total_cached_tokens.* * 100 / ctx.total_input_tokens.*;
+                try std.Io.Writer.print(ctx.w, "  Cache: {d}/{d} tokens hit ({d}%) — prefix caching\n", .{ ctx.total_cached_tokens.*, ctx.total_input_tokens.*, hit_pct });
+            }
             try std.Io.Writer.print(ctx.w, "  Mode: {s} | Model: {s} ({s}) | Tier: {s}\n", .{
                 auth.modeLabel(ctx.current_mode.*),
                 ctx.switcher.modelName(),

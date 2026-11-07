@@ -399,6 +399,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
     // Session token tracking
     var total_input_tokens: u64 = 0;
+    var total_cached_tokens: u64 = 0; // M3.1：网关前缀缓存命中累计（/stats）
     var total_output_tokens: u64 = 0;
 
     // ──── Reflection window (M4: periodic self-review) ────
@@ -676,6 +677,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .plan_raw_last = &plan_raw_last,
         .total_input_tokens = &total_input_tokens,
         .total_output_tokens = &total_output_tokens,
+        .total_cached_tokens = &total_cached_tokens,
         .live_trace = &live_trace,
         .reflector = &reflector,
         .reg = &reg,
@@ -1152,6 +1154,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // count them before it falls out of the totals.
                     total_input_tokens += response.usage.input_tokens;
                     total_output_tokens += response.usage.output_tokens;
+                    total_cached_tokens += response.usage.cached_tokens;
                     turn_in += response.usage.input_tokens;
                     turn_out += response.usage.output_tokens;
                     response = next;
@@ -1180,6 +1183,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // (surfaced once, in the frozen turn-end status row).
             total_input_tokens += response.usage.input_tokens;
             total_output_tokens += response.usage.output_tokens;
+            total_cached_tokens += response.usage.cached_tokens; // M3.1：前缀缓存命中
             turn_in += response.usage.input_tokens;
             turn_out += response.usage.output_tokens;
             // Timing 口径: one window per generation, llm_t0 → accepted
