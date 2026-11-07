@@ -159,6 +159,10 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     if (fork) {
         if (ctx.history) |h| inherited = forkTail(h.items, FORK_TOKEN_CAP);
     }
+    // 审查 B 项：白名单切片本体在 merge 后释放（字符串借用自输入 DOM，
+    // 只释放数组）。放 defer 保证所有 return 路径都覆盖——workers 在
+    // mergeJobs 返回前全部 join，此刻无并发读者。
+    defer if (allowed) |a| alloc.free(a);
 
     const jobs = try alloc.create([MAX_SUBAGENTS]AgentJob);
     var i: usize = 0;

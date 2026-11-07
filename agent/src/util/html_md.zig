@@ -122,9 +122,37 @@ pub fn convert(alloc: std.mem.Allocator, html: []const u8) ![]u8 {
     // 压掉 3+ 连续换行为 2；去首尾空白。
     try collapseNewlines(alloc, &out);
     const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
-    const result = try alloc.dupe(u8, trimmed);
+    // 非 UTF-8 页面（GBK/GB2312 等）防御：无效序列替换 U+FFFD——
+    // tool_result 会进请求 JSON，无效 UTF-8 被网关 400（审查 A 项）。
+    const result = if (std.unicode.utf8ValidateSlice(trimmed))
+        try alloc.dupe(u8, trimmed)
+    else
+        try sanitizeUtf8(alloc, trimmed);
     out.deinit(alloc);
     return result;
+}
+
+/// 逐码点走查：合法序列照抄，非法字节替换 U+FFFD（EF BF BD）。
+/// 每个非法字节前进 1——GBK 的每字节独立替换，不产生新的拼接错读。
+fn sanitizeUtf8(alloc: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < src.len) {
+        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch {
+            try out.appendSlice(alloc, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        };
+        if (i + len <= src.len and (std.unicode.utf8Decode(src[i .. i + len]) catch null) != null) {
+            try out.appendSlice(alloc, src[i .. i + len]);
+            i += len;
+        } else {
+            try out.appendSlice(alloc, "\xEF\xBF\xBD");
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 fn eqAny(name: []const u8, comptime a: []const u8, comptime b: []const u8) bool {
@@ -280,6 +308,19 @@ test "convert: table rows as pipe lines; img alt; malformed literal" {
     try std.testing.expect(std.mem.indexOf(u8, md, "a | b") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "[图: diagram]") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "unclosed bold") != null);
+}
+
+test "convert: non-UTF8 page sanitized to U+FFFD, output always valid (审查A)" {
+    const a = std.testing.allocator;
+    // GBK 的「中文」= D6 D0 CE C4——四字节全非法 UTF-8 序列头。
+    const md = try convert(a, "<p>GBK:\xD6\xD0\xCE\xC4 end</p>");
+    defer a.free(md);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(md));
+    try std.testing.expect(std.mem.indexOf(u8, md, "GBK:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, " end") != null);
+    // 四个非法字节 → 恰好四个替换符。
+    const fffd = std.mem.count(u8, md, "\xEF\xBF\xBD");
+    try std.testing.expectEqual(@as(usize, 4), fffd);
 }
 
 test "convert: empty and tag-only input" {
