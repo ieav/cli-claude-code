@@ -235,7 +235,7 @@ fn render(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: 
             try w.print("    {s}\n", .{item});
         }
     }
-    try w.writeAll("  ↑↓/jk 移动 · Enter 确认 · Esc 取消\n");
+    try w.writeAll("  ↑↓/jk 移动 · 1-9 直达 · Enter 确认 · Esc 取消\n");
 }
 
 /// Show an interactive menu. Returns the selected index, or null on cancel.
@@ -292,10 +292,11 @@ pub fn isTty() bool {
 /// Read one line of text — for entering values after a menu selection.
 /// Runs in SESSION-RAW no-echo mode, so it owns its own minimal line
 /// editing: echo each printable byte, backspace edits, Esc/Ctrl-C cancel
-/// (empty return = every caller's "no change, back to menu" path), escape
+/// (returns null — distinct from the empty-but-submitted Enter so a
+/// multi-field edit session can abort WHOLE on the first field), escape
 /// sequences swallowed, other control bytes dropped. Invariant: only
 /// printable bytes ever enter the value buffer.
-pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, prompt: []const u8, buf: []u8) ![]const u8 {
+pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, prompt: []const u8, buf: []u8) !?[]const u8 {
     try w.print("{s}", .{prompt});
     try std.Io.File.Writer.flush(file_writer);
     // CR or LF both end a line (RawGuard disables ICRNL, so a terminal
@@ -330,7 +331,7 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
             if (escTailIsSequence(r)) continue; // arrow/mouse bytes eaten
             std.Io.Writer.writeAll(w, "\n  [已取消]\n") catch {};
             std.Io.File.Writer.flush(file_writer) catch {};
-            return buf[0..0];
+            return null;
         }
         if (c == 0x7f or c == 0x08) { // backspace: edit, never data
             r.toss(1);
@@ -345,7 +346,7 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
             r.toss(1);
             std.Io.Writer.writeAll(w, "\n  [已取消]\n") catch {};
             std.Io.File.Writer.flush(file_writer) catch {};
-            return buf[0..0];
+            return null;
         }
         if (c < 0x20) { // other control bytes (Tab etc.) never enter the value
             r.toss(1);
@@ -410,47 +411,41 @@ test "readLine: lone Esc cancels, escape sequences are swallowed" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    // Lone Esc with nothing typed → cancel (empty result).
+    // Lone Esc with nothing typed → cancel (null).
     var r1 = std.Io.Reader.fixed("\x1b");
     var b1: [16]u8 = undefined;
-    const v1 = try readLine(&r1, &aw.writer, &fw, "> ", &b1);
-    try std.testing.expectEqual(@as(usize, 0), v1.len);
+    try std.testing.expect((try readLine(&r1, &aw.writer, &fw, "> ", &b1)) == null);
 
     // Partial input then Esc → cancel discards the partial text.
     aw.clearRetainingCapacity();
     var r2 = std.Io.Reader.fixed("81\x1b");
     var b2: [16]u8 = undefined;
-    const v2 = try readLine(&r2, &aw.writer, &fw, "> ", &b2);
-    try std.testing.expectEqual(@as(usize, 0), v2.len);
+    try std.testing.expect((try readLine(&r2, &aw.writer, &fw, "> ", &b2)) == null);
 
     // Arrow key mid-typing: sequence swallowed, digits kept.
     aw.clearRetainingCapacity();
     var r3 = std.Io.Reader.fixed("1\x1b[D2\r");
     var b3: [16]u8 = undefined;
-    const v3 = try readLine(&r3, &aw.writer, &fw, "> ", &b3);
-    try std.testing.expectEqualStrings("12", v3);
+    try std.testing.expectEqualStrings("12", (try readLine(&r3, &aw.writer, &fw, "> ", &b3)).?);
 
     // SGR mouse click injection: whole sequence eaten, value intact.
     aw.clearRetainingCapacity();
     var r4 = std.Io.Reader.fixed("\x1b[<0;5;7M8\r");
     var b4: [16]u8 = undefined;
-    const v4 = try readLine(&r4, &aw.writer, &fw, "> ", &b4);
-    try std.testing.expectEqualStrings("8", v4);
+    try std.testing.expectEqualStrings("8", (try readLine(&r4, &aw.writer, &fw, "> ", &b4)).?);
 
     // Backspace edits (never data); Tab dropped; typed chars echoed.
     // "19"⌫ → "1"; Tab dropped; "2"⌫ → "1"; "8" → "18".
     aw.clearRetainingCapacity();
     var r5 = std.Io.Reader.fixed("19\x7f\t2\x088\r");
     var b5: [16]u8 = undefined;
-    const v5 = try readLine(&r5, &aw.writer, &fw, "> ", &b5);
-    try std.testing.expectEqualStrings("18", v5);
+    try std.testing.expectEqualStrings("18", (try readLine(&r5, &aw.writer, &fw, "> ", &b5)).?);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x08 \x08") != null);
     // Ctrl-C in session-raw (ISIG off) cancels like Esc.
     aw.clearRetainingCapacity();
     var r6 = std.Io.Reader.fixed("12\x03");
     var b6: [16]u8 = undefined;
-    const v6 = try readLine(&r6, &aw.writer, &fw, "> ", &b6);
-    try std.testing.expectEqual(@as(usize, 0), v6.len);
+    try std.testing.expect((try readLine(&r6, &aw.writer, &fw, "> ", &b6)) == null);
 
     // CR terminates immediately (a lone CR must not wait for a follow-up
     // byte — on a live TTY that wait never ends, D1); CRLF when both bytes
@@ -459,15 +454,15 @@ test "readLine: lone Esc cancels, escape sequences are swallowed" {
     aw.clearRetainingCapacity();
     var r7 = std.Io.Reader.fixed("ab\r");
     var b7: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("ab", try readLine(&r7, &aw.writer, &fw, "> ", &b7));
+    try std.testing.expectEqualStrings("ab", (try readLine(&r7, &aw.writer, &fw, "> ", &b7)).?);
     aw.clearRetainingCapacity();
     var r8 = std.Io.Reader.fixed("cd\r\n");
     var b8: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("cd", try readLine(&r8, &aw.writer, &fw, "> ", &b8));
+    try std.testing.expectEqualStrings("cd", (try readLine(&r8, &aw.writer, &fw, "> ", &b8)).?);
     aw.clearRetainingCapacity();
     var r9 = std.Io.Reader.fixed("ef\r9");
     var b9: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("ef", try readLine(&r9, &aw.writer, &fw, "> ", &b9));
+    try std.testing.expectEqualStrings("ef", (try readLine(&r9, &aw.writer, &fw, "> ", &b9)).?);
 }
 
 test "parseKey mappings" {

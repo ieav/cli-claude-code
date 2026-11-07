@@ -70,7 +70,7 @@ pub fn runConfigMenu(
             1 => try configPickModel(w, r, file_writer, switcher, alloc, io),
             2 => {
                 var vbuf: [32]u8 = undefined;
-                const val = menu.readLine(r, w, file_writer, "  最大 tokens (1-128000): ", &vbuf) catch continue;
+                const val = (menu.readLine(r, w, file_writer, "  最大 tokens (1-128000): ", &vbuf) catch continue) orelse continue;
                 if (val.len == 0) continue;
                 const mt = std.fmt.parseInt(u32, val, 10) catch {
                     try std.Io.Writer.writeAll(w, "  无效数字\n");
@@ -83,7 +83,7 @@ pub fn runConfigMenu(
             },
             3 => {
                 var mbbuf: [32]u8 = undefined;
-                const mval = menu.readLine(r, w, file_writer, "  记忆注入预算 tokens (200-8000): ", &mbbuf) catch continue;
+                const mval = (menu.readLine(r, w, file_writer, "  记忆注入预算 tokens (200-8000): ", &mbbuf) catch continue) orelse continue;
                 if (mval.len == 0) continue;
                 const mbt = std.fmt.parseInt(u32, mval, 10) catch {
                     try std.Io.Writer.writeAll(w, "  无效数字\n");
@@ -96,7 +96,7 @@ pub fn runConfigMenu(
             },
             4 => {
                 var scbuf: [32]u8 = undefined;
-                const sval = menu.readLine(r, w, file_writer, "  子代理并发数 (1-8，1=串行): ", &scbuf) catch continue;
+                const sval = (menu.readLine(r, w, file_writer, "  子代理并发数 (1-8，1=串行): ", &scbuf) catch continue) orelse continue;
                 if (sval.len == 0) continue;
                 const sc = std.fmt.parseInt(u32, sval, 10) catch {
                     try std.Io.Writer.writeAll(w, "  无效数字\n");
@@ -123,7 +123,7 @@ pub fn runConfigMenu(
                 const sp = (menu.select(w, r, file_writer, "系统提示词:", &sp_items, 0) catch continue) orelse continue;
                 if (sp == 0) {
                     var pbuf: [4096]u8 = undefined;
-                    const pval = menu.readLine(r, w, file_writer, "  提示词内容: ", &pbuf) catch continue;
+                    const pval = (menu.readLine(r, w, file_writer, "  提示词内容: ", &pbuf) catch continue) orelse continue;
                     if (pval.len > 0) {
                         switcher.settings.system_prompt = try alloc.dupe(u8, pval);
                         autoSaveSettings(w, file_writer, switcher, alloc, io);
@@ -140,7 +140,7 @@ pub fn runConfigMenu(
             },
             9 => {
                 var lbuf: [32]u8 = undefined;
-                const lval = menu.readLine(r, w, file_writer, "  回合工具轮上限 (1-200，50=默认，200=最宽): ", &lbuf) catch continue;
+                const lval = (menu.readLine(r, w, file_writer, "  回合工具轮上限 (1-200，50=默认，200=最宽): ", &lbuf) catch continue) orelse continue;
                 if (lval.len == 0) continue;
                 const lv = std.fmt.parseInt(u32, lval, 10) catch {
                     try std.Io.Writer.writeAll(w, "  无效数字\n");
@@ -177,7 +177,7 @@ fn promptCustomModel(
     alloc: std.mem.Allocator,
 ) !?[]const u8 {
     var vbuf: [128]u8 = undefined;
-    const val = menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return null;
+    const val = (menu.readLine(r, w, file_writer, "  模型名（如 glm-4.6 / deepseek-v3）: ", &vbuf) catch return null) orelse return null;
     if (val.len == 0) return null;
     // vbuf is a stack buffer — dupe BEFORE any further calls, otherwise the
     // returned slice dangles (first bytes got clobbered: "glm-5.3" -> " lm-5.3").
@@ -407,7 +407,7 @@ fn runApiKeysMenu(
                 var kbuf: [256]u8 = undefined;
                 var kp: [96]u8 = undefined;
                 const key_prompt = try_std_fmt(&kp, "  API Key（当前 {s}）: ", .{if (cur_key) |k| maskKey(k) else "(未配置)"});
-                const key = menu.readLine(r, w, file_writer, key_prompt, &kbuf) catch continue;
+                const key = (menu.readLine(r, w, file_writer, key_prompt, &kbuf) catch continue) orelse continue; // Esc=取消整个编辑
                 // Guard: typing menu-ish escape hatches ("q", "/quit") at the
                 // value prompt used to store them AS the key — producing
                 // confusing 401s on the next LLM call.
@@ -418,7 +418,7 @@ fn runApiKeysMenu(
                 var ubuf: [256]u8 = undefined;
                 var up: [160]u8 = undefined;
                 const url_prompt = try_std_fmt(&up, "  Base URL（当前 {s}，-=恢复官方）: ", .{cur_url orelse "官方默认"});
-                const url = menu.readLine(r, w, file_writer, url_prompt, &ubuf) catch continue;
+                const url = (menu.readLine(r, w, file_writer, url_prompt, &ubuf) catch continue) orelse continue; // Esc=取消，零写入
 
                 // 应用唯一规则（P1）。两字段都直接回车 → 未更改，不落盘。
                 var new_key: ?[]const u8 = cur_key;
@@ -470,7 +470,7 @@ fn runApiKeysMenu(
                 var pbuf: [96]u8 = undefined;
                 const prompt = try_std_fmt(&pbuf, "  Brave Key（当前 {s}，回车=保留 · -=清除）: ", .{if (cur) |k| maskKey(k) else "(未配置)"});
                 var vbuf: [256]u8 = undefined;
-                const val = menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue;
+                const val = (menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue) orelse continue;
                 if (val.len > 0) {
                     switcher.settings.api_keys.brave_api_key = if (std.mem.eql(u8, val, "-")) null else try alloc.dupe(u8, val);
                     autoSaveSettings(w, file_writer, switcher, alloc, io);
@@ -481,7 +481,7 @@ fn runApiKeysMenu(
                 var pbuf: [128]u8 = undefined;
                 const prompt = try_std_fmt(&pbuf, "  Ollama Host（当前 {s}，回车=保留）: ", .{cur});
                 var vbuf: [256]u8 = undefined;
-                const val = menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue;
+                const val = (menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue) orelse continue;
                 if (val.len > 0) {
                     switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
                     // The provider caches base_url at init — drop it so the

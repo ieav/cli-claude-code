@@ -282,6 +282,22 @@ def s6_command_smoke():
         out = z.read_until("Ziv 配置", 10)
         if "已取消" not in out:
             raise Fail("config value prompt: lone Esc did not cancel")
+        # open-to-VIEW then Esc at the FIRST field of a two-field edit
+        # session: whole session must abort (no second prompt jumps in —
+        # the doc §3 rule "Esc 在任何层都退出且零写入")
+        z.clear_buf()
+        z.send("1\r")  # API Keys
+        z.read_until("模型接入配置", 10)
+        z.clear_buf()
+        z.send("1\r")  # OpenAI 接入 → first field = API Key
+        z.read_until("回车=保留", 10)
+        z.send("\x1b")
+        out = z.read_until("模型接入配置", 10)
+        if "已取消" not in out or "Base URL" in out:
+            raise Fail("two-field edit: Esc at first field must abort whole session")
+        z.clear_buf()
+        z.send("\x1b")  # viewing done — back out of the submenu too
+        z.read_until("Ziv 配置", 10)
         z.send("q")
         z.read_until("ziv[", 10)  # prompt back
         quit_and_wait(z)
