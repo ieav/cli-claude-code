@@ -38,7 +38,7 @@ class ZivSession:
     owns the controlling terminal — plain subprocess leaves /dev/tty
     'not configured' inside the child)."""
 
-    def __init__(self, reuse_dir=None, settings='{"permission_mode":"bypass"}\n'):
+    def __init__(self, reuse_dir=None, settings='{"permission_mode":"bypass"}\n', env_extra=None):
         self._owns_dir = reuse_dir is None
         self.dir = reuse_dir or tempfile.mkdtemp(prefix="ziv-pty-")
         os.makedirs(os.path.join(self.dir, ".ziv"), exist_ok=True)
@@ -61,6 +61,8 @@ class ZivSession:
             for k in list(env):
                 if k.startswith(("OPENAI_", "ANTHROPIC_", "OLLAMA_")):
                     env.pop(k)
+            if env_extra:
+                env.update(env_extra)
             os.execve(BIN, [BIN], env)
         self.buf = b""
 
@@ -633,6 +635,85 @@ def s13_bg_tasks():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s14_subagent_m4():
+    """M4: agent tool gains tools/fork/max_turns. Mock gateway records every
+    request; the subagent's own request must (a) carry the narrowed tool
+    list, (b) with fork:true inherit the conversation tail (the secret
+    token from turn 1), (c) stay read-only in semantics."""
+    import threading, http.server, json as _json
+    reqs = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = _json.loads(self.rfile.read(n)) if n else {}
+            texts = []
+            for m in body.get("messages", []):
+                c = m.get("content")
+                if isinstance(c, str):
+                    texts.append(c)
+                elif isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            texts.append(b.get("text", ""))
+            reqs.append({
+                "tools": [t.get("function", {}).get("name", t.get("name", "?"))
+                          for t in body.get("tools", [])],
+                "texts": texts,
+            })
+            if body.get("stream"):
+                resp = (b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}\n\n'
+                        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n'
+                        b'data: [DONE]\n\n')
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+            else:
+                resp = _json.dumps({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}}).encode()
+                self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    d = tempfile.mkdtemp(prefix="ziv-m4-")
+    try:
+        os.makedirs(os.path.join(d, ".ziv"))
+        with open(os.path.join(d, ".ziv", "settings.json"), "w") as f:
+            f.write(_json.dumps({"api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{port}/v1"},
+                                 "permission_mode": "bypass"}))
+        z = ZivSession(reuse_dir=d, env_extra={
+            "OPENAI_API_KEY": "sk-mock",
+            "OPENAI_BASE_URL": f"http://127.0.0.1:{port}/v1",
+        })
+        try:
+            z.wait_prompt()
+            # 会话记忆暗号（fork 应继承它）。
+            z.send("暗号是 PINEAPPLE-77，记住\r")
+            z.read_until("ok", 20)
+            z.clear_buf()
+            # M4：白名单 + fork。
+            z.send('/run agent {"task":"report the secret token","fork":true,"tools":["FileRead"]}\r')
+            out = z.read_until("子任务 1", 30)
+            # 找子代理自己的请求（带 narrowed tools 的那个）。
+            sub = [r for r in reqs if r["tools"] == ["FileRead"]]
+            if not sub:
+                raise Fail(f"no subagent request with narrowed tools; saw={[r['tools'] for r in reqs]}")
+            joined = "\n".join(sub[-1]["texts"])
+            if "PINEAPPLE-77" not in joined:
+                raise Fail("fork did not inherit the conversation tail (token missing)")
+            quit_and_wait(z)
+            return "tools whitelist + fork inheritance reached the wire ✓"
+        finally:
+            z.close()
+    finally:
+        srv.shutdown()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -647,6 +728,7 @@ SCENARIOS = [
     ("S11 code-context", s11_code_context_injection),
     ("S12 tui-colors-toggle-resize", s12_tui_colors_toggle_resize),
     ("S13 bg-tasks", s13_bg_tasks),
+    ("S14 subagent-m4", s14_subagent_m4),
 ]
 
 

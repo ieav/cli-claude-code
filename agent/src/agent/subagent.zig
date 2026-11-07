@@ -27,6 +27,17 @@ fn toolAllowed(name: []const u8) bool {
     return true;
 }
 
+/// M4：dispatch 传入的工具白名单之上再收一层（null = 全量可见）。
+/// 白名单只能收窄不能放宽——deny_tools 与只读权限语义不变。
+pub fn toolVisible(name: []const u8, allowed: ?[]const []const u8) bool {
+    if (!toolAllowed(name)) return false;
+    const list = allowed orelse return true;
+    for (list) |a| {
+        if (std.mem.eql(u8, name, a)) return true;
+    }
+    return false;
+}
+
 /// One subagent's run configuration. Providers are always single-thread
 /// owned (see agent_dispatch.ProviderStorage for why sharing is unsafe:
 /// std.http's CA-bundle lock futexes through the constructing io).
@@ -45,6 +56,13 @@ pub const SubagentConfig = struct {
     /// P3 progress: the current turn number (1..max_turns), stored before
     /// each LLM call so a dispatcher can observe live progress.
     progress: ?*std.atomic.Value(u32) = null,
+    /// M4 工具清单：本子代理可见的工具名（null = 继承全部再走 deny 过滤）。
+    /// 只能收窄——权限语义（只读 + ask 自动拒）不变。
+    allowed_tools: ?[]const []const u8 = null,
+    /// M4 fork：继承的父会话消息（只读借用——主线程阻塞在 dispatch 里，
+    /// 期间不会变更；块永不单独释放，借用安全）。种子顺序：
+    /// 子代理 system → 继承消息 → 任务。
+    inherited: ?[]const llm.Message = null,
 };
 
 pub const SubagentResult = struct {
@@ -87,11 +105,11 @@ pub fn run(cfg: SubagentConfig) SubagentResult {
 fn runInner(cfg: SubagentConfig) !SubagentResult {
     const alloc = cfg.alloc;
 
-    // Whitelisted tool specs (T6.2).
+    // Whitelisted tool specs (T6.2; M4 再叠 dispatch 传入的白名单).
     var specs: std.ArrayList(llm.ToolSpec) = .empty;
     defer specs.deinit(alloc);
     for (cfg.tools.definitions()) |*def| {
-        if (!toolAllowed(def.name)) continue;
+        if (!toolVisible(def.name, cfg.allowed_tools)) continue;
         // Registry fields are static strings — a plain borrow is safe.
         try specs.append(alloc, .{
             .name = def.name,
@@ -109,11 +127,15 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
     const ba = block_arena.allocator();
     var history: std.ArrayList(llm.Message) = .empty;
     defer history.deinit(alloc); // blocks live in the arena, freed above
-    // system + task
+    // system (+ fork 继承) + task
     {
         const sb = try ba.alloc(llm.ContentBlock, 1);
         sb[0] = .{ .text = headless_system_prompt };
         try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        if (cfg.inherited) |inh| {
+            // 借用块：只追加、永不单独释放（arena 只管新块）——安全。
+            for (inh) |m| try history.append(alloc, .{ .role = m.role, .content = m.content, .timestamp = m.timestamp });
+        }
         const ub = try ba.alloc(llm.ContentBlock, 1);
         ub[0] = .{ .text = cfg.task };
         try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
@@ -270,6 +292,21 @@ test "toolAllowed whitelist (T6.2)" {
     try std.testing.expect(toolAllowed("FileRead"));
     try std.testing.expect(toolAllowed("Bash"));
     try std.testing.expect(!toolAllowed("agent")); // no recursive fan-out
+}
+
+test "toolVisible: dispatch whitelist narrows, never widens (M4)" {
+    // null = 继承全量（仍走 deny 过滤）。
+    try std.testing.expect(toolVisible("Grep", null));
+    try std.testing.expect(!toolVisible("TaskCreate", null));
+    // 白名单命中才可见。
+    const only = [_][]const u8{ "FileRead", "Grep" };
+    try std.testing.expect(toolVisible("Grep", &only));
+    try std.testing.expect(toolVisible("FileRead", &only));
+    try std.testing.expect(!toolVisible("Bash", &only));
+    // deny 永远优先——白名单列了也看不见。
+    const bad = [_][]const u8{ "TaskCreate", "agent" };
+    try std.testing.expect(!toolVisible("TaskCreate", &bad));
+    try std.testing.expect(!toolVisible("agent", &bad));
 }
 
 test "subagent permission gate runs the CENTRAL pipeline (T6.2 wiring fix)" {

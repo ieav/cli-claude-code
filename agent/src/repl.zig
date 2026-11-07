@@ -456,6 +456,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .tools = &reg,
         .concurrency = &switcher.settings.subagent_concurrency,
         .bus = &evbus,
+        .history = &history, // M4 fork：只读借用（dispatch 期间主线程阻塞在此）
         .backend = switcher.backend,
         .model = switcher.modelName(),
         .api_key = switch (switcher.backend) {
@@ -489,8 +490,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     };
     if (agent_tool_enabled) reg.registerDynamic(
         "agent",
-        "Run 1-3 focused read-only subagents in parallel. Each gets its own context and the read-only tools, then reports back. Use for independent research or verification subtasks (e.g. 'check X in the codebase', 'verify the failing paths'), NOT for sequential work.",
-        "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-3 self-contained task descriptions\"}},\"required\":[\"tasks\"]}",
+        "Run 1-3 focused read-only subagents in parallel. Each gets its own context and the read-only tools, then reports back. Use for independent research or verification subtasks (e.g. 'check X in the codebase', 'verify the failing paths'), NOT for sequential work. Optional: 'tools' narrows what each subagent may use (names, subset of available tools); 'fork' makes them inherit the recent conversation tail (~16K tokens) instead of starting fresh — use when the task depends on what we just discussed; 'max_turns' caps turns (1-10).",
+        "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-3 self-contained task descriptions\"},\"tools\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional tool-name whitelist for every subagent (narrows only; read-only semantics unchanged)\"},\"fork\":{\"type\":\"boolean\",\"description\":\"Inherit the recent conversation tail (~16K tokens) instead of starting fresh\"},\"max_turns\":{\"type\":\"integer\",\"description\":\"Per-subagent turn cap (1-10, default 10)\"}},\"required\":[\"tasks\"]}",
         agent_dispatch.executeWithCtx,
         @ptrCast(&dispatch_ctx),
         false,

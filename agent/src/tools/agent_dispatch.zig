@@ -43,7 +43,45 @@ pub const DispatchCtx = struct {
     /// (main-thread emit only — the dispatch itself runs on the calling
     /// thread, which IS the main thread).
     bus: ?*event_bus.EventBus = null,
+    /// M4 fork：父会话历史（dispatch 期间主线程阻塞在本工具里，历史
+    /// 稳定，只读借用安全）。null = fork 不可用（REPL 未接线）。
+    history: ?*const std.ArrayList(llm.Message) = null,
 };
+
+/// M4 fork 继承的 token 帽：父历史只取尾部（最新上下文最相关，
+/// 且控制子代理首请求体量）。
+pub const FORK_TOKEN_CAP: u32 = 16_000;
+
+/// 从尾部往前取 ≤cap tokens 的连续切片（跳过 index 0 的 system——
+/// 子代理有自己的 system prompt，避免双 system）。
+pub fn forkTail(messages: []const llm.Message, cap: u32) []const llm.Message {
+    if (messages.len <= 1) return &.{};
+    var acc: u32 = 0;
+    var start = messages.len;
+    while (start > 1) {
+        start -= 1;
+        acc += messageTokens(messages[start]);
+        if (acc > cap) {
+            start += 1; // 超帽的最后一条退回
+            break;
+        }
+    }
+    if (start < 1) start = 1;
+    if (start >= messages.len) return &.{};
+    return messages[start..];
+}
+
+/// 单消息 token 估算（块级求和；tool_use 参数 DOM 不展开按次计）。
+fn messageTokens(m: llm.Message) u32 {
+    var acc: u32 = 0;
+    for (m.content) |b| switch (b) {
+        .text => |t| acc += tokens.estimateTokens(t),
+        .tool_result => |tr| acc += tokens.estimateTokens(tr.content),
+        .tool_use => acc += 64,
+        else => {},
+    };
+    return acc;
+}
 
 /// One job slot: the task text (owned by ctx.alloc) plus its result,
 /// written by exactly ONE worker — no locking needed.
@@ -57,6 +95,10 @@ const AgentJob = struct {
     progress: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     failed_turns: usize = 0,
     retried: bool = false,
+    /// M4：本 job 的工具白名单（null=全量）与 fork 继承切片（空=不继承）。
+    allowed_tools: ?[]const []const u8 = null,
+    inherited: []const llm.Message = &.{},
+    max_turns: usize = subagent.MAX_TURNS,
 };
 
 pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
@@ -92,10 +134,42 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     }
     const n = @min(tasks.items.len, MAX_SUBAGENTS);
 
+    // M4 参数：tools 白名单（只能收窄）/ fork 继承 / max_turns。
+    var allowed: ?[]const []const u8 = null;
+    var fork = false;
+    var max_turns: usize = subagent.MAX_TURNS;
+    if (input == .object) {
+        if (input.object.get("tools")) |tarr| {
+            if (tarr == .array and tarr.array.items.len > 0) {
+                var list: std.ArrayList([]const u8) = .empty;
+                for (tarr.array.items) |it| {
+                    if (it == .string) try list.append(alloc, it.string);
+                }
+                if (list.items.len > 0) allowed = try list.toOwnedSlice(alloc);
+            }
+        }
+        if (input.object.get("fork")) |f| {
+            if (f == .bool) fork = f.bool;
+        }
+        if (input.object.get("max_turns")) |mt| {
+            if (mt == .integer and mt.integer >= 1) max_turns = @min(@as(usize, @intCast(mt.integer)), subagent.MAX_TURNS);
+        }
+    }
+    var inherited: []const llm.Message = &.{};
+    if (fork) {
+        if (ctx.history) |h| inherited = forkTail(h.items, FORK_TOKEN_CAP);
+    }
+
     const jobs = try alloc.create([MAX_SUBAGENTS]AgentJob);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        jobs[i] = .{ .ctx = ctx, .task_text = try ctx.alloc.dupe(u8, tasks.items[i]) };
+        jobs[i] = .{
+            .ctx = ctx,
+            .task_text = try ctx.alloc.dupe(u8, tasks.items[i]),
+            .allowed_tools = allowed,
+            .inherited = inherited,
+            .max_turns = max_turns,
+        };
     }
 
     // Claim order: priority-descending, STABLE (equal priorities keep the
@@ -206,14 +280,18 @@ fn workerMain(w: *WorkerCtx) void {
 }
 
 fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
+    const job = &w.jobs[idx];
     const res = subagent.run(.{
-        .task = w.jobs[idx].task_text,
+        .task = job.task_text,
         .alloc = w.ctx.alloc,
         .io = wio,
         .provider = provider,
         .tools = w.ctx.tools,
         .cancel = &w.cancel,
-        .progress = &w.jobs[idx].progress,
+        .progress = &job.progress,
+        .allowed_tools = job.allowed_tools,
+        .inherited = if (job.inherited.len > 0) job.inherited else null,
+        .max_turns = job.max_turns,
     });
     finishJob(&w.jobs[idx], res);
     // P3 retry: fail-FAST jobs (≤3 turns in) get exactly one 1s-backoff
@@ -227,13 +305,16 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
         var ts: std.c.timespec = .{ .sec = 1, .nsec = 0 };
         _ = std.c.nanosleep(&ts, null);
         const res2 = subagent.run(.{
-            .task = w.jobs[idx].task_text,
+            .task = job.task_text,
             .alloc = w.ctx.alloc,
             .io = wio,
             .provider = provider,
             .tools = w.ctx.tools,
             .cancel = &w.cancel,
-            .progress = &w.jobs[idx].progress,
+            .progress = &job.progress,
+            .allowed_tools = job.allowed_tools,
+            .inherited = if (job.inherited.len > 0) job.inherited else null,
+            .max_turns = job.max_turns,
         });
         finishJob(&w.jobs[idx], res2);
     }
@@ -312,6 +393,39 @@ fn makeProviderInto(ctx: *DispatchCtx, job_io: std.Io, storage: *ProviderStorage
         }) },
     }
     return storage.provider();
+}
+
+test "forkTail: tail slice, skips system, honors cap (M4)" {
+    const a = std.testing.allocator;
+    const mkMsg = struct {
+        fn mk(al: std.mem.Allocator, text: []const u8) llm.Message {
+            const b = al.alloc(llm.ContentBlock, 1) catch unreachable;
+            b[0] = .{ .text = @constCast(text) };
+            return .{ .role = .user, .content = b, .timestamp = 0 };
+        }
+    }.mk;
+    var msgs: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (msgs.items) |m| a.free(m.content);
+        msgs.deinit(a);
+    }
+    try msgs.append(a, mkMsg(a, "SYSTEM")); // index 0 — 永不继承
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try msgs.append(a, mkMsg(a, "padding message body text for cap estimation"));
+    }
+    // 大帽：继承除 system 外全部。
+    const full = forkTail(msgs.items, 1_000_000);
+    try std.testing.expectEqual(msgs.items.len - 1, full.len);
+    // 小帽：只留尾部若干条，且不包含 system。
+    const small = forkTail(msgs.items, 30);
+    try std.testing.expect(small.len > 0 and small.len < full.len);
+    try std.testing.expect(!std.mem.eql(u8, small[0].content[0].text, "SYSTEM"));
+    // 单条就超帽 → 空。
+    try std.testing.expectEqual(@as(usize, 0), forkTail(msgs.items, 1).len);
+    // 只剩 system → 空。
+    const only_sys = [_]llm.Message{msgs.items[0]};
+    try std.testing.expectEqual(@as(usize, 0), forkTail(&only_sys, 1_000_000).len);
 }
 
 test "dispatch constants stay bounded" {
