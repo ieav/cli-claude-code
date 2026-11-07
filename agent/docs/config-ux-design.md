@@ -70,6 +70,12 @@ API Keys 子菜单（Key 掩码、Host 明文显示）
 
 ## 5. 守卫与边界
 
+- **Base URL 拼接规则**（防「配好了却一直失败」）：ziv 直接在 Base URL 后
+  拼路径——OpenAI 兼容 `{base}/chat/completions`、Anthropic 兼容
+  `{base}/v1/messages`。填的 base 必须是**有权限访问目标模型**的那一级
+  （同一网关不同路径权限可以不同：实测 bigmodel `/api/v1` 对 glm-5.3
+  403、`/api/paas/v4` 正常，2026-11-07）。失败时 TUI 的
+  `[网关返回: status=… 网关原文]` 行就是排查起点。
 - **误输守卫**（仅 Key 字段）：输入 `q` / `/quit` / 含空格 → 忽略并提示，
   不写入——防「想退菜单时的手势被存成 Key 导致后续 401」。
 - `-` 只在编辑类有效；输入恰好就是一个 `-` 的值不可能合法（URL/Key/

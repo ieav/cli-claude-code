@@ -112,8 +112,6 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     defer tty_guard.restore();
     lineinput.setSessionGuard(&tty_guard);
     // P3c: Ctrl+O toggles tool-output verbosity (prompt AND mid-turn).
-    // P4c: click in the transcript area dumps the newest folded tool body.
-    lineinput.on_transcript_click = turn_tools.dumpLastFolded;
     lineinput.on_verbose_toggle = struct {
         fn cb() []const u8 {
             const next = !turn_tools.verbose_output.load(.monotonic);
