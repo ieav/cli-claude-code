@@ -80,6 +80,32 @@ pub const LastTools = struct {
 /// 终端无法回溯折叠（CC 同此限制）。
 pub var verbose_output: bool = true;
 
+/// P4c 鼠标点击的转写侧锚点：最近一次被折叠的工具输出全文（固定缓冲，
+/// 无分配器依赖——printToolBody 本身不带 alloc）。点击转写区 → 下方
+/// 吐这份全文（行无关语义，精确无簿记；详见 2026-11-07 修订设计）。
+var last_folded_buf: [8192]u8 = undefined;
+var last_folded_len: usize = 0;
+
+fn noteFolded(raw: []const u8) void {
+    const n = @min(raw.len, last_folded_buf.len);
+    @memcpy(last_folded_buf[0..n], raw[0..n]);
+    last_folded_len = n;
+}
+
+pub fn dumpLastFolded(w: *std.Io.Writer) void {
+    if (last_folded_len == 0) return;
+    std.Io.Writer.writeAll(w, "  \x1b[2m—— 展开最近折叠的输出（点击其标记或 Ctrl+O 可收起视图）——\x1b[0m\n") catch {};
+    const raw = last_folded_buf[0..last_folded_len];
+    var rest = raw;
+    var shown: usize = 0;
+    while (rest.len > 0 and shown < 50) : (shown += 1) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch break;
+        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+    }
+    std.Io.Writer.writeAll(w, "\n") catch {};
+}
+
 pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
     const max_lines: usize = 50;
     if (!verbose_output) {
@@ -97,7 +123,8 @@ pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
         }
         const total = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
         if (total > 3) {
-            std.Io.Writer.print(w, "  \x1b[2m… +{d} 行（Ctrl+O 展开）\x1b[0m\n", .{total - 3}) catch {};
+            noteFolded(raw);
+            std.Io.Writer.print(w, "  \x1b[2m… +{d} 行（Ctrl+O 展开 · 点击转写区亦可）\x1b[0m\n", .{total - 3}) catch {};
         }
         std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
         return;
@@ -120,7 +147,8 @@ pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
     // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
     // 10 KiB single line printed unmarked).
     if (shown < total_lines or cut < raw.len) {
-        std.Io.Writer.print(w, "  \x1b[2m…已截断（显示 {d}/{d} 行）· /last 全文\x1b[0m\n", .{ shown, total_lines }) catch {};
+        noteFolded(raw);
+        std.Io.Writer.print(w, "  \x1b[2m…已截断（显示 {d}/{d} 行）· /last 全文 · 点击转写区亦可\x1b[0m\n", .{ shown, total_lines }) catch {};
     }
 }
 

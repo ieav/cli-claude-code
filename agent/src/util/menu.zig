@@ -66,6 +66,7 @@ pub const RawGuard = struct {
     orig: std.c.termios = undefined,
     active: bool = false,
     installed_signal: bool = false,
+    installed_mouse: bool = false,
 
     pub fn enter(self: *RawGuard) void {
         self.enterImpl(false);
@@ -108,13 +109,37 @@ pub const RawGuard = struct {
             installSignalRestore(&self.orig);
             self.installed_signal = true;
         }
+        // SGR mouse reporting (P4c): click-to-expand etc. Same outermost-
+        // only ownership as the signal slot — a nested guard's restore
+        // must not strip mouse from the still-live session.
+        if (self.active and !mouse_on) {
+            mouseWrite("\x1b[?1000h\x1b[?1006h");
+            mouse_on = true;
+            self.installed_mouse = true;
+        }
     }
 
     pub fn restore(self: *RawGuard) void {
+        if (self.installed_mouse) {
+            mouseWrite("\x1b[?1000l\x1b[?1006l");
+            mouse_on = false;
+        }
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
         if (self.installed_signal) removeSignalRestore();
     }
 };
+
+/// Whether SGR mouse reporting is currently pushed (CookedGuard suspends
+/// it around line reads so clicks cannot inject escape bytes into y/N
+/// answers).
+var mouse_on: bool = false;
+
+/// Raw syscall write to stdout — no Io/allocator needed (guard context),
+/// and async-signal-safe for the crash restore path.
+fn mouseWrite(bytes: []const u8) void {
+    const n = std.c.write(1, bytes.ptr, bytes.len);
+    _ = n;
+}
 
 /// Temporary COOKED-with-echo mode for one confirmation read (y/N gates,
 /// /rewind confirm) inside a session that is otherwise raw the whole way
@@ -131,11 +156,19 @@ pub const CookedGuard = struct {
         cooked.lflag.ICANON = true; // driver line-edits (backspace works)
         cooked.lflag.ECHO = true; // the user sees what they type
         cooked.iflag.ICRNL = true; // Enter becomes \n — ends the read
+        // Suspend mouse reporting for the read: a click here would inject
+        // the whole SGR sequence into the answer as garbage text.
+        if (mouse_on) mouseWrite("\x1b[?1000l\x1b[?1006l");
         if (std.c.tcsetattr(0, .NOW, &cooked) == 0) self.active = true;
     }
 
     pub fn restore(self: *CookedGuard) void {
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
+        if (self.active and mouse_on == false) {
+            // Session guard still wants mouse — push it back.
+            mouseWrite("\x1b[?1000h\x1b[?1006h");
+            mouse_on = true;
+        }
     }
 };
 
@@ -146,6 +179,12 @@ var signal_saved: ?std.c.termios = null;
 
 fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
     if (signal_saved) |*t| {
+        // Async-signal-safety: ONLY tcsetattr here. Writing terminal
+        // sequences (mouse-disable etc.) can BLOCK on a full pty buffer
+        // while the parent isn't reading — the process then wedges inside
+        // the signal handler and never reaches re-raise (the 2026-11-07
+        // suite-hang root cause). The terminal's mouse mode leaks on crash;
+        // it self-clears on most terminal resets and is cosmetic only.
         _ = std.c.tcsetattr(0, .NOW, t);
         // Restore the default disposition and re-raise so the exit status
         // still reflects the signal instead of swallowing it.

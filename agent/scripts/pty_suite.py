@@ -106,6 +106,11 @@ class ZivSession:
         # Raw mode: Enter submits as CR (ICRNL is off by design).
         os.write(self.master, data.replace("\n", "\r").encode())
 
+    def send_raw(self, data: str) -> None:
+        """Verbatim bytes — mouse SGR sequences and bracketed-paste markers
+        must NOT get the \n→\r translation."""
+        os.write(self.master, data.encode())
+
     def wait_prompt(self, timeout: float = 20.0) -> None:
         self.read_until("Type your message", timeout)
 
@@ -527,6 +532,7 @@ def s12_tui_colors_toggle_resize():
             z.send("\x03")  # cancel the sleep batch leftover draft
             z.drain(1.0)
             # (d): resize mid-turn self-heals the pinned input row.
+            print("  [s13] starting paste turn", flush=True)
             z.send('/run Bash {"command":"sleep 3","timeout":0}\n')
             time.sleep(0.6)
             import fcntl, termios, struct as sstruct

@@ -437,6 +437,109 @@ fn ctrlLetterByte(seq: []const u8) ?u8 {
     return @intCast(code - 96);
 }
 
+/// P4c SGR mouse event: \x1b[<b;x;yM (press) / m (release). `seq` is the
+/// CSI body WITHOUT "ESC [" (e.g. "<0;5;23M"). Only left-button presses
+/// matter here — motion (b&32) and wheel (b&64) are filtered by callers.
+pub const MouseEvt = struct { button: u8, col: u16, row: u16, press: bool };
+
+pub fn parseMouse(seq: []const u8) ?MouseEvt {
+    if (seq.len < 6 or seq[0] != '<') return null;
+    const final = seq[seq.len - 1];
+    if (final != 'M' and final != 'm') return null;
+    var it = std.mem.splitScalar(u8, seq[1 .. seq.len - 1], ';');
+    const b = it.next() orelse return null;
+    const cx = it.next() orelse return null;
+    const cy = it.next() orelse return null;
+    if (it.next() != null) return null;
+    return .{
+        .button = std.fmt.parseInt(u8, b, 10) catch return null,
+        .col = std.fmt.parseInt(u16, cx, 10) catch return null,
+        .row = std.fmt.parseInt(u16, cy, 10) catch return null,
+        .press = final == 'M',
+    };
+}
+
+/// True for a plain left-button press (no drag/motion, no wheel, no mod
+/// bits we don't own).
+fn isPlainLeftClick(me: MouseEvt) bool {
+    return me.press and (me.button & 0b1110_0011) == 0; // bits: 0-1 button, 5 motion, 6-7 wheel/extra
+}
+
+/// Transcript-side click handler, wired by repl (layering: lineinput never
+/// imports turn/*). Receives the writer to dump through.
+pub var on_transcript_click: ?*const fn (w: *std.Io.Writer) void = null;
+
+/// Dispatch a parsed mouse event. PINNED-block clicks are exact (ziv owns
+/// those rows absolutely); everything else is the row-agnostic transcript
+/// action. Returns true when the event was consumed.
+fn dispatchMouse(me: MouseEvt, w: ?*std.Io.Writer) bool {
+    if (!isPlainLeftClick(me)) return true; // swallowed, no action
+    if (pending_shown) {
+        const split = regionRows();
+        if (me.row > split) {
+            // Editor-block area: exact hit-test against the SAME row walk
+            // the painter uses (single source of truth, zero guessing).
+            const marker_row = split + 2;
+            var rows_buf: [64][]const u8 = undefined;
+            const hidden = collectBlockRows(&rows_buf) -| MAX_LIVE_BLOCK_ROWS;
+            if (hidden > 0 and me.row == marker_row) {
+                // ↟ +N 行 marker: flip the block's view window (head/tail).
+                block_view_head = !block_view_head;
+                if (w) |ww| {
+                    writeEditorBlock(ww);
+                    flushReal(ww);
+                }
+                return true;
+            }
+            // NOTE: no pill click-path — live (mid-turn) pastes never fold
+            // into pills (folding needs the whole body staged, a prompt-path
+            // property), and prompt drafts are not pinned, so a pill in the
+            // absolutely-addressed block cannot occur. Documented dead end
+            // of the 2026-11-07 design review.
+            return true;
+        }
+    }
+    if (on_transcript_click) |cb| {
+        if (w) |ww| cb(ww);
+    }
+    return true;
+}
+
+/// View-window toggle for the pinned block (click on ↟ marker): show the
+
+/// View-window toggle for the pinned block (click on ↟ marker): show the
+/// HEAD of a long draft instead of the tail. Reset per turn.
+var block_view_head: bool = false;
+
+fn pillInRow(span: []const u8) ?u8 {
+    var i: usize = 0;
+    while (i + 2 < span.len) : (i += 1) {
+        if (span[i] == 0 and span[i + 1] >= '0' and span[i + 1] < '0' + PASTE_SLOTS and span[i + 2] == 0) {
+            return span[i + 1] - '0';
+        }
+    }
+    return null;
+}
+
+fn dumpPastePill(slot: u8, w: ?*std.Io.Writer) void {
+    const ww = w orelse return;
+    const ed = live_ed orelse return;
+    const p = ed.pastes[slot] orelse return;
+    var hb: [96]u8 = undefined;
+    const head = std.fmt.bufPrint(&hb, "\x1b[2m—— 展开折叠粘贴 #{d}（{d} 行，提交时仍作为一条消息）——\x1b[0m", .{ slot + 1, p.lines }) catch "";
+    if (head.len > 0) regionPrintLine(ww, head);
+    var rest = p.data;
+    var shown: usize = 0;
+    while (rest.len > 0 and shown < 50) : (shown += 1) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        var lb: [4096]u8 = undefined;
+        const line = std.fmt.bufPrint(&lb, "{s}", .{rest[0..nl]}) catch break;
+        regionPrintLine(ww, line);
+        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+    }
+    regionPrintLine(ww, "");
+}
+
 /// Classify a CSI sequence body (without ESC [ — e.g. "A", "3~", "13;2u",
 /// "200~"). Unknown sequences resolve to .ignore instead of leaking their
 /// parameter bytes into the buffer as text.
@@ -810,17 +913,13 @@ fn regionApply(w: *std.Io.Writer) void {
     pending_status_shown = true;
 }
 
-/// Paint the editor block into its pinned rows (absolute): every soft-
-/// wrapped display row of the draft, prompt sharing row 0, tail-windowed
-/// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
-/// Cursor parks at the end of the LAST row's text — the typing position.
-fn writeEditorBlock(w: *std.Io.Writer) void {
-    const split = regionRows();
-    const tw = currentTermWidth();
-    const pw = strWidth(pendingPrompt());
+/// Soft-wrapped display rows of the live draft (the SAME walk the painter
+/// and the mouse hit-test share — one source of truth).
+pub fn collectBlockRows(out: *[64][]const u8) usize {
+    return collectBlockRowsInto(out, currentTermWidth(), strWidth(pendingPrompt()));
+}
 
-    // Collect display rows first (tail window decision needs the total).
-    var rows_buf: [64][]const u8 = undefined;
+fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
     var nrows: usize = 0;
     var first_logical = true;
     var iter = std.mem.splitScalar(u8, liveDraft(), '\n');
@@ -835,8 +934,8 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
                 const cw = strWidth(logical[i..next]);
                 break :blk col + cw > avail;
             })) {
-                if (nrows < rows_buf.len) {
-                    rows_buf[nrows] = logical[row_start..i];
+                if (nrows < out.len) {
+                    out[nrows] = logical[row_start..i];
                     nrows += 1;
                 }
                 row_start = i;
@@ -850,9 +949,29 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         first_logical = false;
     }
     if (nrows == 0) nrows = 1; // empty draft: one blank input row
+    return nrows;
+}
+
+/// Paint the editor block into its pinned rows (absolute): every soft-
+/// wrapped display row of the draft, prompt sharing row 0, tail-windowed
+/// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
+/// Cursor parks at the end of the LAST row's text — the typing position.
+fn writeEditorBlock(w: *std.Io.Writer) void {
+    const split = regionRows();
+    const tw = currentTermWidth();
+    const pw = strWidth(pendingPrompt());
+
+    // Collect display rows first (tail window decision needs the total).
+    var rows_buf: [64][]const u8 = undefined;
+    const nrows: usize = collectBlockRowsInto(&rows_buf, tw, pw);
 
     const hidden = nrows -| MAX_LIVE_BLOCK_ROWS;
-    const start = if (nrows > MAX_LIVE_BLOCK_ROWS) hidden else 0;
+    // View window: tail by default; block_view_head (↟ click) shows the
+    // head — the same rows, from the other end.
+    const start = if (nrows > MAX_LIVE_BLOCK_ROWS)
+        (if (block_view_head) 0 else hidden)
+    else
+        0;
     var row_idx = split + 2;
     if (hidden > 0) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m↟ +{d} 行\x1b[0m", .{ row_idx, hidden }) catch {};
@@ -909,6 +1028,7 @@ pub fn regionUp() bool {
 pub fn regionBegin(w: *std.Io.Writer, status: []const u8) void {
     ttyLock();
     defer ttyUnlock();
+    block_view_head = false; // fresh turn: tail window
     pendingStatusSet(status);
     regionApply(w);
     flushReal(w);
@@ -1480,8 +1600,9 @@ fn classifyEscSeq(seq: []const u8) EscSeq {
 /// the reader's OWN buffer before polling the fd — a burst "ESC[200~…"
 /// lands in ONE read and the kernel fd goes dry, so a poll-only loop
 /// would see an empty sequence and misclassify.
-fn captureEscSeq(r: *std.Io.Reader) [8]u8 {
-    var seq: [8]u8 = @splat(0);
+fn captureEscSeq(r: *std.Io.Reader) [16]u8 {
+    // 16: mouse SGR sequences ("[<0;100;200M") run past the old 8-byte cap.
+    var seq: [16]u8 = @splat(0);
     var n: usize = 0;
     while (n < seq.len) {
         if (r.bufferedLen() == 0) {
@@ -1768,9 +1889,17 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
             continue;
         }
         // ESC: classify what follows. Editing CSIs edit; newline inserts;
-        // only a REAL Esc key cancels (D4).
+        // only a REAL Esc key cancels (D4). Mouse events take their own
+        // branch (classifyEscSeq would call them cancel and kill the turn).
         const seq = captureEscSeq(r);
         const sl = std.mem.sliceTo(&seq, 0);
+        if (sl.len > 0 and sl[0] == '[') {
+            if (parseMouse(sl[1..])) |me| {
+                _ = dispatchMouse(me, w);
+                if (w) |ww| renderPendingLine(ww);
+                continue;
+            }
+        }
         switch (classifyEscSeq(sl)) {
             .paste_start => paste_active = true,
             .paste_end => {},
@@ -2723,6 +2852,13 @@ pub fn readLine(
             if (!final_seen) {
                 try ed.render();
                 continue; // truncated/garbage CSI: swallow
+            }
+            // P4c mouse: SGR events arrive as CSI "<b;x;yM" — intercept
+            // before the generic classifier (which would .ignore them).
+            if (parseMouse(seq[0..sl])) |me| {
+                _ = dispatchMouse(me, w);
+                try ed.render();
+                continue;
             }
             switch (classifyCsi(seq[0..sl])) {
                 .right => {
@@ -3885,4 +4021,45 @@ test "editorLiveKey: Shift+Enter during generation is a newline, not a cancel" {
     const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
     try std.testing.expect(!editorLiveKey(&fr, null));
     try std.testing.expectEqualStrings("\n", ed.buf[0..ed.len]);
+}
+
+test "parseMouse: SGR click/release/motion matrix" {
+    try std.testing.expect(parseMouse("A") == null); // arrow, not mouse
+    try std.testing.expect(parseMouse("13;2u") == null);
+    try std.testing.expect(parseMouse("<0;5") == null); // truncated
+    const press = parseMouse("<0;5;23M").?;
+    try std.testing.expectEqual(@as(u8, 0), press.button);
+    try std.testing.expectEqual(@as(u16, 5), press.col);
+    try std.testing.expectEqual(@as(u16, 23), press.row);
+    try std.testing.expect(press.press);
+    const rel = parseMouse("<0;5;23m").?;
+    try std.testing.expect(!rel.press);
+    // Wheel and drag have high bits set — parsed, filtered by isPlainLeftClick.
+    const wheel = parseMouse("<64;5;23M").?;
+    try std.testing.expect(!isPlainLeftClick(wheel));
+    const drag = parseMouse("<32;5;23M").?;
+    try std.testing.expect(!isPlainLeftClick(drag));
+    try std.testing.expect(isPlainLeftClick(press));
+}
+
+test "dispatchMouse: transcript click fires the callback (region down)" {
+    resetPendingState();
+    defer resetPendingState();
+    const alloc = std.testing.allocator;
+    const Marker = struct {
+        var fired: bool = false;
+        fn cb(_: *std.Io.Writer) void {
+            fired = true;
+        }
+    };
+    const saved_cb = on_transcript_click;
+    defer on_transcript_click = saved_cb;
+    on_transcript_click = Marker.cb;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    _ = dispatchMouse(.{ .button = 0, .col = 5, .row = 5, .press = true }, &aw.writer);
+    try std.testing.expect(Marker.fired);
+    Marker.fired = false;
+    _ = dispatchMouse(.{ .button = 0, .col = 5, .row = 5, .press = false }, &aw.writer);
+    try std.testing.expect(!Marker.fired);
 }

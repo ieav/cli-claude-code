@@ -806,6 +806,15 @@ pub fn extractSessionMemoriesBounded(
         extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
         return;
     };
+    // No api key in the snapshot → the LLM attempt is doomed to a network
+    // timeout (hermetic suites, unconfigured backends). Skip straight to
+    // heuristics: exit stays fast where LLM extraction cannot succeed.
+    if (c.api_key == null and c.backend != .ollama) {
+        var cc = c;
+        cc.deinit(alloc);
+        extractSessionMemories(mem, kg, history, bus, w, null, aux_cap) catch {};
+        return;
+    }
     std.Io.Writer.print(w, "  [正在提取本会话记忆…（≤{d}s，网关慢时自动降级为关键词提取）]\n", .{@divTrunc(deadline_ms, 1000)}) catch {};
     if (file_writer) |fw| std.Io.File.Writer.flush(fw) catch {};
 
