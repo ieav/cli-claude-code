@@ -132,7 +132,7 @@ fn printToolCallPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, name: []con
     if (toolArgPick(input)) |pick| {
         if (pick.len <= 96 and std.mem.indexOfScalar(u8, pick, '\n') == null) {
             var tb: [192]u8 = undefined;
-            const line_opt: ?[]const u8 = std.fmt.bufPrint(&tb, "  ⏺ \x1b[1m{s}\x1b[0m({s})\n", .{ name, pick }) catch null;
+            const line_opt: ?[]const u8 = std.fmt.bufPrint(&tb, "  \x1b[36m⏺ {s}\x1b[0m\x1b[2m({s})\x1b[0m\n", .{ name, pick }) catch null;
             if (line_opt) |line| {
                 lineinput.regionPrintLine(w, line);
                 return;
@@ -140,7 +140,7 @@ fn printToolCallPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, name: []con
             // Buffer overflow (huge name?) → header+body path below.
         }
         var hb: [96]u8 = undefined;
-        const head = std.fmt.bufPrint(&hb, "  ⏺ \x1b[1m{s}\x1b[0m\n", .{name}) catch "";
+        const head = std.fmt.bufPrint(&hb, "  \x1b[36m⏺ {s}\x1b[0m\n", .{name}) catch "";
         lineinput.regionPrintLine(w, head);
         var rest = pick;
         var shown: usize = 0;

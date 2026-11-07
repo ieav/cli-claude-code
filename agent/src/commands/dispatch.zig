@@ -254,7 +254,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 return .handled;
             };
 
-            try std.Io.Writer.print(ctx.w, "  Running {s}...\n", .{tool_name});
+            try std.Io.Writer.print(ctx.w, "  \x1b[36m⏺ Running {s}\x1b[0m\n", .{tool_name});
             try std.Io.File.Writer.flush(ctx.file_writer);
             logger.info("Tool /run: {s}", .{tool_name});
 
@@ -297,9 +297,12 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             turn_tools.LastTools.push(tool_name, result.output);
 
             if (result.is_error) {
-                try std.Io.Writer.print(ctx.w, "  ERROR: {s}\n\n", .{result.output});
+                try std.Io.Writer.print(ctx.w, "  \x1b[31mERROR:\x1b[0m\n", .{});
+                turn_tools.printToolBody(ctx.w, result.output);
+                try std.Io.Writer.writeAll(ctx.w, "\n");
             } else {
-                try std.Io.Writer.print(ctx.w, "  {s}\n\n", .{result.output});
+                turn_tools.printToolBody(ctx.w, result.output); // dim + Ctrl+O fold, same as the agent-loop phase
+                try std.Io.Writer.writeAll(ctx.w, "\n");
             }
             _ = ctx.log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, ctx.history.items.len) catch {};
             allocator.free(result.output);

@@ -133,7 +133,9 @@ def quit_and_wait(z: ZivSession) -> None:
     z.send("\x03")
     z.drain(0.3)
     z.send("/quit\n")
-    z.read_until("Goodbye", 30)
+    # 60s: exit now runs the bounded memory extraction (≤20s deadline +
+    # heuristic fallback) before Goodbye — 30s was tight.
+    z.read_until("Goodbye", 60)
 
 
 def s1_raw_session():
@@ -483,6 +485,72 @@ def s11_code_context_injection():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s12_tui_colors_toggle_resize():
+    """P3c batch: (a) tool preview paints cyan, tool body dim; (b) the
+    pinned input row keeps slash colors MID-TURN; (c) Ctrl+O roundtrips
+    tool-output verbosity; (d) a terminal resize mid-turn self-heals the
+    input row within a heartbeat (500ms tick)."""
+    d = tempfile.mkdtemp(prefix="ziv-p3c-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            # (a)+(c): a multi-line tool output — preview cyan, body dim;
+            # Ctrl+O collapses, Ctrl+O expands again.
+            z.send('/run Bash {"command":"seq 1 8"}\n')
+            out = z.read_until("Running", 20)  # content marker (the echo repaint carries ziv[ on every key)
+            z.drain(1.0)
+            if "\x1b[36m" not in out:
+                raise Fail("tool preview not cyan")
+            z.drain(0.8)
+            z.send("\x0f")  # Ctrl+O → brief
+            out = z.read_until("工具输出: 简要", 10)
+            z.drain(0.5)
+            z.send('/run Bash {"command":"seq 20 30"}\n')  # 11 lines > 3
+            out = z.read_until("Ctrl+O 展开", 20)
+            z.drain(0.5)
+            if " 27\n" in out.replace("\x1b[0m", ""):
+                raise Fail("brief mode leaked full output past line 3")
+            z.send("\x0f")  # Ctrl+O → verbose
+            out = z.read_until("工具输出: 详细", 10)
+            z.drain(0.5)
+            z.send('/run Bash {"command":"echo A9B8C7"}\n')
+            out = z.read_until("A9B8C7", 20)
+            z.drain(0.8)
+            # (b): mid-turn typing keeps slash colors in the pinned row.
+            z.send('/run Bash {"command":"sleep 2","timeout":0}\n')
+            time.sleep(0.6)
+            z.send("/stats")  # typed MID-TURN into the pinned editor
+            out = z.drain(2.5)
+            if "\x1b[36m/stats" not in out:
+                raise Fail("mid-turn slash typing lost its cyan color")
+            z.send("\x03")  # cancel the sleep batch leftover draft
+            z.drain(1.0)
+            # (d): resize mid-turn self-heals the pinned input row.
+            z.send('/run Bash {"command":"sleep 3","timeout":0}\n')
+            time.sleep(0.6)
+            import fcntl, termios, struct as sstruct
+            fcntl.ioctl(z.master, termios.TIOCSWINSZ, sstruct.pack("HHHH", 30, 100, 0, 0))
+            time.sleep(1.2)  # >2 heartbeat ticks
+            z.buf = b""
+            z.send("ping")  # any keystroke re-renders; row must be alive
+            out = z.drain(2.5)
+            if "ziv[" not in out:
+                raise Fail("pinned input row dead after resize (no repaint on keystroke)")
+            z.send("\x03")
+            z.drain(1.0)
+            # The ^C above and quit_and_wait's own ^C would land inside the
+            # 3s double-Ctrl-C exit window and race the /quit through the
+            # EOF path — let the window lapse so /quit exits cleanly.
+            time.sleep(3.5)
+            quit_and_wait(z)
+            return "colors + ctrl+O roundtrip + resize self-heal ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -495,6 +563,7 @@ SCENARIOS = [
     ("S9 error-selector", s9_error_selector),
     ("S10 code-index", s10_code_index),
     ("S11 code-context", s11_code_context_injection),
+    ("S12 tui-colors-toggle-resize", s12_tui_colors_toggle_resize),
 ]
 
 

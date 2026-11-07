@@ -618,6 +618,14 @@ fn liveDraft() []const u8 {
     return ed.buf[0..ed.len];
 }
 
+/// Whether the live editor is browsing input history (browse rows paint
+/// magenta in the prompt renderer; the pinned block uses the same rule's
+/// negation for slash coloring eligibility).
+fn self_browsing() bool {
+    const ed = live_ed orelse return false;
+    return ed.browsing;
+}
+
 /// Display-capped tail of the live draft, cut at a UTF-8 boundary and
 /// fitting the terminal width minus the prompt prefix (the input row must
 /// stay ONE row — an overflowing echo would wrap over the status row).
@@ -728,6 +736,11 @@ var tty_io: ?std.Io = null;
 pub fn setIo(io: std.Io) void {
     tty_io = io;
 }
+
+/// P3c Ctrl+O（与 Claude Code 的 verbose 开关同键）：切换工具输出的
+/// 详细/简要。回调由 repl 装配（layering：util 层不 import turn 层）。
+/// 回调返回新的详细态文案，供此处打印一行转录提示。
+pub var on_verbose_toggle: ?*const fn () []const u8 = null;
 
 fn ttyLock() void {
     const io = tty_io orelse return;
@@ -845,13 +858,36 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m↟ +{d} 行\x1b[0m", .{ row_idx, hidden }) catch {};
         row_idx += 1;
     }
+    // P3c 配色：与提示符层编辑器同一套斜杠规则——已知命令 cyan、
+    // 未知灰（StyleState 的判定在 emitLineP 侧；此处是钉行区的孪生
+    // 实现，token 上限钳到本显示行的字节范围防软换行越界）。
+    var slash_tok: usize = 0;
+    var slash_known = false;
+    {
+        const draft = liveDraft();
+        if (!self_browsing() and draft.len > 0 and draft[0] == '/') {
+            const l0_len = std.mem.indexOfScalar(u8, draft, '\n') orelse draft.len;
+            const tok_end = std.mem.indexOfScalar(u8, draft[0..l0_len], ' ') orelse l0_len;
+            slash_tok = tok_end;
+            slash_known = lineinput_cmds.isKnownCommand(draft[0..tok_end]);
+        }
+    }
     var shown = start;
     while (shown < nrows and shown - start < MAX_LIVE_BLOCK_ROWS) : (shown += 1) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
         if (shown == 0 and hidden == 0) {
             std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
         }
-        std.Io.Writer.writeAll(w, rows_buf[shown]) catch {};
+        const row = rows_buf[shown];
+        const color_head = shown == 0 and slash_tok > 0 and slash_tok <= row.len;
+        if (color_head) {
+            std.Io.Writer.writeAll(w, if (slash_known) "\x1b[36m" else "\x1b[90m") catch {};
+            std.Io.Writer.writeAll(w, row[0..slash_tok]) catch {};
+            std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+            std.Io.Writer.writeAll(w, row[slash_tok..]) catch {};
+        } else {
+            std.Io.Writer.writeAll(w, row) catch {};
+        }
         row_idx += 1;
     }
     if (nrows > 0 and start >= nrows) {
@@ -1027,6 +1063,10 @@ pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
         return;
     }
     paintStatusRow(w);
+    // P3c 心跳自愈：500ms 节拍连带重绘输入块——任何瞬态擦除（首挂载
+    // 滚屏舞步边界、外部清屏、resize 竞态、未知触发）在半秒内复原，
+    // 对"发送后输入区消失"类问题免疫（2026-11-07 用户报障的根治策略）。
+    writeEditorBlock(w);
     flushReal(w);
 }
 
@@ -1706,6 +1746,15 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
             return true;
         }
         if (c != 0x1b) {
+            if (c == 0x0F) {
+                // Ctrl+O: tool-output verbosity toggle (works mid-turn and
+                // at the prompt — one muscle memory everywhere).
+                if (on_verbose_toggle) |cb| {
+                    if (w) |ww| regionPrintLine(ww, cb()); // self-locking
+                }
+                if (w) |ww| renderPendingLine(ww);
+                continue;
+            }
             if (c == '\r') {
                 _ = liveQueueSubmit(ed, w);
             } else if (c == 0x7f or c == 0x08) {
@@ -2512,6 +2561,17 @@ pub fn readLine(
         // kitty-encoded) restores it before the C0 byte re-dispatches.
         const prev_cc = ctrl_c_at;
         if (c != 0x03) ctrl_c_at = 0;
+
+        if (c == 0x0F) {
+            // Ctrl+O: same verbosity toggle at the prompt level.
+            // regionPrintLine takes tty_mu itself — an outer lock here
+            // self-deadlocks (Io.Mutex is NOT reentrant; found live).
+            if (on_verbose_toggle) |cb| {
+                regionPrintLine(w, cb());
+            }
+            ed.render() catch {};
+            continue;
+        }
 
         // ── Ctrl+R reverse search mode ──
         if (search_on) {
@@ -3482,13 +3542,16 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     try std.testing.expect(std.mem.count(u8, printed, "\x1b[2K") == 0); // no row erasing
     try std.testing.expect(std.mem.indexOf(u8, printed, "ziv (m) [10%] > hi") == null); // input row not redrawn
 
-    // Status tick: ONLY the status row repaints.
+    // Status tick (P3c 心跳自愈): status row AND the editor block repaint —
+    // any transient wipe of the pinned input row self-heals within one
+    // 500ms tick (2026-11-07: the "input area disappears after send"
+    // report's root strategy).
     aw.clearRetainingCapacity();
     regionStatus(w, "⏳ 本轮 1.2s");
     const ticked = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[23;1H\x1b[2K\x1b[2m⏳ 本轮 1.2s") != null);
-    // Input row not REPAINTED (only the cursor parks back on it).
-    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[24;1H\x1b[2K") == null);
+    // Editor block DID repaint (self-heal contract).
+    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[24;1H\x1b[2K") != null);
 
     // Turn end: scroll region reset, pinned rows erased, region down.
     aw.clearRetainingCapacity();
@@ -3525,6 +3588,32 @@ test "live region: multi-line draft renders as a full editor block (P3b)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2K> a") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kb") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24;1H\x1b[2Kc") != null);
+    _ = ed;
+}
+
+test "live region: slash commands keep their colors in the pinned input row (P3c)" {
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 100;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+
+    // Type a KNOWN command mid-turn: the pinned input row must paint it
+    // cyan, exactly like the prompt-level editor (the regression behind
+    // "回合中 /指令没有颜色").
+    var fr = std.Io.Reader.fixed("/stats");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    _ = editorLiveKey(&fr, &aw.writer);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[36m/stats\x1b[0m") != null);
     _ = ed;
 }
 

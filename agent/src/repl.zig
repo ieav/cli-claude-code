@@ -110,7 +110,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var tty_guard = menu.RawGuard{};
     tty_guard.enterNoSig();
     defer tty_guard.restore();
-    lineinput.setSessionGuard(&tty_guard); // Ctrl-Z manual suspend needs it
+    lineinput.setSessionGuard(&tty_guard);
+    // P3c: Ctrl+O toggles tool-output verbosity (prompt AND mid-turn).
+    lineinput.on_verbose_toggle = struct {
+        fn cb() []const u8 {
+            turn_tools.verbose_output = !turn_tools.verbose_output;
+            return if (turn_tools.verbose_output)
+                "\x1b[2m[工具输出: 详细（Ctrl+O 切简要）]\x1b[0m"
+            else
+                "\x1b[2m[工具输出: 简要——长输出只出前 3 行（Ctrl+O 切详细）]\x1b[0m";
+        }
+    }.cb; // Ctrl-Z manual suspend needs it
     // Writer setup
     var write_buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.Writer.initStreaming(stdout_file, io, &write_buf);
@@ -1009,7 +1019,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 lineinput.regionEnd(w);
                 if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic); // monitor: real-429 evidence
-                try std.Io.Writer.print(ow, "  [LLM error: {}]\n", .{err});
+                try std.Io.Writer.print(ow, "  \x1b[31m[LLM error: {}]\x1b[0m\n", .{err});
                 // Designed error-feedback closure (§四): classified analysis
                 // + numbered fixes with the recommended one marked. The
                 // formatter existed since v0.3 with zero callers.

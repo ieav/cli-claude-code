@@ -75,17 +75,46 @@ pub const LastTools = struct {
 /// bytes a dim tail marker points at /last — the ring keeps its full
 /// 8 KiB regardless of what the transcript showed. The byte cut backs
 /// off to a UTF-8 boundary so a mid-汉字 slice can't mojibake.
+/// P3c Ctrl+O 工具输出详细/简要（默认详细=今日行为；Claude Code 同键
+/// 语义）。简要态只出前 3 行 + 折叠标记。只影响后续输出——已打印内容
+/// 终端无法回溯折叠（CC 同此限制）。
+pub var verbose_output: bool = true;
+
 pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
     const max_lines: usize = 50;
+    if (!verbose_output) {
+        // Brief mode: first 3 lines + fold marker (long single lines fold
+        // by bytes instead).
+        var it = std.mem.splitScalar(u8, raw[0..@min(raw.len, LastTools.CAP)], '\n');
+        var n: usize = 0;
+        std.Io.Writer.writeAll(w, "\x1b[2m") catch {};
+        while (it.next()) |ln| {
+            if (n >= 3) break;
+            var tb: [4096]u8 = undefined;
+            const line = std.fmt.bufPrint(&tb, "  {s}\n", .{std.mem.trimEnd(u8, ln, " \t\r")}) catch "  …(单行超 4KiB)\n";
+            std.Io.Writer.writeAll(w, line) catch {};
+            n += 1;
+        }
+        const total = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
+        if (total > 3) {
+            std.Io.Writer.print(w, "  \x1b[2m… +{d} 行（Ctrl+O 展开）\x1b[0m\n", .{total - 3}) catch {};
+        }
+        std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+        return;
+    }
     var cut = @min(raw.len, LastTools.CAP);
     while (cut > 0 and cut < raw.len and (raw[cut] & 0xC0) == 0x80) cut -= 1;
     var rest: []const u8 = raw[0..cut];
     var shown: usize = 0;
+    // P3c 配色：工具体是参照物不是主信息——暗灰呈现，视线自然落在
+    // 白色助手文本与青色工具调用头上。
+    std.Io.Writer.writeAll(w, "\x1b[2m") catch {};
     while (rest.len > 0 and shown < max_lines) : (shown += 1) {
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
         std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch {};
         rest = if (nl < rest.len) rest[nl + 1 ..] else "";
     }
+    std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
     const total_lines = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
     // Byte-cap truncation (one huge line) shows no line-count difference —
     // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
@@ -99,7 +128,7 @@ test "printToolBody: verbatim body, cap marker, empty" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     printToolBody(&aw.writer, "one\ntwo\n");
-    try std.testing.expectEqualStrings("  one\n  two\n", aw.written());
+    try std.testing.expectEqualStrings("\x1b[2m  one\n  two\n\x1b[0m", aw.written());
     // 55 lines: 50 shown + cap marker naming the true total.
     var buf: [300]u8 = undefined;
     var f = std.Io.Writer.fixed(&buf);
@@ -114,7 +143,8 @@ test "printToolBody: verbatim body, cap marker, empty" {
     // Empty output: no body, no marker.
     aw.clearRetainingCapacity();
     printToolBody(&aw.writer, "");
-    try std.testing.expectEqualStrings("", aw.written());
+    // Empty: just the style wrap pair, no rows.
+    try std.testing.expectEqualStrings("\x1b[2m\x1b[0m", aw.written());
 }
 
 test "LastTools: ring order and wrap" {

@@ -84,6 +84,12 @@ pub const RawGuard = struct {
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
         if (no_sig) raw.lflag.ISIG = false;
+        // IEXTEN off: the discipline otherwise consumes ^O (VDISCARD),
+        // ^V (VLNEXT) ITSELF — the byte never reaches the app (the Ctrl+O
+        // verbosity toggle silently dead, 2026-11-07). IXON off likewise:
+        // ^S/^Q are flow control, not keys.
+        raw.lflag.IEXTEN = false;
+        raw.iflag.IXON = false;
         // Deliver Enter verbatim as CR. The line discipline's ICRNL flag
         // (on in most cooked terminals) rewrites every \r to \n before the
         // program sees it — the editor needs \r=submit vs \n=newline to be
