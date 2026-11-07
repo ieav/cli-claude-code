@@ -296,6 +296,11 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
     try std.Io.File.Writer.flush(file_writer);
     // CR or LF both end a line (RawGuard disables ICRNL, so a terminal
     // Enter arrives as \r); a CRLF pair counts as one terminator.
+    // Esc cancels: this read runs in SESSION-RAW no-echo mode (select's
+    // own guard has restored by now), so without this branch Esc was
+    // appended to the value as an invisible literal byte and the user
+    // had no way out but Enter (2026-11-07 /config 报障). Empty return
+    // is every caller's existing "no change, back to menu" path.
     var n: usize = 0;
     while (true) {
         const avail = r.peekGreedy(1) catch break;
@@ -309,6 +314,13 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
             }
             break;
         }
+        if (c == 0x1b) {
+            r.toss(1);
+            if (escTailIsSequence(r)) continue; // arrow/mouse bytes eaten
+            std.Io.Writer.writeAll(w, "\n  [已取消]\n") catch {};
+            std.Io.File.Writer.flush(file_writer) catch {};
+            return buf[0..0];
+        }
         if (n < buf.len) {
             buf[n] = c;
             n += 1;
@@ -316,6 +328,80 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
         r.toss(1);
     }
     return std.mem.trim(u8, buf[0..n], " \t\r\n");
+}
+
+/// After tossing a leading ESC: swallow a full escape sequence and return
+/// true, or report a lone Esc (false). Same lone-Esc litmus as readKey —
+/// buffered follow-up bytes = sequence; a quiet fd within 25ms = lone key.
+/// CSI runs to its final byte (0x40..0x7E, covering arrows/Home and SGR
+/// mouse clicks — a click at a value prompt must not inject its bytes into
+/// the answer); SS3 (ESC O x) and Alt-modified keys take one byte. The
+/// 16-byte CSI cap keeps a garbage stream from spinning forever.
+fn escTailIsSequence(r: *std.Io.Reader) bool {
+    if (r.bufferedLen() == 0) {
+        if (!is_tty) return false; // piped/tests: bytes all pre-buffered
+        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&pfd, 1, 25);
+        if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+    }
+    const b = r.takeByte() catch return true;
+    if (b == 'O') {
+        _ = r.takeByte() catch {};
+        return true;
+    }
+    if (b != '[') return true; // Alt+key — the key itself, swallowed
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const f = r.takeByte() catch return true;
+        if (f >= 0x40 and f <= 0x7E) return true;
+    }
+    return true;
+}
+
+test "readLine: lone Esc cancels, escape sequences are swallowed" {
+    // The /config value-entry hole (2026-11-07): readLine ran in session
+    // raw no-echo mode and only ended on CR/LF — Esc was appended to the
+    // value as a literal byte (invisible, unfreshable), and arrow keys /
+    // SGR mouse clicks injected their ESC[... bytes into it. Lone Esc now
+    // returns empty (every caller's no-change path); sequences are eaten.
+    is_tty = false; // piped: bytes pre-buffered, no poll needed
+
+    // Minimal rig: readLine flushes a real File.Writer (to /dev/null).
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    const devnull = try std.Io.Dir.openFileAbsolute(io_state.io(), "/dev/null", .{ .mode = .write_only });
+    defer devnull.close(io_state.io());
+    var fw_buf: [64]u8 = undefined;
+    var fw = std.Io.File.Writer.initStreaming(devnull, io_state.io(), &fw_buf);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    // Lone Esc with nothing typed → cancel (empty result).
+    var r1 = std.Io.Reader.fixed("\x1b");
+    var b1: [16]u8 = undefined;
+    const v1 = try readLine(&r1, &aw.writer, &fw, "> ", &b1);
+    try std.testing.expectEqual(@as(usize, 0), v1.len);
+
+    // Partial input then Esc → cancel discards the partial text.
+    aw.clearRetainingCapacity();
+    var r2 = std.Io.Reader.fixed("81\x1b");
+    var b2: [16]u8 = undefined;
+    const v2 = try readLine(&r2, &aw.writer, &fw, "> ", &b2);
+    try std.testing.expectEqual(@as(usize, 0), v2.len);
+
+    // Arrow key mid-typing: sequence swallowed, digits kept.
+    aw.clearRetainingCapacity();
+    var r3 = std.Io.Reader.fixed("1\x1b[D2\r");
+    var b3: [16]u8 = undefined;
+    const v3 = try readLine(&r3, &aw.writer, &fw, "> ", &b3);
+    try std.testing.expectEqualStrings("12", v3);
+
+    // SGR mouse click injection: whole sequence eaten, value intact.
+    aw.clearRetainingCapacity();
+    var r4 = std.Io.Reader.fixed("\x1b[<0;5;7M8\r");
+    var b4: [16]u8 = undefined;
+    const v4 = try readLine(&r4, &aw.writer, &fw, "> ", &b4);
+    try std.testing.expectEqualStrings("8", v4);
 }
 
 test "parseKey mappings" {

@@ -274,6 +274,14 @@ def s6_command_smoke():
         z.clear_buf()
         z.send("/config\n")
         z.read_until("Ziv 配置", 10)
+        # value-entry prompt: lone Esc cancels back to the menu (2026-11-07
+        # fix — Esc used to be swallowed as a literal byte with no way out)
+        z.send("3\r")  # digit moves, Enter selects → 最大 tokens prompt
+        z.read_until("1-128000", 10)  # unique to the VALUE prompt
+        z.send("\x1b")
+        out = z.read_until("Ziv 配置", 10)
+        if "已取消" not in out:
+            raise Fail("config value prompt: lone Esc did not cancel")
         z.send("q")
         z.read_until("ziv[", 10)  # prompt back
         quit_and_wait(z)
