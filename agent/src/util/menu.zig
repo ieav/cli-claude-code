@@ -312,7 +312,12 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
         const c = avail[0];
         if (c == '\r' or c == '\n') {
             r.toss(1);
-            if (c == '\r') {
+            // CRLF pair (piped/pasted input arrives with both bytes
+            // buffered): swallow the LF then. A live raw TTY delivers
+            // Enter as a lone CR with NOTHING behind it — peeking there
+            // blocks until the next keystroke and Enter looks dead
+            // (the「回车没反应」root cause, 2026-11-07 D1).
+            if (c == '\r' and r.bufferedLen() > 0) {
                 const a2 = r.peekGreedy(1) catch break;
                 if (a2.len > 0 and a2[0] == '\n') r.toss(1);
             }
@@ -446,6 +451,23 @@ test "readLine: lone Esc cancels, escape sequences are swallowed" {
     var b6: [16]u8 = undefined;
     const v6 = try readLine(&r6, &aw.writer, &fw, "> ", &b6);
     try std.testing.expectEqual(@as(usize, 0), v6.len);
+
+    // CR terminates immediately (a lone CR must not wait for a follow-up
+    // byte — on a live TTY that wait never ends, D1); CRLF when both bytes
+    // are buffered counts as one terminator; a byte after CR stays for the
+    // next reader.
+    aw.clearRetainingCapacity();
+    var r7 = std.Io.Reader.fixed("ab\r");
+    var b7: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ab", try readLine(&r7, &aw.writer, &fw, "> ", &b7));
+    aw.clearRetainingCapacity();
+    var r8 = std.Io.Reader.fixed("cd\r\n");
+    var b8: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("cd", try readLine(&r8, &aw.writer, &fw, "> ", &b8));
+    aw.clearRetainingCapacity();
+    var r9 = std.Io.Reader.fixed("ef\r9");
+    var b9: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ef", try readLine(&r9, &aw.writer, &fw, "> ", &b9));
 }
 
 test "parseKey mappings" {

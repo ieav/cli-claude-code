@@ -335,12 +335,21 @@ fn offerGatewayModels(
     io: std.Io,
     backend: llm.BackendType,
 ) !void {
-    const names = fetchGatewayModels(alloc, io, switcher, backend) catch return;
+    // 失败必须可见（设计 §2.4）：原来静默 return，用户不知道为什么没反应。
+    const names = fetchGatewayModels(alloc, io, switcher, backend) catch {
+        try std.Io.Writer.writeAll(w, "  拉取模型列表失败（检查 Key / Base URL 是否可用）\n");
+        try std.Io.File.Writer.flush(file_writer);
+        return;
+    };
     defer {
         for (names) |n| alloc.free(n);
         alloc.free(names);
     }
-    if (names.len == 0) return;
+    if (names.len == 0) {
+        try std.Io.Writer.writeAll(w, "  网关未返回任何模型\n");
+        try std.Io.File.Writer.flush(file_writer);
+        return;
+    }
 
     try std.Io.Writer.print(w, "\n  网关上发现 {d} 个模型。\n", .{names.len});
     var labels: std.ArrayList([]const u8) = .empty;
@@ -385,9 +394,19 @@ fn runApiKeysMenu(
         const picked = (menu.select(w, r, file_writer, "=== 模型接入配置 ===", &items, 0) catch break) orelse break;
         switch (picked) {
             0, 1 => {
+                // 设计见 docs/config-ux-design.md §2.1：一条规则走天下
+                //（回车=保留 · -=清除 · 输入=修改），两字段问完一次保存，
+                // 保存即终点——无网络往返、无连环菜单（D2/D3 修复）。
                 const is_openai = picked == 0;
-                const key_prompt: []const u8 = if (is_openai) "  API Key: " else "  API Key: ";
+                const cur_key: ?[]const u8 = if (is_openai) switcher.settings.api_keys.openai else switcher.settings.api_keys.anthropic;
+                const cur_url: ?[]const u8 = if (is_openai) switcher.settings.api_keys.openai_base_url else switcher.settings.api_keys.anthropic_base_url;
+
+                try std.Io.Writer.print(w, "\n  {s} 接入（回车=保留 · -=清除 · 输入=修改）\n", .{if (is_openai) "OpenAI" else "Anthropic"});
+                try std.Io.File.Writer.flush(file_writer);
+
                 var kbuf: [256]u8 = undefined;
+                var kp: [96]u8 = undefined;
+                const key_prompt = try_std_fmt(&kp, "  API Key（当前 {s}）: ", .{if (cur_key) |k| maskKey(k) else "(未配置)"});
                 const key = menu.readLine(r, w, file_writer, key_prompt, &kbuf) catch continue;
                 // Guard: typing menu-ish escape hatches ("q", "/quit") at the
                 // value prompt used to store them AS the key — producing
@@ -397,19 +416,32 @@ fn runApiKeysMenu(
                     continue;
                 }
                 var ubuf: [256]u8 = undefined;
-                const url_prompt: []const u8 = if (is_openai)
-                    "  Base URL（兼容网关填这里，回车=官方，-=清除）: "
-                else
-                    "  Base URL（兼容网关填这里，回车=官方，-=清除）: ";
+                var up: [160]u8 = undefined;
+                const url_prompt = try_std_fmt(&up, "  Base URL（当前 {s}，-=恢复官方）: ", .{cur_url orelse "官方默认"});
                 const url = menu.readLine(r, w, file_writer, url_prompt, &ubuf) catch continue;
 
+                // 应用唯一规则（P1）。两字段都直接回车 → 未更改，不落盘。
+                var new_key: ?[]const u8 = cur_key;
+                var new_url: ?[]const u8 = cur_url;
+                var changed = false;
                 if (key.len > 0) {
-                    const kd = try alloc.dupe(u8, key);
-                    if (is_openai) switcher.settings.api_keys.openai = kd else switcher.settings.api_keys.anthropic = kd;
+                    new_key = if (std.mem.eql(u8, key, "-")) null else try alloc.dupe(u8, key);
+                    changed = true;
                 }
                 if (url.len > 0) {
-                    const ud: ?[]const u8 = if (std.mem.eql(u8, url, "-")) null else try alloc.dupe(u8, url);
-                    if (is_openai) switcher.settings.api_keys.openai_base_url = ud else switcher.settings.api_keys.anthropic_base_url = ud;
+                    new_url = if (std.mem.eql(u8, url, "-")) null else try alloc.dupe(u8, url);
+                    changed = true;
+                }
+                if (!changed) {
+                    try std.Io.Writer.writeAll(w, "  未更改\n");
+                    continue;
+                }
+                if (is_openai) {
+                    switcher.settings.api_keys.openai = new_key;
+                    switcher.settings.api_keys.openai_base_url = new_url;
+                } else {
+                    switcher.settings.api_keys.anthropic = new_key;
+                    switcher.settings.api_keys.anthropic_base_url = new_url;
                 }
                 // Drop cached providers so the new key/URL takes effect now.
                 if (switcher.openai_provider) |*p| {
@@ -421,41 +453,46 @@ fn runApiKeysMenu(
                     switcher.claude_provider = null;
                 }
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
-                try offerGatewayModels(w, r, file_writer, switcher, alloc, io, if (is_openai) .openai else .claude);
-
-                // Routing hint: if the current model would NOT use this
-                // gateway (name detection sends it to Ollama), offer to pin
-                // the backend so the configuration actually takes effect.
+                try std.Io.Writer.print(w, "  ✓ 已保存  Key: {s} · Base URL: {s}\n", .{ if (new_key) |k| maskKey(k) else "(未配置)", new_url orelse "官方默认" });
+                try std.Io.Writer.writeAll(w, "  （/model 可查看/切换模型）\n");
+                try std.Io.File.Writer.flush(file_writer);
+                // Routing hint: one TEXT line, never a menu (D3) — only when
+                // the current model name routes to Ollama and would ignore
+                // the gateway just configured.
                 const want: llm.BackendType = if (is_openai) .openai else .claude;
                 if (switcher.backend != want and switcher.backend == .ollama) {
-                    const pin_items = [_][]const u8{ "是，走此接入", "否" };
-                    try std.Io.Writer.print(w, "\n  当前模型 {s} 被按名字路由到了 Ollama。\n", .{switcher.modelName()});
-                    const pin = (menu.select(w, r, file_writer, "让它走刚配置的接入吗？", &pin_items, 0) catch continue) orelse continue;
-                    if (pin == 0) {
-                        switcher.settings.default_backend = if (is_openai) "openai" else "claude";
-                        autoSaveSettings(w, file_writer, switcher, alloc, io);
-                        switcher.switchModel(switcher.modelName()) catch {};
-                    }
+                    try std.Io.Writer.print(w, "  提示：当前模型 {s} 按名称走 Ollama；要走此接入请用 /model 重选。\n", .{switcher.modelName()});
+                    try std.Io.File.Writer.flush(file_writer);
                 }
             },
             2 => {
+                const cur: ?[]const u8 = switcher.settings.api_keys.brave_api_key;
+                var pbuf: [96]u8 = undefined;
+                const prompt = try_std_fmt(&pbuf, "  Brave Key（当前 {s}，回车=保留 · -=清除）: ", .{if (cur) |k| maskKey(k) else "(未配置)"});
                 var vbuf: [256]u8 = undefined;
-                const val = menu.readLine(r, w, file_writer, "  Brave API Key: ", &vbuf) catch continue;
-                if (val.len > 0) switcher.settings.api_keys.brave_api_key = try alloc.dupe(u8, val);
-                autoSaveSettings(w, file_writer, switcher, alloc, io);
+                const val = menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue;
+                if (val.len > 0) {
+                    switcher.settings.api_keys.brave_api_key = if (std.mem.eql(u8, val, "-")) null else try alloc.dupe(u8, val);
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                } else try std.Io.Writer.writeAll(w, "  未更改\n");
             },
             3 => {
+                const cur: []const u8 = switcher.settings.api_keys.ollama_host;
+                var pbuf: [128]u8 = undefined;
+                const prompt = try_std_fmt(&pbuf, "  Ollama Host（当前 {s}，回车=保留）: ", .{cur});
                 var vbuf: [256]u8 = undefined;
-                const val = menu.readLine(r, w, file_writer, "  Ollama Host: ", &vbuf) catch continue;
-                if (val.len > 0) switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
-                // The provider caches base_url at init — drop it so the new
-                // host takes effect this session, then list local models.
-                if (switcher.ollama_provider) |*p| {
-                    p.deinit();
-                    switcher.ollama_provider = null;
-                }
-                autoSaveSettings(w, file_writer, switcher, alloc, io);
-                try offerGatewayModels(w, r, file_writer, switcher, alloc, io, .ollama);
+                const val = menu.readLine(r, w, file_writer, prompt, &vbuf) catch continue;
+                if (val.len > 0) {
+                    switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
+                    // The provider caches base_url at init — drop it so the
+                    // new host takes effect this session.
+                    if (switcher.ollama_provider) |*p| {
+                        p.deinit();
+                        switcher.ollama_provider = null;
+                    }
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                    try std.Io.Writer.writeAll(w, "  （/model 可从网关列出本地模型）\n");
+                } else try std.Io.Writer.writeAll(w, "  未更改\n");
             },
             else => break,
         }
@@ -494,13 +531,16 @@ pub fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io
         try printModelInfo(w, switcher);
         return;
     }
-    var labels: [llm.KNOWN_MODELS.len + 2][]const u8 = undefined;
+    var labels: [llm.KNOWN_MODELS.len + 3][]const u8 = undefined;
     for (&llm.KNOWN_MODELS, 0..) |entry, i| {
         const marker: []const u8 = if (std.mem.eql(u8, entry.name, switcher.modelName())) " ●" else "";
         labels[i] = try std.fmt.allocPrint(std.heap.smp_allocator, "{s:<20} {s}{s}", .{ entry.name, entry.description, marker });
     }
     labels[llm.KNOWN_MODELS.len] = "自定义…（输入模型名，兼容网关可用）";
-    labels[llm.KNOWN_MODELS.len + 1] = "取消 (q)";
+    // 网关发现的唯一入口（设计 §2.4）：从 API Keys 保存流程迁来——配置
+    // 动作不再自动拉列表（D3），发现由用户在此主动触发。
+    labels[llm.KNOWN_MODELS.len + 1] = "从网关列出模型（需已配 Key / Base URL）";
+    labels[llm.KNOWN_MODELS.len + 2] = "取消 (q)";
     defer for (labels[0..llm.KNOWN_MODELS.len]) |l| std.heap.smp_allocator.free(l);
 
     const picked = menu.select(w, r, file_writer, "选择模型 (Enter 切换):", &labels, 0) catch {
@@ -511,7 +551,11 @@ pub fn runModelPicker(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io
         return;
     };
 
-    if (picked == llm.KNOWN_MODELS.len + 1) return; // 取消
+    if (picked == llm.KNOWN_MODELS.len + 2) return; // 取消
+    if (picked == llm.KNOWN_MODELS.len + 1) {
+        try offerGatewayModels(w, r, file_writer, switcher, std.heap.smp_allocator, io, switcher.backend);
+        return;
+    }
     const name: []const u8 = if (picked == llm.KNOWN_MODELS.len) blk: {
         break :blk (try promptCustomModel(w, r, file_writer, switcher, std.heap.smp_allocator)) orelse return;
     } else llm.KNOWN_MODELS[picked].name;
