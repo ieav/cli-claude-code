@@ -10,6 +10,7 @@ const registry = @import("registry.zig");
 const util_time = @import("../util/time.zig");
 const cancel = @import("../util/cancel.zig");
 const cleanup = @import("../util/cleanup.zig");
+const bg_tasks = @import("bg_tasks.zig");
 
 /// Hard ceiling for one command; explicit timeouts clamp to this.
 const MAX_TIMEOUT_S: i64 = 300;
@@ -84,6 +85,8 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     // timeout in seconds; 0 = unlimited, negative treated as 0.
     const timeout_s: i64 = @min(@max(getIntField(input, "timeout") orelse DEFAULT_TIMEOUT_S, 0), MAX_TIMEOUT_S);
+    // P5 M1：后台任务——spawn 后立返任务号，不阻塞回合（见 bg_tasks）。
+    const run_bg = getBoolField(input, "run_in_background") orelse false;
 
     var spawn_opts: std.process.SpawnOptions = .{
         .argv = &.{ "/bin/sh", "-c", command },
@@ -107,6 +110,23 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         if (child.stderr) |f| f.close(io);
         return registry.ToolResult{ .output = "Failed to execute: no child pid", .is_error = true };
     };
+
+    // 后台分支：交接管道给 bg_tasks（此后本函数不再触碰 child）。
+    if (run_bg) {
+        const id = bg_tasks.start(alloc, io, pid, child.stdout.?, child.stderr.?, command) catch |err| {
+            _ = std.c.kill(-pid, .KILL); // 交接失败：回杀整组，不留孤儿
+            if (child.stdout) |f| f.close(io);
+            if (child.stderr) |f| f.close(io);
+            const msg = switch (err) {
+                error.TooManyBackgroundTasks => "Too many background tasks (8 running) — wait or stop one via /bg",
+                else => "Failed to start background task",
+            };
+            return registry.ToolResult{ .output = try alloc.dupe(u8, msg), .is_error = true };
+        };
+        return registry.ToolResult{
+            .output = try alloc.print("[后台任务 #{d} 已启动] {s}\n输出: .ziv/tasks/{d}.log · /bg 查看/停止", .{ id, command, id }),
+        };
+    }
 
     // Register the group so a ziv exit mid-command can kill it (see
     // ActiveGroups); deregistered right after the reap below.
@@ -308,6 +328,13 @@ fn getIntField(input: std.json.Value, key: []const u8) ?i64 {
     const obj = input.object.get(key) orelse return null;
     if (obj != .integer) return null;
     return obj.integer;
+}
+
+fn getBoolField(input: std.json.Value, key: []const u8) ?bool {
+    if (input != .object) return null;
+    const obj = input.object.get(key) orelse return null;
+    if (obj != .bool) return null;
+    return obj.bool;
 }
 
 test "bash executes with output capture" {

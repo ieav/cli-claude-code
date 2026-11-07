@@ -365,7 +365,7 @@ pub const bash_tool: ToolDefinition = .{
     .name = "Bash",
     .description = "Execute a shell command and return its output",
     .input_schema =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 300; 0 = unlimited)"},"working_directory":{"type":"string","description":"Working directory for the command (default: current)"}},"required":["command"]}
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 300; 0 = unlimited; ignored when run_in_background)"},"run_in_background":{"type":"boolean","description":"Run detached and return immediately with a task id (watch/dev-server/long builds). View or stop via /tasks; output lands in .ziv/tasks/<id>.log"},"working_directory":{"type":"string","description":"Working directory for the command (default: current)"}},"required":["command"]}
     ,
     .execute_fn = @import("bash.zig").execute,
     .is_read_only = false,
@@ -461,6 +461,23 @@ pub const web_search_tool: ToolDefinition = .{
     .search_hint = "search web internet google",
 };
 
+/// P5 M2: fetch a URL as readable Markdown（搜索的下一步——搜到链接后
+/// 读内容）。与 WebSearch 同权限级（is_read_only，ziv 既有口径）。
+pub const web_fetch_tool: ToolDefinition = .{
+    .name = "WebFetch",
+    .description = "Fetch a URL and return its content converted to Markdown",
+    .input_schema =
+    \\{"type":"object","properties":{"url":{"type":"string","description":"The http(s) URL to fetch"}},"required":["url"]}
+    ,
+    .execute_fn = @import("web_fetch.zig").execute,
+    .is_read_only = true,
+    .is_destructive = false,
+    .is_concurrency_safe_fn = alwaysConcurrencySafe,
+    .aliases = &.{"Fetch"},
+    .search_hint = "fetch url webpage http read page",
+    .max_result_size = 40_000,
+};
+
 pub const task_create_tool: ToolDefinition = .{
     .name = "TaskCreate",
     .description = "Create a new task for tracking",
@@ -537,6 +554,7 @@ pub const default_tools = &[_]ToolDefinition{
 
     // Web
     web_search_tool,
+    web_fetch_tool,
 
     // Task management
     task_create_tool,
@@ -579,7 +597,8 @@ test "ToolRegistry has and getByName" {
 }
 
 test "ToolRegistry count" {
-    try std.testing.expectEqual(@as(usize, 12), DefaultRegistry.count());
+    // +1 于 P5 M2：WebFetch。
+    try std.testing.expectEqual(@as(usize, 13), DefaultRegistry.count());
 }
 
 test "ToolDefinition matchesName" {

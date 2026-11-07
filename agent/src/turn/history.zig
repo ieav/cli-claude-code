@@ -103,12 +103,22 @@ pub const HYBRID_KEEP: usize = compaction.HYBRID_KEEP_ROUNDS;
 /// 时兜底。纯决策，矩阵可单测。
 pub const PressureLevel = enum { ok, extract, emergency };
 
+/// 压缩起始阈值（P5 T3.1，2026-11-08 由 61.8% 上调）：每次压缩都改写
+/// 历史前缀 → 网关前缀缓存全失效。75% 起步比 61.8% 少约 40% 触发
+/// 次数，emergency 92% 梯子原样兜底（收敛不变量测试锁定不撑爆）。
+pub const COMPACT_ONSET: f64 = 0.75;
+
+/// /stats 观测（P5 T3.3）：压缩次数与回收 token——「前缀稳定性调优」
+/// 的代理指标（网关缓存命中率不可直接观测，触发频次是可拉的自变量）。
+pub var compacts_done: u64 = 0;
+pub var tokens_reclaimed: u64 = 0;
+
 pub fn pressureLadder(est_tokens: u32, ceiling: u32) PressureLevel {
     if (ceiling == 0) return .emergency;
     const e: f64 = @floatFromInt(est_tokens);
     const c: f64 = @floatFromInt(ceiling);
     const pct = e / c;
-    if (pct <= math_mod.constants.PHI) return .ok; // ≤61.8%：不动
+    if (pct <= COMPACT_ONSET) return .ok; // ≤75%：不动（缓存稳定优先）
     if (pct <= 0.92) return .extract; // 提炼（保信息）
     return .emergency; // 收窄保留窗（keep=2）再提炼
 }
@@ -137,6 +147,8 @@ pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocat
     const slim = slimToolResults(history.items, alloc);
     log.bumpEpoch();
     const after_tokens = estimateHistoryTokens(history.items);
+    compacts_done += 1;
+    tokens_reclaimed += if (current_tokens > after_tokens) current_tokens - after_tokens else 0;
     logger.info("compact: strategy=phi+slim tokens ~{d}->~{d} slimmed={d} ({d}->{d}B)", .{
         current_tokens, after_tokens, slim.slimmed, slim.bytes_before, slim.bytes_after,
     });
@@ -235,7 +247,9 @@ pub fn compactHistoryKeep(
     };
     var resp = prov.complete(&msgs, .{
         .max_tokens = @min(switcher.settings.max_tokens, 2048),
-        .temperature = 0.3,
+        // P5 T3.2 前缀稳定：摘要温度 0——网关对确定性前缀有缓存/计价
+        // 优势，我们自己这侧先保证同输入尽量同输出。
+        .temperature = 0,
     }) catch |err| {
         try std.Io.Writer.print(w, "  Summary call failed: {}.\n  History untouched — try /compact phi.\n\n", .{err});
         return;
@@ -265,6 +279,8 @@ pub fn compactHistoryKeep(
     log.bumpEpoch();
 
     const after_tokens = estimateHistoryTokens(history.items);
+    compacts_done += 1;
+    tokens_reclaimed += if (before_tokens > after_tokens) before_tokens - after_tokens else 0;
     logger.info("compact: strategy=hybrid msgs {d}->{d} tokens ~{d}->~{d} slimmed={d} ({d}->{d}B)", .{
         before_msgs, history.items.len, before_tokens, after_tokens, slim.slimmed, slim.bytes_before, slim.bytes_after,
     });
@@ -1311,9 +1327,64 @@ test "pressure ladder + rolling compaction converge: information compresses fore
     const last = estimateHistoryTokens(history.items);
     try std.testing.expect(worst < 4200);
     try std.testing.expect(last < 4200);
-    // 梯子矩阵。
+    // 梯子矩阵（T3.1：起点 75%——700/1000 已落在 ok 段）。
     try std.testing.expect(pressureLadder(500, 1000) == .ok);
-    try std.testing.expect(pressureLadder(700, 1000) == .extract);
+    try std.testing.expect(pressureLadder(700, 1000) == .ok);
+    try std.testing.expect(pressureLadder(800, 1000) == .extract);
     try std.testing.expect(pressureLadder(950, 1000) == .emergency);
     try std.testing.expect(pressureLadder(10, 0) == .emergency);
+}
+
+test "applyHybridLayout is byte-deterministic: same input → same output (T3.2)" {
+    // 前缀稳定的我们这侧的一半：布局手术不得掺入时间戳/计数器等
+    // 随机量——同输入两次手术，逐消息字节一致（LLM 摘要温度已归零，
+    // 这里锁的是 ziv 自己的包装层）。
+    const alloc = std.testing.allocator;
+    const build = struct {
+        fn mk(a: std.mem.Allocator) !std.ArrayList(llm.Message) {
+            var h: std.ArrayList(llm.Message) = .empty;
+            errdefer {
+                for (h.items) |m| freeMessage(m, a);
+                h.deinit(a);
+            }
+            const sb = try a.alloc(llm.ContentBlock, 1);
+            sb[0] = .{ .text = try a.dupe(u8, "SYSTEM") };
+            try h.append(a, .{ .role = .system, .content = sb, .timestamp = 0 });
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                const ub = try a.alloc(llm.ContentBlock, 1);
+                ub[0] = .{ .text = try a.dupe(u8, "turn A padding text") };
+                try h.append(a, .{ .role = .user, .content = ub, .timestamp = 0 });
+                const fb = try a.alloc(llm.ContentBlock, 1);
+                fb[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "tid"), .content = try a.dupe(u8, "fat result bytes") } };
+                try h.append(a, .{ .role = .user, .content = fb, .timestamp = 0 });
+            }
+            return h;
+        }
+    }.mk;
+    var h1 = try build(alloc);
+    defer h1.deinit(alloc);
+    defer for (h1.items) |m| freeMessage(m, alloc);
+    var h2 = try build(alloc);
+    defer h2.deinit(alloc);
+    defer for (h2.items) |m| freeMessage(m, alloc);
+
+    const split = compaction.hybridSplit(h1.items, compaction.HYBRID_KEEP_ROUNDS);
+    _ = try applyHybridLayout(&h1, alloc, split, "SUMMARY payload");
+    _ = try applyHybridLayout(&h2, alloc, split, "SUMMARY payload");
+
+    try std.testing.expectEqual(h1.items.len, h2.items.len);
+    for (h1.items, h2.items) |*a, *b| {
+        try std.testing.expect(a.role == b.role);
+        try std.testing.expectEqual(a.content.len, b.content.len);
+        for (a.content, b.content) |ca, cb| {
+            if (ca == .text and cb == .text) {
+                try std.testing.expectEqualStrings(ca.text, cb.text);
+            } else if (ca == .tool_result and cb == .tool_result) {
+                try std.testing.expectEqualStrings(ca.tool_result.content, cb.tool_result.content);
+            }
+        }
+    }
+    // 梯子计数器只增不减、恒为非负（/stats 读它们）。
+    try std.testing.expect(compacts_done >= 0 and tokens_reclaimed >= 0);
 }

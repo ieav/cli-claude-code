@@ -581,6 +581,58 @@ def s12_tui_colors_toggle_resize():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s13_bg_tasks():
+    """P5 M1: Bash run_in_background returns immediately with a task id,
+    /bg lists it as running, stop kills the group, and ziv exit leaves no
+    orphan (the S5 reaping semantics extended to background)."""
+    import subprocess as sp
+    d = tempfile.mkdtemp(prefix="ziv-m1-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            # 1. 后台启动 —— 立返任务号（回合不被 sleep 阻塞）。
+            z.send('/run Bash {"command":"sleep 57 && echo done-bg-marker","run_in_background":true}\n')
+            t0 = time.time()
+            out = z.read_until("后台任务 #", 10)
+            if time.time() - t0 > 5:
+                raise Fail("background start did not return promptly")
+            # 回执含命令原文属预期；脱离的证明 = 5s 内返回 + 下一步 /bg 立即可用。
+            # 2. /bg 面板列出运行中的任务。
+            z.clear_buf()
+            z.send("/bg\n")
+            out = z.read_until("运行中", 10)
+            if "sleep 57" not in out:
+                raise Fail("bg panel did not list the running command")
+            # 3. 选中任务 → 停止（menu: Enter 选任务，Enter 选停止）。
+            z.clear_buf()
+            z.send("\r")
+            z.read_until("停止", 5)
+            z.send("\r")
+            z.read_until("已发停止信号", 5)
+            # 4. 面板重绘显示被杀状态（waiter 有 1s 泵宽限 + join，先沉淀）。
+            time.sleep(2.5)
+            z.clear_buf()
+            z.send("\x1b")  # 从列表退出再进，拿干净一屏
+            z.read_until("ziv[", 5)
+            z.clear_buf()
+            z.send("/bg\n")
+            out = z.read_until("被杀", 10)
+            # 5. 退出 ziv → 零孤儿。
+            z.send("\x1b")
+            z.read_until("ziv[", 5)
+            quit_and_wait(z)
+            time.sleep(1.0)  # 组杀信号落地窗口
+            r = sp.run(["pgrep", "-f", "sleep 57"], capture_output=True)
+            if r.returncode == 0:
+                raise Fail("orphan survived ziv exit: " + r.stdout.decode())
+            return "bg start → /bg panel → stop → no orphan ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -594,6 +646,7 @@ SCENARIOS = [
     ("S10 code-index", s10_code_index),
     ("S11 code-context", s11_code_context_injection),
     ("S12 tui-colors-toggle-resize", s12_tui_colors_toggle_resize),
+    ("S13 bg-tasks", s13_bg_tasks),
 ]
 
 

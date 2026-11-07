@@ -487,6 +487,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             }
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
+        } else if (std.mem.eql(u8, input, "/bg")) {
+            // P5 M1 后台任务面板：列表（状态/耗时/命令）+ 停止 + 输出预览。
+            // 交互规则沿配置规程：Enter 进操作 / Esc 逐层退出零副作用。
+            try runBgTasksMenu(ctx.w, ctx.r, ctx.file_writer, allocator, ctx.io);
+            return .handled;
         } else if (std.mem.eql(u8, input, "/last") or std.mem.startsWith(u8, input, "/last ")) {
             // ③: full output of a recent tool — the one-line preview in
             // the transcript deliberately truncates; this is the
@@ -594,6 +599,8 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 ctx.log.records.items.len,
             });
             try std.Io.Writer.print(ctx.w, "  Code context: {d} snippets (last turn, from .ziv/index.db)\n", .{session_store_mod_code.last_injected});
+            // P5 T3.3 前缀稳定代理指标：压缩触发越少，网关前缀缓存越稳。
+            try std.Io.Writer.print(ctx.w, "  Compaction: {d} passes, ~{d} tokens reclaimed (onset 75%)\n", .{ turn_history.compacts_done, turn_history.tokens_reclaimed });
             try std.Io.Writer.print(ctx.w, "  Mode: {s} | Model: {s} ({s}) | Tier: {s}\n", .{
                 auth.modeLabel(ctx.current_mode.*),
                 ctx.switcher.modelName(),
@@ -864,5 +871,86 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
         }
     }
     return .message;
+}
+
+/// /bg 面板（P5 M1）。TTY：menu.select 两层（任务 → 操作）；管道/非
+/// TTY：纯文本列表。停止 = 杀整组（waiter 收割落状态）。
+fn runBgTasksMenu(w: *std.Io.Writer, r: *std.Io.Reader, file_writer: *std.Io.File.Writer, alloc: std.mem.Allocator, io: std.Io) !void {
+    const bg_tasks = @import("../tools/bg_tasks.zig");
+    while (true) {
+        const snap = bg_tasks.snapshot(alloc) catch {
+            try std.Io.Writer.writeAll(w, "  后台任务快照失败\n\n");
+            try std.Io.File.Writer.flush(file_writer);
+            return;
+        };
+        defer {
+            for (snap) |s| alloc.free(s.command);
+            alloc.free(snap);
+        }
+        if (snap.len == 0) {
+            try std.Io.Writer.writeAll(w, "  无后台任务（Bash 工具带 run_in_background:true 启动的命令在此查看/停止）\n\n");
+            try std.Io.File.Writer.flush(file_writer);
+            return;
+        }
+        if (!menu.isTty()) {
+            for (snap) |s| {
+                const state = if (s.running) "● 运行中" else if (s.signaled) "✗ 被杀" else "✓ 完成";
+                try std.Io.Writer.print(w, "  #{d} [{s} {d}s] {s}\n", .{ s.id, state, @divTrunc(s.elapsed_ms, 1000), s.command });
+            }
+            try std.Io.Writer.writeAll(w, "\n");
+            try std.Io.File.Writer.flush(file_writer);
+            return;
+        }
+        var items = alloc.alloc([]const u8, snap.len + 1) catch return;
+        defer alloc.free(items);
+        for (snap, 0..) |s, i| {
+            const state = if (s.running) "● 运行中" else if (s.signaled) "✗ 被杀" else "✓ 完成";
+            items[i] = std.fmt.allocPrint(alloc, "[#{d} {s} {d}s] {s}", .{ s.id, state, @divTrunc(s.elapsed_ms, 1000), truncFor(s.command, 44) }) catch continue;
+        }
+        items[snap.len] = "返回";
+        defer for (items[0..snap.len]) |it| alloc.free(@constCast(it));
+        const picked = (menu.select(w, r, file_writer, "后台任务（Enter 操作 · Esc 返回）", items, 0) catch return) orelse return;
+        if (picked >= snap.len) return;
+        const t = snap[picked];
+        if (t.running) {
+            const act_items = [_][]const u8{ "停止（杀整组）", "查看输出", "返回" };
+            const act = (menu.select(w, r, file_writer, "操作：", &act_items, 0) catch continue) orelse continue;
+            if (act == 0) {
+                _ = bg_tasks.stop(t.id);
+                try std.Io.Writer.print(w, "  已发停止信号（#{d}）\n\n", .{t.id});
+                try std.Io.File.Writer.flush(file_writer);
+            } else if (act == 1) {
+                printBgPreview(w, alloc, io, t.id);
+            }
+        } else {
+            printBgPreview(w, alloc, io, t.id);
+        }
+    }
+}
+
+fn printBgPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, io: std.Io, id: u32) void {
+    const bg_tasks = @import("../tools/bg_tasks.zig");
+    const tail = bg_tasks.previewOf(alloc, io, id) orelse {
+        std.Io.Writer.print(w, "  （#{d} 无输出）\n\n", .{id}) catch {};
+        return;
+    };
+    defer alloc.free(tail);
+    std.Io.Writer.print(w, "  ── #{d} 输出预览 ──\n", .{id}) catch {};
+    var it = std.mem.splitScalar(u8, tail, '\n');
+    var n: usize = 0;
+    while (it.next()) |ln| {
+        if (n >= 30) {
+            std.Io.Writer.print(w, "  …（预览 30 行为帽，全文见 .ziv/tasks/{d}.log）\n", .{id}) catch {};
+            break;
+        }
+        std.Io.Writer.print(w, "  {s}\n", .{ln}) catch {};
+        n += 1;
+    }
+    std.Io.Writer.writeAll(w, "\n") catch {};
+}
+
+fn truncFor(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    return s[0 .. max - 1];
 }
 
