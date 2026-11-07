@@ -881,6 +881,26 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         }
                     }
 
+                    // 压后目标（2026-11-08）：压完要真的小——首轮深压后仍
+                    // >45% 且预算未尽，收窄保留窗再压一轮（回合内工具结果
+                    // 折叠由 applyHybridLayout 统一处理）。原先 <75% 即停。
+                    if (deep_compacts == 1 and level == .extract) {
+                        const pct_now = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                        const prov2 = switcher.getProvider() catch null;
+                        if (pct_now > turn_history.POST_COMPACT_TARGET and prov2 != null and
+                            switcher.settings.auto_deep_compact and
+                            llm.provider.capabilityTier(switcher.modelName(), switcher.backend) == .full and
+                            history.items.len > 8)
+                        {
+                            deep_compacts += 1;
+                            const before_pct = est_ctx * 100 / ceiling;
+                            std.Io.Writer.print(ow, "\x1b[2m  [压后仍 {d}%（目标 ≤45%）— 收窄再提炼（摘要 + 近2轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
+                            try std.Io.File.Writer.flush(&file_writer);
+                            turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", 2) catch {};
+                            est_ctx = turn_history.estimateHistoryTokens(history.items);
+                        }
+                    }
+
                     // 提炼不可用/没压够 → φ 截断 + 瘦身（有损兜底）。
                     if (turn_history.pressureLadder(est_ctx, ceiling) != .ok) {
                         const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);

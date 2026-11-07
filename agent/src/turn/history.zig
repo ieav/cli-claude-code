@@ -108,6 +108,11 @@ pub const PressureLevel = enum { ok, extract, emergency };
 /// 次数，emergency 92% 梯子原样兜底（收敛不变量测试锁定不撑爆）。
 pub const COMPACT_ONSET: f64 = 0.75;
 
+/// 压后目标（2026-11-08）：压缩要压到位——首轮深压后仍高于此水位则
+/// 收窄保留窗再压一轮。原先「压完 <75% 即合格」导致压后仍占半窗，
+/// 用户看到的就是「压完上下文还是很长」。
+pub const POST_COMPACT_TARGET: f64 = 0.45;
+
 /// /stats 观测（P5 T3.3）：压缩次数与回收 token——「前缀稳定性调优」
 /// 的代理指标（网关缓存命中率不可直接观测，触发频次是可拉的自变量）。
 pub var compacts_done: u64 = 0;
@@ -246,7 +251,9 @@ pub fn compactHistoryKeep(
         .{ .role = .user, .content = user_blocks, .timestamp = util_time.nowMillis() },
     };
     var resp = prov.complete(&msgs, .{
-        .max_tokens = @min(switcher.settings.max_tokens, 2048),
+        // 2026-11-08 收紧：2048→1024——摘要要替代整段历史，臃肿摘要
+        // 自败其义（指令里同步给了 ~600 词预算）。
+        .max_tokens = @min(switcher.settings.max_tokens, 1024),
         // P5 T3.2 前缀稳定：摘要温度 0——网关对确定性前缀有缓存/计价
         // 优势，我们自己这侧先保证同输入尽量同输出。
         .temperature = 0,
@@ -356,10 +363,96 @@ pub fn slimToolResults(messages: []llm.Message, alloc: std.mem.Allocator) SlimSt
     return stats;
 }
 
+/// 每个用户回合内只保留最近 K 条 tool_result 的内容，更早的替换成
+/// 单行标记（tool_use 原样保留——API 要求 use/result 配对完整）。
+/// 修「马拉松回合被当一个 round 整体保留」的口子（hybridSplit 按 user
+/// 文本消息锚定，单回合 50 次工具调用全算一个 round）：留存从
+/// 50×体量 降到 K×体量 + (N-K)×标记行。/last 环不受影响（独立全文）。
+pub const FOLD_KEEP_PER_ROUND: usize = 8;
+
+pub const FoldStats = struct { folded: usize = 0, bytes_before: usize = 0 };
+
+pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) FoldStats {
+    // 第一遍：数每个 round 的 tool_result 总数。
+    var round_total: std.ArrayList(usize) = .empty;
+    defer round_total.deinit(alloc);
+    var cur: usize = 0;
+    for (messages) |*m| {
+        const starts_round = m.role == .user and m.content.len > 0 and m.content[0] == .text;
+        if (starts_round) {
+            round_total.append(alloc, 0) catch break;
+            cur = round_total.items.len - 1;
+        }
+        if (round_total.items.len == 0) continue; // 系统提示段（无 round 上下文）不动
+        for (m.content) |b| {
+            if (b == .tool_result) round_total.items[cur] += 1;
+        }
+    }
+    // 第二遍：重建含超额 tool_result 的消息（沿 slimToolResults 的换法）。
+    var stats: FoldStats = .{};
+    var round_idx: usize = 0; // 已进入的 round 计数
+    var seen_in_round: usize = 0;
+    for (messages) |*m| {
+        const starts_round = m.role == .user and m.content.len > 0 and m.content[0] == .text;
+        if (starts_round) {
+            round_idx += 1;
+            seen_in_round = 0;
+        }
+        if (round_idx == 0 or round_idx > round_total.items.len) continue;
+        // 本消息是否含「该 round 内序号 < 总数-K」的 tool_result。
+        var n_before: usize = 0;
+        var has_fold = false;
+        for (m.content) |b| {
+            if (b != .tool_result) continue;
+            const ordinal = seen_in_round + n_before;
+            const total = round_total.items[round_idx - 1];
+            if (total > FOLD_KEEP_PER_ROUND and ordinal + FOLD_KEEP_PER_ROUND < total) has_fold = true;
+            n_before += 1;
+        }
+        seen_in_round += n_before;
+        if (!has_fold) continue;
+
+        const old = m.content;
+        const nb = alloc.alloc(llm.ContentBlock, old.len) catch continue;
+        var bi: usize = 0;
+        var ord: usize = seen_in_round - n_before;
+        for (old) |b| {
+            if (b == .tool_result) {
+                const total = round_total.items[round_idx - 1];
+                if (total > FOLD_KEEP_PER_ROUND and ord + FOLD_KEEP_PER_ROUND < total) {
+                    var mbuf: [96]u8 = undefined;
+                    const marker = std.fmt.bufPrint(&mbuf, "[工具输出已并入摘要（原 {d} B）· /last 查全文]", .{b.tool_result.content.len}) catch "[folded]";
+                    if (alloc.dupe(u8, marker)) |owned| {
+                        stats.folded += 1;
+                        stats.bytes_before += b.tool_result.content.len;
+                        nb[bi] = .{ .tool_result = .{
+                            .tool_use_id = b.tool_result.tool_use_id,
+                            .content = owned,
+                            .is_error = b.tool_result.is_error,
+                        } };
+                        bi += 1;
+                        ord += 1;
+                        // 旧 content 归 history 所有：释放防漏。
+                        alloc.free(@constCast(b.tool_result.content));
+                        continue;
+                    } else |_| {}
+                }
+                ord += 1;
+            }
+            nb[bi] = b;
+            bi += 1;
+        }
+        alloc.free(@constCast(old));
+        m.content = nb[0..bi];
+    }
+    return stats;
+}
+
 /// Hybrid surgery (pure, no LLM): rebuild history as
 /// [system prompt (kept — clearHistory preserves index 0)] +
-/// [summary-as-user-message] + [verbatim tail from summarize_to], then slim
-/// oversized tool_results everywhere. The tail is duped out before the
+/// [summary-as-user-message] + [verbatim tail from summarize_to], then
+/// foldOldToolResults（每回合只留最近 K 条工具结果）+ slim oversized
+/// tool_results everywhere. The tail is duped out before the
 /// clear, so on error the history is left untouched. Unit-testable with a
 /// fake summary.
 pub fn applyHybridLayout(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, summarize_to: usize, summary: []const u8) !SlimStats {
@@ -381,6 +474,7 @@ pub fn applyHybridLayout(history: *std.ArrayList(llm.Message), alloc: std.mem.Al
     }
     // Ownership moved into history: neutralize the defer's cleanup.
     tail.clearRetainingCapacity();
+    _ = foldOldToolResults(history.items, alloc);
     return slimToolResults(history.items, alloc);
 }
 
@@ -1279,6 +1373,51 @@ test "maybeCompact auto path: phi cut + tier-3 slimming fire together" {
     // cut itself is already asserted via ev.compacted.)
 }
 
+
+test "foldOldToolResults: marathon round keeps only the last K results (pairing intact)" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+    }
+    {
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .text = try alloc.dupe(u8, "marathon turn") };
+        try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
+    }
+    // 同一回合 12 条 tool_result，每条 2 KiB（阈值 1 KiB 之下不会被
+    // slim 单独处理，专测 fold）。
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const fb = try alloc.alloc(llm.ContentBlock, 1);
+        const payload = try alloc.alloc(u8, 2048);
+        @memset(payload, 'r');
+        fb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "tid"), .content = payload } };
+        try history.append(alloc, .{ .role = .user, .content = fb, .timestamp = 0 });
+    }
+    const stats = foldOldToolResults(history.items, alloc);
+    try std.testing.expectEqual(@as(usize, 4), stats.folded); // 12 - FOLD_KEEP(8)
+    try std.testing.expect(stats.bytes_before == 4 * 2048);
+    // 配对完整性：消息数不变，被折叠的 content 是标记行而非全文。
+    try std.testing.expectEqual(@as(usize, 14), history.items.len);
+    var folded_markers: usize = 0;
+    var kept_full: usize = 0;
+    for (history.items[2..]) |m| {
+        for (m.content) |b| {
+            if (b == .tool_result) {
+                if (std.mem.indexOf(u8, b.tool_result.content, "已并入摘要") != null) folded_markers += 1 else kept_full += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), folded_markers);
+    try std.testing.expectEqual(@as(usize, 8), kept_full);
+}
 
 test "pressure ladder + rolling compaction converge: information compresses forever, never blows up" {
     const alloc = std.testing.allocator;

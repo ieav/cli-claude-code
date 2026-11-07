@@ -47,8 +47,10 @@ pub const HYBRID_KEEP_ROUNDS: usize = 5;
 /// Tier-3: a tool_result larger than this is slimmed IN HISTORY to
 /// TOOL_SLIM_HEAD bytes + a byte-count marker. The display layer (/last)
 /// keeps full text independently — this saves request tokens only.
-pub const TOOL_SLIM_THRESHOLD: usize = 4 * 1024;
-pub const TOOL_SLIM_HEAD: usize = 1024;
+/// 2026-11-08 收紧（用户反馈「压完上下文还是很长」）：阈值 4 KiB→1 KiB、
+/// 保留头 1024→512。显示层不受影响（/last 环、LastTools 独立持有全文）。
+pub const TOOL_SLIM_THRESHOLD: usize = 1 * 1024;
+pub const TOOL_SLIM_HEAD: usize = 512;
 
 /// Marker appended to a slimmed tool_result: `[截断，完整输出 N 字节]`.
 pub fn toolSlimMarker(buf: []u8, original_bytes: usize) []const u8 {
@@ -120,6 +122,8 @@ pub const SUMMARY_INSTRUCTION =
     \\8. Optional Next Step:
     \\
     \\Be specific and information-dense: exact file paths, commands, APIs, decisions and their reasons, and concrete results. Prefer facts over prose. Do not preface the summary with any commentary.
+    \\
+    \\Length budget: at most ~600 words total. Compress aggressively — the summary REPLACES the history, and a bloated summary defeats its own purpose. Cut anything the next step does not strictly need.
 ;
 
 /// Render conversation messages as a role-labeled transcript for the
