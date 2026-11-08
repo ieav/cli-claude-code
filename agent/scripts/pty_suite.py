@@ -912,6 +912,54 @@ def s17_hooks():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s18_tree_sitter():
+    """③ milestone 1: post-edit syntax validation. A FileEdit that breaks
+    python must surface the tree-sitter warning in the tool result; valid
+    writes stay silent; unknown extensions skip validation entirely."""
+    d = tempfile.mkdtemp(prefix="ziv-ts-")
+    try:
+        with open(os.path.join(d, "calc.py"), "w") as f:
+            f.write("def calc():\n    return 1\n")
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+
+            def run_and_wait(cmd, marker, timeout=10):
+                # /run 收尾窗口（op_log/flush/提示符重画）到达的输入会被丢
+                # （既有行为，S6/S10 抖动同源）——每步等提示符真正回来再发下一条。
+                z.clear_buf()
+                z.send(cmd)
+                out = z.read_until(marker, timeout)
+                z.read_until("ziv[bypass] (gpt-4o) [0%] >", 5)
+                return out
+
+            # 坏编辑：return 1 → return 1( —— 未闭合调用。
+            out = run_and_wait('/run FileEdit {"path":"calc.py","old_string":"return 1","new_string":"return 1("}\r', "语法检查")
+            if "calc.py" not in out:
+                raise Fail(f"warning missing file name: {out[-300:]!r}")
+            # 好编辑：修回去，警告必须不出现。
+            out2 = run_and_wait('/run FileEdit {"path":"calc.py","old_string":"return 1(","new_string":"return 1"}\r', "Replaced 1 occurrence")
+            if "语法检查" in out2:
+                raise Fail("valid edit produced a syntax warning")
+            # FileWrite：合法 python 静默；坏 zig（缺分号）报。
+            out3 = run_and_wait('/run FileWrite {"path":"ok.py","content":"x = 1\\n"}\r', "Wrote")
+            if "语法检查" in out3:
+                raise Fail("valid python write produced a syntax warning")
+            out4 = run_and_wait('/run FileWrite {"path":"bad.zig","content":"const x = 1\\nconst y = 2;\\n"}\r', "语法检查")
+            if "bad.zig" not in out4:
+                raise Fail(f"zig warning missing: {out4[-300:]!r}")
+            # 未知扩展名：纯文本，永不校验。
+            out5 = run_and_wait('/run FileWrite {"path":"notes.txt","content":"((("}\r', "Wrote")
+            if "语法检查" in out5:
+                raise Fail("txt must not be validated")
+            quit_and_wait(z)
+            return "break→warning, fix→silent, .zig caught, .txt skipped ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -930,6 +978,7 @@ SCENARIOS = [
     ("S15 project-root", s15_project_root),
     ("S16 print-mode", s16_print_mode),
     ("S17 hooks", s17_hooks),
+    ("S18 tree-sitter", s18_tree_sitter),
 ]
 
 

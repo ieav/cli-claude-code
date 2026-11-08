@@ -1,5 +1,32 @@
 const std = @import("std");
 
+/// tree-sitter（③ 里程碑 1）：核心 + 六语法全部编进模块。scanner 符号
+/// 带语言前缀（现代 tree-sitter 惯例），无链接冲突，无需分静态库。
+/// 每语法需要自己的 include 路径（scanner.c include "tree_sitter/parser.h"）。
+fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFiles(.{
+        .files = &.{
+            "deps/tree-sitter/lib/src/lib.c",
+            "deps/tree-sitter/python/src/parser.c",
+            "deps/tree-sitter/python/src/scanner.c",
+            "deps/tree-sitter/javascript/src/parser.c",
+            "deps/tree-sitter/javascript/src/scanner.c",
+            "deps/tree-sitter/typescript/src/parser.c",
+            "deps/tree-sitter/typescript/src/scanner.c",
+            "deps/tree-sitter/tsx/src/parser.c",
+            "deps/tree-sitter/tsx/src/scanner.c",
+            "deps/tree-sitter/java/src/parser.c",
+            "deps/tree-sitter/zig/src/parser.c",
+        },
+        .flags = &.{"-std=c11"},
+    });
+    mod.addIncludePath(b.path("deps/tree-sitter/lib/include"));
+    mod.addIncludePath(b.path("deps/tree-sitter/lib/src"));
+    inline for (.{ "python", "javascript", "typescript", "tsx", "java", "zig" }) |lang| {
+        mod.addIncludePath(b.path("deps/tree-sitter/" ++ lang ++ "/src"));
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -12,6 +39,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const utf8proc_mod = utf8proc_tc.createModule();
+
+    // tree-sitter api.h 的 Zig 绑定（与 utf8proc 同路径：translate-c）。
+    const ts_tc = b.addTranslateC(.{
+        .root_source_file = b.path("deps/tree-sitter/lib/include/tree_sitter/api.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ts_mod = ts_tc.createModule();
 
     // Root module with SQLite C source
     const root_mod = b.createModule(.{
@@ -40,6 +75,8 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-DSQLITE_CORE"},
     });
     root_mod.addImport("utf8proc", utf8proc_mod);
+    addTreeSitter(b, root_mod);
+    root_mod.addImport("treesitter", ts_mod);
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -79,6 +116,8 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-DSQLITE_CORE"},
     });
     test_mod.addImport("utf8proc", utf8proc_mod);
+    addTreeSitter(b, test_mod);
+    test_mod.addImport("treesitter", ts_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

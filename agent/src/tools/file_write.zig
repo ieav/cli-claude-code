@@ -1,6 +1,7 @@
 /// FileWrite tool — writes content to a file.
 const std = @import("std");
 const registry = @import("registry.zig");
+const treesitter = @import("../util/treesitter.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = getStringField(input, "path") orelse
@@ -18,8 +19,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 
-    const msg = alloc.print("Wrote {} bytes to {s}", .{ content.len, path }) catch "wrote file";
-    return registry.ToolResult{ .output = msg };
+    const base = alloc.print("Wrote {} bytes to {s}", .{ content.len, path }) catch "wrote file";
+    // ③ 里程碑 1：整文件重写与定点编辑同一套落盘后语法校验。
+    if (treesitter.appendValidationWarning(alloc, path, content)) |warn| {
+        defer alloc.free(warn);
+        const joined = std.mem.concat(alloc, u8, &.{ base, warn }) catch base;
+        return registry.ToolResult{ .output = joined };
+    }
+    return registry.ToolResult{ .output = base };
 }
 
 fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {

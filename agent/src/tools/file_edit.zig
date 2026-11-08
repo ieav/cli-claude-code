@@ -1,6 +1,7 @@
 /// FileEdit tool — find and replace strings in a file.
 const std = @import("std");
 const registry = @import("registry.zig");
+const treesitter = @import("../util/treesitter.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = registry.getStringField(input, "path") orelse
@@ -76,9 +77,16 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     else
         @as(usize, 1);
 
-    return registry.ToolResult{
-        .output = try alloc.print("Replaced {d} occurrence(s) in {s}", .{ count, path }),
-    };
+    // ③ 里程碑 1：落盘后语法校验（内存里的新内容，不回读磁盘）。有错附
+    // 警告行让模型当场自纠；未知扩展名/超限 → null 零成本跳过。
+    const base = try alloc.print("Replaced {d} occurrence(s) in {s}", .{ count, path });
+    if (treesitter.appendValidationWarning(alloc, path, new_contents.items)) |warn| {
+        defer alloc.free(warn);
+        return registry.ToolResult{
+            .output = try std.mem.concat(alloc, u8, &.{ base, warn }),
+        };
+    }
+    return registry.ToolResult{ .output = base };
 }
 
 fn fileEditIsConcurrencySafe(_: std.json.Value) bool {
