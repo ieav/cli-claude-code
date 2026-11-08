@@ -34,9 +34,41 @@ fn charWidth(b: u8) usize {
     return 2;
 }
 
+/// East Asian Ambiguous 字符（2026-11-10 用户表格取证：em dash「—」
+/// 被终端按 1 列渲染，ziv 按 2 计 → 该行竖线左移一格）。这些码点在
+/// 非 CJK 语境的终端（含 macOS Terminal 默认）为窄渲染——统一按 1。
+/// 注意中文引号「“”‘’」不在表内：CJK 语境下按全角渲染更常见。
+fn ambiguousNarrow(cp: u21) bool {
+    return switch (cp) {
+        0x2010...0x2015 => true, // ‐‑‒–—（连字符族/破折号）
+        0x00B1, 0x00D7, 0x00F7, 0x00B0, 0x00A7 => true, // ± × ÷ ° §
+        else => false,
+    };
+}
+
+/// 码点级宽度：歧义窄字符按 1，其余沿首字节规则。
+fn charWidthCp(cp: u21, lead_byte: u8) usize {
+    if (ambiguousNarrow(cp)) return 1;
+    return charWidth(lead_byte);
+}
+
 fn strWidth(s: []const u8) usize {
     var w: usize = 0;
-    for (s) |c| w += charWidth(c);
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > s.len) break; // 截断尾：按已见字节计
+        const cp = std.unicode.utf8Decode(s[i .. i + len]) catch {
+            i += len;
+            continue;
+        };
+        w += charWidthCp(cp, s[i]);
+        i += len;
+    }
+    // 截断尾的残余字节按旧口径补计（不完美输入的防御，不影响正常表）。
     return w;
 }
 
@@ -3688,6 +3720,63 @@ test "live region: slash commands keep their colors in the pinned input row (P3c
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[36m/stats\x1b[0m") != null);
     _ = ed;
+}
+
+test "ambiguous-width chars (em dash) align as narrow (2026-11-10 取证)" {
+    // 用户实测：第 2 列「185」(3 列) 与「—」(终端按 1 列渲染) 同列时，
+    // ziv 旧口径把 — 按 2 列计 → 该行竖线左移一格。歧义窄字符须按 1。
+    const alloc = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 100;
+    defer force_width = 0;
+    regionBegin(&aw.writer, "st");
+    var rw = RegionWriter{ .real = &aw.writer, .table_alloc = alloc };
+    const tbl = "| 项 | 数 | 备注 |\n|---|---|---|\n| a | 185 | x |\n| b | — | y |\n| c | ±3 | z |\nend\n";
+    try std.Io.Writer.writeAll(&rw.interface, tbl);
+    rw.flushTableBlock();
+    const out = aw.written();
+    // 收集 │ 行，比较每行 │ 的显示列位置（歧义字符按 1 计后应全一致）。
+    var rows: std.ArrayList([]const u8) = .empty;
+    defer rows.deinit(alloc);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |ln| {
+        var t2 = std.mem.trimStart(u8, ln, "\x1b8");
+        t2 = std.mem.trimStart(u8, t2, "\x1b[2m");
+        if (std.mem.startsWith(u8, t2, "\u{2502}")) rows.append(alloc, t2) catch break;
+    }
+    try std.testing.expectEqual(@as(usize, 4), rows.items.len);
+    var cols: [4][]const usize = undefined;
+    var lens: [4]usize = undefined;
+    for (rows.items, 0..) |ln, ri| {
+        var buf: [16]usize = undefined;
+        var n: usize = 0;
+        var col: usize = 0;
+        var i: usize = 0;
+        while (i < ln.len) {
+            const nl = std.unicode.utf8ByteSequenceLength(ln[i]) catch 1;
+            if (ln[i] == '\u{2502}' and n < buf.len) {
+                buf[n] = col;
+                n += 1;
+            }
+            const end = @min(i + nl, ln.len);
+            const cp: u21 = if (nl > 1) (std.unicode.utf8Decode(ln[i..end]) catch 0xFFFD) else ln[i];
+            col += charWidthCp(cp, ln[i]);
+            i += @max(nl, 1);
+        }
+        const heap = alloc.dupe(usize, buf[0..n]) catch return error.TestUnexpectedResult;
+        cols[ri] = heap;
+        lens[ri] = n;
+        _ = &heap;
+    }
+    defer for (cols) |c| alloc.free(@constCast(c));
+    for (1..4) |ri| {
+        try std.testing.expectEqual(lens[0], lens[ri]);
+        try std.testing.expectEqualSlices(usize, cols[0][0..lens[0]], cols[ri][0..lens[ri]]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "end") != null);
 }
 
 test "markdown table renders aligned and width-clipped" {
