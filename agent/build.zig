@@ -4,6 +4,8 @@ const std = @import("std");
 /// 带语言前缀（现代 tree-sitter 惯例），无链接冲突，无需分静态库。
 /// 每语法需要自己的 include 路径（scanner.c include "tree_sitter/parser.h"）。
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
+    // -O2 恒定：tree-sitter 是查表密集型 C，-O0 下 1MB python 解析要 2s
+    // （实测 2026-11-08），交互回合不可接受；Zig 侧照旧跟随全局 optimize。
     mod.addCSourceFiles(.{
         .files = &.{
             "deps/tree-sitter/lib/src/lib.c",
@@ -18,7 +20,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
             "deps/tree-sitter/java/src/parser.c",
             "deps/tree-sitter/zig/src/parser.c",
         },
-        .flags = &.{"-std=c11"},
+        .flags = &.{ "-std=c11", "-O2" },
     });
     mod.addIncludePath(b.path("deps/tree-sitter/lib/include"));
     mod.addIncludePath(b.path("deps/tree-sitter/lib/src"));

@@ -19,12 +19,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 
-    const base = alloc.print("Wrote {} bytes to {s}", .{ content.len, path }) catch "wrote file";
+    // 所有权纪律：output alloc-owned（history freeContentBlocks 无差别
+    // free，静态串会炸）。print OOM 直接走 error 路径，不再用字面量兜底。
+    const base = try alloc.print("Wrote {} bytes to {s}", .{ content.len, path });
     // ③ 里程碑 1：整文件重写与定点编辑同一套落盘后语法校验。
     if (treesitter.appendValidationWarning(alloc, path, content)) |warn| {
         defer alloc.free(warn);
-        const joined = std.mem.concat(alloc, u8, &.{ base, warn }) catch base;
-        return registry.ToolResult{ .output = joined };
+        defer alloc.free(base);
+        return registry.ToolResult{ .output = try std.mem.concat(alloc, u8, &.{ base, warn }) };
     }
     return registry.ToolResult{ .output = base };
 }

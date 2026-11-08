@@ -79,9 +79,12 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     // ③ 里程碑 1：落盘后语法校验（内存里的新内容，不回读磁盘）。有错附
     // 警告行让模型当场自纠；未知扩展名/超限 → null 零成本跳过。
+    // 所有权：output 必须 alloc-owned（history freeContentBlocks 无差别
+    // free）——base 拼接后同样要释放，静态串一律不允许。
     const base = try alloc.print("Replaced {d} occurrence(s) in {s}", .{ count, path });
     if (treesitter.appendValidationWarning(alloc, path, new_contents.items)) |warn| {
         defer alloc.free(warn);
+        defer alloc.free(base); // concat 在 return 表达式先求值，defer 后跑——安全
         return registry.ToolResult{
             .output = try std.mem.concat(alloc, u8, &.{ base, warn }),
         };
