@@ -260,6 +260,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var live_llm_calls = std.atomic.Value(u32).init(0);
     var live_llm_429s = std.atomic.Value(u32).init(0); // real 429s → monitor rule
     var live_est_tokens = std.atomic.Value(u32).init(0);
+    monitor.setLiveStats(&live_llm_calls, &live_llm_429s, &live_est_tokens);
     // Test hook: ZIV_CRON_SCALE=60 compresses the timeline (81.5min → ~82s)
     // so scheduled maintenance is observable in a smoke run.
     var cron_scale: u64 = 1;
@@ -726,6 +727,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .total_input_tokens = &total_input_tokens,
         .total_output_tokens = &total_output_tokens,
         .total_cached_tokens = &total_cached_tokens,
+        .monitor = &monitor,
+        .live_llm_calls = &live_llm_calls,
+        .live_llm_429s = &live_llm_429s,
+        .live_est_tokens = &live_est_tokens,
         .live_trace = &live_trace,
         .reflector = &reflector,
         .reg = &reg,

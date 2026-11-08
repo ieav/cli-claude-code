@@ -13,6 +13,7 @@ const lineinput = @import("../util/lineinput.zig");
 const util_time = @import("../util/time.zig");
 const logger = @import("../util/log.zig");
 const env = @import("../util/env.zig");
+const runtime_monitor = @import("../runtime/monitor.zig");
 const version_mod = @import("../util/version.zig");
 const fs_ops = @import("../util/fs_ops.zig");
 const slash_cmds = @import("../util/slash_commands.zig");
@@ -86,6 +87,11 @@ pub const ReplCtx = struct {
     total_input_tokens: *u64,
     total_output_tokens: *u64,
     total_cached_tokens: *u64,
+    /// 诊断实测包（2026-11-10）：与 /stats 同源的原子量与累计量。
+    monitor: *runtime_monitor.RuntimeMonitor,
+    live_llm_calls: *std.atomic.Value(u32),
+    live_llm_429s: *std.atomic.Value(u32),
+    live_est_tokens: *std.atomic.Value(u32),
     live_trace: *?decision_trace.DecisionTrace,
     reflector: *reflection_mod.ReflectionEngine,
     reg: *runtime_registry.RuntimeRegistry,
@@ -450,6 +456,26 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             return .handled;
         } else if (std.mem.eql(u8, input, "/context")) {
             try history_cmds.showContext(ctx.history, ctx.total_input_tokens.*, ctx.total_output_tokens.*, ctx.w);
+            // 检测规则现场跑 + 建议分级（2026-11-10 #2）：auto_fixable
+            // 的建议直接给出一键动作文案，人按不按都在他——自动改配置
+            // 不做（越权风险），「动得了」落在可执行指引而非暗改。
+            const mon = ctx.monitor;
+                mon.syncLiveStats();
+                var failures: std.ArrayList(runtime_monitor.FailedCheck) = .empty;
+                defer failures.deinit(allocator);
+                mon.runChecks(&failures) catch {};
+                if (failures.items.len > 0) {
+                    try std.Io.Writer.writeAll(ctx.w, "  检测规则:\n");
+                    for (failures.items) |f| {
+                        try std.Io.Writer.print(ctx.w, "    ⚠ [{s}] {s}\n", .{ f.rule_id, f.message });
+                        for (f.suggested_fixes) |fix| {
+                            const mark: []const u8 = if (fix.auto_fixable) "可自动" else "需确认";
+                            try std.Io.Writer.print(ctx.w, "      → ({s}) {s}\n", .{ mark, fix.description });
+                        }
+                    }
+                } else {
+                    try std.Io.Writer.writeAll(ctx.w, "  检测规则: 全部通过\n");
+                }
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.eql(u8, input, "/trace")) {
@@ -551,7 +577,19 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             if (concern.len == 0) {
                 try std.Io.Writer.writeAll(ctx.w, "  Usage: /diagnose <your concern about the last answer>\n\n");
             } else {
-                try memory_ops.runDiagnose(if (ctx.live_trace.*) |*t| t else null, concern, ctx.injected_count.*, ctx.window_tools.*, ctx.window_errors.*, if (ctx.mem_sys.*) |*ms| ms else null, allocator, ctx.w);
+                const m = memory_ops.LiveMetrics{
+                    .llm_calls = ctx.live_llm_calls.load(.monotonic),
+                    .llm_429s = ctx.live_llm_429s.load(.monotonic),
+                    .tool_calls = ctx.window_tools.*,
+                    .tool_errors = ctx.window_errors.*,
+                    .compacts_done = turn_history.compacts_done,
+                    .tokens_reclaimed = turn_history.tokens_reclaimed,
+                    .cache_hit_tokens = ctx.total_cached_tokens.*,
+                    .cache_total_tokens = ctx.total_input_tokens.*,
+                    .est_ctx_tokens = ctx.live_est_tokens.load(.monotonic),
+                    .ctx_ceiling = llm.provider.contextEstimate(ctx.switcher.modelName(), ctx.switcher.backend),
+                };
+                try memory_ops.runDiagnose(if (ctx.live_trace.*) |*t| t else null, concern, ctx.injected_count.*, ctx.window_tools.*, ctx.window_errors.*, if (ctx.mem_sys.*) |*ms| ms else null, allocator, ctx.w, m);
             }
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;

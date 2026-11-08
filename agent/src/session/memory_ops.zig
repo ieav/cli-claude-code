@@ -1471,6 +1471,21 @@ pub fn runResearch(topic: []const u8, alloc: std.mem.Allocator, io: std.Io, w: *
 
 /// M8: /diagnose — build a lightweight decision trace from real session
 /// stats and run the self-diagnostic engine against the user's concern.
+/// 实测指标包（2026-11-10 诊断喂真实数据）：/stats 同源数字直接进
+/// 诊断报告——从「猜」变「测」。零值字段省略渲染。
+pub const LiveMetrics = struct {
+    llm_calls: u32 = 0,
+    llm_429s: u32 = 0,
+    tool_calls: u32 = 0,
+    tool_errors: u32 = 0,
+    compacts_done: u64 = 0,
+    tokens_reclaimed: u64 = 0,
+    cache_hit_tokens: u64 = 0,
+    cache_total_tokens: u64 = 0,
+    est_ctx_tokens: u32 = 0,
+    ctx_ceiling: u32 = 0,
+};
+
 pub fn runDiagnose(
     live: ?*decision_trace.DecisionTrace,
     concern: []const u8,
@@ -1480,6 +1495,7 @@ pub fn runDiagnose(
     mem: ?*memory_mod.MemorySystem,
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    metrics: ?LiveMetrics,
 ) !void {
     var fallback_trace: ?decision_trace.DecisionTrace = null;
     defer if (fallback_trace) |*t| t.deinit();
@@ -1538,6 +1554,40 @@ pub fn runDiagnose(
 
     const source: []const u8 = if (live != null) "live agent-loop trace" else "static fallback";
     try std.Io.Writer.print(w, "  Diagnosing ({s}, {d} steps)…\n", .{ source, trace.getSteps().len });
+
+    // 实测指标先行（2026-11-10）：诊断的输入从启发式猜测定锚到
+    // /stats 同源数字——下面每条 gap 判断都能对回这里的数据。
+    if (metrics) |m| {
+        try std.Io.Writer.writeAll(w, "  [实测] ");
+        var first = true;
+        if (m.llm_calls > 0) {
+            try std.Io.Writer.print(w, "{s}LLM {d} 次", .{ if (first) "" else " · ", m.llm_calls });
+            first = false;
+        }
+        if (m.llm_429s > 0) {
+            try std.Io.Writer.print(w, "{s}429 ×{d}", .{ if (first) "" else " · ", m.llm_429s });
+            first = false;
+        }
+        if (m.tool_calls > 0) {
+            const rate = @as(f64, @floatFromInt(m.tool_errors)) / @as(f64, @floatFromInt(m.tool_calls));
+            try std.Io.Writer.print(w, "{s}工具 {d}/{d}（失败率 {d:.0}%）", .{ if (first) "" else " · ", m.tool_calls - @min(m.tool_errors, m.tool_calls), m.tool_calls, rate * 100 });
+            first = false;
+        }
+        if (m.cache_total_tokens > 0) {
+            const hit = m.cache_hit_tokens * 100 / m.cache_total_tokens;
+            try std.Io.Writer.print(w, "{s}缓存命中 {d}%", .{ if (first) "" else " · ", hit });
+            first = false;
+        }
+        if (m.compacts_done > 0) {
+            try std.Io.Writer.print(w, "{s}压缩 {d} 次（回收 ~{d} tok）", .{ if (first) "" else " · ", m.compacts_done, m.tokens_reclaimed });
+            first = false;
+        }
+        if (m.ctx_ceiling > 0) {
+            const pct = m.est_ctx_tokens * 100 / m.ctx_ceiling;
+            try std.Io.Writer.print(w, "{s}上下文 {d}%", .{ if (first) "" else " · ", pct });
+        }
+        try std.Io.Writer.writeAll(w, "\n");
+    }
 
     // Designed step-by-step review (§九): walk the chain with ✓/⚠ per step
     // (conf ≥ φ passes) before the gap summary.

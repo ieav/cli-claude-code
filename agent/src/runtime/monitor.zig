@@ -2,6 +2,7 @@
 const std = @import("std");
 const event_bus = @import("../task/event_bus.zig");
 const rules = @import("rules.zig");
+pub const FailedCheck = rules.FailedCheck;
 const builtin = @import("builtin_rules.zig");
 
 pub const RuntimeMonitor = struct {
@@ -14,6 +15,10 @@ pub const RuntimeMonitor = struct {
     running: std.atomic.Value(bool),
     total_checks: std.atomic.Value(usize),
     total_failures: std.atomic.Value(usize),
+    /// 2026-11-10 #2：/context 现场检查前同步实测原子量。
+    live_llm_calls: ?*std.atomic.Value(u32) = null,
+    live_llm_429s: ?*std.atomic.Value(u32) = null,
+    live_est_tokens: ?*std.atomic.Value(u32) = null,
 
     const Self = @This();
 
@@ -47,6 +52,24 @@ pub const RuntimeMonitor = struct {
 
     pub fn setEventBus(self: *Self, bus: *event_bus.EventBus) void {
         self.event_bus_ref = bus;
+    }
+
+    /// 2026-11-10 #2：实测原子量同步——规则吃真实 429/上下文水位。
+    pub fn setLiveStats(
+        self: *Self,
+        calls: *std.atomic.Value(u32),
+        errs: *std.atomic.Value(u32),
+        tokens: *std.atomic.Value(u32),
+    ) void {
+        self.live_llm_calls = calls;
+        self.live_llm_429s = errs;
+        self.live_est_tokens = tokens;
+    }
+
+    pub fn syncLiveStats(self: *Self) void {
+        if (self.live_llm_429s) |c| self.context.api_rate_limited_count = c.load(.monotonic);
+        if (self.live_est_tokens) |t| self.context.current_tokens = t.load(.monotonic);
+        if (self.live_llm_calls) |l| self.context.api_calls_last_minute = l.load(.monotonic);
     }
 
     pub fn updateContext(self: *Self, ctx: rules.RuntimeContext) void {
