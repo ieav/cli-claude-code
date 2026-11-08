@@ -186,9 +186,9 @@ pub const RuntimeRegistry = struct {
 
 // ── Tests ──
 
-fn testExec(_: ?*anyopaque, _: std.mem.Allocator, input: std.json.Value, _: std.Io) anyerror!registry.ToolResult {
+fn testExec(_: ?*anyopaque, allocator: std.mem.Allocator, input: std.json.Value, _: std.Io) anyerror!registry.ToolResult {
     _ = input;
-    return .{ .output = "dyn-ok" };
+    return .{ .output = allocator.dupe(u8, "dyn-ok") catch "" };
 }
 
 test "RuntimeRegistry: built-ins present, specs in sync" {

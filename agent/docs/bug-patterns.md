@@ -121,3 +121,23 @@ feature macro 裁剪；BSD（macOS）不裁剪 → 平台间行为分裂
 zig build ~4 分钟并行）
 **命中次数**：1（2026-11-09 tree-sitter 入库次日发版炸）→ 不变量已落
 build.zig 注释
+
+### [Zig 所有权] ToolResult.output 静态字面量 → free 只读段 → 迟到的段错误
+
+**判别信号**：进程 SIGSEGV 崩在与毛病无关的位置（实测崩在 utf8proc 宽
+度计算），故障地址解出来是被复用内存里的普通字符串（本例 "approved"）；
+且 defer/cleanup 全没跑（后台进程成孤儿）
+**触发条件**：工具 execute 的参数校验分支 `return .{ .output = "字面量" }`
+——output 进 history 后被 freeContentBlocks 无差别 free，静态指针 =
+分配器元数据损坏，崩点随机漂移在后续任意分配
+**机制**：history 的所有权纪律是"块内一切字符串堆分配"；字面量在
+.rodata 段，free 它是 UB（macOS 上常静默腐蚀，偶发段错误）
+**排查动作**：崩溃报告故障地址按 ASCII 反解；`rg '\.output = "' src/`
+扫存量
+**不变量（L3）**：工具的一切返回 output 一律 `alloc.dupe`（OOM 兜底
+error.OutOfMemory 或空串——free() 对零长 no-op 是唯一豁免）
+**护栏（L4）**：registry.zig 的 guard 测试扫 src/tools + src/turn 源码，
+新写字面量输出直接挂 `zig build test`
+**命中次数**：1 次用户实崩（2026-11-09 v0.9.0 多 agent 场景）+ 存量
+36 处同类（含 2 天前新写的 bg_task 5 处——证明人工纪律挡不住再生）
+→ 已上护栏

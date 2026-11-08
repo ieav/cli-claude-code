@@ -5,15 +5,15 @@ const treesitter = @import("../util/treesitter.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = registry.getStringField(input, "path") orelse
-        return registry.ToolResult{ .output = "Missing required field: path", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: path") catch "", .is_error = true };
     const old_string = registry.getStringField(input, "old_string") orelse
-        return registry.ToolResult{ .output = "Missing required field: old_string", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: old_string") catch "", .is_error = true };
     const new_string = registry.getStringField(input, "new_string") orelse
-        return registry.ToolResult{ .output = "Missing required field: new_string", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: new_string") catch "", .is_error = true };
     const replace_all_flag = if (registry.getBool(input, "replaceAll")) |v| v else false;
 
     if (old_string.len == 0) {
-        return registry.ToolResult{ .output = "old_string cannot be empty", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "old_string cannot be empty") catch "", .is_error = true };
     }
 
     // Read file
@@ -37,7 +37,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         const second_pos = std.mem.indexOfPos(u8, contents, first_pos + old_string.len, old_string);
         if (second_pos != null) {
             return registry.ToolResult{
-                .output = "old_string is not unique in file. Use replaceAll=true or provide more context.",
+                .output = alloc.dupe(u8, "old_string is not unique in file. Use replaceAll=true or provide more context.") catch "",
                 .is_error = true,
             };
         }

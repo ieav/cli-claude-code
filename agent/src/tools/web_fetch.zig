@@ -14,15 +14,15 @@ pub const DOWNLOAD_CAP: usize = 512 * 1024;
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const url = registry.getStringField(input, "url") orelse
-        return registry.ToolResult{ .output = "Missing required field: url", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: url") catch "", .is_error = true };
     if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-        return registry.ToolResult{ .output = "Only http(s) URLs are supported", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Only http(s) URLs are supported") catch "", .is_error = true };
     }
 
     var client = std.http.Client{ .allocator = alloc, .io = io };
     defer client.deinit();
     const uri = std.Uri.parse(url) catch {
-        return registry.ToolResult{ .output = "Invalid URL", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Invalid URL") catch "", .is_error = true };
     };
     var req = client.request(.GET, uri, .{}) catch |err| {
         return registry.ToolResult{ .output = try alloc.print("fetch failed: {s}", .{@errorName(err)}), .is_error = true };

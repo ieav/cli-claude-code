@@ -27,7 +27,7 @@ pub fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: 
     _ = io;
     const ctx: *AskUserCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.NoAskContext));
     const question = registry.getStringField(input, "question") orelse
-        return registry.ToolResult{ .output = "Missing required field: question", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: question") catch "", .is_error = true };
     // Interactive prompt/read happens with the turn-scoped region DOWN:
     // the question + typed answer need the bottom rows and cooked-input
     // echo, and a direct print with the region up would smear the
@@ -47,7 +47,7 @@ pub fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: 
     defer ans_aw.deinit();
     _ = std.Io.Reader.streamDelimiter(ctx.r, &ans_aw.writer, '\n') catch {
         lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-        return registry.ToolResult{ .output = "user input unavailable", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "user input unavailable") catch "", .is_error = true };
     };
     ctx.r.toss(1);
     const ans = std.mem.trim(u8, ans_aw.written(), " \t\r\n");
@@ -56,7 +56,7 @@ pub fn askUserExecute(ctx_opaque: ?*anyopaque, alloc: std.mem.Allocator, input: 
     // model the raw byte used to turn "user pressed Esc" into junk text.
     if (ans.len > 0 and (ans[0] == 0x1b or ans[0] == 0x03)) {
         lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
-        return registry.ToolResult{ .output = "user cancelled the question (Esc)", .expected_stop = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "user cancelled the question (Esc)") catch "", .expected_stop = true };
     }
     lineinput.regionBegin(ctx.w, "⚙ 执行工具 · Esc 中断");
     return registry.ToolResult{

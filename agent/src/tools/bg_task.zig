@@ -13,9 +13,9 @@ const util_time = @import("../util/time.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const action = registry.getStringField(input, "action") orelse
-        return registry.ToolResult{ .output = "Error: 'action' is required (status|output|stop)", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'action' is required (status|output|stop)") catch "", .is_error = true };
     const id: ?u32 = if (registry.getIntField(input, "id")) |n|
-        (if (n > 0) @intCast(n) else return registry.ToolResult{ .output = "Error: id must be positive", .is_error = true })
+        (if (n > 0) @intCast(n) else return registry.ToolResult{ .output = alloc.dupe(u8, "Error: id must be positive") catch "", .is_error = true })
     else
         null;
 
@@ -23,19 +23,19 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = try renderStatus(alloc, id) };
     }
     if (std.mem.eql(u8, action, "output")) {
-        const sid = id orelse return registry.ToolResult{ .output = "Error: output requires 'id'", .is_error = true };
+        const sid = id orelse return registry.ToolResult{ .output = alloc.dupe(u8, "Error: output requires 'id'") catch "", .is_error = true };
         const out = bg_tasks.previewOf(alloc, io, sid) orelse
             return registry.ToolResult{ .output = try alloc.print("No such background task #{d}", .{sid}), .is_error = true };
         return registry.ToolResult{ .output = out };
     }
     if (std.mem.eql(u8, action, "stop")) {
-        const sid = id orelse return registry.ToolResult{ .output = "Error: stop requires 'id'", .is_error = true };
+        const sid = id orelse return registry.ToolResult{ .output = alloc.dupe(u8, "Error: stop requires 'id'") catch "", .is_error = true };
         if (bg_tasks.stop(sid)) {
             return registry.ToolResult{ .output = try alloc.print("Stopped background task #{d} (process group killed)", .{sid}) };
         }
         return registry.ToolResult{ .output = try alloc.print("Task #{d} is not running (already finished or unknown id)", .{sid}), .is_error = true };
     }
-    return registry.ToolResult{ .output = "Error: unknown action (use status|output|stop)", .is_error = true };
+    return registry.ToolResult{ .output = alloc.dupe(u8, "Error: unknown action (use status|output|stop)") catch "", .is_error = true };
 }
 
 /// status 行渲染（/bg 面板同款信息密度，纯文本）。

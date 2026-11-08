@@ -667,3 +667,41 @@ test "getStringField degrades wrong-typed field to null" {
     try std.testing.expect(getStringField(parsed, "nope") == null);
     try std.testing.expect(getStringField(std.json.Value{ .integer = 1 }, "path") == null);
 }
+
+// L4 护栏（2026-11-09 崩溃事故）：ToolResult.output 进 history 后由
+// freeContentBlocks 无差别 free——静态字面量 = free 只读段 = 分配器
+// 损坏，崩在任意后续分配（实测：utf8proc 宽度计算段错误、SIGSEGV、
+// defer 不跑 → 后台进程孤儿）。本测试扫源码，新写一个字面量输出
+// 直接挂 zig build test——让这类错写不出来。
+test "guard: no static-literal ToolResult outputs (free-safety)" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    var offenders: usize = 0;
+    const dirs = [_][]const u8{ "src/tools", "src/turn" };
+    for (dirs) |dir_name| {
+        var d = std.Io.Dir.cwd().openDir(io, dir_name, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |ent| {
+            if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".zig")) continue;
+            var pb: [512]u8 = undefined;
+            const p = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir_name, ent.name }) catch continue;
+            const src = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, p, alloc, std.Io.Limit.limited(4 * 1024 * 1024)) catch continue;
+            defer alloc.free(src);
+            var lines = std.mem.splitScalar(u8, src, '\n');
+            var ln: usize = 0;
+            while (lines.next()) |line| : (ln += 1) {
+                if (std.mem.indexOf(u8, line, ".output = \"") != null and
+                    std.mem.indexOf(u8, line, "dupe") == null and
+                    std.mem.indexOf(u8, line, "\"\"") == null) // 空串豁免：free() 零长 no-op
+                {
+                    offenders += 1;
+                    std.debug.print("LITERAL {s}:{d}: {s}\n", .{ p, ln + 1, std.mem.trim(u8, line, " \t") });
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), offenders);
+}

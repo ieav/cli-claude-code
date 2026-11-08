@@ -146,7 +146,7 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         }
     }
     if (tasks.items.len == 0) {
-        return registry.ToolResult{ .output = "Missing field: tasks (array of task descriptions)", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing field: tasks (array of task descriptions)") catch "", .is_error = true };
     }
     const n = @min(tasks.items.len, MAX_SUBAGENTS);
 

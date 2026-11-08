@@ -152,7 +152,7 @@ const ParallelCall = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     tools_def: []const registry.ToolDefinition,
-    result: registry.ToolResult = .{ .output = "not run", .is_error = true },
+    result: registry.ToolResult = .{ .output = "", .is_error = true }, // 空串是 free 容忍的唯一字面量；worker 必先赋值
 };
 
 fn parallelCallThread(ctx: *ParallelCall) void {

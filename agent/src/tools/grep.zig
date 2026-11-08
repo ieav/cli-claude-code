@@ -6,7 +6,7 @@ const code_index = @import("../knowledge/code_index.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const pattern = registry.getStringField(input, "pattern") orelse
-        return registry.ToolResult{ .output = "Missing required field: pattern", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: pattern") catch "", .is_error = true };
     const path = registry.getStringField(input, "path") orelse ".";
     const max_results: u32 = @intCast(registry.getIntField(input, "maxResults") orelse 100);
 
@@ -36,7 +36,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
 
     const search_result = ripgrep.search(alloc, pattern, path, io) catch |err| switch (err) {
         error.NoSearchBackend => return registry.ToolResult{
-            .output = "Error: neither rg nor grep is available on PATH",
+            .output = alloc.dupe(u8, "Error: neither rg nor grep is available on PATH") catch "",
             .is_error = true,
         },
         error.SearchTimedOut => return registry.ToolResult{

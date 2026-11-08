@@ -16,7 +16,7 @@ pub fn sourceOrder(has_brave_key: bool) [2]?knowledge_search.SearchBackend {
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const query = registry.getStringField(input, "query") orelse
-        return registry.ToolResult{ .output = "Missing required field: query", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: query") catch "", .is_error = true };
     const max_results: usize = @intCast(registry.getIntField(input, "maxResults") orelse 5);
 
     const brave_key = env.get("BRAVE_API_KEY");

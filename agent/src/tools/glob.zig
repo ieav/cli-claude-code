@@ -23,7 +23,7 @@ const path_buf_len = 4096;
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const pattern = registry.getStringField(input, "pattern") orelse
-        return registry.ToolResult{ .output = "Missing required field: pattern", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: pattern") catch "", .is_error = true };
     const path = registry.getStringField(input, "path") orelse ".";
     const max_depth: u32 = @intCast(registry.getIntField(input, "maxDepth") orelse default_max_depth);
 

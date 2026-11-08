@@ -5,7 +5,7 @@ const task_store = @import("task_store.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, _: std.Io) anyerror!registry.ToolResult {
     const subject = registry.getStringField(input, "subject") orelse
-        return registry.ToolResult{ .output = "Missing required field: subject", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: subject") catch "", .is_error = true };
     const description = registry.getStringField(input, "description") orelse "";
     // P3: optional priority 1-5 (5 highest, default 3) — orders the task
     // list and mirrors the subagent dispatch claim order.

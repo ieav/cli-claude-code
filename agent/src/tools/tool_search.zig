@@ -4,7 +4,7 @@ const registry = @import("registry.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, _: std.Io) anyerror!registry.ToolResult {
     const query = registry.getStringField(input, "query") orelse
-        return registry.ToolResult{ .output = "Missing required field: query", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Missing required field: query") catch "", .is_error = true };
     const tools_list = registry.default_tools;
 
     var output = std.ArrayList(u8).empty;

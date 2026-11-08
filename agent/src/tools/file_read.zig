@@ -10,7 +10,7 @@ const code_index = @import("../knowledge/code_index.zig");
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = getStringField(input, "path") orelse
-        return registry.ToolResult{ .output = "Error: 'path' field is required", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'path' field is required") catch "", .is_error = true };
 
     const max_size: usize = 1024 * 1024;
 
@@ -27,7 +27,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const st: ?std.Io.Dir.Stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch null;
 
     const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, std.Io.Limit.limited(max_size)) catch |err| {
-        const msg = alloc.print("Failed to read '{s}': {}", .{ path, err }) catch "read failed";
+        const msg = alloc.print("Failed to read '{s}': {}", .{ path, err }) catch return error.OutOfMemory;
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
 

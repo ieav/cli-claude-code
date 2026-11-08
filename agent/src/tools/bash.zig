@@ -74,7 +74,7 @@ const OUTPUT_LIMIT: usize = 256 * 1024;
 
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const command = getStringField(input, "command") orelse
-        return registry.ToolResult{ .output = "Error: 'command' field is required", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'command' field is required") catch "", .is_error = true };
 
     // Batch already cancelled (Esc) — don't even spawn. Ownership rule:
     // output transfers to history which FREES it — must be allocated,
@@ -101,14 +101,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     }
 
     const child = std.process.spawn(io, spawn_opts) catch |err| {
-        const msg = alloc.print("Failed to execute: {}", .{err}) catch "exec failed";
+        const msg = alloc.print("Failed to execute: {}", .{err}) catch return error.OutOfMemory;
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
     const pid: i32 = child.id orelse {
         // Spawn returned but no pid (already reaped) — nothing to run.
         if (child.stdout) |f| f.close(io);
         if (child.stderr) |f| f.close(io);
-        return registry.ToolResult{ .output = "Failed to execute: no child pid", .is_error = true };
+        return registry.ToolResult{ .output = alloc.dupe(u8, "Failed to execute: no child pid") catch "", .is_error = true };
     };
 
     // 后台分支：交接管道给 bg_tasks（此后本函数不再触碰 child）。

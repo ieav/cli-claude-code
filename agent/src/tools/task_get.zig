@@ -7,8 +7,8 @@ const task_store = @import("task_store.zig");
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, _: std.Io) anyerror!registry.ToolResult {
     const id: usize = blk: {
         const n = registry.getIntField(input, "id") orelse
-            return registry.ToolResult{ .output = "Error: 'id' field is required", .is_error = true };
-        if (n <= 0) return registry.ToolResult{ .output = "Error: id must be positive", .is_error = true };
+            return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'id' field is required") catch "", .is_error = true };
+        if (n <= 0) return registry.ToolResult{ .output = alloc.dupe(u8, "Error: id must be positive") catch "", .is_error = true };
         break :blk @intCast(n);
     };
     const store = task_store.global();
