@@ -857,7 +857,9 @@ def s16_print_mode():
         joined = "\n".join(sys_texts)
         if "You are Ziv" not in joined:
             raise Fail("system prompt is not ziv's real prompt (missing 'You are Ziv')")
-        if "focused subagent" in joined:
+        # 精确匹配无头提示的开头句——主系统提示的 Parallel work 段也含
+        # "focused subagents" 字样（2026-11-09 加入），宽匹配会误伤。
+        if "You are a focused subagent" in joined:
             raise Fail("headless subagent prompt leaked into -p mode")
         round2 = _json.dumps(reqs[1].get("messages", []))
         if "permission denied" not in round2 or "non-interactive" not in round2:

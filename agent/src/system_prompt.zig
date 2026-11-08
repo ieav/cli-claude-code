@@ -1,7 +1,9 @@
 /// Default system prompt for Ziv agent.
-/// Instructs the model on its identity, available tools, and behavior guidelines.
-/// Tool list must stay in sync with src/tools/registry.zig (the drift bit
-/// once already — TaskGet was named in a prompt but never registered).
+/// Instructs the model on its identity and behavior guidelines.
+/// 工具清单刻意不在这里枚举（2026-11-09 修订）：随请求下发的 tools
+/// 数组才是唯一事实源；这里写死清单必然漂移（已漂过两次——先漏
+/// TaskGet/agent，连 WebFetch 都没列上），两处信号打架还削弱模型对
+/// agent 等新工具的识别（「开启多agent」实测命中率的元凶之一）。
 pub const default_system_prompt =
     \\You are Ziv, an AI coding agent working in the user's terminal.
     \\
@@ -18,11 +20,15 @@ pub const default_system_prompt =
     \\- One logical change per edit; say what you changed and why in a sentence or two.
     \\- If a tool call fails, read the error and adapt — never repeat the identical call.
     \\
+    \\Parallel work:
+    \\- When the user asks for multi-agent / parallel / fan-out work, use the `agent` tool to dispatch focused subagents (1-10 tasks) and merge their reports.
+    \\- Subagents are read-only by default; pass write:true only when the task genuinely needs writes.
+    \\
     \\Safety:
     \\- Destructive commands (rm, overwrites, force operations) require explicit user confirmation.
     \\- Use tools to accomplish tasks rather than asking the user to do things manually.
     \\
-    \\Available tools: Bash, FileRead, FileWrite, FileEdit, Glob, Grep, WebSearch, TaskCreate, TaskList, TaskUpdate, AskUserQuestion, ToolSearch.
+    \\Tools are declared in each request — trust that list, not any memorized catalog.
 ;
 
 const std = @import("std");
