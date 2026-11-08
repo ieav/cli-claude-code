@@ -101,3 +101,23 @@ flush + 区域协议重排）有一个输入不读窗口；bulk 输入整段丢�
 **不变量（L3）**：pty 套件里任何「输出匹配后立即发下一条」的写法都是
 未来抖动（S6/S10 历史抖动同源）；新场景一律 run_and_wait 模式
 **命中次数**：1（2026-11-08 S18 开发中连续复现 3 次）→ 已在套件固化
+
+### [C 交叉编译] 严格 -std=c 隐藏 POSIX 声明——本机绿、musl 炸
+
+**判别信号**：`call to undeclared function 'fdopen'`（或任意 POSIX 函数）
++ `incompatible integer to pointer conversion ... FILE *`——只在交叉
+linux-musl 报，macOS 本机构建/测试全绿
+**触发条件**：vendored C 依赖带 `-std=c11` 这类严格 ISO 标志，而代码
+调 POSIX/BSD 扩展（fdopen/kill/…）；macOS libc 头宽松暴露这些符号，
+musl/glibc 在严格 ISO 下按标准隐藏
+**机制**：-std=cNN 请求纯 ISO 环境 → libc 头按 `_POSIX_C_SOURCE` 等
+feature macro 裁剪；BSD（macOS）不裁剪 → 平台间行为分裂
+**排查动作**：报错函数名查 man 页所属标准（fdopen=POSIX）；看 build
+里给该 C 源的 -std 标志
+**不变量（L3）**：vendored C 一律 `-std=gnu11`（或按需
+`-D_POSIX_C_SOURCE=200809L`）；**新增 C 依赖落地时必须跑一次四目标
+交叉构建**（release.sh 的构建段），本机绿不算数
+**护栏（L4）**：候选——发版脚本前移为 CI/预提交检查（四目标
+zig build ~4 分钟并行）
+**命中次数**：1（2026-11-09 tree-sitter 入库次日发版炸）→ 不变量已落
+build.zig 注释
