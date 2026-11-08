@@ -73,6 +73,7 @@ pub fn preToolUse(alloc: std.mem.Allocator, io: std.Io, tool_name: []const u8, i
     for (active.pre) |entry| {
         if (!entryMatches(entry, tool_name)) continue;
         const payload = buildPayload(alloc, tool_name, input, null);
+        defer alloc.free(payload);
         const run = runHook(alloc, io, entry.command, payload, HOOK_TIMEOUT_MS);
         defer alloc.free(run.stderr);
         if (run.timed_out) {
@@ -97,6 +98,7 @@ pub fn postToolUse(alloc: std.mem.Allocator, io: std.Io, tool_name: []const u8, 
     for (active.post) |entry| {
         if (!entryMatches(entry, tool_name)) continue;
         const payload = buildPayload(alloc, tool_name, input, output);
+        defer alloc.free(payload);
         const run = runHook(alloc, io, entry.command, payload, HOOK_TIMEOUT_MS);
         defer alloc.free(run.stderr);
         if (run.timed_out) {
