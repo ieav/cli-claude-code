@@ -112,6 +112,9 @@ const AgentJob = struct {
     allowed_tools: ?[]const []const u8 = null,
     inherited: []const llm.Message = &.{},
     max_turns: usize = subagent.MAX_TURNS,
+    /// 实时观测（2026-11-09）：UI 状态行读 progress/finished 都是原子，
+    /// 主线程渲染与 worker 写入无数据竞争；result 本体仍只归 worker。
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
@@ -259,8 +262,10 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     while (spawned < conc - 1) : (spawned += 1) {
         threads[spawned] = std.Thread.spawn(.{}, workerMain, .{&wctx}) catch break;
     }
+    live_dispatch = &wctx; // UI 泵从这刻起可渲染子代理实时进度
     workerMain(&wctx); // the calling thread is the last worker
     for (threads[0..spawned]) |t| t.?.join();
+    live_dispatch = null; // join 完即撤——jobs 将随本函数栈销毁
 
     const canceled = wctx.cancel.load(.acquire);
     if (ctx.bus) |b| {
@@ -305,6 +310,41 @@ const WorkerCtx = struct {
 /// the handler only does an atomic store). Null outside a dispatch, where
 /// SIGINT keeps its default disposition.
 var active_cancel: ?*std.atomic.Value(bool) = null;
+
+/// 活跃 dispatch 的观测句柄（与 active_cancel 同生命周期）：REPL 工具
+/// 相位的 UI 泵每 500ms 读 liveSummary 渲染子代理实时进度。jobs 栈上
+/// 存活、join 后清空——UI 只在 tool_job.done 前读，无悬垂窗口。
+var live_dispatch: ?*WorkerCtx = null;
+
+/// 子代理实时进度行（写入 buf，返回切片；无活跃 dispatch → null）。
+/// 只读原子量：progress（当前轮次）/ finished。最多列 6 个 + 省略号。
+pub fn liveSummary(buf: []u8) ?[]const u8 {
+    const wctx = live_dispatch orelse return null;
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
+    const shown = @min(wctx.order_len, 6);
+    w.print("agent {d}/{d}：", .{ countDone(wctx), wctx.order_len }) catch return null;
+    var i: usize = 0;
+    while (i < shown) : (i += 1) {
+        const j = &wctx.jobs[i];
+        if (i > 0) w.writeAll(" · ") catch break;
+        if (j.finished.load(.acquire)) {
+            w.print("#{d} ✓", .{i + 1}) catch break;
+        } else {
+            w.print("#{d} t{d}", .{ i + 1, j.progress.load(.acquire) }) catch break;
+        }
+    }
+    if (wctx.order_len > shown) w.writeAll(" · …") catch {};
+    return buf[0..w.end];
+}
+
+fn countDone(wctx: *WorkerCtx) usize {
+    var n: usize = 0;
+    for (wctx.jobs[0..wctx.order_len]) |*j| {
+        if (j.finished.load(.acquire)) n += 1;
+    }
+    return n;
+}
 
 fn onDispatchSigint(_: std.posix.SIG) callconv(.c) void {
     if (active_cancel) |c| c.store(true, .release);
@@ -378,6 +418,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
 }
 
 fn finishJob(job: *AgentJob, res: subagent.SubagentResult) void {
+    job.finished.store(true, .release);
     job.result = res;
     if (std.mem.startsWith(u8, res.summary, "subagent failed")) {
         job.failed = true;
@@ -517,4 +558,30 @@ test "claim order: priority descending, stable within equals" {
         order2[j] = v;
     }
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, &order2);
+}
+
+test "liveSummary renders per-subagent progress from atomics only" {
+    // 模拟一个 3 任务 dispatch：#1 完成、#2 跑到 t4、#3 未开始。
+    var jobs: [MAX_SUBAGENTS]AgentJob = undefined;
+    for (&jobs) |*j| j.* = .{ .ctx = undefined, .task_text = @constCast("t") };
+    jobs[0].finished.store(true, .release);
+    jobs[1].progress.store(4, .release);
+    var wctx = WorkerCtx{
+        .ctx = undefined,
+        .jobs = &jobs,
+        .order = undefined,
+        .order_len = 3,
+        .next = std.atomic.Value(u32).init(0),
+    };
+    live_dispatch = &wctx;
+    defer live_dispatch = null;
+    var buf: [128]u8 = undefined;
+    const s = liveSummary(&buf) orelse return error.NoSummary;
+    try std.testing.expect(std.mem.indexOf(u8, s, "agent 1/3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "#1 ✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "#2 t4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "#3 t0") != null);
+    // 无活跃 dispatch → null（UI 回落泛化状态行）。
+    live_dispatch = null;
+    try std.testing.expect(liveSummary(&buf) == null);
 }

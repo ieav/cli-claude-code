@@ -1119,6 +1119,91 @@ def s20_bgtool():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s21_agent_live_status():
+    """Live per-subagent progress in the status row during an agent dispatch
+    (the observability gap: dispatch blocks silently for its whole duration).
+    Stateful mock: main round 1 → agent tool_use (3 tasks); subagent requests
+    sleep so the dispatch lasts seconds; the UI pump (500ms) must render
+    'agent N/3：#k tM' into the region status. Final merged report closes."""
+    import threading, http.server, json as _json
+    state = {"main_done": False}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = _json.loads(self.rfile.read(n)) if n else {}
+            def sys_text(m):
+                c = m.get("content")
+                return c if isinstance(c, str) else _json.dumps(c)
+            is_sub = any(m.get("role") == "system" and "You are a focused subagent" in sys_text(m) for m in body.get("messages", []))
+            if body.get("stream"):
+                # 主回合走流式：SSE 分支（tool_calls 以 delta 下发）。
+                import time as _t
+                if not state["main_done"]:
+                    state["main_done"] = True
+                    deltas = [
+                        {"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {
+                            "name": "agent",
+                            "arguments": _json.dumps({"tasks": ["probe one", "probe two", "probe three"]})}}]},
+                    ]
+                else:
+                    deltas = [{"content": "all probes complete"}]
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                for d in deltas:
+                    chunk = _json.dumps({"choices": [{"index": 0, "delta": d}]})
+                    self.wfile.write(f"data: {chunk}\n\n".encode())
+                fin = _json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+                self.wfile.write(f"data: {fin}\n\ndata: [DONE]\n\n".encode())
+                return
+            if is_sub:
+                import time as _t
+                _t.sleep(3)
+                msg = {"role": "assistant", "content": "probe done", "tool_calls": None}
+            else:
+                msg = {"role": "assistant", "content": "probe done", "tool_calls": None}
+            resp = _json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 5, "completion_tokens": 1}}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    d = tempfile.mkdtemp(prefix="ziv-s21-")
+    try:
+        os.makedirs(os.path.join(d, ".ziv"))
+        with open(os.path.join(d, ".ziv", "settings.json"), "w") as f:
+            f.write(_json.dumps({"permission_mode": "bypass",
+                                 "api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{port}/v1"}}))
+        z = ZivSession(reuse_dir=d, env_extra={
+            "OPENAI_API_KEY": "sk-mock",
+            "OPENAI_BASE_URL": f"http://127.0.0.1:{port}/v1",
+        })
+        try:
+            z.wait_prompt()
+            z.clear_buf()
+            z.send("run the three probes\r")
+            # dispatch 持续 ~3s（并发 3 子代理各睡 3s）——实时行必须出现。
+            out = z.read_until("agent ", 40)
+            if "agent 0/3" not in out and "agent 1/3" not in out and "agent 2/3" not in out and "agent 3/3" not in out:
+                raise Fail(f"live agent line missing: {out[-300:]!r}")
+            z.read_until("子任务 3", 60)
+            z.read_until_seen("ziv[bypass] (gpt-4o) [0%] >", 10)
+            quit_and_wait(z)
+            return "live per-agent status row during dispatch ✓"
+        finally:
+            z.close()
+    finally:
+        srv.shutdown()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1140,6 +1225,7 @@ SCENARIOS = [
     ("S18 tree-sitter", s18_tree_sitter),
     ("S19 full-subagent", s19_full_subagent),
     ("S20 bgtool", s20_bgtool),
+    ("S21 agent-live-status", s21_agent_live_status),
 ]
 
 

@@ -1586,8 +1586,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                                 const now = util_time.nowMillis();
                                 if (now - last_status >= 500) {
                                     last_status = now;
-                                    var sb: [96]u8 = undefined;
-                                    lineinput.regionStatus(w, ToolJob.statusText(turn_t0, turn_llm_calls, prepared.items.len, prepared.items[0].call.tool_name, &sb));
+                                    // 子代理 dispatch 进行中 → 状态行换实时
+                                    // 进度（agent 2/5：#1 ✓ · #2 t4 · …），
+                                    // 其余工具维持泛化状态行。
+                                    var asb: [128]u8 = undefined;
+                                    if (agent_dispatch.liveSummary(&asb)) |live| {
+                                        lineinput.regionStatus(w, live);
+                                    } else {
+                                        var sb: [96]u8 = undefined;
+                                        lineinput.regionStatus(w, ToolJob.statusText(turn_t0, turn_llm_calls, prepared.items.len, prepared.items[0].call.tool_name, &sb));
+                                    }
                                     std.Io.File.Writer.flush(&file_writer) catch {};
                                 }
                             }
