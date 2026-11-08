@@ -88,6 +88,9 @@ pub const ReflectionEngine = struct {
         trigger: ReflectionTrigger,
     ) !?Reflection {
         if (recent_queries.len == 0) return null;
+        // 窗口起点 = 上次反思落点（0 = 本引擎首次反思 → 本会话口径）。
+        // 在函数尾部 store 新值之前读，就是本窗口的起点。
+        const window_start_ms = self.last_reflection_at.load(.monotonic);
 
         // Build summary
         var summary_buf = std.ArrayList(u8).empty;
@@ -120,7 +123,20 @@ pub const ReflectionEngine = struct {
             // misdiagnosed deliberate timeout-driven debugging as
             // environment instability and got stored as a cross-session
             // "insight"; point at the actual outputs instead.
-            try insights_buf.appendSlice(self.allocator, "工具真实失败率过高（超时击杀与用户取消已剔除）。建议回看失败工具的输出定位具体原因。");
+            // 2026-11-08 用户要求实测化：干巴巴一句"过高"不说数——把
+            // 失败率、窗口轮数、时间跨度打出来，人能直接判断是不是
+            // 调试型会话的预期噪音。
+            const pct: u32 = @intFromFloat(error_rate * 100.0);
+            const span_min: i64 = if (window_start_ms > 0)
+                @max(1, @divTrunc(time_mod.nowMillis() - window_start_ms, 60_000))
+            else
+                0;
+            const txt = if (window_start_ms > 0)
+                try std.fmt.allocPrint(self.allocator, "工具真实失败率 {d}%（窗口：近 {d} 轮 / 约 {d} 分钟，{d} 次失败；超时击杀与用户取消已剔除）。建议回看失败工具的输出定位具体原因。", .{ pct, recent_queries.len, span_min, recent_errors })
+            else
+                try std.fmt.allocPrint(self.allocator, "工具真实失败率 {d}%（窗口：本会话近 {d} 轮，{d} 次失败；超时击杀与用户取消已剔除）。建议回看失败工具的输出定位具体原因。", .{ pct, recent_queries.len, recent_errors });
+            defer self.allocator.free(txt);
+            try insights_buf.appendSlice(self.allocator, txt);
             actionable = true;
         } else if (recent_tools_used > recent_queries.len * 3) {
             try insights_buf.appendSlice(self.allocator, "工具调用频繁。可能需要优化提示词以减少不必要的工具调用。");
@@ -271,6 +287,26 @@ test "reflect classifies actionable vs routine windows" {
     const r4 = (try engine.reflect(&mediocre, 5, 1, .on_query_complete)).?;
     try std.testing.expect(r4.actionable);
     try std.testing.expect(r4.quality_score < 0.62);
+}
+
+test "failure-rate insight carries the actual numbers (2026-11-08 实测化)" {
+    const alloc = std.testing.allocator;
+    var engine = ReflectionEngine.init(alloc);
+    defer engine.deinit();
+
+    // 首次反思（无上次落点）→「本会话」口径；数字必须齐：率/轮数/失败数。
+    const first = [_][]const u8{ "a", "b", "c", "d" }; // 3/4 = 75%
+    const r1 = (try engine.reflect(&first, 4, 3, .on_query_complete)).?;
+    try std.testing.expect(r1.actionable);
+    try std.testing.expect(std.mem.indexOf(u8, r1.insights, "75%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.insights, "本会话近 4 轮") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.insights, "3 次失败") != null);
+
+    // 第二次反思 → 窗口口径带时间跨度。
+    const second = [_][]const u8{ "x", "y" }; // 1/2 = 50%
+    const r2 = (try engine.reflect(&second, 1, 1, .on_query_complete)).?;
+    try std.testing.expect(std.mem.indexOf(u8, r2.insights, "50%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.insights, "近 2 轮 / 约") != null);
 }
 
 
