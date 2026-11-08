@@ -87,6 +87,7 @@ test {
     _ = @import("hooks/hooks.zig");
     _ = @import("tools/runtime_registry.zig");
     _ = @import("util/binary_check.zig");
+    _ = @import("util/treesitter.zig");
     _ = @import("util/cancel.zig");
     _ = @import("util/diff.zig");
     _ = @import("util/env.zig");
