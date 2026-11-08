@@ -209,7 +209,15 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             }
-            try std.Io.Writer.print(w, "  \x1b[1;36mcwd: {s}\x1b[0m\n\n", .{shown});
+            try std.Io.Writer.print(w, "  \x1b[1;36mcwd: {s}\x1b[0m\n", .{shown});
+            // 项目根锚定（docs/ziv-project-root.md）：子目录启动继承上级
+            // .ziv——横幅直接可见，用户知道记忆/会话/索引挂在哪里。
+            const zivroot = @import("util/zivroot.zig");
+            zivroot.init(io);
+            if (zivroot.inherited) {
+                try std.Io.Writer.print(w, "  \x1b[2m⤴ 使用项目存储 {s}/.ziv（记忆/会话/索引共享）\x1b[0m\n", .{zivroot.rootDir()});
+            }
+            try std.Io.Writer.writeAll(w, "\n");
         } else |_| {}
     }
     try std.Io.File.Writer.flush(&file_writer);

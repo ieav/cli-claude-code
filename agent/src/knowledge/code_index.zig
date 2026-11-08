@@ -41,7 +41,9 @@ var global_mu: std.Io.Mutex = .init;
 fn conn(alloc: std.mem.Allocator) ?*database_mod.Database {
     if (global_failed) return null;
     if (global_conn == null) {
-        global_conn = database_mod.Database.init(alloc, ".ziv/index.db") catch {
+        const zivroot = @import("../util/zivroot.zig");
+        var idx_buf: [std.fs.max_path_bytes]u8 = undefined;
+        global_conn = database_mod.Database.init(alloc, zivroot.sub(&idx_buf, "index.db")) catch {
             global_failed = true;
             return null;
         };

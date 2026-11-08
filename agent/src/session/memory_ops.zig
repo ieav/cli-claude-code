@@ -808,7 +808,12 @@ pub fn exitExtractDeadlineMs() i64 {
 //   启动的分离线程；结果经文件交接（*.reply），主线程在提示符循环收
 //   回并落库（sqlite THREADSAFE=0，DB 写永不出主线程）。
 
-pub const PENDING_DIR = ".ziv/pending_extract";
+/// 锚点下的 pending_extract 目录（zivroot 迁移：原为模块常量字符串，
+/// 4 处使用点改经此函数以继承项目根）。
+const zivroot = @import("../util/zivroot.zig");
+fn pendingDir(buf: []u8) []const u8 {
+    return zivroot.sub(buf, "pending_extract");
+}
 /// 存档上限：最新 2 份——网关长期不可用时最老的被挤掉（有界放弃）。
 const PENDING_KEEP: usize = 2;
 
@@ -819,10 +824,11 @@ pub fn deferSessionExtraction(alloc: std.mem.Allocator, io: std.Io, history: []c
     if (transcript.len < 200) return false; // 空会话不值得排队
     const tr = if (transcript.len > 24_000) transcriptBackoff(transcript, transcript.len - 24_000) else transcript;
 
-    system_dirs.ensureDir(PENDING_DIR, io) catch return false;
+    var pd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    system_dirs.ensureDir(pendingDir(&pd_buf), io) catch return false;
     prunePending(io);
-    var name_buf: [96]u8 = undefined;
-    const path = std.fmt.bufPrint(&name_buf, "{s}/{d}.txt", .{ PENDING_DIR, util_time.nowMillis() }) catch return false;
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&name_buf, "{s}/{d}.txt", .{ pendingDir(&pd_buf), util_time.nowMillis() }) catch return false;
     const body = std.fmt.allocPrint(alloc, "{s}", .{tr}) catch return false;
     defer alloc.free(body);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body }) catch return false;
@@ -834,7 +840,8 @@ pub fn deferSessionExtraction(alloc: std.mem.Allocator, io: std.Io, history: []c
 
 /// 只留最新 PENDING_KEEP 份 .txt（老的直接放弃——有界）。
 fn prunePending(io: std.Io) void {
-    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    var pdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir = std.Io.Dir.cwd().openDir(io, pendingDir(&pdir_buf), .{}) catch return;
     defer dir.close(io);
     var names: [16][]const u8 = undefined;
     var mtimes: [16]i64 = undefined;
@@ -865,7 +872,7 @@ fn prunePending(io: std.Io) void {
     var buf: [128]u8 = undefined;
     var k = PENDING_KEEP;
     while (k < n) : (k += 1) {
-        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ PENDING_DIR, names[k] }) catch continue;
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ pendingDir(&pdir_buf), names[k] }) catch continue;
         std.Io.Dir.cwd().deleteFile(io, p) catch {};
     }
     // names 指向 name_scratch 静态数组（调用入口已重置槽位）——无可释放。
@@ -895,7 +902,8 @@ const PendingWorkerCtx = struct {
 /// 下次启动重试（网关不可达的常态容忍，PENDING_KEEP 兜底有界）。
 pub fn spawnPendingExtraction(cfg: BackgroundLlmConfig, alloc: std.mem.Allocator, io: std.Io) void {
     name_scratch_n = 0; // 复用槽位（仅主线程调用）
-    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    var pdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir = std.Io.Dir.cwd().openDir(io, pendingDir(&pdir_buf), .{}) catch return;
     var newest: ?[]const u8 = null;
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
@@ -906,7 +914,8 @@ pub fn spawnPendingExtraction(cfg: BackgroundLlmConfig, alloc: std.mem.Allocator
     }
     dir.close(io);
     const name = newest orelse return;
-    const txt = std.fmt.allocPrint(alloc, "{s}/{s}", .{ PENDING_DIR, name }) catch return;
+    var tp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const txt = std.fmt.allocPrint(alloc, "{s}/{s}", .{ pendingDir(&tp_buf), name }) catch return;
     const stem = txt[0 .. txt.len - 4];
     const reply = std.fmt.allocPrint(alloc, "{s}.reply", .{stem}) catch {
         alloc.free(txt);
@@ -966,7 +975,8 @@ pub fn collectPendingExtraction(
     alloc: std.mem.Allocator,
     io: std.Io,
 ) void {
-    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    var pdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir = std.Io.Dir.cwd().openDir(io, pendingDir(&pdir_buf), .{}) catch return;
     defer dir.close(io);
     var found: ?[]const u8 = null;
     name_scratch_n = 0;
@@ -979,7 +989,8 @@ pub fn collectPendingExtraction(
     }
     const name = found orelse return;
     var pbuf: [160]u8 = undefined;
-    const rpath = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ PENDING_DIR, name }) catch return;
+    var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rpath = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ pendingDir(&rp_buf), name }) catch return;
     const reply = std.Io.Dir.cwd().readFileAlloc(io, rpath, alloc, .limited(64 * 1024)) catch return;
     defer alloc.free(reply);
     const parsed = parseExtractionReply(alloc, reply) catch {

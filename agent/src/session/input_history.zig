@@ -12,15 +12,16 @@ const logger = @import("../util/log.zig");
 /// the working directory, newest last, capped at INPUT_HISTORY_MAX entries.
 /// Whole-file rewrite on every commit (≤ ~50 KB) — no append mode needed and
 /// rotation comes for free.
-const INPUT_HISTORY_FILE = ".ziv/input_history";
+const zivroot = @import("../util/zivroot.zig");
 /// Cross-process mutex for history saves. Locked via createFile's atomic
 /// flock (blocking); its inode never changes — locking the history file
 /// itself would be voided by the tmp+rename swap that replaces it.
-const INPUT_HISTORY_LOCK = ".ziv/input_history.lock";
+
 const INPUT_HISTORY_MAX: usize = 500;
 
 pub fn loadInputHistory(alloc: std.mem.Allocator, io: std.Io, history: *std.ArrayList([]u8)) void {
-    const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, INPUT_HISTORY_FILE, alloc, std.Io.Limit.limited(256 * 1024)) catch return;
+    var hp: [std.fs.max_path_bytes]u8 = undefined;
+    const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, zivroot.sub(&hp, "input_history"), alloc, std.Io.Limit.limited(256 * 1024)) catch return;
     defer alloc.free(contents);
     // Collect first, keep the TAIL: breaking early on an oversized file would
     // recall the OLDEST entries and silently drop the newest ones.
@@ -108,7 +109,8 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
     // the losing window skipped its save entirely.
     var io_state = std.Io.Threaded.init(alloc, .{});
     defer io_state.deinit();
-    var lock_file = std.Io.Dir.cwd().createFile(io_state.io(), INPUT_HISTORY_LOCK, .{
+    var lp: [std.fs.max_path_bytes]u8 = undefined;
+    var lock_file = std.Io.Dir.cwd().createFile(io_state.io(), zivroot.sub(&lp, "input_history.lock"), .{
         .read = true,
         .truncate = false,
     }) catch blk: {
@@ -144,7 +146,8 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
     }
     var file_lines: std.ArrayList([]const u8) = .empty;
     defer file_lines.deinit(alloc);
-    if (std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io_state.io(), INPUT_HISTORY_FILE, alloc, std.Io.Limit.limited(256 * 1024))) |contents| {
+    var hp2: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io_state.io(), zivroot.sub(&hp2, "input_history"), alloc, std.Io.Limit.limited(256 * 1024))) |contents| {
         // OWNERSHIP: file_lines borrows slices into `contents`, so it must
         // outlive the if-block — a defer inside the block freed it on block
         // exit and merge then read freed memory (0xAA garbage entries).
@@ -163,15 +166,17 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
         buf.append(alloc, '\n') catch return;
     }
 
-    fs_ops.ensureDir(".ziv") catch return;
+    var ed: [std.fs.max_path_bytes]u8 = undefined;
+    fs_ops.ensureDir(zivroot.sub(&ed, ".")) catch return;
     var tmp_buf: [128]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp{d}", .{ INPUT_HISTORY_FILE, std.c.getpid() }) catch return;
+    var hp3: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp{d}", .{ zivroot.sub(&hp3, "input_history"), std.c.getpid() }) catch return;
     fs_ops.writeFile(tmp, buf.items) catch
         return logger.warning("input history save failed", .{});
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), INPUT_HISTORY_FILE, io_state.io()) catch {
+    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), zivroot.sub(&hp3, "input_history"), io_state.io()) catch {
         // Rename failed — fall back to a plain write so the history is at
         // least saved, not silently dropped.
-        fs_ops.writeFile(INPUT_HISTORY_FILE, buf.items) catch
+        fs_ops.writeFile(zivroot.sub(&hp3, "input_history"), buf.items) catch
             logger.warning("input history save failed", .{});
     };
 }

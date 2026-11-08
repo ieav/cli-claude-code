@@ -714,6 +714,60 @@ def s14_subagent_m4():
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+
+def s15_project_root():
+    """Project-root anchoring (docs/ziv-project-root.md): a session started
+    in a SUBDIRECTORY shares the root project .ziv — startup hint prints,
+    root memories are visible. (Manual pty spawn: ZivSession would create
+    a LOCAL .ziv in the subdir, which by design wins over inheritance.)"""
+    import json as _json, sqlite3
+    root = tempfile.mkdtemp(prefix="ziv-root-")
+    try:
+        sub = os.path.join(root, "sub", "deep")
+        os.makedirs(os.path.join(root, ".ziv"))
+        os.makedirs(sub)
+        with open(os.path.join(root, ".ziv", "settings.json"), "w") as f:
+            f.write(_json.dumps({"permission_mode": "bypass"}))
+        db = sqlite3.connect(os.path.join(root, ".ziv", "memory.db"))
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS memories (id BLOB PRIMARY KEY, type TEXT, scope TEXT DEFAULT 'private',
+         name TEXT, description TEXT DEFAULT '', content TEXT, access_count INTEGER DEFAULT 0,
+         embedding_id INTEGER, model TEXT DEFAULT '', dimensions INTEGER DEFAULT 0,
+         created_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0);
+        INSERT INTO memories (id, type, name, content, created_at, updated_at)
+         VALUES (X'0102030405060708090a0b0c0d0e0f10', 'project', 'root-marker', 'ROOT_MEMORY_MARKER_42 根会话记忆', 1, 1);
+        """)
+        db.commit(); db.close()
+
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(sub)
+            env = dict(os.environ)
+            env["TERM"] = "xterm-256color"
+            env["HOME"] = sub  # hermetic: user-level settings stay out
+            os.execv(BIN, [BIN])
+        z = ZivSession.__new__(ZivSession)
+        z.pid, z.master = pid, master
+        z.buf = b""
+        z._owns_dir = False
+        z.dir = root
+        try:
+            z.wait_prompt()
+            if "使用项目存储" not in z.buf.decode("utf-8", "replace"):
+                raise Fail("no inheritance hint on startup banner")
+            z.send("/memory\r")
+            out = z.read_until("Most recent", 10)
+            if "root-marker" not in out:
+                raise Fail("root memory not visible from subdir session")
+            quit_and_wait(z)
+            return "subdir inherits root .ziv (hint + shared memory) ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -729,6 +783,7 @@ SCENARIOS = [
     ("S12 tui-colors-toggle-resize", s12_tui_colors_toggle_resize),
     ("S13 bg-tasks", s13_bg_tasks),
     ("S14 subagent-m4", s14_subagent_m4),
+    ("S15 project-root", s15_project_root),
 ]
 
 

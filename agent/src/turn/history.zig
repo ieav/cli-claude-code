@@ -1048,7 +1048,9 @@ pub fn removeSystemBlockByText(history: *std.ArrayList(llm.Message), alloc: std.
 
 /// T8: read .ziv/plan.md (≤8 KiB). Null when absent/unreadable.
 pub fn readPlanFile(alloc: std.mem.Allocator, io: std.Io) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, ".ziv/plan.md", alloc, .limited(8 * 1024)) catch null;
+    const zivroot = @import("../util/zivroot.zig");
+    var plan_buf: [std.fs.max_path_bytes]u8 = undefined;
+    return std.Io.Dir.cwd().readFileAlloc(io, zivroot.sub(&plan_buf, "plan.md"), alloc, .limited(8 * 1024)) catch null;
 }
 
 /// T8: the plan's system-prompt summary — trimmed non-empty lines under

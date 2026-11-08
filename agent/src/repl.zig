@@ -8,6 +8,7 @@ const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
 const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
+const zivroot = @import("util/zivroot.zig");
 const lineinput = @import("util/lineinput.zig");
 const stream_mod = @import("turn/stream.zig");
 const turn_ask = @import("turn/ask.zig");
@@ -156,7 +157,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // and re-formatting); freshness is validated per read via stat.
     file_cache_mod.globalInit(allocator);
     defer file_cache_mod.deinitGlobal();
-    var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, ".ziv/checkpoints"));
+    // 项目根锚定：main.zig 已在横幅处初始化（含继承提示）；此处幂等兜底
+    // （直接单测调用 repl.run 的形态）。
+    if (zivroot.rootLen() == 0) zivroot.init(io);
+    var fhist_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, zivroot.sub(&fhist_buf, "checkpoints")));
     // The /config snapshot cap used to be write-only — the state hardcoded
     // 100 and nothing read the setting.
     fhist.max_snapshots = switcher.settings.max_snapshots;
@@ -170,12 +175,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
     // ──── Persistent memory (episodic tier, cross-session) ────
     var injected_count: usize = 0;
-    std.Io.Dir.cwd().createDirPath(io, ".ziv") catch {};
+    var dotziv_buf: [std.fs.max_path_bytes]u8 = undefined;
+    std.Io.Dir.cwd().createDirPath(io, zivroot.sub(&dotziv_buf, ".")) catch {};
     // Persistent diagnostics: the interactive-stderr mute hides every log
     // line in TUI mode, so gateway failures used to leave no trail at all.
-    logger.setLogFile(io, ".ziv/logs");
+    var logs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    logger.setLogFile(io, zivroot.sub(&logs_buf, "logs"));
     var mem_db: ?database_mod.Database = blk: {
-        var db = database_mod.Database.init(allocator, ".ziv/memory.db") catch break :blk null;
+        var memdb_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var db = database_mod.Database.init(allocator, zivroot.sub(&memdb_buf, "memory.db")) catch break :blk null;
         db.runMigrations() catch {
             logger.warning("memory: migrations failed, memory disabled", .{});
             db.deinit();
@@ -188,7 +196,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // .ziv/sessions.db; /resume brings a past conversation (blocks, model,
     // mode) back. Best-effort — the REPL runs fine without it.
     const sess_store: ?*session_store.SessionStore = blk: {
-        const store = session_store.SessionStore.open(allocator, ".ziv/sessions.db", ".", switcher.modelName(), current_mode) orelse break :blk null;
+        var sessdb_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const store = session_store.SessionStore.open(allocator, zivroot.sub(&sessdb_buf, "sessions.db"), ".", switcher.modelName(), current_mode) orelse break :blk null;
         break :blk store;
     };
     defer if (sess_store) |st| {
@@ -1725,10 +1734,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             };
             if (!trace_off and t.getSteps().len > 0) {
                 t.complete();
-                if (t.writeJsonlFile(io, ".ziv/traces", allocator)) {
+                var traces_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (t.writeJsonlFile(io, zivroot.sub(&traces_buf, "traces"), allocator)) {
                     // /trace reads this path back — record it on success only.
                     var path_b: [160]u8 = undefined;
-                    if (std.fmt.bufPrint(&path_b, ".ziv/traces/{d}.jsonl", .{t.started_at})) |p| {
+                    var tr2: [std.fs.max_path_bytes]u8 = undefined;
+                    if (std.fmt.bufPrint(&path_b, "{s}/{d}.jsonl", .{ zivroot.sub(&tr2, "traces"), t.started_at })) |p| {
                         turn_clock.setTracePath(p);
                     } else |_| {}
                 } else |e| {

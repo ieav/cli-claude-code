@@ -27,6 +27,7 @@ const turn_history = @import("../turn/history.zig");
 const session_store_mod = @import("../session/session_store.zig");
 const session_store_mod_code = @import("../knowledge/code_index.zig");
 const menu = @import("../util/menu.zig");
+const zivroot = @import("../util/zivroot.zig");
 const turn_tools = @import("../turn/tools.zig");
 const registry = @import("../tools/registry.zig");
 const op_log = @import("../checkpoint/op_log.zig");
@@ -581,7 +582,8 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
         } else if (std.mem.eql(u8, input, "/plan") or std.mem.startsWith(u8, input, "/plan ")) {
             const plan_arg = std.mem.trim(u8, input[5..], " \t");
             if (std.mem.eql(u8, plan_arg, "off")) {
-                std.Io.Dir.cwd().deleteFile(ctx.io, ".ziv/plan.md") catch {};
+                var zr1: [std.fs.max_path_bytes]u8 = undefined;
+                std.Io.Dir.cwd().deleteFile(ctx.io, zivroot.sub(&zr1, "plan.md")) catch {};
                 turn_history.refreshPlanAnchor(ctx.history, ctx.plan_block, ctx.plan_raw_last, allocator, ctx.io);
                 try std.Io.Writer.writeAll(ctx.w, "  计划已停用（.ziv/plan.md 已删除，system 锚点已移除）\n\n");
             } else if (plan_arg.len == 0) {
@@ -591,11 +593,13 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                     try std.Io.Writer.writeAll(ctx.w, "  当前无计划。用法：/plan <目标> 创建 ｜ /plan off 停用\n\n");
                 }
             } else {
-                std.Io.Dir.cwd().createDirPath(ctx.io, ".ziv") catch {};
+                var zr2: [std.fs.max_path_bytes]u8 = undefined;
+                std.Io.Dir.cwd().createDirPath(ctx.io, zivroot.sub(&zr2, ".")) catch {};
                 var tp: [4096]u8 = undefined;
                 const template = std.fmt.bufPrint(&tp, "# 计划：{s}\n\n- [ ] （补充步骤；勾选为 [x] 后，system 注入的摘要自动更新）\n", .{plan_arg}) catch "";
                 if (template.len > 0) {
-                    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ".ziv/plan.md", .data = template }) catch {
+                    var zr3: [std.fs.max_path_bytes]u8 = undefined;
+                std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = zivroot.sub(&zr3, "plan.md"), .data = template }) catch {
                         try std.Io.Writer.writeAll(ctx.w, "  写入 .ziv/plan.md 失败\n\n");
                         try std.Io.File.Writer.flush(ctx.file_writer);
                         return .handled;

@@ -69,7 +69,9 @@ pub const SkillLoader = struct {
     }
 
     fn projectRoot(self: *Self) ![]u8 {
-        return self.allocator.dupe(u8, ".ziv/skills");
+        const zivroot = @import("../util/zivroot.zig");
+            var sb: [std.fs.max_path_bytes]u8 = undefined;
+            return self.allocator.dupe(u8, zivroot.sub(&sb, "skills"));
     }
 
     fn loadDir(self: *Self, root: []const u8, source: Source) !void {
