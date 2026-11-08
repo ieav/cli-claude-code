@@ -19,6 +19,9 @@ pub const SettingSource = enum {
 
 pub const Settings = struct {
     permission_mode: auth_mode.PermissionMode = .default,
+    /// MCP 启动自动连接（2026-11-10：配置了就该连上，不该让人再敲
+    /// /mcp connect）。ZIV_MCP_AUTOSTART=0 可关。
+    mcp_autostart: bool = true,
     allow_rules: []const auth_mode.PermissionRule = &.{},
     deny_rules: []const auth_mode.PermissionRule = &.{},
     ask_rules: []const auth_mode.PermissionRule = &.{},
@@ -204,6 +207,9 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
         if (sc >= 1 and sc <= 8) {
             settings.subagent_concurrency = @intCast(sc);
         }
+    }
+    if (json_helpers.getBool(value, "mcp_autostart")) |ma| {
+        settings.mcp_autostart = ma;
     }
     if (json_helpers.getInt(value, "agent_loop_limit")) |al| {
         if (al >= 1 and al <= 200) {
@@ -395,6 +401,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};
+    buf.print(allocator, "  \"mcp_autostart\": {},\n", .{settings.mcp_autostart}) catch {};
     // permission_mode
     const mode_str = @tagName(settings.permission_mode);
     buf.print(allocator, "  \"permission_mode\": \"{s}\",\n", .{mode_str}) catch {};

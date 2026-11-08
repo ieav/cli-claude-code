@@ -9,6 +9,11 @@ const auth = @import("tools/auth_mode.zig");
 const classifier_mod = @import("tools/classifier.zig");
 const menu = @import("util/menu.zig");
 const zivroot = @import("util/zivroot.zig");
+
+fn env_flag_off(name: []const u8) bool {
+    const v = @import("util/env.zig").get(name) orelse return false;
+    return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false");
+}
 const lineinput = @import("util/lineinput.zig");
 const stream_mod = @import("turn/stream.zig");
 const turn_ask = @import("turn/ask.zig");
@@ -513,6 +518,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         @ptrCast(&dispatch_ctx),
         false,
     ) catch |e| logger.warning("agent tool registration failed: {}", .{e});
+    // MCP 自动连接（2026-11-10）：配置了就连——不该让人再敲 /mcp connect。
+    // ZIV_MCP_AUTOSTART=0 或 settings.mcp_autostart=false 关闭。失败只记
+    // 日志不打断启动（网关类工具离线是常态）。
+    if (switcher.settings.mcp_autostart and env_flag_off("ZIV_MCP_AUTOSTART") == false) {
+        for (mcp_cfg.servers.items) |*entry| {
+            if (!entry.enabled) continue;
+            connectMcpServer(entry, &mcp_sessions, &reg, allocator, io, w, &file_writer) catch |err| {
+                logger.warning("mcp autostart {s}: {}", .{ entry.name, err });
+            };
+        }
+    }
+
 
     // Consecutive-denial watchdog (designed anti-loop for dont_ask/auto
     // modes): after N denials in a row, say so instead of silently
@@ -1756,6 +1773,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             lineinput.recall_text = "继续";
             lineinput.recall_prefill = true;
         }
+
+        // Skill 工具门解除（2026-11-10 C 项）：门只管 skill 生效的那一个
+        // 回合——回合一结束恢复全量（下一个 /skill 重新武装）。
+        skills_mod.gate.disarm();
 
         // T1.3: topic-drift re-anchor — checked after EVERY completed turn
         // (cheap: ≤3 hash embeddings + one cosine), fires at most once.

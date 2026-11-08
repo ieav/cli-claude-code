@@ -47,6 +47,13 @@ pub fn checkToolPermission(
     input: std.json.Value,
     ctx: *const PermissionContext,
 ) PermissionDecision {
+    // Skill 工具门（2026-11-10）：skill 生效回合内，前置声明 tools:
+    // 之外的工具一律拒——声明即授权边界，权限模式不可放宽它。
+    if (@import("../skills/gate.zig").armed()) {
+        if (!@import("../skills/gate.zig").allows(tool.name)) {
+            return .{ .deny = .{ .message = "denied by skill tools gate (not in declared tools:)" } };
+        }
+    }
     // Step 1a: Check deny rules. A rule without a pattern denies the tool
     // outright; a rule with a pattern only denies when the input matches it.
     for (ctx.deny_rules) |rule| {

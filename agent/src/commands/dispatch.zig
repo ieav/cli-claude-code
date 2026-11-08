@@ -864,6 +864,9 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 } else |_| {}
             }
             defer if (did_subst) allocator.free(expanded);
+            // C 项（2026-11-10）：前置声明 tools: 武装为强制门——本回合
+            // 只许清单内工具（空声明 = 不设限，老 skill 兼容）。
+            skills_mod.gate.arm(skill.tools);
             const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
                 skill.name,
                 expanded,
