@@ -1211,11 +1211,12 @@ fn renderTableBlock(alloc: std.mem.Allocator, rows: []const []const u8, term_w: 
         for (cr, 0..) |c, i| widths[i] = @max(widths[i], strWidth(c));
     }
 
-    // Structure cost: "| " + " | "×(cols-1) + " |\n" = 2*cols + 1.
+    // 行宽口径（2026-11-10 修正）：一行 = │×(cols+1) + 每列(2 空格+宽)
+    // = widthsTotal + 3*cols + 1（旧式少算 cols，宽表会超预算一列宽）。
     const budget: usize = if (term_w > 4) term_w - 2 else 10; // small margin
     // Shrink the widest column by one display column until the table
     // fits the terminal (cells then clip with an ellipsis at emit time).
-    while (widthsTotal(widths, max_cols) + 2 * max_cols + 1 > budget) {
+    while (widthsTotal(widths, max_cols) + 3 * max_cols + 1 > budget) {
         var widest: usize = 0;
         for (widths[1..], 1..) |wd, i| {
             if (wd > widths[widest]) widest = i;
@@ -1224,28 +1225,56 @@ fn renderTableBlock(alloc: std.mem.Allocator, rows: []const []const u8, term_w: 
         widths[widest] -= 1;
     }
 
-    // Emit rows.
+    // Emit（2026-11-10 用户定纲：既然画表就画实心制表线）：
+    //   ┌────┬────┐   边框线整体 dim，数据行正常亮度——层级分明。
+    //   │ a  │ b  │   分隔行(|---|)只保留为表头下的 ├─┼─┤ 规则线。
+    //   └────┴────┘
+    const dim = "\x1b[2m";
+    const rst = "\x1b[0m";
+    // 顶边
+    try out.appendSlice(alloc, dim);
+    try out.appendSlice(alloc, "\u{250C}");
+    for (widths, 0..) |wd, i| {
+        if (i > 0) try out.appendSlice(alloc, "\u{252C}");
+        var k: usize = 0;
+        while (k < wd + 2) : (k += 1) try out.appendSlice(alloc, "\u{2500}");
+    }
+    try out.appendSlice(alloc, "\u{2510}");
+    try out.appendSlice(alloc, rst ++ "\n");
+    // 数据行（has_sep 时表头下画 ├─┼─┤）
     for (cell_rows.items, 0..) |cr, ri| {
         if (has_sep and ri == 1) {
-            // Rule line under the header row (replaces the |---| row).
-            try out.appendSlice(alloc, "\x1b[2m|");
-            for (widths) |wd| {
+            try out.appendSlice(alloc, dim);
+            try out.appendSlice(alloc, "\u{251C}");
+            for (widths, 0..) |wd, i| {
+                if (i > 0) try out.appendSlice(alloc, "\u{253C}");
                 var k: usize = 0;
                 while (k < wd + 2) : (k += 1) try out.appendSlice(alloc, "\u{2500}");
             }
-            try out.appendSlice(alloc, "|\x1b[0m\n");
+            try out.appendSlice(alloc, "\u{2524}");
+            try out.appendSlice(alloc, rst ++ "\n");
         }
-        try out.append(alloc, '|');
+        try out.appendSlice(alloc, "\u{2502}");
         for (0..max_cols) |ci| {
             const cell = if (ci < cr.len) cr[ci] else "";
             try out.append(alloc, ' ');
             try appendClipped(alloc, out, cell, widths[ci]);
             var pad = widths[ci] -| strWidth(cell);
             while (pad > 0) : (pad -= 1) try out.append(alloc, ' ');
-            try out.appendSlice(alloc, " |");
+            try out.appendSlice(alloc, " \u{2502}");
         }
         try out.append(alloc, '\n');
     }
+    // 底边
+    try out.appendSlice(alloc, dim);
+    try out.appendSlice(alloc, "\u{2514}");
+    for (widths, 0..) |wd, i| {
+        if (i > 0) try out.appendSlice(alloc, "\u{2534}");
+        var k: usize = 0;
+        while (k < wd + 2) : (k += 1) try out.appendSlice(alloc, "\u{2500}");
+    }
+    try out.appendSlice(alloc, "\u{2518}");
+    try out.appendSlice(alloc, rst ++ "\n");
 }
 
 fn widthsTotal(w: []const usize, n: usize) usize {
@@ -3679,20 +3708,23 @@ test "markdown table renders aligned and width-clipped" {
     try std.Io.Writer.writeAll(&rw.interface, tbl);
     rw.flushTableBlock();
 
-    // Collect the rendered table lines (start with '|').
+    // Collect the rendered DATA lines (start with │——border lines start
+    // with ┌/├/└ and are excluded by construction).
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(alloc);
     var it = std.mem.splitScalar(u8, aw.written(), '\n');
     while (it.next()) |ln| {
         var t2 = std.mem.trimStart(u8, ln, "\x1b8");
         t2 = std.mem.trimStart(u8, t2, "\x1b[2m");
-        if (std.mem.startsWith(u8, t2, "|")) try lines.append(alloc, ln);
+        if (std.mem.startsWith(u8, t2, "\u{2502}")) try lines.append(alloc, ln);
     }
-    // The header row is glued to the region-arming control sequence (no
-    // newline between them), so the per-line collection sees rule + 2
-    // body rows; the header is asserted as a substring directly.
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b8| 板块") != null);
+    // 实心边框三件套（2026-11-10 用户定纲：画表就画实心线）。
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\u{250C}") != null); // ┌
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\u{251C}") != null); // ├ （表头规则线）
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\u{2514}") != null); // └
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "|---|") == null); // 原始分隔行已消化
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\u{2502} 板块") != null);
     // THE invariant: pipe byte-offsets identical across the data rows
     // (padding aligned the columns).
     // Pipe positions in DISPLAY columns (CJK = 2): alignment is a
@@ -3704,7 +3736,7 @@ test "markdown table renders aligned and width-clipped" {
             var i: usize = 0;
             while (i < line.len) {
                 const next = nextChar(line, i);
-                if (line[i] == '|') {
+                if (line[i] == '\u{2502}') {
                     if (n < buf.len) {
                         buf[n] = col;
                         n += 1;
@@ -3716,7 +3748,7 @@ test "markdown table renders aligned and width-clipped" {
             return n;
         }
     };
-    // Reference = the FIRST data row (the rule line only has 2 pipes).
+    // Reference = the FIRST data row（边框行不含 │，天然被排除）。
     var ref: [32]usize = undefined;
     const ref_n = pipeCols.of(lines.items[1], &ref);
     for (lines.items[2..]) |ln| {
