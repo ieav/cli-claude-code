@@ -7,6 +7,7 @@ const system_dirs = @import("util/system_dirs.zig");
 const json_helpers = @import("util/json_helpers.zig");
 const auth_mode = @import("tools/auth_mode.zig");
 const env_mod = @import("util/env.zig");
+const zivroot = @import("util/zivroot.zig");
 const rule_parser = @import("tools/rule_parser.zig");
 
 pub const SettingSource = enum {
@@ -140,8 +141,10 @@ pub fn settingsFingerprint(allocator: std.mem.Allocator, io: std.Io) u64 {
     const user_path = std.fs.path.join(allocator, &.{ user_dir, "settings.json" }) catch return h;
     defer allocator.free(user_path);
     h = h *% 1000003 +% hashSettingsFile(user_path, allocator, io);
-    h = h *% 1000003 +% hashSettingsFile(".ziv/settings.json", allocator, io);
-    h = h *% 1000003 +% hashSettingsFile(".ziv/settings.local.json", allocator, io);
+    var fp1: [std.fs.max_path_bytes]u8 = undefined;
+    var fp2: [std.fs.max_path_bytes]u8 = undefined;
+    h = h *% 1000003 +% hashSettingsFile(zivroot.sub(&fp1, "settings.json"), allocator, io);
+    h = h *% 1000003 +% hashSettingsFile(zivroot.sub(&fp2, "settings.local.json"), allocator, io);
     return h;
 }
 
@@ -160,13 +163,13 @@ fn loadFromUserSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
 }
 
 fn loadFromProjectSettings(settings: *Settings, allocator: std.mem.Allocator, io: std.Io) !void {
-    const path = ".ziv/settings.json";
-    loadJsonIntoSettings(settings, allocator, io, path) catch {};
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    loadJsonIntoSettings(settings, allocator, io, zivroot.sub(&pb, "settings.json")) catch {};
 }
 
 fn loadFromLocalSettings(settings: *Settings, allocator: std.mem.Allocator, io: std.Io) !void {
-    const path = ".ziv/settings.local.json";
-    loadJsonIntoSettings(settings, allocator, io, path) catch {};
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    loadJsonIntoSettings(settings, allocator, io, zivroot.sub(&lb, "settings.local.json")) catch {};
 }
 
 fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
