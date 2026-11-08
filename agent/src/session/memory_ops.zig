@@ -614,6 +614,11 @@ pub fn memoryDecayTask(opaque_ctx: ?*anyopaque) anyerror!void {
     }
     const deleted = ms.episodic_mem.deleteByIds(prune[0..prune_len]);
     if (deleted > 0) {
+        // 向量索引同删（②审查发现：忘删会留幽灵向量——被清扫的记忆
+        // 仍参与语义查重，误杀后续新记忆且表无界增长）。
+        for (prune[0..prune_len]) |pid_hex| {
+            vec_dedup.forgetMemory(ms.db, pid_hex);
+        }
         logger.info("memory: φ sweep pruned {d}/{d} stale entries (>30d untouched)", .{ deleted, n_cand });
         // NOTE: deliberately no memory_updated emit — that event marks
         // additions; a sweep log line is enough signal.
