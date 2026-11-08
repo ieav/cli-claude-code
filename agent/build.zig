@@ -6,6 +6,10 @@ const std = @import("std");
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     // -O2 恒定：tree-sitter 是查表密集型 C，-O0 下 1MB python 解析要 2s
     // （实测 2026-11-08），交互回合不可接受；Zig 侧照旧跟随全局 optimize。
+    // -std=gnu11（不是 c11）：核心的 parser.c/tree.c 调 POSIX fdopen()
+    // （dot-graph 调试输出），严格 ISO 模式下 musl 头不暴露其声明——
+    // macOS/BSD libc 恰好暴露所以本机过、交叉 linux-musl 炸（发版
+    // 2026-11-09 实测四缺二）。gnu 模式恒暴露 POSIX/BSD 扩展。
     mod.addCSourceFiles(.{
         .files = &.{
             "deps/tree-sitter/lib/src/lib.c",
@@ -20,7 +24,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
             "deps/tree-sitter/java/src/parser.c",
             "deps/tree-sitter/zig/src/parser.c",
         },
-        .flags = &.{ "-std=c11", "-O2" },
+        .flags = &.{ "-std=gnu11", "-O2" },
     });
     mod.addIncludePath(b.path("deps/tree-sitter/lib/include"));
     mod.addIncludePath(b.path("deps/tree-sitter/lib/src"));
