@@ -102,7 +102,7 @@ pub fn runConfigMenu(
                     try std.Io.Writer.writeAll(w, "  无效数字\n");
                     continue;
                 };
-                if (sc >= 1 and sc <= 8) {
+                if (sc >= 1 and sc <= 10) {
                     switcher.settings.subagent_concurrency = sc;
                     autoSaveSettings(w, file_writer, switcher, alloc, io);
                 } else try std.Io.Writer.writeAll(w, "  超出范围\n");

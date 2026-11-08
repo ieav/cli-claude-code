@@ -494,6 +494,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             .ollama => null,
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
+        // 全能力素材（write:true 用）：模式指针热切换实时生效；规则切片
+        // 指向 settings（retired 不释放，生命周期安全）。auto 由 dispatch
+        // 侧降级为 default（无头不做 LLM 分类审批）。
+        .perm_mode = &current_mode,
+        .allow_rules = switcher.settings.allow_rules,
+        .deny_rules = switcher.settings.deny_rules,
+        .ask_rules = switcher.settings.ask_rules,
     };
     // T6.4 status: the subagent dispatch tool is ENABLED by default
     // (2026-11-04). The old "intermittent hang after an agent-tool turn"
@@ -514,8 +521,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     };
     if (agent_tool_enabled) reg.registerDynamic(
         "agent",
-        "Run 1-3 focused read-only subagents in parallel. Each gets its own context and the read-only tools, then reports back. Use for independent research or verification subtasks (e.g. 'check X in the codebase', 'verify the failing paths'), NOT for sequential work. Optional: 'tools' narrows what each subagent may use (names, subset of available tools); 'fork' makes them inherit the recent conversation tail (~16K tokens) instead of starting fresh — use when the task depends on what we just discussed; 'max_turns' caps turns (1-10).",
-        "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-3 self-contained task descriptions\"},\"tools\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional tool-name whitelist for every subagent (narrows only; read-only semantics unchanged)\"},\"fork\":{\"type\":\"boolean\",\"description\":\"Inherit the recent conversation tail (~16K tokens) instead of starting fresh\"},\"max_turns\":{\"type\":\"integer\",\"description\":\"Per-subagent turn cap (1-10, default 10)\"}},\"required\":[\"tasks\"]}",
+        "Run 1-10 focused subagents in parallel and get their merged reports. Default is READ-ONLY (research/verification fan-out). Set 'write':true to grant FULL permissions through the user's real rules (writes/Bash allowed; anything that would ASK is still denied — headless; write dispatches run serially). Each subagent has its own context. Optional: 'tools' narrows what each subagent may use; 'fork' makes them inherit the recent conversation tail (~16K tokens); 'max_turns' caps turns (1-10).",
+        "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"1-10 self-contained task descriptions\"},\"tools\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional tool-name whitelist for every subagent (narrows only)\"},\"fork\":{\"type\":\"boolean\",\"description\":\"Inherit the recent conversation tail (~16K tokens) instead of starting fresh\"},\"write\":{\"type\":\"boolean\",\"description\":\"Full permissions via the user's real rules (writes allowed, ask-tier denied; forces serial execution). Default false = read-only\"},\"max_turns\":{\"type\":\"integer\",\"description\":\"Per-subagent turn cap (1-10, default 10)\"}},\"required\":[\"tasks\"]}",
         agent_dispatch.executeWithCtx,
         @ptrCast(&dispatch_ctx),
         false,

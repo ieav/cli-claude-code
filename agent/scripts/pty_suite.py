@@ -86,6 +86,27 @@ class ZivSession:
         tail = self.buf[-400:].decode("utf-8", "replace")
         raise Fail(f"timeout {timeout}s waiting for {pattern!r}; tail:\n{tail}")
 
+    def read_until_seen(self, pattern: str, timeout: float) -> str:
+        """同 read_until，但已缓冲内容也算命中——适用于「字节可能已被
+        前一次 read_until/drain 吃进 buf」的等待（read_until 只认新到
+        字节，这种形态会干等到超时；S19 开发中实证）。"""
+        deadline = time.time() + timeout
+        pat = pattern.encode()
+        while time.time() < deadline:
+            if pat in self.buf:
+                return self.buf.decode("utf-8", "replace")
+            r, _, _ = select.select([self.master], [], [], 0.2)
+            if self.master in r:
+                try:
+                    chunk = os.read(self.master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.buf += chunk
+        tail = self.buf[-400:].decode("utf-8", "replace")
+        raise Fail(f"timeout {timeout}s waiting for {pattern!r}; tail:\n{tail}")
+
     def drain(self, seconds: float) -> str:
         """Read whatever arrives for `seconds` (no pattern)."""
         deadline = time.time() + seconds
@@ -960,6 +981,98 @@ def s18_tree_sitter():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s19_full_subagent():
+    """Full-capability subagents (write:true): (a) bypass + write → the
+    subagent's FileWrite REALLY lands (file created); (b) no write param →
+    read-only denial reaches the merged report; (c) default mode + write →
+    ask degrades to '(non-interactive)' denial. Mock gateway serves the
+    subagent's own LLM rounds (detected by the headless system prompt)."""
+    import threading, http.server, json as _json
+    state = {"sub_round": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = _json.loads(self.rfile.read(n)) if n else {}
+            def sys_text(m):
+                c = m.get("content")
+                return c if isinstance(c, str) else _json.dumps(c)
+            is_sub = any(m.get("role") == "system" and "focused subagent" in sys_text(m) for m in body.get("messages", []))
+            if is_sub:
+                state["sub_round"] += 1
+                if state["sub_round"] % 2 == 1:  # 每个子代理第一轮：要求写文件
+                    msg = {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": f"c{state['sub_round']}", "type": "function", "function": {
+                            "name": "FileWrite",
+                            "arguments": _json.dumps({"path": "marker-write.txt", "content": "from-subagent"})}}]}
+                else:  # 第二轮：回显最后的工具结果（拒绝/成功语义由此进入报告）
+                    last_tool = ""
+                    for m in body.get("messages", []):
+                        c = m.get("content")
+                        if isinstance(c, str) and m.get("role") == "tool":
+                            last_tool = c
+                        elif isinstance(c, list):
+                            for b in c:
+                                if isinstance(b, dict) and b.get("type") == "tool_result":
+                                    last_tool = b.get("content", "") if isinstance(b.get("content"), str) else _json.dumps(b.get("content", ""))
+                    msg = {"role": "assistant", "content": f"RESULT[{last_tool}]", "tool_calls": None}
+            else:
+                msg = {"role": "assistant", "content": "ok", "tool_calls": None}
+            resp = _json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 2}}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def run_case(settings_mode, use_write, marker):
+        d = tempfile.mkdtemp(prefix="ziv-full-")
+        try:
+            hook_settings = _json.dumps({"permission_mode": settings_mode,
+                                         "api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{port}/v1"}})
+            z = ZivSession(reuse_dir=d, settings=hook_settings)
+            try:
+                z.wait_prompt()
+                z.clear_buf()
+                arg = ',"write":true' if use_write else ''
+                z.send(f'/run agent {{"task":"create the marker file"{arg}}}\r')
+                # default 模式下 agent 工具本身要审批（非只读工具）——替操作员答 y。
+                try:
+                    z.read_until("Allow?", 5)
+                    z.send("y\r")
+                except Exception:
+                    pass  # bypass：无审批直接跑
+                out = z.read_until_seen("子任务 1", 30)
+                z.drain(2.0)  # 回合收尾（default 模式提示符无模式标签，别匹配形态）
+                return out, os.path.exists(os.path.join(d, "marker-write.txt"))
+            finally:
+                z.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    try:
+        # (a) bypass + write:true → 真落盘
+        out_a, wrote = run_case("bypass", True, "a")
+        if not wrote:
+            raise Fail(f"write dispatch did not create the file; report: {out_a[-300:]!r}")
+        # (b) 无 write → 只读拒绝进报告，文件不存在
+        out_b, wrote_b = run_case("bypass", False, "b")
+        if wrote_b or "subagents are read-only" not in out_b:
+            raise Fail(f"read-only semantics broken: wrote={wrote_b}; report: {out_b[-300:]!r}")
+        # (c) default 模式 + write:true → ask 降级 (non-interactive)，仍拒
+        out_c, wrote_c = run_case("default", True, "c")
+        if wrote_c or "non-interactive" not in out_c:
+            raise Fail(f"ask-degrade broken: wrote={wrote_c}; report: {out_c[-300:]!r}")
+        return "write lands (bypass), read-only default intact, ask degrades headless ✓"
+    finally:
+        srv.shutdown()
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -979,6 +1092,7 @@ SCENARIOS = [
     ("S16 print-mode", s16_print_mode),
     ("S17 hooks", s17_hooks),
     ("S18 tree-sitter", s18_tree_sitter),
+    ("S19 full-subagent", s19_full_subagent),
 ]
 
 

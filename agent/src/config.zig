@@ -51,9 +51,10 @@ pub const Settings = struct {
     /// quality gate (T2.x) to land first.
     memory_budget_tokens: u32 = 1200,
     /// P2: concurrent subagent workers per agent dispatch. 1 = serial
-    /// (escape hatch); clamped to 1..8 on load — values beyond the
-    /// per-dispatch task cap (3) simply mean "all tasks parallel".
-    subagent_concurrency: u32 = 3,
+    /// (escape hatch); clamped to 1..10 on load. Default 4: 只读 fan-out
+    /// 的并行收益仍在、网关限流风险可控（写型 dispatch 恒串行，不受
+    /// 此值影响）。
+    subagent_concurrency: u32 = 4,
     /// P4: automatic error recovery (429/timeout backoff retries, overflow
     /// auto-compact). Off → every error goes straight to the selector.
     auto_fix: bool = true,
@@ -212,7 +213,7 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
         settings.auto_deep_compact = adc;
     }
     if (json_helpers.getInt(value, "subagent_concurrency")) |sc| {
-        if (sc >= 1 and sc <= 8) {
+        if (sc >= 1 and sc <= 10) {
             settings.subagent_concurrency = @intCast(sc);
         }
     }

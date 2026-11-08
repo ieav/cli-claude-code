@@ -1,12 +1,17 @@
 /// Agent dispatch tool (T6.3-T6.5, P2 re-opened T6.4) — parallel subagent
-/// fan-out. The MAIN agent spawns up to 3 focused read-only subagents
-/// (agent/subagent.zig) and gets their merged reports. Concurrency is
-/// configurable (settings.subagent_concurrency, default 3); each worker
-/// thread owns a PRIVATE Io.Threaded + provider (B-pattern — sharing the
-/// main loop's io across threads is unsafe at the std layer) and claims
-/// jobs through a shared atomic index in priority-descending order. The
-/// calling thread joins the worker pool; spawn failures degrade to fewer
-/// workers, never to a hang (the P1 stall watchdog caps every request).
+/// fan-out. The MAIN agent spawns up to 10 focused subagents
+/// (agent/subagent.zig) and gets their merged reports. Default semantics
+/// stay READ-ONLY (no write param); `write:true` grants FULL permissions
+/// through the caller's real rules — ask-tier calls still denied (headless
+/// discipline), and write dispatches run SERIALLY (parallel agents editing
+/// the same file lose updates; serial is the simplest correct v1).
+/// Concurrency is configurable (settings.subagent_concurrency, default 4,
+/// clamp 1..10); each worker thread owns a PRIVATE Io.Threaded + provider
+/// (B-pattern — sharing the main loop's io across threads is unsafe at the
+/// std layer) and claims jobs through a shared atomic index in
+/// priority-descending order. The calling thread joins the worker pool;
+/// spawn failures degrade to fewer workers, never to a hang (the P1 stall
+/// watchdog caps every request).
 const std = @import("std");
 const registry = @import("registry.zig");
 const runtime_registry = @import("runtime_registry.zig");
@@ -19,7 +24,7 @@ const openai = @import("../llm/openai.zig");
 const claude = @import("../llm/claude.zig");
 const ollama = @import("../llm/ollama.zig");
 
-pub const MAX_SUBAGENTS: usize = 3;
+pub const MAX_SUBAGENTS: usize = 10;
 const SUMMARY_TOKEN_CAP: u32 = 500;
 
 /// Context built once by the REPL: everything a worker needs to construct
@@ -46,6 +51,14 @@ pub const DispatchCtx = struct {
     /// M4 fork：父会话历史（dispatch 期间主线程阻塞在本工具里，历史
     /// 稳定，只读借用安全）。null = fork 不可用（REPL 未接线）。
     history: ?*const std.ArrayList(llm.Message) = null,
+    /// 全能力素材（write:true 时组 PermissionsContext 注入子代理）。
+    /// mode 用指针——/mode 热切换对下一次 dispatch 生效；规则切片指
+    /// 向 switcher.settings（retired 不释放，生命周期安全）。null =
+    /// REPL 未接线 → write 请求静默降级为只读。
+    perm_mode: ?*const registry.PermissionMode = null,
+    allow_rules: []const registry.PermissionRule = &.{},
+    deny_rules: []const registry.PermissionRule = &.{},
+    ask_rules: []const registry.PermissionRule = &.{},
 };
 
 /// M4 fork 继承的 token 帽：父历史只取尾部（最新上下文最相关，
@@ -135,8 +148,12 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     const n = @min(tasks.items.len, MAX_SUBAGENTS);
 
     // M4 参数：tools 白名单（只能收窄）/ fork 继承 / max_turns。
+    // 全能力（write:true）：经调用方真实权限规则放行——ask 档在无头
+    // 环境仍然拒绝（与 -p 同语义）；deny/allow/bypass/dont_ask 照常
+    // 生效。写型 dispatch 强制串行（并行子代理改同一文件会丢更新）。
     var allowed: ?[]const []const u8 = null;
     var fork = false;
+    var write = false;
     var max_turns: usize = subagent.MAX_TURNS;
     if (input == .object) {
         if (input.object.get("tools")) |tarr| {
@@ -151,8 +168,30 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         if (input.object.get("fork")) |f| {
             if (f == .bool) fork = f.bool;
         }
+        if (input.object.get("write")) |wt| {
+            if (wt == .bool) write = wt.bool;
+        }
         if (input.object.get("max_turns")) |mt| {
             if (mt == .integer and mt.integer >= 1) max_turns = @min(@as(usize, @intCast(mt.integer)), subagent.MAX_TURNS);
+        }
+    }
+
+    // 组全能力权限上下文：auto 在子代理环境降级为 default（无头不做
+    // LLM 分类审批——每次工具调用烧一轮 LLM 不划算，规则语义足够）。
+    var perm_ctx_storage: ?registry.PermissionContext = null;
+    if (write) {
+        if (ctx.perm_mode) |mp| {
+            var mode = mp.*;
+            if (mode == .auto) mode = .default;
+            perm_ctx_storage = .{
+                .mode = mode,
+                .allow_rules = ctx.allow_rules,
+                .deny_rules = ctx.deny_rules,
+                .ask_rules = ctx.ask_rules,
+                .provider = null,
+                .allocator = ctx.alloc,
+                .model_name = ctx.model,
+            };
         }
     }
     var inherited: []const llm.Message = &.{};
@@ -194,6 +233,7 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         .order = order,
         .order_len = n,
         .next = std.atomic.Value(u32).init(0),
+        .perm_ctx = if (perm_ctx_storage) |*pc| pc else null,
     };
 
     // P3 cancel: during a dispatch the terminal is in COOKED mode with
@@ -212,7 +252,8 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         std.posix.sigaction(.INT, &old_int, null);
     }
 
-    const conc = @min(@as(usize, @max(ctx.concurrency.*, 1)), n);
+    // 写型 dispatch 一律串行：并发只给只读研究型 fan-out。
+    const conc = if (perm_ctx_storage != null) 1 else @min(@as(usize, @max(ctx.concurrency.*, 1)), n);
     var threads: [MAX_SUBAGENTS - 1]?std.Thread = @splat(null);
     var spawned: usize = 0;
     while (spawned < conc - 1) : (spawned += 1) {
@@ -245,6 +286,8 @@ const WorkerCtx = struct {
     order: [MAX_SUBAGENTS]usize,
     order_len: usize,
     next: std.atomic.Value(u32),
+    /// 全能力权限上下文（dispatch 栈上，worker 借用——join 完才返回）。
+    perm_ctx: ?*const registry.PermissionContext = null,
     /// P3 cooperative cancel — set by the dispatch SIGINT handler; checked
     /// before claiming a job and inside the subagent every turn/tool.
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -296,6 +339,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
         .allowed_tools = job.allowed_tools,
         .inherited = if (job.inherited.len > 0) job.inherited else null,
         .max_turns = job.max_turns,
+        .perm_ctx = w.perm_ctx,
     });
     finishJob(&w.jobs[idx], res);
     // P3 retry: fail-FAST jobs (≤3 turns in) get exactly one 1s-backoff
@@ -319,6 +363,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
             .allowed_tools = job.allowed_tools,
             .inherited = if (job.inherited.len > 0) job.inherited else null,
             .max_turns = job.max_turns,
+            .perm_ctx = w.perm_ctx,
         });
         finishJob(&w.jobs[idx], res2);
     }
@@ -433,7 +478,9 @@ test "forkTail: tail slice, skips system, honors cap (M4)" {
 }
 
 test "dispatch constants stay bounded" {
-    try std.testing.expectEqual(@as(usize, 3), MAX_SUBAGENTS);
+    // 2026-11-08 容量 3→10（全能力多 agent 需求）；10 也是网关限流
+    // 面的合理上界——20 路并发 LLM 流必撞 429。
+    try std.testing.expectEqual(@as(usize, 10), MAX_SUBAGENTS);
     try std.testing.expect(SUMMARY_TOKEN_CAP == 500);
 }
 
