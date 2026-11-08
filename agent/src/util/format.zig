@@ -1,5 +1,6 @@
 /// Formatting utilities — numbers, tokens, costs, durations.
 const std = @import("std");
+const uwidth = @import("uwidth.zig");
 
 /// Format a byte count as human-readable (e.g., "1.5 MB").
 /// Caller owns the returned slice.
@@ -65,20 +66,24 @@ test "formatDuration" {
     try std.testing.expectEqualStrings("2.5s", d2);
 }
 
-/// Display width of a UTF-8 string: CJK/emoji count 2 terminal columns,
-/// ASCII 1, continuation bytes 0 (mirrors the editor's charWidth). Byte
-/// counting misaligns every column that contains Chinese text.
+/// Display width of a UTF-8 string — utf8proc 码点级 Unicode 表
+/// （2026-11-10 起：歧义宽度 —±× 等按 1 列，与终端渲染一致；旧首字节
+/// 分类把所有 3 字节当 2 列，CJK 文本外的表格必歪）。控制符按 0。
 pub fn displayWidth(s: []const u8) usize {
     var w: usize = 0;
-    for (s) |c| {
-        if (c < 0x20) continue;
-        if (c < 0x80) {
-            w += 1;
-        } else if (c >= 0xC0 and c < 0xE0) {
-            w += 1;
-        } else if (c >= 0xE0) {
-            w += 2;
-        }
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > s.len) break;
+        const cp = std.unicode.utf8Decode(s[i .. i + len]) catch {
+            i += len;
+            continue;
+        };
+        if (cp >= 0x20) w += uwidth.charWidth(cp);
+        i += len;
     }
     return w;
 }

@@ -34,21 +34,15 @@ fn charWidth(b: u8) usize {
     return 2;
 }
 
-/// East Asian Ambiguous 字符（2026-11-10 用户表格取证：em dash「—」
-/// 被终端按 1 列渲染，ziv 按 2 计 → 该行竖线左移一格）。这些码点在
-/// 非 CJK 语境的终端（含 macOS Terminal 默认）为窄渲染——统一按 1。
-/// 注意中文引号「“”‘’」不在表内：CJK 语境下按全角渲染更常见。
-fn ambiguousNarrow(cp: u21) bool {
-    return switch (cp) {
-        0x2010...0x2015 => true, // ‐‑‒–—（连字符族/破折号）
-        0x00B1, 0x00D7, 0x00F7, 0x00B0, 0x00A7 => true, // ± × ÷ ° §
-        else => false,
-    };
-}
+/// 码点级宽度：utf8proc 的 Unicode 表（2026-11-10 起替代手写歧义窄表
+/// ——那只是打地鼠，utf8proc 把整个 East Asian Width 类别一次根治）。
+const uwidth = @import("uwidth.zig");
 
-/// 码点级宽度：歧义窄字符按 1，其余沿首字节规则。
 fn charWidthCp(cp: u21, lead_byte: u8) usize {
-    if (ambiguousNarrow(cp)) return 1;
+    const w = uwidth.charWidth(cp);
+    if (w > 0) return w;
+    // utf8proc 给控制/组合符 0——表格场景按不可见处理；但 strWidth 的
+    // 老口径对前导字节至少给 1（安全兜底，防全 0 单元格塌缩）。
     return charWidth(lead_byte);
 }
 

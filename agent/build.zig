@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // utf8proc C 头的 Zig 绑定（0.17 的 @cImport 已移除——translate-c
+    // 是官方替代路径，产物作为普通模块引入）。
+    const utf8proc_tc = b.addTranslateC(.{
+        .root_source_file = b.path("deps/utf8proc/utf8proc.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const utf8proc_mod = utf8proc_tc.createModule();
+
     // Root module with SQLite C source
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -13,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_mod.addCSourceFiles(.{
-        .files = &.{"deps/sqlite3/sqlite3.c"},
+        .files = &.{ "deps/sqlite3/sqlite3.c", "deps/utf8proc/utf8proc.c" },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
@@ -22,6 +31,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     root_mod.addIncludePath(b.path("deps/sqlite3"));
+    root_mod.addImport("utf8proc", utf8proc_mod);
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -44,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addCSourceFiles(.{
-        .files = &.{"deps/sqlite3/sqlite3.c"},
+        .files = &.{ "deps/sqlite3/sqlite3.c", "deps/utf8proc/utf8proc.c" },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
@@ -53,6 +63,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_mod.addIncludePath(b.path("deps/sqlite3"));
+    test_mod.addImport("utf8proc", utf8proc_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
