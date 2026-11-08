@@ -216,7 +216,7 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     }
 
     // Claim order: priority-descending, STABLE (equal priorities keep the
-    // task order — n <= 3 so a tiny insertion sort beats std.sort).
+    // task order — n <= 10, a tiny insertion sort beats std.sort).
     var order: [MAX_SUBAGENTS]usize = undefined;
     for (0..n) |k| order[k] = k;
     var k: usize = 1;
@@ -277,6 +277,14 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     }
     const tr = try mergeJobs(alloc, ctx, jobs, n, canceled);
     alloc.destroy(jobs);
+    // 超限任务必须可见：静默丢弃会让模型以为全部已派（容量升到 10 后
+    // 这个坑从"理论"变"现实"）——拼一行提示让它分批。
+    if (tasks.items.len > n) {
+        const dropped = tasks.items.len - n;
+        const note = std.fmt.allocPrint(alloc, "{s}\n(超出单次上限 {d}：后 {d} 个任务未执行——请分批派发)\n", .{ tr.output, MAX_SUBAGENTS, dropped }) catch return tr;
+        alloc.free(tr.output);
+        return registry.ToolResult{ .output = note };
+    }
     return tr;
 }
 
