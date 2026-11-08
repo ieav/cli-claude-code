@@ -13,6 +13,7 @@ const llm = @import("../llm/mod.zig");
 const registry = @import("../tools/registry.zig");
 const runtime_registry = @import("../tools/runtime_registry.zig");
 const auth = @import("../tools/auth_mode.zig");
+const hooks_mod = @import("../hooks/hooks.zig");
 
 pub const MAX_TURNS: usize = 10;
 
@@ -63,6 +64,13 @@ pub const SubagentConfig = struct {
     /// 期间不会变更；块永不单独释放，借用安全）。种子顺序：
     /// 子代理 system → 继承消息 → 任务。
     inherited: ?[]const llm.Message = null,
+    /// M7 -p：覆盖系统提示（null = 子代理默认 headless 提示）。oneshot
+    /// 传 ziv 正式 system prompt，让两种入口共享同一份人设。
+    system_prompt: ?[]const u8 = null,
+    /// M7 -p：覆盖权限上下文（null = 空规则 + Default 的子代理只读语
+    /// 义）。oneshot 传用户 settings 的规则与模式——ask 决策在无头环境
+    /// 仍然降级为拒绝（无人在场，不允许悬停等待）。
+    perm_ctx: ?*const registry.PermissionContext = null,
 };
 
 pub const SubagentResult = struct {
@@ -74,6 +82,9 @@ pub const SubagentResult = struct {
     /// report surfaces these so a fan-out's cost is visible, not felt).
     tokens_in: u32 = 0,
     tokens_out: u32 = 0,
+    /// M7 -p：runInner 出错（provider 不可达等）。summary 已是错误文本；
+    /// 该标志让 oneshot 能区分「答案」与「失败」，给 CI 正确的退出码。
+    err: bool = false,
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.summary);
@@ -96,7 +107,7 @@ pub fn run(cfg: SubagentConfig) SubagentResult {
     var err_buf: ?[]u8 = null;
     const res = runInner(cfg) catch |e| blk: {
         err_buf = std.fmt.allocPrint(cfg.alloc, "subagent failed: {s}", .{@errorName(e)}) catch null;
-        break :blk SubagentResult{ .summary = err_buf.?, .turns_used = 0, .tool_calls = 0 };
+        break :blk SubagentResult{ .summary = err_buf.?, .turns_used = 0, .tool_calls = 0, .err = true };
     };
     if (err_buf != null) return res; // summary already the error text
     return res;
@@ -130,7 +141,7 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
     // system (+ fork 继承) + task
     {
         const sb = try ba.alloc(llm.ContentBlock, 1);
-        sb[0] = .{ .text = headless_system_prompt };
+        sb[0] = .{ .text = cfg.system_prompt orelse headless_system_prompt };
         try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
         if (cfg.inherited) |inh| {
             // 借用块：只追加、永不单独释放（arena 只管新块）——安全。
@@ -222,7 +233,9 @@ fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 
     // rules gives exactly the headless semantics: read-only passes,
     // writes and protected paths fall through to ask — and ask is denied
     // here, because a headless worker must never block on a user.
-    const perm_ctx = registry.PermissionContext{
+    // M7 -p：perm_ctx 覆盖时走调用方上下文（oneshot 传用户 settings 的
+    // 规则与模式）；ask 的降级语义不变——无人在场即拒绝。
+    const fallback_ctx = registry.PermissionContext{
         .mode = .default,
         .allow_rules = &.{},
         .deny_rules = &.{},
@@ -231,14 +244,24 @@ fn executeWhitelisted(cfg: SubagentConfig, tu: llm.provider.ToolUseBlock) ![]u8 
         .allocator = alloc,
         .model_name = "",
     };
+    const perm_ctx = cfg.perm_ctx orelse &fallback_ctx;
     const input = jsonFromToolUse(alloc, tu) catch return error.OutOfMemory;
-    const decision = auth.checkToolPermission(def, input, &perm_ctx);
+    const decision = auth.checkToolPermission(def, input, perm_ctx);
     switch (decision) {
         .allow => {},
-        .ask => |a| return std.fmt.allocPrint(alloc, "permission denied (subagents are read-only): {s}", .{a.message}),
+        .ask => |a| {
+            const why = if (cfg.perm_ctx != null) "non-interactive" else "subagents are read-only";
+            return std.fmt.allocPrint(alloc, "permission denied ({s}): {s}", .{ why, a.message });
+        },
         .deny => |d| return std.fmt.allocPrint(alloc, "permission denied: {s}", .{d.message}),
     }
+    // M6 Hooks：与 REPL 同一条纪律（权限 → Pre → 执行 → Post）——钩子对
+    // 子代理/oneshot 的工具调用同样生效（全局配置，回合边界换装）。
+    if (hooks_mod.preToolUse(alloc, cfg.io, tu.name, input)) |block_msg| {
+        return block_msg;
+    }
     const tr = try def.execute(alloc, input, cfg.io);
+    hooks_mod.postToolUse(alloc, cfg.io, tu.name, input, tr.output);
     return alloc.dupe(u8, tr.output) catch error.OutOfMemory;
 }
 

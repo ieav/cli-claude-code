@@ -84,6 +84,7 @@ test {
     _ = @import("mcp/jsonrpc.zig");
     _ = @import("mcp/session.zig");
     _ = @import("skills/loader.zig");
+    _ = @import("hooks/hooks.zig");
     _ = @import("tools/runtime_registry.zig");
     _ = @import("util/binary_check.zig");
     _ = @import("util/cancel.zig");
@@ -110,6 +111,7 @@ test {
     _ = @import("util/time.zig");
     _ = @import("util/tokens.zig");
     _ = @import("agent/subagent.zig");
+    _ = @import("agent/oneshot.zig");
     _ = @import("tools/agent_dispatch.zig");
     _ = @import("util/uuid.zig");
 }
@@ -130,8 +132,11 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI arguments: version/help short-circuit BEFORE the banner and
     // self-tests — `ziv --version` is a probe, not a REPL launch.
+    // `-p` (M7 non-interactive) likewise exits before any TUI setup: raw
+    // mode, banner and self-tests are all REPL-only concerns.
     var args_it = std.process.Args.iterate(init.minimal.args);
     _ = args_it.next(); // skip argv[0]
+    var print_prompt: ?[]const u8 = null;
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             try std.Io.Writer.print(w, "ziv {s} (Zig {s})\n", .{ version_mod.version, @import("builtin").zig_version_string });
@@ -144,6 +149,8 @@ pub fn main(init: std.process.Init) !void {
                 \\
                 \\Usage:
                 \\  ziv                start the interactive REPL
+                \\  ziv -p "prompt"    one non-interactive agent turn, print the
+                \\                     result and exit (prompt omitted → read stdin)
                 \\  ziv --version      print version and exit
                 \\  ziv --help         show this help and exit
                 \\
@@ -153,6 +160,45 @@ pub fn main(init: std.process.Init) !void {
             try std.Io.File.Writer.flush(&file_writer);
             return;
         }
+        if ((std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) and print_prompt == null) {
+            // Next arg is the prompt; absent/empty → read stdin to EOF
+            // (`echo hi | ziv -p`). First -p wins; later ones stay literal
+            // so a prompt containing "-p" round-trips.
+            const next = args_it.next();
+            print_prompt = if (next != null and next.?.len > 0) next.? else "";
+            continue;
+        }
+    }
+
+    // M7: non-interactive one-shot. Empty-string prompt means "stdin".
+    if (print_prompt) |pp| {
+        const oneshot = @import("agent/oneshot.zig");
+        var prompt_buf: ?[]u8 = null;
+        defer if (prompt_buf) |pb| std.heap.smp_allocator.free(pb);
+        const prompt: []const u8 = blk: {
+            if (pp.len > 0) break :blk pp;
+            // Read stdin to EOF (bounded — a runaway pipe shouldn't OOM).
+            var rbuf: [4096]u8 = undefined;
+            var fr = std.Io.File.Reader.init(stdin_file, io, &rbuf);
+            const drained = std.Io.Reader.allocRemaining(&fr.interface, std.heap.smp_allocator, .limited(4 * 1024 * 1024)) catch |e| {
+                var ebuf: [256]u8 = undefined;
+                var ew_stream = std.Io.File.Writer.initStreaming(std.Io.File.stderr(), io, &ebuf);
+                try std.Io.Writer.print(&ew_stream.interface, "ziv -p: reading stdin failed ({s})\n", .{@errorName(e)});
+                try std.Io.File.Writer.flush(&ew_stream);
+                return;
+            };
+            prompt_buf = drained;
+            break :blk std.mem.trim(u8, drained, " \t\r\n");
+        };
+        // Answer → stdout (what a pipe consumes); diagnostics → stderr, so
+        // `ziv -p ... | jq` never sees error chatter mixed into the stream.
+        var ebuf: [512]u8 = undefined;
+        var ew_stream = std.Io.File.Writer.initStreaming(std.Io.File.stderr(), io, &ebuf);
+        const code = oneshot.run(std.heap.smp_allocator, io, w, &ew_stream.interface, prompt) catch 1;
+        try std.Io.File.Writer.flush(&file_writer);
+        try std.Io.File.Writer.flush(&ew_stream);
+        if (code != 0) std.process.exit(code);
+        return;
     }
 
     // Startup banner. Naming, for whoever reads this cold:
