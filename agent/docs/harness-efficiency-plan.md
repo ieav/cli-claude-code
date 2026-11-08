@@ -58,9 +58,21 @@
   `fork`（继承会话尾部 ≤16K tokens，只读借用）/ `max_turns`（1-10）。
   **后台化明确延期**：需要异步结果回送基建（回合循环同步等待工具返
   回），M5 Workflow 基建落地时一并做——并行 fan-out 已覆盖效率收益。
-  → M7 `-p` 非交互
-- **P1.5→候选**：M5 Workflow 脚本化（触发：出现 ≥2 个重复性多 agent 流程；先出语法 spike）
-- **P2**：M6 Hooks（Pre/PostToolUse 简版）
+- **M7 `-p` 非交互**——**已完成**（2026-11-08）：`ziv -p "提示"` 一发即
+  走（复用 subagent 无头循环，正式 system prompt + 用户权限规则 +
+  agent_loop_limit；stdin 管道模式；退出码区分成败；S16 验收）。
+- **M6 Hooks（Pre/PostToolUse 简版）**——**已完成**（2026-11-08）：
+  settings.json `hooks.PreToolUse/PostToolUse`，matcher 精确/空=全部，
+  /bin/sh -c + 10s 超时 + exit 2 阻断；三个工具执行口统一
+  （orchestration 波次 / subagent 无头 / /run 直达）。S17 验收。
+- **③ tree-sitter 里程碑 1（编辑后语法校验）**——**已完成**（2026-11-08）：
+  vendor 核心 + 六语法（py/js/ts/tsx/java/zig，deps/tree-sitter/）；
+  FileEdit/FileWrite 落盘后重解析，首错（ERROR/MISSING）附警告行，
+  模型当场自纠。里程碑 2（符号级索引进 FTS5 旁路）、3（按需语法加载）
+  待排。S18 验收。
+- **M5 Workflow 脚本化**——**spike 已出**（2026-11-08，docs/workflow-spike.md）：
+  原触发条件（≥2 个重复性多 agent 流程）未变，语法定稿等真实用例喂
+  参数；实现仍候触发。
 - **条件触发**：元诊断置信度——诊断结论进入自动消费链路（自动触发/
   喂给恢复决策）时才值得上；当前 /diagnose 人读报告，溯源行+
   [实测] 行已承担该职责（2026-11-10 用户裁定跳过）
