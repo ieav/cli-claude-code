@@ -1073,6 +1073,50 @@ def s19_full_subagent():
         srv.shutdown()
 
 
+def s20_bgtool():
+    """BgTask + TaskGet: the model can now START (Bash run_in_background),
+    INSPECT (status/output) and STOP (kill group) a background task without
+    the human /bg panel — plus TaskGet returns the full untruncated task
+    description."""
+    d = tempfile.mkdtemp(prefix="ziv-bgtool-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+
+            def run_and_wait(cmd, marker, timeout=15):
+                z.clear_buf()
+                z.send(cmd + "\r")
+                out = z.read_until(marker, timeout)
+                z.read_until_seen("ziv[bypass] (gpt-4o) [0%] >", 5)
+                return out
+
+            # 起一个长跑后台任务
+            run_and_wait('/run Bash {"command":"sleep 30","run_in_background":true}', "后台任务 #1")
+            out = run_and_wait('/run BgTask {"action":"status"}', "[#1] running")
+            if "sleep 30" not in out:
+                raise Fail(f"status missing command: {out[-200:]!r}")
+            run_and_wait('/run BgTask {"action":"output","id":1}', "ziv[bypass]")
+            out = run_and_wait('/run BgTask {"action":"stop","id":1}', "Stopped background task #1")
+            out = run_and_wait('/run BgTask {"action":"status"}', "[#1]")
+            if "running" in out.split("ziv[bypass]")[-2] and "killed" not in out and "exit" not in out:
+                raise Fail(f"task still shows running after stop: {out[-200:]!r}")
+            # 未知 id 的报错形态
+            out = run_and_wait('/run BgTask {"action":"stop","id":99}', "not running")
+
+            # TaskGet：创建 → 全文描述可取
+            run_and_wait('/run TaskCreate {"subject":"fix login","description":"Reproduce on UAT then check the token refresh path and the expiry math corner cases","priority":2}', "#1")
+            out = run_and_wait('/run TaskGet {"id":1}', "expiry math")
+            if "fix login" not in out:
+                raise Fail("TaskGet missing subject")
+            quit_and_wait(z)
+            return "bg start→status→output→stop closed; TaskGet full text ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1093,6 +1137,7 @@ SCENARIOS = [
     ("S17 hooks", s17_hooks),
     ("S18 tree-sitter", s18_tree_sitter),
     ("S19 full-subagent", s19_full_subagent),
+    ("S20 bgtool", s20_bgtool),
 ]
 
 

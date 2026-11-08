@@ -515,6 +515,36 @@ pub const task_update_tool: ToolDefinition = .{
     .search_hint = "update task status",
 };
 
+/// TaskGet：按 id 查单条完整详情（列表截断描述，Get 给全文）。
+pub const task_get_tool: ToolDefinition = .{
+    .name = "TaskGet",
+    .description = "Get one task's full details by id (TaskList truncates descriptions)",
+    .input_schema =
+    \\{"type":"object","properties":{"id":{"type":"integer","description":"Task id from TaskList"}},"required":["id"]}
+    ,
+    .execute_fn = @import("task_get.zig").execute,
+    .is_read_only = true,
+    .is_destructive = false,
+    .is_concurrency_safe_fn = alwaysConcurrencySafe,
+    .search_hint = "task detail get by id",
+};
+
+/// BgTask：模型对后台任务的自管理（对称性：能启动就该能查看/停止）。
+/// status/output 纯读；stop 杀进程组（default 模式走审批）。
+pub const bg_task_tool: ToolDefinition = .{
+    .name = "BgTask",
+    .description = "Manage background tasks started with Bash run_in_background: status (all or one by id), output tail, stop (kills the process group)",
+    .input_schema =
+    \\{"type":"object","properties":{"action":{"type":"string","enum":["status","output","stop"],"description":"What to do"},"id":{"type":"integer","description":"Background task id (required for output/stop)"}},"required":["action"]}
+    ,
+    .execute_fn = @import("bg_task.zig").execute,
+    .is_read_only = true,
+    .is_read_only_fn = @import("bg_task.zig").bgTaskIsReadOnly,
+    .is_destructive = false,
+    .is_concurrency_safe_fn = alwaysConcurrencySafe,
+    .search_hint = "background task status stop kill output",
+};
+
 pub const ask_user_tool: ToolDefinition = .{
     .name = "AskUserQuestion",
     .description = "Ask the user a question during execution",
@@ -560,6 +590,10 @@ pub const default_tools = &[_]ToolDefinition{
     task_create_tool,
     task_list_tool,
     task_update_tool,
+    task_get_tool,
+
+    // Background task self-management (Bash run_in_background 闭环)
+    bg_task_tool,
 
     // Interaction
     ask_user_tool,
@@ -597,8 +631,8 @@ test "ToolRegistry has and getByName" {
 }
 
 test "ToolRegistry count" {
-    // +1 于 P5 M2：WebFetch。
-    try std.testing.expectEqual(@as(usize, 13), DefaultRegistry.count());
+    // +2 于 2026-11-09：TaskGet（任务详情）+ BgTask（后台任务自管理）。
+    try std.testing.expectEqual(@as(usize, 15), DefaultRegistry.count());
 }
 
 test "ToolDefinition matchesName" {

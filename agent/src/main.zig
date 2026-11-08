@@ -76,6 +76,8 @@ test {
     _ = @import("tools/registry.zig");
     _ = @import("tools/rule_parser.zig");
     _ = @import("tools/task_store.zig");
+    _ = @import("tools/task_get.zig");
+    _ = @import("tools/bg_task.zig");
     _ = @import("util/embedding.zig");
     _ = @import("util/menu.zig");
     _ = @import("util/lineinput.zig");
