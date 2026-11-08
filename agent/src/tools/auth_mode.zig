@@ -90,9 +90,17 @@ pub fn checkToolPermission(
         .allow => {},
     }
 
-    // Step 1d: Safety path checks (bypass-immune)
-    if (hasProtectedPathInput(input)) {
-        return .{ .ask = .{ .message = "protected path requires approval" } };
+    // Step 1d: Safety path checks（写类 + 非 bypass 模式）。
+    // 2026-11-09 修订（用户裁定 bypass 还问授权不合理）：
+    //   · bypass 模式整体跳过——bypass 的语义就是"用户显式放弃审批"，
+    //     硬编码守卫覆盖用户选择属越权；要拦 .git//etc 用户自配 deny
+    //     规则（Step 1 仍在 bypass 生效）。
+    //   · 纯读永不因路径被问——FileRead /etc/hosts、读 .git/config 无
+    //     破坏面，先前的"所有模式都问"是纯摩擦；守卫只保护写类操作。
+    if (ctx.mode != .bypass and !tool.isReadOnly(input)) {
+        if (hasProtectedPathInput(input)) {
+            return .{ .ask = .{ .message = "protected path requires approval" } };
+        }
     }
 
     // Step 2a: Mode-based behavior
@@ -498,4 +506,42 @@ test "auto mode: explicit allow rule outranks the classifier" {
     try obj2.put(std.testing.allocator, "path", .{ .string = "/etc/passwd" });
     const r2 = checkToolPermission(&registry.file_write_tool, .{ .object = obj2 }, &ctx);
     try std.testing.expect(r2 == .ask);
+}
+
+test "protected-path guard: writes-only, and never in bypass (2026-11-09 修订)" {
+    const alloc = std.testing.allocator;
+    const mkInput = struct {
+        fn mk(cmd_or_path: []const u8) std.json.Value {
+            return .{ .string = cmd_or_path };
+        }
+    }.mk;
+    _ = alloc;
+    _ = mkInput;
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+
+    // bypass + 命令涉 /.git/ → 放行（bypass 就是 bypass）。
+    try obj.put(std.testing.allocator, "command", .{ .string = "ls /repo/.git/refs" });
+    const by_ctx = PermissionContext{ .mode = .bypass, .allow_rules = &.{}, .deny_rules = &.{}, .ask_rules = &.{} };
+    try std.testing.expect(checkToolPermission(&registry.bash_tool, .{ .object = obj }, &by_ctx) == .allow);
+
+    // default + 纯读涉 /etc/ → 放行（读永不因路径被问；default 读自动放行）。
+    var obj2: std.json.ObjectMap = .empty;
+    defer obj2.deinit(std.testing.allocator);
+    try obj2.put(std.testing.allocator, "command", .{ .string = "cat /etc/hosts" });
+    const d_ctx = PermissionContext{ .mode = .default, .allow_rules = &.{}, .deny_rules = &.{}, .ask_rules = &.{} };
+    try std.testing.expect(checkToolPermission(&registry.bash_tool, .{ .object = obj2 }, &d_ctx) == .allow);
+
+    // default + 写类涉 /etc/ → 仍 ask（守卫保留在它有价值的形态上）。
+    var obj3: std.json.ObjectMap = .empty;
+    defer obj3.deinit(std.testing.allocator);
+    try obj3.put(std.testing.allocator, "command", .{ .string = "rm /etc/hosts.bak" });
+    try std.testing.expect(checkToolPermission(&registry.bash_tool, .{ .object = obj3 }, &d_ctx) == .ask);
+
+    // default + FileWrite 到 .git 内 → ask；FileRead 同路径 → 放行。
+    var w: std.json.ObjectMap = .empty;
+    defer w.deinit(std.testing.allocator);
+    try w.put(std.testing.allocator, "path", .{ .string = "/repo/.git/config" });
+    try std.testing.expect(checkToolPermission(&registry.file_write_tool, .{ .object = w }, &d_ctx) == .ask);
+    try std.testing.expect(checkToolPermission(&registry.file_read_tool, .{ .object = w }, &d_ctx) == .allow);
 }
