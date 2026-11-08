@@ -9,6 +9,7 @@ const auth_mode = @import("tools/auth_mode.zig");
 const env_mod = @import("util/env.zig");
 const zivroot = @import("util/zivroot.zig");
 const rule_parser = @import("tools/rule_parser.zig");
+const hooks_mod = @import("hooks/hooks.zig");
 
 pub const SettingSource = enum {
     user_settings,
@@ -26,6 +27,10 @@ pub const Settings = struct {
     allow_rules: []const auth_mode.PermissionRule = &.{},
     deny_rules: []const auth_mode.PermissionRule = &.{},
     ask_rules: []const auth_mode.PermissionRule = &.{},
+    /// M6 Hooks（src/hooks/hooks.zig）：Pre/PostToolUse 外部钩子。空表
+    /// = 无钩子（零开销——执行口先查长度再走配置）。
+    hooks_pre: []const hooks_mod.HookEntry = &.{},
+    hooks_post: []const hooks_mod.HookEntry = &.{},
     api_keys: ApiKeys = .{},
     env_sourced: ApiKeysEnvSourced = .{},
     default_model: []const u8 = "gpt-4o",
@@ -258,6 +263,85 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getArray(value, "ask_rules")) |arr| {
         settings.ask_rules = parseRuleArray(allocator, arr, .ask) catch settings.ask_rules;
     }
+
+    // M6 hooks: {"PreToolUse":[{"matcher":"Bash","command":"..."}], ...}
+    applyHooksJson(settings, allocator, value);
+}
+
+/// Hooks 子树解析（独立成函数供往返测试直接喂 DOM）。
+fn applyHooksJson(settings: *Settings, allocator: std.mem.Allocator, value: std.json.Value) void {
+    const h = json_helpers.getObject(value, "hooks") orelse return;
+    if (json_helpers.getArray(h, "PreToolUse")) |arr| {
+        settings.hooks_pre = parseHookArray(allocator, arr) catch settings.hooks_pre;
+    }
+    if (json_helpers.getArray(h, "PostToolUse")) |arr| {
+        settings.hooks_post = parseHookArray(allocator, arr) catch settings.hooks_post;
+    }
+}
+
+/// Parse a hooks array of {matcher, command} objects (dupe'd onto the
+/// settings allocator — session-lifetime; malformed entries are skipped,
+/// not fatal: one bad hook must not take the rest of the settings down).
+fn parseHookArray(allocator: std.mem.Allocator, arr: []std.json.Value) ![]hooks_mod.HookEntry {
+    var entries = std.ArrayList(hooks_mod.HookEntry).empty;
+    errdefer entries.deinit(allocator);
+    for (arr) |item| {
+        if (item != .object) continue;
+        const cmd = json_helpers.getString(item, "command") orelse continue;
+        if (cmd.len == 0) continue;
+        try entries.append(allocator, .{
+            .matcher = if (json_helpers.getString(item, "matcher")) |m| try allocator.dupe(u8, m) else "",
+            .command = try allocator.dupe(u8, cmd),
+        });
+    }
+    return entries.toOwnedSlice(allocator);
+}
+
+/// Serialize the hooks object back (comma-spliced like writeRuleArray).
+fn writeHooks(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), pre: []const hooks_mod.HookEntry, post: []const hooks_mod.HookEntry) void {
+    if (pre.len == 0 and post.len == 0) return;
+    const tail = std.mem.trim(u8, buf.items, " \t\n");
+    if (std.mem.endsWith(u8, tail, "}") or std.mem.endsWith(u8, tail, "]")) {
+        if (buf.items.len > 0) buf.items[buf.items.len - 1] = ',';
+    }
+    buf.appendSlice(allocator, "\n  \"hooks\": {") catch return;
+    var first_event = true;
+    if (pre.len > 0) {
+        buf.appendSlice(allocator, "\n    \"PreToolUse\": [") catch return;
+        writeHookEntries(allocator, buf, pre);
+        buf.appendSlice(allocator, "]") catch return;
+        first_event = false;
+    }
+    if (post.len > 0) {
+        if (!first_event) buf.appendSlice(allocator, ",") catch return;
+        buf.appendSlice(allocator, "\n    \"PostToolUse\": [") catch return;
+        writeHookEntries(allocator, buf, post);
+        buf.appendSlice(allocator, "]") catch return;
+    }
+    buf.appendSlice(allocator, "\n  }\n") catch return;
+}
+
+fn writeHookEntries(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), entries: []const hooks_mod.HookEntry) void {
+    for (entries, 0..) |e, i| {
+        if (i > 0) buf.appendSlice(allocator, ",") catch return;
+        buf.appendSlice(allocator, "\n      {\"matcher\": \"") catch return;
+        for (e.matcher) |ch| escapeJsonChar(allocator, buf, ch);
+        buf.appendSlice(allocator, "\", \"command\": \"") catch return;
+        for (e.command) |ch| escapeJsonChar(allocator, buf, ch);
+        buf.appendSlice(allocator, "\"}") catch return;
+    }
+    buf.appendSlice(allocator, "\n    ") catch return;
+}
+
+fn escapeJsonChar(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), ch: u8) void {
+    switch (ch) {
+        '"' => buf.appendSlice(allocator, "\\\"") catch {},
+        '\\' => buf.appendSlice(allocator, "\\\\") catch {},
+        '\n' => buf.appendSlice(allocator, "\\n") catch {},
+        '\r' => buf.appendSlice(allocator, "\\r") catch {},
+        '\t' => buf.appendSlice(allocator, "\\t") catch {},
+        else => buf.append(allocator, ch) catch {},
+    }
 }
 
 /// Parse a JSON array of rule strings into PermissionRules (dupe'd onto
@@ -457,6 +541,10 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     writeRuleArray(allocator, &buf, "deny_rules", settings.deny_rules);
     writeRuleArray(allocator, &buf, "ask_rules", settings.ask_rules);
 
+    // M6 hooks（symmetric with the load side——漏写会让任何一次
+    // autoSaveSettings 静默清掉用户钩子）
+    writeHooks(allocator, &buf, settings.hooks_pre, settings.hooks_post);
+
     buf.appendSlice(allocator, "}\n") catch {};
 
     // Write file
@@ -486,4 +574,55 @@ test "parseRuleArray parses Tool(pattern) rule strings" {
     try std.testing.expectEqualStrings("Bash", rules[0].tool_name);
     try std.testing.expectEqualStrings("git status*", rules[0].content_pattern.?);
     try std.testing.expect(rules[1].content_pattern == null);
+}
+
+test "hooks: parse + serialize round-trip survives a settings save" {
+    const alloc = std.testing.allocator;
+    // 手工构造 loadFromJson 会产出的等价 JSON（parseHookArray 的输入面）。
+    const json_src =
+        \\{"hooks": {
+        \\  "PreToolUse":  [{"matcher": "Bash", "command": "./guard.sh \"quote\""},
+        \\                 {"command": "exit 0"}],
+        \\  "PostToolUse": [{"matcher": "FileEdit", "command": "make lint"}],
+        \\  "IgnoredEvent": [{"command": "x"}]
+        \\}}
+    ;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const parsed = json_helpers.parse(alloc, json_src) catch return error.ParseFailed;
+    defer parsed.deinit();
+    var settings = Settings{};
+    applyHooksJson(&settings, alloc, parsed.value);
+    defer {
+        for (settings.hooks_pre) |e| {
+            alloc.free(e.matcher);
+            alloc.free(e.command);
+        }
+        alloc.free(settings.hooks_pre);
+        for (settings.hooks_post) |e| {
+            alloc.free(e.matcher);
+            alloc.free(e.command);
+        }
+        alloc.free(settings.hooks_post);
+    }
+    try std.testing.expectEqual(@as(usize, 2), settings.hooks_pre.len);
+    try std.testing.expectEqualStrings("Bash", settings.hooks_pre[0].matcher);
+    try std.testing.expectEqualStrings("./guard.sh \"quote\"", settings.hooks_pre[0].command);
+    try std.testing.expectEqualStrings("", settings.hooks_pre[1].matcher); // 空 matcher = 全部工具
+    try std.testing.expectEqual(@as(usize, 1), settings.hooks_post.len);
+
+    // 序列化往返：写出的 JSON 必须能重新解析出同样的钩子（autoSave 不丢
+    // 配置）。writeHooks 产出的是 settings 对象内的片段——补上外层 {} 再解析。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    buf.append(alloc, '{') catch return error.OutOfMemory;
+    writeHooks(alloc, &buf, settings.hooks_pre, settings.hooks_post);
+    buf.append(alloc, '}') catch return error.OutOfMemory;
+    const reparsed = json_helpers.parse(alloc, buf.items) catch return error.ReparseFailed;
+    defer reparsed.deinit();
+    const h = reparsed.value.object.get("hooks").?;
+    try std.testing.expectEqual(@as(usize, 2), h.object.get("PreToolUse").?.array.items.len);
+    const first = h.object.get("PreToolUse").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Bash", first.get("matcher").?.string);
+    try std.testing.expectEqualStrings("./guard.sh \"quote\"", first.get("command").?.string);
 }

@@ -33,6 +33,7 @@ const json_tree = @import("util/json_tree.zig");
 const slash_cmds = @import("util/slash_commands.zig");
 const runtime_registry = @import("tools/runtime_registry.zig");
 const skills_mod = @import("skills/mod.zig");
+const hooks_mod = @import("hooks/hooks.zig");
 const mcp_mod = @import("mcp/mod.zig");
 const registry = @import("tools/registry.zig");
 const denial_tracker_mod = @import("tools/denial_tracker.zig");
@@ -598,6 +599,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.File.Writer.flush(&file_writer);
             } else |_| {}
         }
+
+        // M6 Hooks：回合边界换装（与热重载同点——外部改 hooks 立即生效；
+        // 执行线程只在回合内读，无并发换装窗口，skills gate 同款纪律）。
+        hooks_mod.setConfig(.{
+            .pre = switcher.settings.hooks_pre,
+            .post = switcher.settings.hooks_post,
+        });
 
         // T8: sync the plan anchor with .ziv/plan.md (fingerprint-gated;
         // also covers the very first prompt — the file may predate us).

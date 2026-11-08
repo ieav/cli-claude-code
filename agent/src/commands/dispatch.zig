@@ -20,6 +20,7 @@ const slash_cmds = @import("../util/slash_commands.zig");
 const mcp_mod = @import("../mcp/mod.zig");
 const system_prompt_mod = @import("../system_prompt.zig");
 const skills_mod = @import("../skills/mod.zig");
+const hooks_mod = @import("../hooks/hooks.zig");
 const memory_ops = @import("../session/memory_ops.zig");
 const config_menu = @import("config_menu.zig");
 const history_cmds = @import("history_cmds.zig");
@@ -299,6 +300,18 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 }
             }
 
+            // M6 Hooks：/run 与 agent 回合同一条纪律（权限语义 /run 一直是
+            // 操作员直达豁免，但钩子不是权限——guard/lint 对手工触发同样
+            // 该生效，否则「/run 测钩子没反应」会成为一桩悬案）。
+            if (hooks_mod.preToolUse(allocator, ctx.io, tool_name, parsed)) |block_msg| {
+                try std.Io.Writer.print(ctx.w, "  \x1b[31mBLOCKED by PreToolUse hook:\x1b[0m\n", .{});
+                turn_tools.printToolBody(ctx.w, block_msg);
+                try std.Io.Writer.writeAll(ctx.w, "\n");
+                allocator.free(block_msg);
+                _ = ctx.log.record(tool_name, "pre-hook", "blocked", run_snap_id, false, ctx.history.items.len) catch {};
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
             const result = run_tool.execute(allocator, parsed, ctx.io) catch |err| {
                 logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
                 try std.Io.Writer.print(ctx.w, "  Tool error: {}\n\n", .{err});
@@ -306,6 +319,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 try std.Io.File.Writer.flush(ctx.file_writer);
                 return .handled;
             };
+            hooks_mod.postToolUse(allocator, ctx.io, tool_name, parsed, result.output);
 
             // Same /last ring as agent-loop calls (finishToolCall) —
             // the expansion valve must cover manual /run too.

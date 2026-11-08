@@ -60,19 +60,22 @@ pub fn parse(allocator: std.mem.Allocator, json_str: []const u8) !std.json.Parse
 }
 
 /// Serialize a JSON Value to a string. Caller owns the returned slice.
+/// (0.17: std.json.stringify is gone — Stringify.value is the API. This
+/// fn had zero callers before M6 hooks, so the dead reference to the old
+/// name survived lazy analysis unnoticed.)
 pub fn serialize(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    try std.json.stringify(value, .{}, buf.writer(allocator));
-    return buf.toOwnedSlice(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(value, .{}, &aw.writer);
+    return allocator.dupe(u8, aw.written());
 }
 
 /// Serialize a JSON Value to a pretty-printed string. Caller owns the returned slice.
 pub fn serializePretty(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    try std.json.stringify(value, .{ .whitespace = .indent_2 }, buf.writer(allocator));
-    return buf.toOwnedSlice(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &aw.writer);
+    return allocator.dupe(u8, aw.written());
 }
 
 test "getString" {

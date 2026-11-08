@@ -6,6 +6,7 @@ const code_index = @import("../knowledge/code_index.zig");
 const math = @import("../math/mod.zig");
 const cancel = @import("../util/cancel.zig");
 const util_time = @import("../util/time.zig");
+const hooks = @import("../hooks/hooks.zig");
 
 pub const ToolCall = struct {
     tool_name: []const u8,
@@ -179,8 +180,15 @@ fn executeToolCall(
     const tool = findTool(tools_def, call.tool_name) orelse
         return .{ .output = allocator.dupe(u8, "Tool not found") catch "", .is_error = true };
 
-    return tool.execute(allocator, call.input, io) catch
-        .{ .output = allocator.dupe(u8, "Tool execution error") catch "", .is_error = true };
+    // M6 Hooks：PreToolUse（权限已在此之前的审批阶段通过；exit 2 → 阻断
+    // 消息作为 tool_result 回给模型）。顺序恒定：权限 → Pre → 执行 → Post。
+    if (hooks.preToolUse(allocator, io, call.tool_name, call.input)) |block_msg| {
+        return .{ .output = block_msg, .is_error = true };
+    }
+    const result = tool.execute(allocator, call.input, io) catch
+        registry.ToolResult{ .output = allocator.dupe(u8, "Tool execution error") catch "", .is_error = true };
+    hooks.postToolUse(allocator, io, call.tool_name, call.input, result.output);
+    return result;
 }
 
 test "partitionToolCalls" {

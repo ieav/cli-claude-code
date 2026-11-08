@@ -768,6 +768,150 @@ def s15_project_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def s16_print_mode():
+    """M7 `ziv -p`: non-interactive one-shot. Plain subprocess (no pty — -p
+    never touches the TUI) against the mock gateway. Asserts: (a) exit 0,
+    final text on stdout, nothing but the answer; (b) the request's system
+    message is ziv's REAL prompt ("You are Ziv"), not the subagent headless
+    one; (c) a FileWrite attempt in default mode is denied non-interactively
+    and the model sees the denial; (d) stdin prompt mode works; (e) dead
+    gateway → exit 1 with stderr diagnostics."""
+    import subprocess, threading, http.server, json as _json
+    reqs = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = _json.loads(self.rfile.read(n)) if n else {}
+            reqs.append(body)
+            if len(reqs) == 1:
+                # Round 1: demand a FileWrite (default mode → ask → denied).
+                msg = {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call1", "type": "function", "function": {
+                        "name": "FileWrite",
+                        "arguments": _json.dumps({"path": "p.txt", "content": "x"})}}]}
+            else:
+                msg = {"role": "assistant", "content": "ONE-SHOT-ANSWER-42", "tool_calls": None}
+            resp = _json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 2}}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    d = tempfile.mkdtemp(prefix="ziv-p-")
+    try:
+        os.makedirs(os.path.join(d, ".ziv"))
+        with open(os.path.join(d, ".ziv", "settings.json"), "w") as f:
+            f.write(_json.dumps({"api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{port}/v1"},
+                                 "permission_mode": "default"}))
+        env = dict(os.environ)
+        env["HOME"] = d  # hermetic
+        for k in list(env):
+            if k.startswith(("OPENAI_", "ANTHROPIC_", "OLLAMA_")):
+                env.pop(k)
+
+        def ziv_p(args, stdin=None, timeout=60):
+            return subprocess.run([BIN] + args, cwd=d, env=env, input=stdin,
+                                  capture_output=True, timeout=timeout)
+
+        # (a)+(b)+(c): arg mode, real system prompt, write denial round-trip.
+        r = ziv_p(["-p", "write a file then report"])
+        if r.returncode != 0:
+            raise Fail(f"-p exited {r.returncode}; stderr={r.stderr[:300]!r}")
+        if b"ONE-SHOT-ANSWER-42" not in r.stdout:
+            raise Fail(f"final text missing from stdout: {r.stdout[:300]!r}")
+        if len(reqs) < 2:
+            raise Fail(f"expected tool round-trip, saw {len(reqs)} request(s)")
+        sys_texts = []
+        for m in reqs[0].get("messages", []):
+            if m.get("role") == "system":
+                c = m.get("content")
+                sys_texts.append(c if isinstance(c, str) else _json.dumps(c))
+        joined = "\n".join(sys_texts)
+        if "You are Ziv" not in joined:
+            raise Fail("system prompt is not ziv's real prompt (missing 'You are Ziv')")
+        if "focused subagent" in joined:
+            raise Fail("headless subagent prompt leaked into -p mode")
+        round2 = _json.dumps(reqs[1].get("messages", []))
+        if "permission denied" not in round2 or "non-interactive" not in round2:
+            raise Fail(f"write denial not reported back to the model: {round2[:300]}")
+        if os.path.exists(os.path.join(d, "p.txt")):
+            raise Fail("FileWrite executed despite default-mode ask")
+
+        # (d): stdin prompt mode.
+        reqs.clear()
+        r2 = ziv_p(["-p"], stdin=b"say the answer")
+        if r2.returncode != 0 or b"ONE-SHOT-ANSWER-42" not in r2.stdout:
+            raise Fail(f"stdin -p failed: rc={r2.returncode} out={r2.stdout[:200]!r} err={r2.stderr[:200]!r}")
+
+        # (e): dead gateway → exit 1, diagnostics on stderr.
+        with open(os.path.join(d, ".ziv", "settings.json"), "w") as f:
+            f.write(_json.dumps({"api_keys": {"openai": "sk-mock", "openai_base_url": "http://127.0.0.1:1/v1"},
+                                 "permission_mode": "default"}))
+        r3 = ziv_p(["-p", "probe"], timeout=120)
+        if r3.returncode == 0:
+            raise Fail("dead gateway must exit non-zero")
+        if not r3.stderr.strip():
+            raise Fail("no stderr diagnostics on failure")
+        return "arg+stdin modes, real system prompt, ask→deny, exit codes ✓"
+    finally:
+        srv.shutdown()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def s17_hooks():
+    """M6 Hooks: PreToolUse exit-2 blocks a /run Bash call (block reason
+    visible), PostToolUse fires after FileRead (side-effect file written).
+    Configured in project settings.json — the same place permission rules
+    live."""
+    import json as _json
+    d = tempfile.mkdtemp(prefix="ziv-hooks-")
+    try:
+        # NOTE: hooks 配置必须经构造器的 settings 参数写入——ZivSession
+        # 构造时会用自己的 settings 覆写 .ziv/settings.json，外面手写
+        # 会被静默 clobber（S14 逃过这坑纯靠 env 变量兜底）。
+        hook_settings = _json.dumps({
+            "permission_mode": "bypass",
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash", "command": "echo no-bash-for-you >&2; exit 2"}],
+                "PostToolUse": [{"matcher": "FileRead", "command": "echo ran >> hook-marker.txt"}],
+            },
+        })
+        with open(os.path.join(d, "target.txt"), "w") as f:
+            f.write("hook target contents\n")
+        z = ZivSession(reuse_dir=d, settings=hook_settings)
+        try:
+            z.wait_prompt()
+            # PreToolUse: Bash 阻断，工具本体绝不执行。
+            z.clear_buf()
+            z.send('/run Bash {"command":"echo should-not-run"}\r')
+            out = z.read_until("no-bash-for-you", 10)
+            if "BLOCKED by PreToolUse hook" not in out:
+                raise Fail(f"block banner missing: {out[-300:]!r}")
+            # PostToolUse: FileRead 放行且钩子留下记号。
+            z.send('/run FileRead {"path":"target.txt"}\r')
+            z.read_until("hook target contents", 10)
+            deadline = time.time() + 10
+            marker = os.path.join(d, "hook-marker.txt")
+            while not os.path.exists(marker) and time.time() < deadline:
+                time.sleep(0.2)
+            if not os.path.exists(marker):
+                raise Fail("PostToolUse hook never ran (marker file missing)")
+            # matcher 过滤：Bash 的 Pre 钩子不该拦 FileRead（上面已放行即证）。
+            quit_and_wait(z)
+            return "pre-block + post-side-effect + matcher filter ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -784,6 +928,8 @@ SCENARIOS = [
     ("S13 bg-tasks", s13_bg_tasks),
     ("S14 subagent-m4", s14_subagent_m4),
     ("S15 project-root", s15_project_root),
+    ("S16 print-mode", s16_print_mode),
+    ("S17 hooks", s17_hooks),
 ]
 
 
