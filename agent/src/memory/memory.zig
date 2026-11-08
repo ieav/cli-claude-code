@@ -6,11 +6,14 @@ const types = @import("types.zig");
 const working = @import("working.zig");
 const episodic = @import("episodic.zig");
 const database = @import("../storage/database.zig");
+const vec_dedup = @import("vec_dedup.zig");
 
 pub const MemorySystem = struct {
     allocator: std.mem.Allocator,
     working_mem: working.WorkingMemory,
     episodic_mem: episodic.EpisodicStore,
+    /// 语义去重的向量索引挂点（episodic_mem 持库指针，这里复用）。
+    db: *database.Database,
 
     const Self = @This();
 
@@ -19,6 +22,7 @@ pub const MemorySystem = struct {
             .allocator = allocator,
             .working_mem = working.WorkingMemory.init(allocator, 50),
             .episodic_mem = episodic.EpisodicStore.init(allocator, db),
+            .db = db,
         };
     }
 
@@ -43,6 +47,8 @@ pub const MemorySystem = struct {
             std.debug.print("Warning: episodic store failed: {}\n", .{err});
             return err;
         };
+        // ② 语义索引（best-effort：vec 未就绪时内部 no-op）。
+        vec_dedup.indexMemory(self.db, entry.id, entry.content);
     }
 
     /// Retrieve relevant memories for a query.

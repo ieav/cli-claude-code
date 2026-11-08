@@ -10,6 +10,8 @@ pub const Database = struct {
     allocator: std.mem.Allocator,
     db: ?*c.sqlite3,
     path: []const u8,
+    /// sqlite-vec 注册结果（false = 向量特性降级关闭）。
+    vec_ready: bool = false,
 
     const Self = @This();
 
@@ -28,6 +30,9 @@ pub const Database = struct {
             return error.DatabaseOpenFailed;
         }
 
+        // sqlite-vec（2026-11-10 ②）：静态注册向量扩展——失败不致命
+        // （旧库/异常环境降级为无向量检索，vec_dedup 自查可用性）。
+        const vec_ok = c.sqlite3_vec_init(db, null, null) == c.SQLITE_OK;
         // Enable WAL mode for better concurrent reads
         _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL;", null, null, null);
         _ = c.sqlite3_exec(db, "PRAGMA foreign_keys=ON;", null, null, null);
@@ -42,6 +47,7 @@ pub const Database = struct {
             .allocator = allocator,
             .db = db,
             .path = owned_path,
+            .vec_ready = vec_ok,
         };
     }
 

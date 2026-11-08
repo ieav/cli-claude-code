@@ -8,6 +8,7 @@ const std = @import("std");
 const llm = @import("../llm/mod.zig");
 const compaction = @import("../llm/compaction.zig");
 const memory_mod = @import("../memory/mod.zig");
+const vec_dedup = @import("../memory/vec_dedup.zig");
 const injection_mod = @import("../memory/injection.zig");
 const extraction_mod = @import("../memory/extraction.zig");
 const reflection_mod = @import("../memory/reflection.zig");
@@ -728,7 +729,9 @@ fn reflectionIsDuplicate(mem: *memory_mod.MemorySystem, insight: []const u8) boo
     for (entries) |e| {
         if (jaccardTokens(e.content, insight) > 0.8) return true;
     }
-    return false;
+    // ② 语义查重（sqlite-vec）：字符串 Jaccard 只能抓同词重复——同一
+    // 件事的两种说法要向量 KNN 才认得。近 20 条之外的旧记忆也在射程。
+    return vec_dedup.isSemanticDup(mem.db, insight);
 }
 
 /// T3.2 (as-designed): background reflection result, handed from the

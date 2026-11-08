@@ -22,7 +22,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_mod.addCSourceFiles(.{
-        .files = &.{ "deps/sqlite3/sqlite3.c", "deps/utf8proc/utf8proc.c" },
+        .files = &.{
+                "deps/sqlite3/sqlite3.c",
+                "deps/utf8proc/utf8proc.c",
+            },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
@@ -31,6 +34,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     root_mod.addIncludePath(b.path("deps/sqlite3"));
+    // sqlite-vec：静态链接（-DSQLITE_CORE 不走 load_extension API）。
+    root_mod.addCSourceFile(.{
+        .file = b.path("deps/sqlite_vec/sqlite-vec.c"),
+        .flags = &.{"-DSQLITE_CORE"},
+    });
     root_mod.addImport("utf8proc", utf8proc_mod);
 
     // Main executable
@@ -54,7 +62,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addCSourceFiles(.{
-        .files = &.{ "deps/sqlite3/sqlite3.c", "deps/utf8proc/utf8proc.c" },
+        .files = &.{
+                "deps/sqlite3/sqlite3.c",
+                "deps/utf8proc/utf8proc.c",
+            },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
@@ -63,6 +74,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_mod.addIncludePath(b.path("deps/sqlite3"));
+    test_mod.addCSourceFile(.{
+        .file = b.path("deps/sqlite_vec/sqlite-vec.c"),
+        .flags = &.{"-DSQLITE_CORE"},
+    });
     test_mod.addImport("utf8proc", utf8proc_mod);
 
     const unit_tests = b.addTest(.{

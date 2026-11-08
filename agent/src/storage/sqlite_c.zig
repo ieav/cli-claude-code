@@ -57,3 +57,7 @@ pub extern fn sqlite3_column_bytes(stmt: ?*sqlite3_stmt, i_col: c_int) c_int;
 /// Number of rows modified by the most recent INSERT/UPDATE/DELETE.
 pub extern fn sqlite3_changes(db: ?*sqlite3) c_int;
 pub extern fn sqlite3_bind_double(stmt: ?*sqlite3_stmt, idx: c_int, value: f64) c_int;
+
+/// sqlite-vec 静态注册（SQLITE_CORE 编译；pApi 恒 null）。
+pub extern fn sqlite3_vec_init(db: ?*sqlite3, pz_err_msg: ?*?[*c]u8, p_api: ?*anyopaque) c_int;
+pub extern fn sqlite3_column_double(stmt: ?*sqlite3_stmt, idx: c_int) f64;

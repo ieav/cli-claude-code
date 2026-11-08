@@ -13,3 +13,4 @@ pub const ReflectionEngine = reflection.ReflectionEngine;
 pub const ExtractionEngine = extraction.ExtractionEngine;
 pub const Reflection = reflection.Reflection;
 pub const ExtractedFact = extraction.ExtractedFact;
+pub const vec_dedup = @import("vec_dedup.zig");
