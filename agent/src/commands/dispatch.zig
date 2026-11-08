@@ -284,6 +284,20 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             };
             if (!try turn_ask.permissionGate(run_tool, parsed, ctx.current_mode.*, ctx.switcher, allocator, ctx.r, ctx.w, ctx.ow, ctx.file_writer, ctx.denial_state)) return .handled;
 
+            // M6 Hooks：/run 与 agent 回合同一条纪律（权限语义 /run 一直是
+            // 操作员直达豁免，但钩子不是权限——guard/lint 对手工触发同样
+            // 该生效，否则「/run 测钩子没反应」会成为一桩悬案）。放在文件
+            // 备份之前：被阻断的编辑根本不该发生，也就不该留编辑前快照。
+            if (hooks_mod.preToolUse(allocator, ctx.io, tool_name, parsed)) |block_msg| {
+                try std.Io.Writer.print(ctx.w, "  \x1b[31mBLOCKED by PreToolUse hook:\x1b[0m\n", .{});
+                turn_tools.printToolBody(ctx.w, block_msg);
+                try std.Io.Writer.writeAll(ctx.w, "\n");
+                allocator.free(block_msg);
+                _ = ctx.log.record(tool_name, "pre-hook", "blocked", null, false, ctx.history.items.len) catch {};
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+
             // Backup file before modification (for /run commands)
             var run_snap_id: ?[16]u8 = null;
             if (turn_tools.isFileModifyingTool(tool_name)) {
@@ -300,18 +314,6 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 }
             }
 
-            // M6 Hooks：/run 与 agent 回合同一条纪律（权限语义 /run 一直是
-            // 操作员直达豁免，但钩子不是权限——guard/lint 对手工触发同样
-            // 该生效，否则「/run 测钩子没反应」会成为一桩悬案）。
-            if (hooks_mod.preToolUse(allocator, ctx.io, tool_name, parsed)) |block_msg| {
-                try std.Io.Writer.print(ctx.w, "  \x1b[31mBLOCKED by PreToolUse hook:\x1b[0m\n", .{});
-                turn_tools.printToolBody(ctx.w, block_msg);
-                try std.Io.Writer.writeAll(ctx.w, "\n");
-                allocator.free(block_msg);
-                _ = ctx.log.record(tool_name, "pre-hook", "blocked", run_snap_id, false, ctx.history.items.len) catch {};
-                try std.Io.File.Writer.flush(ctx.file_writer);
-                return .handled;
-            }
             const result = run_tool.execute(allocator, parsed, ctx.io) catch |err| {
                 logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
                 try std.Io.Writer.print(ctx.w, "  Tool error: {}\n\n", .{err});

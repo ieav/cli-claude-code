@@ -224,6 +224,10 @@ fn runHook(alloc: std.mem.Allocator, io: std.Io, command: []const u8, payload: [
 
     const ustatus: u32 = @bitCast(status);
     const code: i32 = if (std.posix.W.IFEXITED(ustatus)) @intCast(std.posix.W.EXITSTATUS(ustatus)) else -1;
+    // 管道读端由父进程持有——排水线程退出后必须 close（bash.zig 同款；
+    // 漏关 = 每次钩子调用泄 2 个 fd，长会话最终 EMFILE）。
+    out_drain.file.close(io);
+    err_drain.file.close(io);
     return .{ .code = code, .stderr = err_drain.buf.toOwnedSlice(alloc) catch "", .timed_out = timed_out };
 }
 

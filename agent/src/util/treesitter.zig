@@ -130,9 +130,11 @@ fn errFromNode(node: c.TSNode, missing: bool) SyntaxError {
 
 /// 工具结果附加行（FileEdit/FileWrite 共用）。null 错误 → 空串。
 /// caller 持有返回值（alloc 分配）。
+/// 措辞刻意容错：语法器有已知盲区（如 Zig 0.14 的多重声明解构），
+/// 「确信正确就继续」防止模型在误报上空转烧回合。
 pub fn formatWarning(alloc: std.mem.Allocator, path: []const u8, e: *const SyntaxError) ?[]u8 {
     const short = std.fs.path.basename(path);
-    return std.fmt.allocPrint(alloc, "\n[语法检查] ⚠ {s}:{d}:{d} {s}（tree-sitter，请修复后再继续）", .{
+    return std.fmt.allocPrint(alloc, "\n[语法检查] ⚠ {s}:{d}:{d} {s}（tree-sitter）。若该行确为合法语法（新语言特性可能是语法器盲区）可忽略，否则请修复", .{
         short, e.line, e.col, e.detailText(),
     }) catch null;
 }
@@ -198,4 +200,42 @@ test "formatWarning includes path line col" {
     defer alloc.free(w);
     try std.testing.expect(std.mem.indexOf(u8, w, "a.py:3:7") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "语法检查") != null);
+}
+
+
+// 回归门：真实代码语料零误报基线。当前已知豁免 1 处——config_menu.zig
+// 的 Zig 多重声明解构（maxxnino 语法器不认 0.14 新语法）。语法器升级
+// 支持后把上限收回 0。
+test "false-positive scan over this repo's real code" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    var flagged: usize = 0;
+    var total: usize = 0;
+    var total_ms: i64 = 0;
+    const dirs = [_][]const u8{ "src", "src/util", "src/tools", "src/turn", "src/session", "src/commands", "src/agent", "src/llm", "src/memory", "src/knowledge", "src/hooks", "src/mcp", "src/skills", "src/runtime", "src/storage", "src/task", "src/checkpoint", "src/math", "src/research", "scripts", "deps/sqlite3", "examples" };
+    for (dirs) |dir_name| {
+        var d = std.Io.Dir.cwd().openDir(io, dir_name, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |ent| {
+            if (ent.kind != .file) continue;
+            const lang = langForPath(ent.name) orelse continue;
+            var pb: [512]u8 = undefined;
+            const p = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir_name, ent.name }) catch continue;
+            const src = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, p, alloc, std.Io.Limit.limited(4 * 1024 * 1024)) catch continue;
+            defer alloc.free(src);
+            total += 1;
+            const t0 = @import("time.zig").nowMillis();
+            const e = firstError(lang, src);
+            total_ms += @import("time.zig").nowMillis() - t0;
+            if (e) |err| {
+                flagged += 1;
+                std.debug.print("FP? {s}:{d}:{d} {s}\n", .{ p, err.line, err.col, err.detailText() });
+            }
+        }
+    }
+    std.debug.print("SCAN: {d}/{d} flagged, {d}ms total parse\n", .{ flagged, total, total_ms });
+    try std.testing.expect(flagged <= 1); // 已知豁免：Zig 解构语法（见上）
 }
