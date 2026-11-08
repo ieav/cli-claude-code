@@ -225,6 +225,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         null;
     defer if (kgraph) |*g| g.deinit(); // finalize cached stmts before db close
 
+    // 延迟提取（2026-11-10）：上次退出存档的会话转录在后台补提（LLM），
+    // 结果经 .reply 文件交接，提示符循环顶落库——启动零延迟。
+    if (mem_db != null) {
+        if (memory_ops.backgroundLlmConfig(allocator, &switcher)) |cfg| {
+            memory_ops.spawnPendingExtraction(cfg, allocator, io);
+        }
+    }
+
     // ──── P3: runtime layer — typed event bus + cron (main-thread exec) ────
     // Threading contract: the bus emits ONLY on the main thread; the cron
     // scheduler thread never runs task code, it just queues due indices
@@ -533,6 +541,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // transaction per turn — roadmap P3 "每轮结束原子追加").
         if (sess_store) |st| st.flush(history.items);
 
+        // 延迟提取回收（2026-11-10）：上次会话的后台补提结果在此落库
+        // （主线程 DB 写；一次一份，小步走）。
+        if (mem_sys) |*ms| {
+            memory_ops.collectPendingExtraction(ms, if (kgraph) |*g| g else null, &evbus, w, allocator, io);
+        }
+
         // Hot-reload: a settings file changed on disk since the last prompt
         // (external edit) → reload everything and resync the live permission
         // mode. Own saves refresh the baseline, so this never fires for them.
@@ -620,11 +634,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Extract first, reflect last — see the /quit path note.
             if (mem_sys) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemoriesBounded(ms, if (kgraph) |*g| g else null, &history, &evbus, w, &file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, &switcher), switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                if (memory_ops.exitExtractDeadlineMs() > 0) {
+                    memory_ops.extractSessionMemoriesBounded(ms, if (kgraph) |*g| g else null, &history, &evbus, w, &file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, &switcher), switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                } else {
+                    // 2026-11-10 默认：退出零 LLM 等待（启发式毫秒级 +
+                    // 转录存档，LLM 提取下次启动后台补）。
+                    memory_ops.extractSessionMemories(ms, if (kgraph) |*g| g else null, &history, &evbus, w, null, switcher.settings.max_tokens) catch {};
+                    _ = memory_ops.deferSessionExtraction(allocator, io, history.items, w);
+                }
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (mem_sys != null and window_queries.items.len > 0) {
-                memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
+                memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, null, .full, null, null, false); // exit: 不入库（无质量门防污染）
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously
@@ -1760,7 +1781,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // or after a π-spaced interval; see ReflectionEngine.shouldReflect).
         evbus.emit(.{ .user_query_end = .{ .tools = window_tools, .errors = window_errors } }); // P3 event record
         if (mem_sys != null and reflector.shouldReflect()) {
-            memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend), memory_ops.backgroundLlmConfig(allocator, &switcher), &evbus);
+            memory_ops.runReflection(&reflector, &mem_sys.?, &window_queries, &window_tools, &window_errors, allocator, w, switcher.getProvider() catch null, llm.provider.capabilityTier(switcher.modelName(), switcher.backend), memory_ops.backgroundLlmConfig(allocator, &switcher), &evbus, true);
             if (live_trace) |*t| {
                 traceAddStep(t, .reflection_trigger, 0.9, "query window", "insights stored", "phi/e heuristics", 0, allocator) catch {};
             }

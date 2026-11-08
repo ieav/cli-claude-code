@@ -109,11 +109,18 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // used to lose the whole session's learnings.
             if (ctx.mem_sys.*) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                if (memory_ops.exitExtractDeadlineMs() > 0) {
+                    memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                } else {
+                    // 2026-11-10 默认：退出零 LLM 等待——启发式（毫秒）+ 转录
+                    // 存档；LLM 提取下次启动后台补提。
+                    memory_ops.extractSessionMemories(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, null, ctx.switcher.settings.max_tokens) catch {};
+                    _ = memory_ops.deferSessionExtraction(allocator, ctx.io, ctx.history.items, ctx.w);
+                }
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (ctx.mem_sys.* != null and ctx.window_queries.items.len > 0) {
-                memory_ops.runReflection(ctx.reflector, &ctx.mem_sys.*.?, ctx.window_queries, ctx.window_tools, ctx.window_errors, allocator, ctx.w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
+                memory_ops.runReflection(ctx.reflector, &ctx.mem_sys.*.?, ctx.window_queries, ctx.window_tools, ctx.window_errors, allocator, ctx.w, null, .full, null, null, false); // exit path: heuristic-only, 不入库（罐头洞察无质量门，防污染）
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously
@@ -387,11 +394,18 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // used to lose the whole session's learnings.
             if (ctx.mem_sys.*) |*ms| {
                 const ext_t0 = util_time.nowMillis();
-                memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                if (memory_ops.exitExtractDeadlineMs() > 0) {
+                    memory_ops.extractSessionMemoriesBounded(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, ctx.file_writer, allocator, memory_ops.backgroundLlmConfig(allocator, ctx.switcher), ctx.switcher.settings.max_tokens, memory_ops.exitExtractDeadlineMs());
+                } else {
+                    // 2026-11-10 默认：退出零 LLM 等待——启发式（毫秒）+ 转录
+                    // 存档；LLM 提取下次启动后台补提。
+                    memory_ops.extractSessionMemories(ms, if (ctx.kgraph.*) |*g| g else null, ctx.history, ctx.evbus, ctx.w, null, ctx.switcher.settings.max_tokens) catch {};
+                    _ = memory_ops.deferSessionExtraction(allocator, ctx.io, ctx.history.items, ctx.w);
+                }
                 logger.info("session extraction: {d}ms", .{util_time.nowMillis() - ext_t0});
             }
             if (ctx.mem_sys.* != null and ctx.window_queries.items.len > 0) {
-                memory_ops.runReflection(ctx.reflector, &ctx.mem_sys.*.?, ctx.window_queries, ctx.window_tools, ctx.window_errors, allocator, ctx.w, null, .full, null, null); // exit path: heuristic-only, no background dispatch
+                memory_ops.runReflection(ctx.reflector, &ctx.mem_sys.*.?, ctx.window_queries, ctx.window_tools, ctx.window_errors, allocator, ctx.w, null, .full, null, null, false); // exit path: heuristic-only, 不入库（罐头洞察无质量门，防污染）
                 // Best-effort drain: an insight that already landed in the
                 // inbox is stored now; one still in flight dies with the
                 // process (the heuristic reflection was stored synchronously

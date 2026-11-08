@@ -451,7 +451,7 @@ fn runReflectionWithMockGate(
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
 
-    memory_ops.runReflection(&reflector, &mem, &window, &tools, &errors, alloc, &aw.writer, prov, .full, null, null);
+    memory_ops.runReflection(&reflector, &mem, &window, &tools, &errors, alloc, &aw.writer, prov, .full, null, null, true);
 
     // Exactly one gate round trip.
     try std.testing.expectEqual(@as(u32, 1), server.served.load(.monotonic));

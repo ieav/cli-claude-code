@@ -17,6 +17,7 @@ const util_time = @import("../util/time.zig");
 const logger = @import("../util/log.zig");
 const math_mod = @import("../math/mod.zig");
 const env = @import("../util/env.zig");
+const system_dirs = @import("../util/system_dirs.zig");
 const self_diagnostic = @import("../runtime/self_diagnostic.zig");
 const decision_trace = @import("../runtime/decision_trace.zig");
 const runtime_monitor = @import("../runtime/monitor.zig");
@@ -145,6 +146,15 @@ fn transcriptBackoff(s: []const u8, from: usize) []const u8 {
     return s[i..];
 }
 
+/// 提取指令（同步路径与延迟补提共用同一提示词——同一事实源）。
+const EXTRACT_INSTRUCTION =
+    \\Extract durable knowledge from this coding-agent conversation for long-term memory.
+    \\Respond with ONLY a JSON object (no markdown fences, no commentary), exactly this schema:
+    \\{"facts":[{"type":"user_preference|project_context|technical_fact|error_solution|pattern_observed","content":"..."}],"entities":[{"name":"...","type":"technology|person|concept|organization|code_pattern|api_endpoint"}],"relations":[{"from":"entity name","to":"entity name","relation":"short verb phrase"}]}
+    \\Rules: each fact is ONE standalone statement, max 300 chars, in the conversation's dominant language; skip small talk, raw code dumps and transient state; at most 12 facts. Entities are the concrete technologies, files, tools, commands and projects involved (max 15). Relations (max 20) only between listed entities.
+    \\
+;
+
 fn llmExtractSession(alloc: std.mem.Allocator, prov: llm.Provider, messages: []const llm.Message, aux_cap: u32) !LlmExtraction {
     const transcript = compaction.renderTranscript(alloc, messages) catch return error.ExtractTranscriptFailed;
     defer alloc.free(transcript);
@@ -153,16 +163,15 @@ fn llmExtractSession(alloc: std.mem.Allocator, prov: llm.Provider, messages: []c
     // 记忆价值的部分；最近的对话才是「本会话学到了什么」）。UTF-8
     // 边界回退，不切断多字节字符。
     const tr = if (transcript.len > 24_000) transcriptBackoff(transcript, transcript.len - 24_000) else transcript;
+    return llmExtractTranscript(alloc, prov, tr, aux_cap);
+}
 
+/// 从「已是转录文本」的输入拿到模型的原始回复（调用方释放）——
+/// 同步路径与延迟补提共用。
+fn llmExtractReplyText(alloc: std.mem.Allocator, prov: llm.Provider, tr: []const u8, aux_cap: u32) ![]u8 {
     var prompt: std.ArrayList(u8) = .empty;
     defer prompt.deinit(alloc);
-    try prompt.appendSlice(alloc,
-        \\Extract durable knowledge from this coding-agent conversation for long-term memory.
-        \\Respond with ONLY a JSON object (no markdown fences, no commentary), exactly this schema:
-        \\{"facts":[{"type":"user_preference|project_context|technical_fact|error_solution|pattern_observed","content":"..."}],"entities":[{"name":"...","type":"technology|person|concept|organization|code_pattern|api_endpoint"}],"relations":[{"from":"entity name","to":"entity name","relation":"short verb phrase"}]}
-        \\Rules: each fact is ONE standalone statement, max 300 chars, in the conversation's dominant language; skip small talk, raw code dumps and transient state; at most 12 facts. Entities are the concrete technologies, files, tools, commands and projects involved (max 15). Relations (max 20) only between listed entities.
-        \\
-    );
+    try prompt.appendSlice(alloc, EXTRACT_INSTRUCTION);
     try prompt.appendSlice(alloc, tr);
 
     var blocks = try alloc.alloc(llm.ContentBlock, 1);
@@ -178,13 +187,19 @@ fn llmExtractSession(alloc: std.mem.Allocator, prov: llm.Provider, messages: []c
     });
     // Pull the text out before the response DOM arena is freed.
     var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(alloc);
+    errdefer text.deinit(alloc);
     for (resp.content) |b| {
         if (b == .text) text.appendSlice(alloc, b.text) catch break;
     }
     resp.free(alloc);
     if (text.items.len == 0) return error.ExtractEmptyReply;
-    return parseExtractionReply(alloc, text.items);
+    return text.toOwnedSlice(alloc);
+}
+
+fn llmExtractTranscript(alloc: std.mem.Allocator, prov: llm.Provider, tr: []const u8, aux_cap: u32) !LlmExtraction {
+    const reply = try llmExtractReplyText(alloc, prov, tr, aux_cap);
+    defer alloc.free(reply);
+    return parseExtractionReply(alloc, reply);
 }
 
 /// Lenient JSON recovery + field extraction from a model's extraction
@@ -762,13 +777,12 @@ pub fn insightPassesGate(alloc: std.mem.Allocator, prov: llm.Provider, insight: 
     return null;
 }
 
-/// 退出期提取的兜底时限（2026-11-10 由 20s 收紧到 8s：提取是辅助价值，
-/// 退出延迟是每次都付的成本——实测网关正常 2-5s 完成，拖过 8s 的多为
-/// 网络停顿，等满 20s 后照样降级启发式，纯浪费）。超时 → 关键词启发式
-/// 兜底（毫秒级），LLM 线程被放弃（随进程消亡——与后台反思同一放弃
-/// 契约：泄漏优于悬垂释放）。ZIV_EXIT_EXTRACT_MS 环境变量可覆盖；
-/// 0 = 完全跳过 LLM 等待（直接启发式，退出零等待）。
-pub const EXIT_EXTRACT_DEADLINE_MS: i64 = 8_000;
+/// 退出期提取（2026-11-10 定纲重设计）：默认 **0 = 延迟档**——退出只做
+/// 毫秒级动作（关键词启发式 + 转录落盘），LLM 提取移交下次启动的后台
+/// 线程（推理模型对 JSON 提取常 >8s，同步等超时后拿到的还是启发式，
+/// 等待纯浪费）。ZIV_EXIT_EXTRACT_MS>0 = 选择回到同步等待档（旧行为，
+/// 上限即该值）；显式 0 = 维持延迟档。
+pub const EXIT_EXTRACT_DEADLINE_MS: i64 = 0;
 
 pub fn exitExtractDeadlineMs() i64 {
     if (env.get("ZIV_EXIT_EXTRACT_MS")) |v| {
@@ -776,6 +790,203 @@ pub fn exitExtractDeadlineMs() i64 {
         return @max(0, n);
     }
     return EXIT_EXTRACT_DEADLINE_MS;
+}
+
+// ─── 延迟提取（2026-11-10 定纲：退出零 LLM 等待） ─────────────────────
+// 旧同步路径的两个实证问题：①glm 推理模型对 JSON 提取任务常想 >8s，
+//   超时烧满死线后拿到的还是启发式（纯浪费）；②退出时网关慢 → 反思
+//   洞察的质量门（需要 LLM）也被跳过 → 罐头洞察未过门入库（污染）。
+// 新架构：退出只做毫秒级动作（启发式 + 转录落盘）；LLM 提取移交下次
+//   启动的分离线程；结果经文件交接（*.reply），主线程在提示符循环收
+//   回并落库（sqlite THREADSAFE=0，DB 写永不出主线程）。
+
+pub const PENDING_DIR = ".ziv/pending_extract";
+/// 存档上限：最新 2 份——网关长期不可用时最老的被挤掉（有界放弃）。
+const PENDING_KEEP: usize = 2;
+
+/// 退出路径：转录落盘排队（毫秒级）。返回 true = 已排队。
+pub fn deferSessionExtraction(alloc: std.mem.Allocator, io: std.Io, history: []const llm.Message, w: ?*std.Io.Writer) bool {
+    const transcript = compaction.renderTranscript(alloc, history) catch return false;
+    defer alloc.free(transcript);
+    if (transcript.len < 200) return false; // 空会话不值得排队
+    const tr = if (transcript.len > 24_000) transcriptBackoff(transcript, transcript.len - 24_000) else transcript;
+
+    system_dirs.ensureDir(PENDING_DIR, io) catch return false;
+    prunePending(io);
+    var name_buf: [96]u8 = undefined;
+    const path = std.fmt.bufPrint(&name_buf, "{s}/{d}.txt", .{ PENDING_DIR, util_time.nowMillis() }) catch return false;
+    const body = std.fmt.allocPrint(alloc, "{s}", .{tr}) catch return false;
+    defer alloc.free(body);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body }) catch return false;
+    if (w) |ww| {
+        std.Io.Writer.print(ww, "  [会话转录已存档——LLM 提取转入下次启动后台执行，退出不再等待]\n", .{}) catch {};
+    }
+    return true;
+}
+
+/// 只留最新 PENDING_KEEP 份 .txt（老的直接放弃——有界）。
+fn prunePending(io: std.Io) void {
+    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    defer dir.close(io);
+    var names: [16][]const u8 = undefined;
+    var mtimes: [16]i64 = undefined;
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file) continue;
+        if (!std.mem.endsWith(u8, e.name, ".txt")) continue;
+        if (n >= names.len) break;
+        const st = dir.statFile(io, e.name, .{}) catch continue;
+        names[n] = dupeName(e.name) catch continue;
+        mtimes[n] = @intCast(@divTrunc(st.mtime.nanoseconds, 1_000_000));
+        n += 1;
+    }
+    // 冒泡：按 mtime 降序，保留前 PENDING_KEEP，删除其余。
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        var j = i;
+        while (j > 0 and mtimes[j - 1] < mtimes[j]) : (j -= 1) {
+            const tm = mtimes[j];
+            mtimes[j] = mtimes[j - 1];
+            mtimes[j - 1] = tm;
+            const tn = names[j];
+            names[j] = names[j - 1];
+            names[j - 1] = tn;
+        }
+    }
+    var buf: [128]u8 = undefined;
+    var k = PENDING_KEEP;
+    while (k < n) : (k += 1) {
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ PENDING_DIR, names[k] }) catch continue;
+        std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    }
+    // names 指向 name_scratch 静态数组（调用入口已重置槽位）——无可释放。
+    // 旧草稿在此对静态数组切片做 page_allocator.free → alignment panic，
+    // 进程带栈转储死掉、Goodbye 永不出现（S7 偶发挂起的根因）。
+}
+
+var name_scratch: [16][128]u8 = undefined;
+var name_scratch_n: usize = 0;
+fn dupeName(name: []const u8) ![]const u8 {
+    if (name_scratch_n >= name_scratch.len) return error.NoRoom;
+    const slot = name_scratch[name_scratch_n][0..@min(name.len, 128)];
+    @memcpy(slot, name[0..slot.len]);
+    name_scratch_n += 1;
+    return slot;
+}
+
+const PendingWorkerCtx = struct {
+    cfg: BackgroundLlmConfig,
+    alloc: std.mem.Allocator,
+    txt_path: []const u8,  // alloc 所有
+    reply_path: []const u8, // alloc 所有
+};
+
+/// 启动路径：有存档则分离线程补提（own io/provider，B-pattern）。
+/// 成功 → 模型原始回复写 <stem>.reply、删 .txt；失败 → 保留 .txt
+/// 下次启动重试（网关不可达的常态容忍，PENDING_KEEP 兜底有界）。
+pub fn spawnPendingExtraction(cfg: BackgroundLlmConfig, alloc: std.mem.Allocator, io: std.Io) void {
+    name_scratch_n = 0; // 复用槽位（仅主线程调用）
+    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    var newest: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".txt")) continue;
+        if (newest == null or std.mem.order(u8, e.name, newest.?) == .gt) {
+            newest = dupeName(e.name) catch null;
+        }
+    }
+    dir.close(io);
+    const name = newest orelse return;
+    const txt = std.fmt.allocPrint(alloc, "{s}/{s}", .{ PENDING_DIR, name }) catch return;
+    const stem = txt[0 .. txt.len - 4];
+    const reply = std.fmt.allocPrint(alloc, "{s}.reply", .{stem}) catch {
+        alloc.free(txt);
+        return;
+    };
+    const ctx = alloc.create(PendingWorkerCtx) catch {
+        alloc.free(txt);
+        alloc.free(reply);
+        return;
+    };
+    ctx.* = .{ .cfg = cfg, .alloc = alloc, .txt_path = txt, .reply_path = reply };
+    const th = std.Thread.spawn(.{}, pendingWorker, .{ctx}) catch {
+        alloc.free(txt);
+        alloc.free(reply);
+        var c2 = cfg;
+        c2.deinit(alloc);
+        alloc.destroy(ctx);
+        return;
+    };
+    th.detach();
+}
+
+fn pendingWorker(ctx: *PendingWorkerCtx) void {
+    const alloc = ctx.alloc;
+    defer {
+        alloc.free(@constCast(ctx.txt_path));
+        alloc.free(@constCast(ctx.reply_path));
+        alloc.destroy(ctx);
+    }
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    var storage: BgProviderStorage = undefined;
+    const c = ctx.cfg;
+    const prov = makeBackgroundProviderInto(alloc, io_state.io(), c.backend, c.model, c.api_key, c.base_url, c.ollama_host, &storage) orelse {
+        ctx.cfg.deinit(alloc);
+        return; // 留 .txt 下次重试
+    };
+    defer prov.deinit();
+    defer ctx.cfg.deinit(alloc);
+    const io2 = io_state.io();
+    const body = std.Io.Dir.cwd().readFileAlloc(io2, ctx.txt_path, alloc, .limited(64 * 1024)) catch return;
+    defer alloc.free(body);
+    const reply_text = llmExtractReplyText(alloc, prov, body, 2048) catch return; // 失败留 .txt
+    defer alloc.free(reply_text);
+    std.Io.Dir.cwd().writeFile(io2, .{ .sub_path = ctx.reply_path, .data = reply_text }) catch return;
+    std.Io.Dir.cwd().deleteFile(io2, ctx.txt_path) catch {};
+    logger.info("pending extraction: reply archived ({d}B), main thread will ingest", .{reply_text.len});
+}
+
+/// 提示符循环（主线程）：*.reply 存在 → 解析 → applyLlmExtraction 落库
+/// → 删文件。一次收一份（下次循环收下一份——落库事务小步走）。
+pub fn collectPendingExtraction(
+    mem: *memory_mod.MemorySystem,
+    kg: ?*knowledge_graph.KnowledgeGraph,
+    bus: ?*task_mod.EventBus,
+    w: ?*std.Io.Writer,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+) void {
+    var dir = std.Io.Dir.cwd().openDir(io, PENDING_DIR, .{}) catch return;
+    defer dir.close(io);
+    var found: ?[]const u8 = null;
+    name_scratch_n = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.name, ".reply")) {
+            found = dupeName(e.name) catch null;
+            break;
+        }
+    }
+    const name = found orelse return;
+    var pbuf: [160]u8 = undefined;
+    const rpath = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ PENDING_DIR, name }) catch return;
+    const reply = std.Io.Dir.cwd().readFileAlloc(io, rpath, alloc, .limited(64 * 1024)) catch return;
+    defer alloc.free(reply);
+    const parsed = parseExtractionReply(alloc, reply) catch {
+        // 模型输出反复不可解析：放弃这一份（删 reply），不留死循环。
+        std.Io.Dir.cwd().deleteFile(io, rpath) catch {};
+        logger.info("pending extraction: unparseable reply dropped", .{});
+        return;
+    };
+    var out = parsed;
+    defer out.deinit(alloc);
+    applyLlmExtraction(mem, kg, bus, w.?, out) catch return;
+    std.Io.Dir.cwd().deleteFile(io, rpath) catch {};
+    if (w) |ww| {
+        std.Io.Writer.print(ww, "  \x1b[2m[上次会话的记忆提取已完成并入库]\x1b[0m\n", .{}) catch {};
+    }
 }
 
 const ExitExtractSlot = struct {
@@ -1026,6 +1237,9 @@ pub fn runReflection(
     tier: llm.provider.CapabilityTier,
     bg_cfg: ?BackgroundLlmConfig,
     bus: ?*task_mod.EventBus,
+    /// 2026-11-10：false = 退出路径——启发式罐头洞察只打印不入库
+    /// （此时无 provider，质量门不可用；入库即污染通道）。
+    store_heuristic: bool,
 ) void {
     const reflect_t0 = util_time.nowMillis();
     // P5 经验回放：窗口 >20 条时 π-均匀采样——反思看见会话全史（早期
@@ -1131,7 +1345,7 @@ pub fn runReflection(
                 }
             }
         }
-        if (store_insight) {
+        if (store_insight and store_heuristic) {
         const now = util_time.nowMillis();
         mem.store(.{
             .id = injection_mod.memoryId(insights, "reflection"),
