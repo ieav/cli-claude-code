@@ -522,11 +522,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     ) catch |e| logger.warning("agent tool registration failed: {}", .{e});
     // MCP 自动连接（2026-11-10）：配置了就连——不该让人再敲 /mcp connect。
     // ZIV_MCP_AUTOSTART=0 或 settings.mcp_autostart=false 关闭。失败只记
-    // 日志不打断启动（网关类工具离线是常态）。
+    // 日志不打断启动（网关类工具离线是常态）。握手走短预算（默认 3s，
+    // ZIV_MCP_AUTOSTART_TIMEOUT_MS 可调）：这里拖住的是每次冷启动，一个
+    // 挂起的 server 不配罚全体用户 20s（实测修复前 20.7s 才出提示符）。
     if (switcher.settings.mcp_autostart and env_flag_off("ZIV_MCP_AUTOSTART") == false) {
+        const autostart_timeout: u32 = blk: {
+            const v = env.get("ZIV_MCP_AUTOSTART_TIMEOUT_MS") orelse break :blk 3000;
+            break :blk std.fmt.parseInt(u32, v, 10) catch 3000;
+        };
         for (mcp_cfg.servers.items) |*entry| {
             if (!entry.enabled) continue;
-            connectMcpServer(entry, &mcp_sessions, &reg, allocator, io, w, &file_writer) catch |err| {
+            connectMcpServer(entry, &mcp_sessions, &reg, allocator, io, w, &file_writer, autostart_timeout) catch |err| {
                 logger.warning("mcp autostart {s}: {}", .{ entry.name, err });
             };
         }
@@ -2009,6 +2015,10 @@ pub fn connectMcpServer(
     io: std.Io,
     w: *std.Io.Writer,
     file_writer: *std.Io.File.Writer,
+    /// 0 = 默认 20s（手动 /mcp connect，人在主动等）。启动自动连接传
+    /// 短预算：挂起的 server 拖住的是每一次冷启动（实测 20.7s 才出
+    /// 提示符），3s 是「等一个正常 server 起来」的合理上限。
+    handshake_timeout_ms: u32,
 ) !void {
     if (findMcpSession(sessions.items, entry.name)) |existing| {
         if (existing.connected) {
@@ -2034,6 +2044,7 @@ pub fn connectMcpServer(
     sess.* = .{ .allocator = alloc, .name = try alloc.dupe(u8, entry.name), .allocator_io = io };
     errdefer alloc.free(sess.name);
     var cfg = mcp_mod.session.ServerConfig{ .name = entry.name };
+    if (handshake_timeout_ms > 0) cfg.handshake_timeout_ms = handshake_timeout_ms;
     if (entry.url) |u| {
         cfg.url = u;
     } else {

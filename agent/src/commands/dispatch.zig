@@ -209,7 +209,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                     try std.Io.File.Writer.flush(ctx.file_writer);
                     return .handled;
                 };
-                try repl_mod.connectMcpServer(entry, ctx.mcp_sessions, ctx.reg, allocator, ctx.io, ctx.w, ctx.file_writer);
+                try repl_mod.connectMcpServer(entry, ctx.mcp_sessions, ctx.reg, allocator, ctx.io, ctx.w, ctx.file_writer, 0);
             } else if (std.mem.startsWith(u8, rest_mcp, "disconnect ")) {
                 const want = std.mem.trim(u8, rest_mcp[11..], " \t");
                 if (repl_mod.findMcpSession(ctx.mcp_sessions.items, want)) |sess| {
@@ -920,7 +920,10 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             defer if (did_subst) allocator.free(expanded);
             // C 项（2026-11-10）：前置声明 tools: 武装为强制门——本回合
             // 只许清单内工具（空声明 = 不设限，老 skill 兼容）。
-            skills_mod.gate.arm(skill.tools);
+            // C 项（2026-11-10）：前置声明 tools: 武装为强制门——本回合
+            // 只许清单内工具（空声明 = 不设限，老 skill 兼容）。arm 必须在
+            // 全部可失败操作之后：中途失败 return 会绕过回合尾的 disarm，
+            // 门就跨回合残留（下回合普通工具被误拒）。
             const msg = std.fmt.allocPrint(allocator, "[Skill: {s}]\n{s}\n\nTask: {s}", .{
                 skill.name,
                 expanded,
@@ -933,6 +936,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 .content = skill_blocks,
                 .timestamp = util_time.nowMillis(),
             });
+            skills_mod.gate.arm(skill.tools);
             return .skill;
         } else {
             try std.Io.Writer.print(ctx.w, "Unknown command: {s}", .{input});
