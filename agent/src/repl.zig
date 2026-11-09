@@ -1161,7 +1161,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // P4 (design §五): the numbered suggestions above become
                 // actionable — one arrow-key pick, no retyping. Esc = ignore.
                 if (error_recovery.selectorEligible(err)) {
-                    if (error_recovery.offerMenu(ow, r, &file_writer)) |choice| switch (choice) {
+                    // 模态生命周期必须走裸 w（TUI v2）：RegionWriter 行原子缓冲会吞掉
+                    // modalEnter/Exit 的无换行转义舞步（S9 开发中实证——标题被吃）。
+                    if (error_recovery.offerMenu(w, r, &file_writer)) |choice| switch (choice) {
                         .retry => {
                             try std.Io.Writer.writeAll(ow, "  [重试本回合…]\n");
                             try std.Io.File.Writer.flush(&file_writer);

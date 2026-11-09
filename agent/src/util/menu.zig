@@ -225,6 +225,13 @@ pub fn select(
     defer guard.restore();
     is_tty = guard.active;
 
+    // MODAL 生命周期（TUI v2）：进入=解除 region（流内自绘）；退出=清残
+    // 留+规范重画输入区。Esc/Enter/错误三条出口都走 modalExit——菜单
+    // 残留类问题的收口点。
+    const lineinput = @import("lineinput.zig");
+    lineinput.modalEnter(w);
+    defer lineinput.modalExit(w);
+
     var idx = @min(start, items.len - 1);
     try render(w, title, items, idx);
     try std.Io.File.Writer.flush(file_writer);

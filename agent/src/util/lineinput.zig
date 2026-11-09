@@ -855,10 +855,16 @@ fn regionApply(w: *std.Io.Writer) void {
         // visible".)
         std.Io.Writer.print(w, "\x1b[1;{d}r", .{split}) catch {};
     }
-    // Status row (absolute), dim.
+    // Status/hint row (absolute), dim — 空闲态画输入区边界 hint（与
+    // paintStatusRow 同一规则，两处绘制点必须一致）。
     std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
+    } else {
+        const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
+        const tw = currentTermWidth();
+        const cut = if (hint.len > tw) hint[0..@min(hint.len, tw)] else hint;
+        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{cut}) catch {};
     }
     writeEditorBlock(w);
     pending_shown = true;
@@ -1037,7 +1043,9 @@ pub fn renderPendingLine(w: *std.Io.Writer) void {
 
 fn renderPendingLineLocked(w: *std.Io.Writer) void {
     if (liveDraft().len == 0 and pending_status_len == 0) {
-        if (pending_shown) regionEndLocked(w);
+        // TUI v2 常驻输入区：空草稿只重画（提示符行仍在 pinned 块里），
+        // 不再解除 region——旧自动解除是"输入区消失"类观感的来源。
+        if (pending_shown) writeEditorBlock(w);
         return;
     }
     if (!pending_shown) {
@@ -1115,6 +1123,13 @@ fn paintStatusRow(w: *std.Io.Writer) void {
     std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
+    } else {
+        // 空闲态：meta 行=输入区上边界（hint）。回合中该行被回合状态
+        // 占用（regionStatus），两态共用同一行——账目不变。
+        const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
+        const tw = currentTermWidth();
+        const cut = if (hint.len > tw) hint[0..@min(hint.len, tw)] else hint;
+        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{cut}) catch {};
     }
     parkCursor(w);
 }
@@ -1135,6 +1150,23 @@ pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
     // 滚屏舞步边界、外部清屏、resize 竞态、未知触发）在半秒内复原，
     // 对"发送后输入区消失"类问题免疫（2026-11-07 用户报障的根治策略）。
     writeEditorBlock(w);
+    flushReal(w);
+}
+
+/// MODAL 生命周期（TUI v2，docs/tui-architecture.md）：菜单/面板打开前
+/// 解除 region（菜单回到流内自绘——现行为）；退出时清流位置以下残留并
+/// 规范重 arm 输入区。不变量：任何 MODAL 退出后屏幕 == IDLE 规范态。
+/// 收口在这里，menu.select 的全部调用点自动覆盖。
+pub fn modalEnter(w: *std.Io.Writer) void {
+    regionEnd(w);
+}
+
+pub fn modalExit(w: *std.Io.Writer) void {
+    ttyLock();
+    defer ttyUnlock();
+    // 清掉菜单半绘残留（流位置以下），再按首次 arm 舞步规范重建输入区。
+    std.Io.Writer.writeAll(w, "\x1b[J") catch {};
+    regionApply(w);
     flushReal(w);
 }
 
@@ -2646,7 +2678,16 @@ pub fn readLine(
             ed.insertBytes(t) catch {};
         }
     }
-    try ed.render();
+    // TUI v2 常驻输入区：进入提示符即 arm（pinned 提示行 + hint 行），
+    // 全部出口统一解除——终端永不残留 DECSTBM 滚动区。回合机制照旧
+    // （readLine 返回后 regionBegin 首挂载，与原生命周期兼容）。
+    {
+        ttyLock();
+        if (!pending_shown) regionApply(w) else writeEditorBlock(w);
+        ttyUnlock();
+        flushReal(w);
+    }
+    defer regionEnd(w);
     while (true) {
         // Kitty ctrl+letter arrives as CSI u and is mapped back to its C0
         // byte by the CSI handler — dispatch it through this same switch.
@@ -2668,7 +2709,7 @@ pub fn readLine(
             if (on_verbose_toggle) |cb| {
                 regionPrintLine(w, cb());
             }
-            ed.render() catch {};
+            renderPendingLine(w);
             continue;
         }
 
@@ -2934,12 +2975,14 @@ pub fn readLine(
                     // KEEPS its content — show it again and let the user
                     // retry (the session survives).
                     const line = ed.takeLine(alloc) catch {
-                        try ed.render();
+                        renderPendingLine(w);
                         continue;
                     };
                     // Re-render the committed line in the history color so
                     // sent messages stay distinguishable in the transcript.
-                    try renderCommitted(ed.w, ed.prompt, line);
+                    // Region 安全回显：常驻 armed 下经 regionPrintLine 打进
+                    // 转录（defer 的 regionEnd 随后解除）。
+                    regionEchoCommitted(w, line);
                     try std.Io.File.Writer.flush(file_writer);
                     last_submit_ms = util_time.nowMillis();
                     recall_text = null; // submitted: recall window re-arms only via Esc interrupt

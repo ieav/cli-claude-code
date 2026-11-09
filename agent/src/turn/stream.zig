@@ -128,7 +128,7 @@ fn toolArgPick(input: std.json.Value) ?[]const u8 {
 /// 80-col one-line cut reduced long commands to "(cd ~/… && grep …)" —
 /// the user could never see what was about to run. JSON-fallback
 /// previews (no interesting field) keep the summarized one-line shape.
-fn printToolCallPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, name: []const u8, input: std.json.Value) void {
+pub fn printToolCallPreview(w: *std.Io.Writer, alloc: std.mem.Allocator, name: []const u8, input: std.json.Value) void {
     if (toolArgPick(input)) |pick| {
         if (pick.len <= 96 and std.mem.indexOfScalar(u8, pick, '\n') == null) {
             var tb: [192]u8 = undefined;

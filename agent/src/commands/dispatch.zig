@@ -26,6 +26,7 @@ const config_menu = @import("config_menu.zig");
 const history_cmds = @import("history_cmds.zig");
 const turn_ask = @import("../turn/ask.zig");
 const turn_history = @import("../turn/history.zig");
+const stream_mod = @import("../turn/stream.zig");
 const session_store_mod = @import("../session/session_store.zig");
 const session_store_mod_code = @import("../knowledge/code_index.zig");
 const menu = @import("../util/menu.zig");
@@ -270,7 +271,9 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 return .handled;
             };
 
-            try std.Io.Writer.print(ctx.w, "  \x1b[36m⏺ Running {s}\x1b[0m\n", .{tool_name});
+            // TUI v2：/run 与 agent 回合同一工具头格式（⏺ Name(args)，
+            // stream.zig 单一事实源）——信息呈现的一致性。
+            stream_mod.printToolCallPreview(ctx.w, allocator, tool_name, parsed);
             try std.Io.File.Writer.flush(ctx.file_writer);
             logger.info("Tool /run: {s}", .{tool_name});
 

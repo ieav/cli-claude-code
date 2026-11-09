@@ -254,7 +254,7 @@ def s5_pipe_holder_reaped():
     try:
         z.wait_prompt()
         z.send('/run Bash {"command":"sleep 30 & exit 0","timeout":0}\n')
-        z.read_until("Running Bash", 15)
+        z.read_until("\u23fa Bash", 15)  # TUI v2 统一工具头 ⏺ Name(args)
         z.clear_buf()  # wait for a NEW prompt paint, not the stale one
         t0 = time.time()
         z.read_until("ziv[", 30)
@@ -550,7 +550,7 @@ def s12_tui_colors_toggle_resize():
             # (a)+(c): a multi-line tool output — preview cyan, body dim;
             # Ctrl+O collapses, Ctrl+O expands again.
             z.send('/run Bash {"command":"seq 1 8"}\n')
-            out = z.read_until("Running", 20)  # content marker (the echo repaint carries ziv[ on every key)
+            out = z.read_until("\u23fa", 20)  # content marker (TUI v2 统一工具头 ⏺)
             z.drain(1.0)
             if "\x1b[36m" not in out:
                 raise Fail("tool preview not cyan")
@@ -1204,6 +1204,37 @@ def s21_agent_live_status():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s22_modal_exit_canonical():
+    """TUI v2 invariant: ANY modal exit leaves the canonical IDLE screen —
+    hint row + prompt row re-armed, no menu remnants below (docs/tui-
+    architecture.md). Covers config menu (Esc cancel) and /bg panel."""
+    d = tempfile.mkdtemp(prefix="ziv-modal-")
+    try:
+        z = ZivSession(reuse_dir=d)
+        try:
+            z.wait_prompt()
+            # 常驻输入区：空闲即有 hint 行 + 提示符行。
+            z.read_until("\u23f5 Enter", 10)
+            # 配置菜单：进入 → Esc 取消 → 规范态（取消文案之后必须重新
+            # 出现 hint 行——modalExit 的重 arm 证据）。
+            z.send("/config\r")
+            z.read_until("Ziv 配置", 10)
+            z.clear_buf()
+            z.send("\x1b")
+            z.read_until("[取消]", 10)
+            z.read_until_seen("\u23f5 Enter", 10)
+            # 菜单退出后输入路径干净：直接提交一条命令照常执行。
+            z.clear_buf()
+            z.send("/help\r")
+            z.read_until("Available commands", 10)
+            quit_and_wait(z)
+            return "modal exit → canonical IDLE (hint+prompt re-armed), input path clean ✓"
+        finally:
+            z.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1226,6 +1257,7 @@ SCENARIOS = [
     ("S19 full-subagent", s19_full_subagent),
     ("S20 bgtool", s20_bgtool),
     ("S21 agent-live-status", s21_agent_live_status),
+    ("S22 modal-exit", s22_modal_exit_canonical),
 ]
 
 
