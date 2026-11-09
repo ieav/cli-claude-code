@@ -2,11 +2,10 @@
 
 > 一个用 Zig 构建的支持多 LLM 后端、具备自动学习能力（记忆+反思+知识库）的 CLI Agent。
 > 核心算法由三大数学常数驱动：**pi** 圆融信息、**e** 控制增长、**phi** 浓缩知识。
-> v0.4.0 — 自学习闭环：记忆/反思飞轮 + 知识图谱 + /research /diagnose + 工具并行编排（π/e/φ 全落地）。
-> v0.5.0 — 工具自动调用 · v0.5.x — MCP + Skill 系统 · **v0.6.0 — 输入系统重写（块渲染/kitty 协议/粘贴折叠）、记忆飞轮升级（自适应注入/漂移重锚/质量门控/后台反思）、/plan 计划文件、压缩自适应+关键事实保留、搜索双源回退、agent 子代理工具（默认关闭）**；
-> **v0.6.1 — 稳定性：LLM 请求看护狗（网关停摆不再挂死）、agent 工具注册悬垂修复、反思洞察落库接线、子代理并发恢复（可配置 1-8）、Ctrl-C 协作取消、任务系统通电（cron/事件总线/监控/优先级/重试）**；
-> **v0.7.x — 事件循环重构（回合中输入全程在线 + 排队注入）、表格渲染/任务进度/工具全文显示 TUI、工具批次 Esc 取消（timeout:0 也能解绑）、keep-alive 竞态透明重试**；
-> **v0.7.9+（2026-11-06）— 会话级 raw 终端（回合中按键不再被 tty 驱动回显成 ^[[C 乱码）、终端写跨线程互斥、Bash 进程治理（管道 EOF 兜底 + 会话退出清场进程组）、速率告警改证据驱动（真实 429 才告警）、`agent_loop_limit` 可配 + 到限预填「继续」、cron 任务回合中不再饿死（UI 空闲片排水）、AskUserQuestion 支持 Esc 取消、排队消息全量续发**。
+> v0.4.0 — 自学习闭环 · v0.5.x — 工具自动调用 + MCP + Skill · v0.6.x — 输入系统重写（块渲染/kitty 协议/粘贴折叠）+ 记忆飞轮升级 · v0.6.1 — 稳定性（看护狗/任务系统/Ctrl-C 协作取消）· v0.7.x — 事件循环重构（回合中输入全程在线）、工具批次 Esc 取消、keep-alive 重试、raw 终端治理；
+> **v0.8.0 — 会话恢复（/resume）、提炼压缩梯子（onset 75% + /compact 焦点文本）、错误选择器 + auto_fix、后台任务（run_in_background + /bg + BgTask）、WebFetch、/tasks /last /trace 命令、前缀缓存观测（/stats）、子代理白名单/fork/max_turns、代码索引 FTS5、/config 中文菜单自动保存、TUI 可读性（配色五分类 + Ctrl+O 折叠）**；
+> **v0.9.0 — harness 效率批次：utf8proc 宽度判定、sqlite-vec 记忆语义去重、项目根锚定（子目录共享上级 .ziv）、MCP 启动自动连接、Skill tools 强制门、M6 Hooks（Pre/PostToolUse）、M7 `-p` 非交互一发模式、tree-sitter 编辑后语法校验、退出零 LLM 等待（延迟提取档）**；
+> **v0.9.1 — TUI v2 框架化（IDLE/TURN/MODAL 状态机、常驻输入区、模态退出零残留、统一工具头）、Concise 输出风格（/style）、全能力子代理（write:true、容量上限 10、实时进度行）、请求体 UTF-8 清洗**。
 
 ---
 
@@ -17,9 +16,9 @@
 | 依赖 | 版本 | 说明 |
 |------|------|------|
 | Zig | 0.17.0 | 编译器 |
-| SQLite3 | amalgamation | 已内置于 `deps/sqlite3/` |
+| SQLite3 | amalgamation | 已内置于 `deps/sqlite3/`（含 sqlite-vec） |
 | OpenSSL | 系统 | HTTPS 请求 (macOS 使用 Security.framework) |
-| C 编译器 | clang/gcc | SQLite C 编译 |
+| C 编译器 | clang/gcc | SQLite / sqlite-vec / tree-sitter C 编译 |
 | ripgrep (可选) | 系统 | Grep 工具优先使用 rg，不可用时回退到内置搜索 |
 
 ## 2. 构建与运行
@@ -47,7 +46,7 @@ zig build install
 ```bash
 # ① 改版本号 —— 只改一处：版本单一事实源
 #    （启动 banner、/version、--version、MCP clientInfo、release.sh 全部读它）
-vim src/util/version.zig   # pub const version = "0.5.2";
+vim src/util/version.zig   # pub const version = "0.9.1";
 
 # ② 构建 + 安装包打包（唯一入口，产物见下方表格）
 ./release.sh
@@ -57,12 +56,12 @@ vim src/util/version.zig   # pub const version = "0.5.2";
 scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./install.sh
 ```
 
-也可以显式传版本号 `./release.sh 0.5.2`，但**传参不构成 bump**——必须先改 `src/util/version.zig`，传参与源码不符会被拒绝。
+也可以显式传版本号 `./release.sh 0.9.1`，但**传参不构成 bump**——必须先改 `src/util/version.zig`，传参与源码不符会被拒绝。
 
 **版本防呆**：脚本从 `src/util/version.zig` 抽取版本；显式传参必须与源码一致，否则拒绝构建：
 
 ```
-✗ version mismatch: src/util/version.zig='0.5.0' arg='0.5.1'
+✗ version mismatch: src/util/version.zig='0.9.0' arg='0.9.1'
   bump src/util/version.zig, then rerun (or omit the argument)
 ```
 
@@ -88,43 +87,63 @@ scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./instal
 - 脚本依赖 `rg`（提取版本号）、`shasum`；`lipo`/`pkgbuild` 为 macOS 原生自带；`dpkg-deb` 可选
 - `.pkg` 未签名公证（需 Apple 开发者账号）：首次安装如被 Gatekeeper 拦，右键→打开，或 `xattr -d com.apple.quarantine ziv-*.pkg`
 
-### 2.2 运行打包产物
+### 2.2 命令行用法
 
-产物为单文件可执行，免安装；配置读取与开发版完全一致（`~/.config/ziv/settings.json` + 启动目录 `.ziv/`）。
+产物为单文件可执行，免安装；配置读取与开发版完全一致（`~/.config/ziv/settings.json` + 项目锚点 `.ziv/`，见 2.3）。
 
-命令行参数：`ziv --version`（或 `-V`）打印版本退出；`ziv --help`（或 `-h`）打印用法退出；无参数进入交互 REPL。版本号唯一来源是 `src/util/version.zig`（启动 banner、REPL `/version`、`--version`、release.sh 同读一处）。
+```bash
+ziv                 # 交互式 REPL（默认）
+ziv -p "prompt"     # 非交互一发模式（M7）：跑一个完整 agent 回合，
+                    #   打印结果退出——CI/脚本的门票
+echo "hi" | ziv -p  # prompt 省略或为空 → 读 stdin 到 EOF（上限 4 MiB）
+ziv --version       # 或 -V：打印版本退出
+ziv --help          # 或 -h：打印用法退出
+```
+
+`-p` 模式的输出纪律：**回答走 stdout，诊断走 stderr**——`ziv -p "..." | jq` 永远不会把错误碎语混进管道流。子代理、hooks、权限规则在 `-p` 下同样生效（无头纪律：ask 级操作直接拒绝，不会卡在交互确认上）。非零退出码表示回合失败，脚本可用 `$?` 判定。
+
+版本号唯一来源是 `src/util/version.zig`（启动 banner、REPL `/version`、`--version`、release.sh 同读一处）。
 
 四种安装方式按需选：
 
 ```bash
-cd agent/dist/ziv-v0.6.1
+cd agent/dist/ziv-v0.9.1
 
 # 方式一：离线安装脚本（自动识别平台；默认 /usr/local，无写权限自动回退 ~/.local）
 ./install.sh
 ./install.sh uninstall     # 卸载二进制（配置与 .ziv/ 数据保留，按需手动删）
 
 # 方式二：macOS 安装包（universal，装到 /usr/local/bin/ziv）
-sudo installer -pkg ziv-0.5.1-macos.pkg -target /        # 或双击安装
+sudo installer -pkg ziv-0.9.1-macos.pkg -target /        # 或双击安装
 sudo pkgutil --forget com.ziv.ziv                        # 卸载登记（另需 sudo rm /usr/local/bin/ziv）
 
 # 方式三：Linux .deb（卸载：sudo dpkg -r ziv）
-sudo dpkg -i ziv_0.5.1-1_amd64.deb
+sudo dpkg -i ziv_0.9.1-1_amd64.deb
 
 # 方式四：tar.gz / 裸二进制，解压即用
-tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
+tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 ```
 
 - 传输后确认执行位（`chmod +x`）；Linux musl 版为静态链接，目标机无需安装任何运行时
 - macOS：经浏览器/聊天工具下载的文件带 quarantine 属性会被 Gatekeeper 拦截，执行 `xattr -d com.apple.quarantine ziv-aarch64-macos` 解除；scp/rsync 传输一般不触发
+- **升级二进制后需退出并重启 ziv 会话**（运行中的旧会话仍执行旧二进制）
 
-**运行时数据落点**（在启动目录生成）：
+### 2.3 运行时数据落点（项目根锚定）
 
-| 路径 | 内容 |
+**v0.9.0 起锚定规则**：从启动目录（cwd）**逐级向上**（含自身）找第一个已存在的 `.ziv/` 目录作为存储锚点——在项目子目录里启动 ziv，记忆/会话/索引/检查点与项目根**共享同一份**；子目录自建 `.ziv/` 则就近锚定（本地覆盖）；到根都没有则锚在 cwd（历史行为）。锚点继承了上级目录时启动有提示。符号链接经 realpath 归一，不分裂。
+
+| 路径（相对锚点根） | 内容 |
 |------|------|
-| `.ziv/memory.db` | SQLite 情景记忆库（含 -shm/-wal，跨会话） |
+| `.ziv/memory.db` | SQLite 情景记忆库（含 -shm/-wal，跨会话；v0.9.0 起内嵌 sqlite-vec 做语义去重） |
+| `.ziv/sessions.db` | 会话库（v0.8.0 起，/resume 恢复用，含未正常退出标记） |
+| `.ziv/index.db` | 代码索引（FTS5，v0.8.0 起；/stats 的 Code context 指标来自此） |
 | `.ziv/checkpoints/` | 文件快照（/rewind 回滚用，首次文件编辑时创建） |
+| `.ziv/traces/*.jsonl` | 回合决策链遥测（默认开，`ZIV_TRACE=0` 关闭，`/trace` 直读） |
+| `.ziv/tasks/<id>.log` | 后台任务输出全文（Bash `run_in_background:true` 启动的命令） |
+| `.ziv/skills/<名>/SKILL.md` | 项目级 Skill（覆盖同名全局 Skill） |
+| `.ziv/plan.md` | /plan 计划文件 |
+| `.ziv/input_history` | 输入历史（最近 500 条，跨会话 ↑ 召回） |
 | `.ziv/settings.json` / `settings.local.json` | 项目级配置（优先级高于用户级） |
-| `.ziv/skills/<名>/SKILL.md` | 项目级 Skill（v0.5.1，覆盖同名全局 Skill） |
 | stderr | 结构化运行日志（`./ziv 2>ziv.log` 落盘） |
 
 ## 3. CLI 使用
@@ -133,17 +152,17 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — v0.6.1 | (Self-learning)     ║
-║  π 圆融 · e 增长 · φ 浓缩            ║
+║  Ziv — v0.9.1 | (Self-learning)      ║
+║  π 圆融 · e 增长 · φ 浓缩             ║
 ╚══════════════════════════════════════╝
   π   = 3.1415926536
   e   = 2.7182818285
   φ   = 0.6180339887
 
-  cwd: ~/projects/xxx        ← 当前工作目录（~ 压缩，数据落在其 .ziv/）
+  cwd: ~/projects/xxx        ← 当前工作目录（~ 压缩，数据锚点见 2.3）
 ```
 
-启动自检（编译进二进制的全量单元测试）**成功时静默**，失败才红字提示。
+启动自检（编译进二进制的全量单元测试）**成功时静默**，失败才红字提示。启动时自动执行：记忆注入（跨会话记忆按 e 衰减 × 向量相似度排序注入 system prompt）、MCP 自动连接（配置过的服务器握手 + 工具桥接，`mcp_autostart` 可关）、崩溃会话检测（上次未正常退出时提示 /resume）。
 
 ### 多行输入（Claude Code 风格）
 
@@ -151,13 +170,13 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 | 按键 | 说明 |
 |------|------|
-| Shift+Enter / Ctrl+Enter | **开箱即用**（kitty 键盘终端）：ziv 启动时自动启用 kitty 键盘协议（`CSI >1u`），终端把修饰回车编码为 `CSI 13;2u`/`13;5u`，退出时自动恢复；Esc 编码为 `CSI 27u`、**Ctrl+字母** 编码为 `CSI <码点>;5u`——ziv 均映射回传统控制码，所有 Ctrl 快捷键（双击 Ctrl-C 退出、Ctrl-R 搜索、Ctrl-A/E/B/F/W/U/K/D/Z/J 等）在协议终端下行为不变 |
+| Shift+Enter / Ctrl+Enter | **开箱即用**（kitty 键盘终端）：ziv 启动时自动启用 kitty 键盘协议（`CSI >1u`），终端把修饰回车编码为 `CSI 13;2u`/`13;5u`，退出时自动恢复；Esc 编码为 `CSI 27u`、**Ctrl+字母** 编码为 `CSI <码点>;5u`——ziv 均映射回传统控制码，所有 Ctrl 快捷键在协议终端下行为不变 |
 | `\` + Enter | 行尾反斜杠续行（回车前删掉 `\` 并换行）——所有终端可用 |
 | Ctrl+J | 字面换行符 |
 | Option/Alt + Enter | 发送 `ESC+CR` 的终端（macOS Terminal 等） |
-| **粘贴多行文本** | 自动走 bracketed paste：整段作为**一条**输入（不会被逐行执行），CRLF/CR 归一为 LF；**超过 8 行或 1 KiB 的大段自动折叠**为一枚青色 pill（`[📄 粘贴 · N 行 · B]`），输入框不再被撑爆——pill 前后可继续打字，退格一次整枚删除，回车提交时自动展开，模型收到完整原文（同一提示下最多 4 枚 pill，超出按原文粘贴） |
+| **粘贴多行文本** | 自动走 bracketed paste：整段作为**一条**输入（不会被逐行执行），CRLF/CR 归一为 LF；**超过 8 行或 1 KiB 的大段自动折叠**为一枚青色 pill（`[📄 粘贴 · N 行 · B]`），pill 前后可继续打字，退格一次整枚删除，回车提交时自动展开，模型收到完整原文（同一提示下最多 4 枚 pill，超出按原文粘贴） |
 
-多行缓冲的编辑体验：**整个缓冲区全文可见**——每条逻辑行都渲染出来，超宽行按显示宽度**软折行**（宽字符不跨行拆分）；内容超出 16 行的窗口预算时，显示以光标为中心的窗口，上下边缘灰色 `↟ +N 行` / `↡ +N 行` 提示被折叠的行数。↑/↓ 在多行缓冲的行间移动（首行↑/末行↓仍走历史）；超过 4 KiB 的粘贴自动扩容（上限 1 MiB）。多行输入一律作为消息发给模型（不会被当作斜杠命令）；多行内容仅本会话内 ↑ 召回，不写入跨会话历史文件。
+多行缓冲的编辑体验：**整个缓冲区全文可见**——每条逻辑行都渲染出来，超宽行按显示宽度**软折行**（宽字符不跨行拆分，utf8proc 判宽，歧义宽度字符整类 bug 已根治）；内容超出 16 行的窗口预算时，显示以光标为中心的窗口，上下边缘灰色 `↟ +N 行` / `↡ +N 行` 提示被折叠的行数。↑/↓ 在多行缓冲的行间移动（首行↑/末行↓仍走历史）；超过 4 KiB 的粘贴自动扩容（上限 1 MiB）。多行输入一律作为消息发给模型（不会被当作斜杠命令）；多行内容仅本会话内 ↑ 召回，不写入跨会话历史文件。
 
 **行编辑快捷键（Emacs 系）**：`Ctrl+A`/`Ctrl+E` 行首/行尾 · `Ctrl+B`/`Ctrl+F` 左/右一字符 · `Ctrl+W` 删前一个词 · `Ctrl+U` 删到行首 · `Ctrl+K` 删到行尾 · `Ctrl+H` 退格 · `Ctrl+D` 空行=退出、非空=向后删。
 
@@ -165,11 +184,23 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 **Shift+Enter 一键配置**：`/terminal-setup` 按当前终端（iTerm2 / VS Code / WezTerm / 其他）打印对应配置步骤。
 
+**发送的消息**以粗体品红定格在对话记录中；↑↓ 翻输入历史时回溯行同样品红。历史**跨会话持久化**于 `.ziv/input_history`。**Ctrl-C**：单击清行（防误触），3 秒内连按两次优雅退出；**Ctrl-Z** 挂起照常可用。
+
+### TUI v2：常驻输入区与模态（v0.9.1）
+
+屏幕由三态状态机统一仲裁（`docs/tui-architecture.md`）：
+
+- **IDLE**：region 武装，**输入区常驻屏幕底部**（不再与输出混流），上方一行 hint（当前模式/模型提示）
+- **TURN**：回合进行中，同一输入块保持 pinned 底部、全程可编辑（见下节），meta 行变为状态行（当前工具/子代理进度）
+- **MODAL**：菜单/面板（/config、/resume、/bg、模型选择器…）打开时 region 解除、菜单流内自绘；**退出必经统一收口**——清残留 → 重 arm region → 输入块规范重画。菜单退出后不再有字符残留/输入被吞
+
+工具调用在对话记录中呈现**统一工具头** `⏺ Name(args)`（/run 与 agent 回合同一格式）；工具输出暗色显示，**Ctrl+O 切换详细/简要**（默认详细；简要=长输出只出前 3 行 + `… +N 行` 折叠提示，提示符下与回合中都可切）。完整输出用 `/last` 回看。表格渲染用实心制表线（`┌─┬─┐` 全框），歧义宽度字符（em dash 等）按窄列对齐不劈叉。
+
 ### Esc / Ctrl-C 中断与撤回
 
 - **生成期间按 Esc（或 Ctrl-C）**：立刻中断当前回复流，刚发出的消息**自动回到输入框**（可编辑后回车重发），期间你提前打的字也会接在后面
-- **工具执行期间按 Esc（或 Ctrl-C）**（v0.7.9）：取消当前工具批次——正在跑的 Bash 由其看门狗**击杀整个进程组**（`timeout: 0` 无限命令也能解绑，不再永久卡回合），尚未开始的调用直接短路跳过。取消后回合结束，取消/部分结果已按规范写入历史（对话可无缝继续）。工具未全部结束前状态行显示"正在取消工具批次…"
-- **生成期间 / 工具执行期间直接打字**（v0.7.0 事件循环重构）：输入框**全程在线、全功能**——方向键移动光标、Home/End/Delete、Ctrl 编辑键、↑↓ 翻历史、Shift+Enter 换行，与提示符下完全同一套编辑器（网络与工具在后台线程跑，UI 线程永远在收键盘）。**回车 = 排队**：排队的补充在下一个工具轮注入**本轮**对话，流结束后仍未消费的排队内容自动作为下一轮发送；多行粘贴仍算**一条**消息。**编辑键永远不会取消生成**——只有 Esc / Ctrl-C 会
+- **工具执行期间按 Esc（或 Ctrl-C）**：取消当前工具批次——正在跑的 Bash 由其看门狗**击杀整个进程组**（`timeout: 0` 无限命令也能解绑），尚未开始的调用直接短路跳过。取消后回合结束，取消/部分结果已按规范写入历史
+- **生成期间 / 工具执行期间直接打字**：输入框**全程在线、全功能**——方向键、Home/End/Delete、Ctrl 编辑键、↑↓ 翻历史、Shift+Enter 换行，与提示符下完全同一套编辑器。**回车 = 排队**：排队的补充在下一个工具轮注入**本轮**对话，流结束后仍未消费的排队内容自动作为下一轮发送；多行粘贴仍算**一条**消息。**编辑键永远不会取消生成**——只有 Esc / Ctrl-C 会
 - **提交后 5 秒内在空输入框按 Esc**：同样把刚发的消息撤回到输入框（回答已飞快完成时兜底）
 - 中断是干净的：已收到的部分不会写入对话历史
 
@@ -178,41 +209,87 @@ tar xzf ziv-0.5.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | 命令 | 说明 |
 |------|------|
 | `/help`, `/h` | 显示帮助信息 |
-| `/quit`, `/q`, `/exit` | 退出 Ziv（**大小写不敏感**）；等价退出：空行 Ctrl-D、提示符下 3 秒内**连按两次 Ctrl-C**——三者都走完整收尾（反思 + 记忆提取 + Goodbye） |
-| `/version` | 显示版本号 (v0.6.1) |
-| `/terminal-setup` | Shift+Enter 换行的终端配置指引（kitty 协议终端已自动支持，无需配置；Apple Terminal 等不支持协议的终端按指引映射按键） |
-| `/stats` | 显示当前会话统计（消息数、token 用量、权限模式、当前模型） |
+| `/quit`, `/q`, `/exit` | 退出 Ziv（**大小写不敏感**）；等价退出：空行 Ctrl-D、提示符下 3 秒内**连按两次 Ctrl-C**——三者都走完整收尾（记忆提取 + 反思 + Goodbye；v0.9.0 起默认**零 LLM 等待**档：启发式提取毫秒完成，LLM 深度提取存档后下次启动后台补提，实测退出 ~0.5s） |
+| `/version` | 显示版本号 |
+| `/terminal-setup` | Shift+Enter 换行的终端配置指引（kitty 协议终端已自动支持） |
+| `/stats` | 会话统计：消息数/token 估算/操作数、代码上下文片段数、压缩次数与回收量、**前缀缓存命中率**（cached_tokens，网关支持时显示）、模式/模型/能力档、总 token |
 | `/tools` | 列出所有已注册工具（含安全属性） |
-| `/run <ToolName> <json>` | 直接执行工具 |
+| `/run <ToolName> <json>` | 直接执行工具（走同一权限门 + hooks，不再绕过 Plan 模式） |
+| `/style` | **输出风格开关**（v0.9.1）：`/style` 查看当前风格；`/style concise` 切换简洁模式（结果优先：省略开场白/过程叙述/结尾复述）；`/style default` 切回。写入 settings 并立即重建 system prompt，下一回合生效 |
 | **模型 & 配置** | |
-| `/model`、`/models` | 显示当前模型和可用模型列表 |
-| `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`） |
-| `/mode` | 切换权限模式 |
-| `/config` | 打开交互式配置菜单（API Key、模型、权限等），改动**即时生效**（含权限模式） |
+| `/model`、`/models` | **交互式模型选择器**（方向键 + Enter；q 显示纯文本列表） |
+| `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`，自定义名如 `glm-4.6` 可选后端接入） |
+| `/mode` | 切换权限模式（**已持久化**到 settings，重启不再回落） |
+| `/config` | 打开交互式配置菜单（中文，方向键导航，**改动自动保存**即时生效） |
 | **对话管理** | |
-| `/compact` | LLM 摘要压缩（Claude 式）：摘要替换历史，上下文被浓缩而非丢弃 |
-| **输入行编辑** | **发送的消息以粗体品红定格在对话记录中**（`\x1b[1;35m`，回车提交时重绘着色；超终端宽度的长行回退素色以防错位）；↑↓ 翻输入历史时回溯行同样品红。历史**跨会话持久化**于 `.ziv/input_history`（最近 500 条，重启后 ↑ 照常可翻）；**升级二进制后需退出并重启 ziv 会话**（运行中的旧会话仍执行旧二进制）。**Ctrl-C**：单击清行（防误触，兼顾复制习惯），3 秒内连按两次优雅退出；**Ctrl-Z** 挂起照常可用。注意：LLM/工具执行期间 Ctrl-C 仍是强杀（无清理），等长任务请先用 /quit |
-| `/compact phi` | φ 截断压缩：保留 system + 最近 61.8% 消息，最旧的直接丢弃（无 LLM 调用，自动压缩同此策略） |
-| `/clear` | 清空对话，重新开始（别名: `/reset`, `/new`） |
-| `/context` | 显示当前上下文/token 用量 |
+| `/compact` | LLM 提炼压缩：摘要替换较早历史、**最近消息原样保留**（双侧保护）；可带自由文本引导重点——`/compact 重点保留数据库迁移的决策` |
+| `/compact phi` | φ 截断压缩：保留 system + 最近 61.8% 消息，无 LLM 调用 |
+| `/clear` | 清空对话，重新开始（别名: `/reset`, `/new`；旧会话保留可 /resume 恢复） |
+| `/context` | 上下文/token 用量 + **检测规则现场检查**（规则失败逐条列出并给建议动作，按「可自动/需确认」分级） |
+| `/trace` | **上一回合逐步耗时**（直读 `.ziv/traces/*.jsonl`：流式/工具各阶段时长，超 80 步截断） |
 | `/undo` | 撤销上一轮对话 |
 | `/history` | 显示操作历史记录 |
-| `/rewind` | **Claude 式双重回滚**：恢复文件 + 对话按精确索引截断回该时刻（触发操作的 user 提问保留可重做；`[0]` 回卷全部） |
-| `/plan <目标>` | 计划文件：向 `.ziv/plan.md` 写入目标/步骤模板并**锚定到 system prompt**（勾选 `[x]` 后注入摘要自动同步，独立 150 token 预算）；`/plan` 查看当前计划，`/plan off` 停用并移除锚点 |
+| `/rewind` | **双重回滚**：恢复文件 + 对话按精确索引截断回该时刻（`[0]` 回卷全部） |
+| `/plan <目标>` | 计划文件：向 `.ziv/plan.md` 写入目标/步骤模板并**锚定到 system prompt**（勾选 `[x]` 后注入摘要自动同步）；`/plan` 查看当前计划，`/plan off` 停用 |
+| `/resume [编号]` | **会话恢复**（v0.8.0）：交互选择最近 9 个会话（编号·时间·轮数·首句·未正常退出标记）或直接 `/resume 42`；恢复消息 + 模型 + 权限模式，继续对话即可 |
+| **任务 & 后台** | |
+| `/tasks` | 任务面板：模型用 TaskCreate 建的任务在此查看进度 |
+| `/bg` | **后台任务面板**（v0.8.0）：`run_in_background:true` 启动的命令在此查看状态/耗时/输出预览（30 行帽，全文见 `.ziv/tasks/<id>.log`）与停止（杀整组）；非 TTY 环境降级纯文本列表 |
+| `/last [N]` | **工具输出全文回看**（v0.8.0）：`/last` = 最近一条，`/last 3` = 第 3 近（对话流里的预览刻意截断，这是展开阀；环容量 8 条） |
 | **记忆 & 自学习** | |
 | `/memory` | 查看本会话注入的记忆条数与最近存储的记忆 |
 | `/research <topic>` | 网络自主研究：φ 生成多组查询并发搜索、精选方案并给出 ★ 推荐 |
-| `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链，定位低于 φ 置信度的环节并给建议 |
-| `/knowledge` | 查看知识图谱统计（节点总数与最近节点） |
-| **MCP & Skill (v0.5.1)** | |
-| `/skills` | 列出已安装 Skill（详见下文 v0.5.1 节） |
-| `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见下文 v0.5.1 节） |
+| `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链（live 埋点优先），定位低于 φ 置信度的环节并给建议 |
+| `/knowledge` | 查看知识图谱统计（节点总数、最近节点、π 周期扫描出的孤立节点/断边） |
+| **MCP & Skill** | |
+| `/skills` | 列出已安装 Skill（详见 5.13） |
+| `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见 5.12） |
 
-> **`agent` 并行子代理（非斜杠命令）**：子代理派发是注册给模型的动态工具，**默认开启**（设 `ZIV_AGENT_TOOL=0` 关闭），由 LLM 在对话中自主调用，也可 `/run agent {"tasks":["…","…"]}` 手动触发——直接输入 `/agent` 不会执行任何命令。并发数经 `/config` → 子代理并发（1-8，默认 3，1=串行）或 settings.json `subagent_concurrency` 调整；派发期间 **Ctrl-C 协作取消**未完成的子任务；子代理失败自动重试 1 次（仅快速失败类）；每个 LLM 请求由看护狗保护（默认 180s 空闲——距上一字节无数据才算超时，持续出数据的长流不会被杀，`ZIV_LLM_TIMEOUT_MS` 可调），网关停摆会报错恢复而不是永久挂死（E2E 已锁：tests/agent_e2e.zig）。
+输入框中斜杠命令实时着色：已知命令青色、未知暗灰；打错命令给出 Did-you-mean 提示。
+
+### 非交互一发模式（`ziv -p`）
+
+CI/脚本的门票（v0.9.0 M7）：
+
+```bash
+# 单发提问，答案打印到 stdout
+ziv -p "总结 src/main.zig 的入口逻辑"
+
+# 管道输入
+git diff | ziv -p "审查这个 diff，只报正确性问题"
+
+# 退出码判定
+ziv -p "..." || echo "回合失败"
+```
+
+- 完整 agent 回合（工具调用、压缩、hooks 全部生效），跑完即退
+- 无头纪律：需要人工确认（ask 级）的操作直接拒绝而不是挂死
+- 子代理可用（同 REPL 的 agent 工具语义）
+- stdout 只有回答；诊断/警告全走 stderr
+
+### `agent` 并行子代理
+
+子代理派发是注册给模型的动态工具，**默认开启**（`ZIV_AGENT_TOOL=0` 关闭），由 LLM 在对话中自主调用，也可 `/run agent {...}` 手动触发：
+
+```json
+{
+  "tasks": ["审查 src/llm 的错误处理", "列出未加锁的全局变量"],
+  "tools": ["FileRead", "Grep"],          // 可选：工具白名单（只收窄）
+  "fork": true,                            // 可选：继承最近对话尾部 ~16K tokens
+  "write": true,                           // 可选：全能力模式（默认 false 只读）
+  "max_turns": 10                          // 可选：每个子代理回合上限 1-10
+}
+```
+
+- **容量**：1-10 个子代理并行（`subagent_concurrency` 控制并发 worker，默认 4，clamp 1..10；`/config` 菜单可改）；dispatch 超过 10 条任务**可见化报错**而非静默丢弃
+- **只读默认 / 全能力**：默认只读（研究/验证 fan-out）；`write:true` 经**用户真实权限规则**放行写操作（无头纪律：ask 级仍拒绝），写型 dispatch 恒串行
+- **进度可见**（v0.9.1）：dispatch 期间状态行实时显示各 agent 状态
+- **Ctrl-C 协作取消**未完成的子任务；每个 LLM 请求由看护狗保护（默认 180s 空闲超时，持续出数据的长流不杀，`ZIV_LLM_TIMEOUT_MS` 可调）
+- 子代理不可递归 fan-out（agent 工具对子代理不可见）
 
 ### 权限模式 (Permission Modes)
 
-Ziv 内置 6 种授权执行模式，通过 `/mode` 命令循环切换：
+Ziv 内置 6 种授权执行模式，通过 `/mode` 命令循环切换（选择持久化；无快捷键）：
 
 | 模式 | 提示符 | 说明 |
 |------|--------|------|
@@ -221,12 +298,7 @@ Ziv 内置 6 种授权执行模式，通过 `/mode` 命令循环切换：
 | **Plan** | `ziv[plan]>` | 只读模式，所有写操作被阻止 |
 | **Bypass** | `ziv[bypass]>` | 跳过所有权限检查 |
 | **Don't Ask** | `ziv[dontask]>` | 自动拒绝所有需要确认的操作 |
-| **Auto** | `ziv[auto]>` | 分类器自动决定；ask 级操作交 LLM 分类（provider 可达时，实测 mock 直通），失败降级规则 |
-
-切换流程（Shift+Tab 或 `/mode`）：
-```
-default → accept_edits → plan → bypass → default
-```
+| **Auto** | `ziv[auto]>` | 分类器自动决定；ask 级操作交 LLM 分类，失败降级规则；判定按 (工具+入参) 缓存 |
 
 权限管道 6 步检查：
 1. **Deny rules** — 全局拒绝规则
@@ -236,7 +308,7 @@ default → accept_edits → plan → bypass → default
 5. **Mode behavior** — 当前模式行为
 6. **Allow rules** — 全局允许规则
 
-**bypass 不是免死金牌**：第 2/3/4 步在 bypass 之前执行且不受其豁免——配置了 `ask_rules`、命令/路径涉及保护位置（`.git/`、`/etc/` 等）、或工具自身判定需确认时，bypass 模式下依然会问。这是有意设计（防绕过），不是 bug。
+**bypass 不是免死金牌**：第 2/3/4 步在 bypass 之前执行且不受其豁免——配置了 `ask_rules`、命令/路径涉及保护位置、或工具自身判定需确认时，bypass 模式下依然会问。
 
 ### 工具执行示例
 
@@ -244,34 +316,35 @@ default → accept_edits → plan → bypass → default
 # 执行 shell 命令
 ziv> /run Bash {"command":"ls -la"}
 
+# 后台命令（v0.8.0）：立即返回任务 id，/bg 或 BgTask 查看/停止
+ziv> /run Bash {"command":"npm run watch","run_in_background":true}
+
 # 读取文件
 ziv> /run FileRead {"path":"/tmp/test.txt"}
 
-# 写入文件
+# 写入 / 编辑文件
 ziv> /run FileWrite {"path":"/tmp/hello.txt","content":"Hello, Ziv!"}
+ziv> /run FileEdit {"path":"test.txt","old_string":"hello","new_string":"world","replaceAll":true}
 
-# 文件搜索
-ziv> /run Glob {"pattern":"*.zig"}
-ziv> /run Glob {"pattern":"src/**/*.ts","path":"/project"}
-
-# 内容搜索
-ziv> /run Grep {"pattern":"pub fn","path":"src/"}
+# 文件 / 内容搜索
+ziv> /run Glob {"pattern":"src/**/*.ts"}
 ziv> /run Grep {"pattern":"TODO","maxResults":10}
-
-# 文件编辑
-ziv> /run FileEdit {"path":"test.txt","old_string":"hello","new_string":"world"}
-ziv> /run FileEdit {"path":"test.txt","old_string":"foo","new_string":"bar","replaceAll":true}
 
 # 网络搜索（免 key 用 DuckDuckGo；设 BRAVE_API_KEY 自动切 Brave）
 ziv> /run WebSearch {"query":"zig programming language","maxResults":3}
-# → [1] 标题 / URL / 摘要 …
+# 网页抓取（v0.8.0）：URL → Markdown
+ziv> /run WebFetch {"url":"https://ziglang.org/learn/"}
 
-# 任务管理（会话级任务存储，taskId 为数字）
+# 任务管理（taskId 为数字；TaskGet 给全文详情）
 ziv> /run TaskCreate {"subject":"修复 bug #42","description":"修复登录验证问题"}
-# → Task #1 created
 ziv> /run TaskUpdate {"taskId":"1","status":"in_progress"}   # pending | in_progress | completed
 ziv> /run TaskList {}
-# → Tasks (0/1 completed): #1 ◐ in_progress — 修复 bug #42
+ziv> /run TaskGet {"id":1}
+
+# 后台任务自管理（v0.8.0）：模型侧的 /bg
+ziv> /run BgTask {"action":"status"}
+ziv> /run BgTask {"action":"output","id":1}
+ziv> /run BgTask {"action":"stop","id":1}
 
 # 向用户提问
 ziv> /run AskUserQuestion {"question":"要使用哪个配置？"}
@@ -286,132 +359,88 @@ ziv> /run ToolSearch {"query":"file read"}
 # 查看操作历史
 ziv[edit]> /history
   Operation history (5 operations):
-    [1] Bash - rollback_safe: true
-    [2] FileEdit - rollback_safe: true
-    [3] FileWrite - rollback_safe: false
-    [4] Glob - rollback_safe: false
-    [5] Grep - rollback_safe: false
+    [1] Bash
+    [2] FileEdit
+    ...
 
-# 回滚到检查点
+# 回滚到检查点（文件快照 + 对话截断，双重）
 ziv[edit]> /rewind
-  Rewind: No checkpoints available yet.
 ```
 
 ### 普通对话 (Agent Loop)
 
-输入非 `/` 开头的文本即为对话消息。Ziv 现在是完整的 Agent：
+输入非 `/` 开头的文本即为对话消息：
 
-- **系统提示词已注入当前本地日期时间**（`system_prompt.zig` 构建时嵌入，/clear 时刷新）——问"今天几号/几点"直接回答，**不再花一次 Bash 工具往返**；跨午夜长会话记得 /clear 刷新
-- 推理模型（GLM reasoning_content / Claude thinking）思考期间显示暗色 `(thinking…)` 指示，不再是死寂等待
+- **系统提示词已注入当前本地日期时间**——问"今天几号/几点"直接回答；跨午夜长会话记得 /clear 刷新
+- 推理模型（GLM reasoning_content / Claude thinking）思考期间显示暗色 `(thinking…)` 指示
+- 每次请求携带**系统提示词 + 完整对话历史**；LLM 返回 `tool_use` 时自动执行工具并回传结果，循环直到完成
+- 权限检查集成在工具执行中（`default` 模式下破坏性操作需确认）
+- 上下文压力梯子（v0.8.0 P2.5）：**≤75% 不动**（前缀缓存稳定优先）→ 超限先 **LLM 提炼压缩**（摘要 + 最近轮原文保留，`auto_deep_compact`）→ 仍超才 φ 截断（有损兜底）
+- 回合工具轮上限 `agent_loop_limit`（默认 50，clamp 1..200）；到限不再硬停——预填「继续」一键接续
+- 每轮 FileWrite/FileEdit 上限 15 次（写马拉松回合显式收束）
+- 编辑后自动 tree-sitter 语法校验（py/js/ts/tsx/java/zig，见 5.15）
 
-- 每次请求携带**系统提示词 + 完整对话历史**
-- LLM 返回 `tool_use` 时**自动执行工具**并将结果反馈，循环直到完成
-- 权限检查集成在工具执行中（`default` 模式下破坏性操作需用户确认）
-- Token 使用超过 phi 阈值 (61.8%) 时自动压缩历史
-
-提示符中的 `[N%]` 显示当前上下文使用百分比（类似 Claude HUD）：
-
-```
-ziv (gpt-4o) [0%] > 列出当前目录的 zig 文件
-  [Processing: "列出当前目录的 zig 文件"]
-  [calling tool: Glob]
-  [Executing: Glob]
-  [Result: src/main.zig, src/repl.zig, src/config.zig...]
-  当前目录下有以下 zig 文件：
-  1. src/main.zig — 程序入口
-  2. src/repl.zig — 交互式 REPL
-  ...
-  [tokens: in=256 out=128 | stop: end_turn]
-```
+提示符中的 `[N%]` 显示当前上下文使用百分比。
 
 ### 模型切换
 
-Ziv 支持在会话中随时切换 LLM 模型，无需重启：
+```
+ziv> /model                 # 交互选择器（方向键+Enter；q 纯文本列表）
+ziv> /model claude-sonnet-4-6
+  Switched to claude-sonnet-4-6 (Claude)
+ziv> /model glm-4.6         # 识别不了的自定义名 + 已配网关 → 询问走哪个后端
+```
+
+模型名自动识别后端：`claude-*` → Anthropic，`gpt-*`/`o1-*`/`o3-*` → OpenAI，其他 → Ollama。**`default_backend` 显式覆盖**：settings.json 设 `"default_backend": "openai"` 后，任意自定义模型名（glm/deepseek 等）都路由到 OpenAI 兼容网关——名字检测不再挡路。
 
 ### 交互式配置 (/config)
 
-通过 `/config` 命令打开交互式配置菜单：
+`/config` 打开中文交互菜单（方向键导航，**改动自动保存并即时生效**，Esc 逐层退出零副作用）：
 
 ```
-ziv> /config
-
-=== Ziv Configuration ===
-  1. API Keys
-  2. Default model       : gpt-4o
-  3. Max tokens          : 4096
-  4. Permission mode     : Default
-  5. Checkpointing       : on
-  6. System prompt       : (default)
-  7. Save & Exit
-  8. Exit without saving
-
-  Select [1-8]:
+=== Ziv 配置 ===
+  API Keys
+  默认模型: gpt-4o
+  最大 tokens: 16384
+  记忆注入预算: 1200 tokens
+  子代理并发: 4
+  权限模式: Default
+  检查点: 开
+  系统提示词: (默认)
+  自动错误修复: 开（429/超时退避重试）
+  回合工具轮上限: 50
+  上下文提炼压缩: 开（LLM 摘要优先，截断兜底）
+  退出
 ```
 
-选择 `1` 进入 API Keys 子菜单，选择 `7` 保存到 `~/.config/ziv/settings.json`。
+保存目标 `~/.config/ziv/settings.json`。自动错误修复关掉后，429/超时/溢出等错误直接进**错误选择器**（重试/换模型/压缩/放弃，人工裁决）。
 
 ### 对话管理命令
 
 ```bash
-# 查看上下文用量
+# 查看上下文用量 + 检测规则现场
 ziv (gpt-4o) [12%] > /context
   Context: 2450 / 128000 tokens (1.9%)
-  Messages: 1 system, 5 user, 4 assistant, 2 tool
-  Compaction threshold: 79104 tokens (61.8%)
-  Session total: 1234 in / 567 out tokens
+  ...
+  检测规则: 全部通过
 
-# LLM 摘要压缩（Claude 式，默认）
-ziv (gpt-4o) [45%] > /compact
+# LLM 提炼压缩（默认；带焦点文本引导摘要）
+ziv (gpt-4o) [78%] > /compact
   Compacting: summarizing 14 messages (~52000 tokens)…
-  Compacted: 15 → 2 messages (~52000 → ~2400 tokens | summary call 51000 in / 380 out)
+  Compacted: 15 → 2 messages (~52000 → ~2400 tokens)
 # 失败时历史保持原样并提示改用截断：
 #   Summary model unavailable (error.MissingApiKey).
 #   History untouched — try /compact phi for plain truncation.
 
-# φ 截断压缩（原始算法，无 LLM 调用）
-ziv (gpt-4o) [45%] > /compact phi
-  Compacted (phi): 15 → 10 messages (~3200 tokens)
+# φ 截断压缩（无 LLM 调用）
+ziv (gpt-4o) [78%] > /compact phi
 
-# 清空对话
-ziv (gpt-4o) [45%] > /clear
-  Conversation cleared. Starting fresh.
-
-# 撤销上一轮
-ziv (gpt-4o) [12%] > /undo
-  Undone: removed 2 message(s). History now has 8 messages.
-```
-
-```bash
-# 查看当前模型和可用模型列表
-ziv (gpt-4o)> /model
-
-  Current model: gpt-4o (OpenAI)
-
-  Available models:
-   *  gpt-4o                OpenAI     GPT-4o — OpenAI flagship
-      gpt-4o-mini           OpenAI     GPT-4o Mini — fast & cheap
-      o3-mini               OpenAI     O3 Mini — reasoning
-      claude-opus-4-6       Claude     Claude Opus 4.6 — most capable
-      claude-sonnet-4-6     Claude     Claude Sonnet 4.6 — balanced
-      claude-haiku-4-5      Claude     Claude Haiku 4.5 — fast
-      llama3.2              Ollama     Llama 3.2 — local (Ollama)
-      qwen2.5               Ollama     Qwen 2.5 — local (Ollama)
-      deepseek-r1           Ollama     DeepSeek R1 — local (Ollama)
-
-  * = current model
-  Usage: /model <name>  (e.g. /model claude-sonnet-4-6)
-
-# 切换模型
-ziv (gpt-4o)> /model claude-sonnet-4-6
-  Switched to claude-sonnet-4-6 (Claude)
-ziv (claude-sonnet-4-6)> 你好
-```
-
-也支持自定义模型名（自动路由到对应后端）：
-```bash
-ziv> /model claude-opus-4-6     # → Claude 后端
-ziv> /model gpt-4-1106-preview  # → OpenAI 后端
-ziv> /model mistral             # → Ollama 后端（本地模型）
+# 恢复上一个会话
+ziv> /resume
+  恢复会话（当前对话将被替换；q 取消）:
+    #41 · 2026-11-10 14:02 · 12 轮 · 修复登录验证问题
+    #40 · 2026-11-09 18:44 · 3 轮 · (无消息) · 未正常退出
+ziv> 已恢复会话 #41：24 条消息（~8100 tokens · 模型 gpt-4o · 模式 default）。继续对话即可。
 ```
 
 ---
@@ -419,10 +448,17 @@ ziv> /model mistral             # → Ollama 后端（本地模型）
 ## 4. 架构总览
 
 ```
-Ziv Agent v0.5.0
+Ziv Agent v0.9.1
 ├── math/           数学常数核心 (pi, e, phi)
-├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 消息压缩
-├── tools/          comptime 工具系统 (12 tools) + 权限 + 编排
+├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 流式 + 消息压缩
+├── tools/          comptime 工具系统 (15 内置工具 + agent 动态工具) + 权限 + 编排
+├── agent/          子代理执行器 (subagent) + 非交互一发 (oneshot)
+├── turn/           回合子系统 (流式/工具/历史压缩/ask)
+├── commands/       斜杠命令分发 (dispatch/config_menu/history_cmds)
+├── session/        会话存储/模型切换/记忆操作/输入历史
+├── hooks/          M6 Pre/PostToolUse 外部钩子
+├── mcp/            MCP 客户端 (stdio + Streamable HTTP)
+├── skills/         SKILL.md 加载器 (tools 门)
 ├── task/           异步任务系统 (线程池, MPSC队列, 事件总线, 定时任务)
 ├── storage/        持久化层 (SQLite, 向量存储)
 ├── memory/         三层记忆 (工作记忆, 情景记忆, 反思, 经验提取)
@@ -430,9 +466,10 @@ Ziv Agent v0.5.0
 ├── runtime/        运行时检测 + 自诊断 + 错误处理
 ├── research/       自主优化研究引擎
 ├── checkpoint/     操作记录 + 文件快照 + 回滚引擎
-├── util/           工具库 (30+ 文件: cancel, hash, uuid, format, path...)
+├── util/           工具库 (40+ 文件: lineinput, menu, zivroot, treesitter, uwidth, turn_clock...)
 ├── config.zig      五层配置层级
-└── repl.zig        交互式 REPL
+├── repl.zig        交互式 REPL + TUI v2 状态机
+└── system_prompt.zig 系统提示词（含输出风格/工具清单动态生成）
 ```
 
 ---
@@ -447,147 +484,95 @@ Ziv Agent v0.5.0
 | **pi** | 事件历史 | EventBus 用 pi ring buffer 存储最近 1024 个事件 |
 | **e** | sigmoid/logistic | 资源压力评分、并发上限、重试退避 |
 | **e** | 知识衰减 | `relevance(t) = initial * e^(-lambda * t)` |
+| **e** | 记忆注入排序 | 0.5×e 衰减 + 0.5×与最新记忆的向量余弦混合 |
 | **phi** | 知识浓缩 | 每次反思将知识压缩到 61.8% |
 | **phi** | Fibonacci 哈希 | 最均匀的哈希分布，用于记忆索引 |
 | **phi** | 上下文溢出检测 | 使用率超过 61.8% 时预警 |
 | **phi** | 任务失败率检测 | 失败率超过 38.2% (1-phi) 时告警 |
-| **phi** | 消息压缩触发 | token 使用超过 max_tokens 的 61.8% 时触发压缩 |
 
 ### 5.2 多 LLM 后端
 
 | 后端 | 配置 | 状态 |
 |------|------|------|
 | **Claude** (Anthropic) | 需要 API Key | 完整实现 (claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5) |
-| **OpenAI** | 需要 API Key | 完整实现 (GPT-4o 等) |
+| **OpenAI** | 需要 API Key | 完整实现 (GPT-4o 等)；`openai_base_url` 指向兼容网关可接 glm/deepseek 等 |
 | **Ollama** (本地) | 需要 Ollama 运行 | 完整实现 (llama3.2 等) |
 
-所有后端通过 comptime vtable 模式统一接口：
-- `complete()` — 同步请求
-- `stream()` — SSE 流式响应（**REPL 默认走此路径，回复逐块实时显示**）
-- `countTokens()` — token 估算
-- `supportsToolUse()` / `supportsStreaming()`
+统一接口（comptime vtable）：`complete()` 同步 · `stream()` SSE 流式（REPL 默认）· `countTokens()` 估算。模型名自动路由（`claude-*`/`gpt-*`/其他），`default_backend` 显式覆盖。
 
-运行时通过 `/model` 命令自由切换：
+**请求体 UTF-8 清洗**（v0.9.1）：非法 UTF-8 字节在出网前被清洗净化——网关对脏字节的 400 InvalidRequest 不再发生。
 
-```bash
-# 查看当前模型和可用模型
-ziv> /model
+### 5.3 工具系统（15 内置 + 动态）
 
-# 切换到 Claude
-ziv> /model claude-sonnet-4-6
-  Switched to claude-sonnet-4-6 (Claude)
-
-# 切换到 OpenAI
-ziv> /model gpt-4o
-  Switched to gpt-4o (OpenAI)
-
-# 切换到本地 Ollama
-ziv> /model llama3.2
-  Switched to llama3.2 (Ollama)
-```
-
-模型名会自动识别后端：`claude-*` → Anthropic, `gpt-*`/`o1-*`/`o3-*` → OpenAI, 其他 → Ollama。
-
-### 5.3 工具系统 (12 Tools)
-
-comptime 泛型注册，零运行时开销。每个工具支持：
-- **并发安全检查** (`is_concurrency_safe_fn`) — 输入级别判断
-- **破坏性检测** (`is_destructive_fn`) — 输入级别判断
-- **输入验证** (`validate_input_fn`)
-- **权限检查** (`check_permissions_fn`)
-- **别名匹配** (`matchesName`) — 支持多名称查找
-
-#### 工具一览
+comptime 泛型注册，零运行时开销。每个工具支持并发安全检查（输入级）、破坏性检测（输入级）、输入验证、权限检查、别名匹配。
 
 | 工具 | 别名 | 类型 | 并发安全 | 说明 |
 |------|------|------|----------|------|
-| **Bash** | Shell, sh | 读写/破坏性 | 不安全 | 执行 shell 命令，自动检测破坏性命令。参数：`timeout`（秒，默认 30、上限 300、0=不限）、`working_directory`（工作目录）；stdout/stderr 各限 256 KiB |
-| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页）；重复读取未变更文件走 FileStateCache（mtime+size 校验命中，跳过磁盘 IO 与格式化） |
-| **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配（`*.zig`, `src/**/*.ts`）；构建/依赖目录（.git/target/node_modules/.zig-cache/zig-out/dist 等 14 种）整树剪枝不进入，`maxDepth` 默认 10，结果上限 2000；目录符号链接不跟随 |
-| **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置）；后端一次判定（rg→grep 降级结果进程内缓存，不再每次 spawn 试错），30s 超时、1 MiB 捕获上限、解析 500 条截断 |
+| **Bash** | Shell, sh | 读写/破坏性 | 不安全 | 执行 shell 命令。`timeout`（秒，默认 30、上限 300、0=不限）；`run_in_background`（v0.8.0：脱离执行立即返回任务 id，watch/dev-server/长构建用，输出落 `.ziv/tasks/<id>.log`，`/bg` 或 BgTask 管理）；`working_directory`；stdout/stderr 各限 256 KiB |
+| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页）；重复读取未变更文件走 FileStateCache |
 | **FileWrite** | Write | 读写 | 不安全 | 写入文件 |
 | **FileEdit** | Edit, sed | 读写 | 不安全 | 字符串查找替换编辑 |
-| **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave） |
-| **TaskCreate** | — | 读写 | 不安全 | 创建任务 |
+| **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配；构建/依赖目录整树剪枝，`maxDepth` 默认 10，结果上限 2000 |
+| **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置；后端一次判定，进程内缓存）；30s 超时、500 条截断 |
+| **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave；SearXNG 可配） |
+| **WebFetch** | Fetch | 只读 | 安全 | **v0.8.0**：抓取 URL 转 Markdown（搜索的下一步）；结果上限 40K |
+| **TaskCreate** | — | 读写 | 不安全 | 创建任务（`priority` 1-5，默认 3） |
 | **TaskList** | — | 只读 | 安全 | 列出所有任务 |
 | **TaskUpdate** | — | 读写 | 不安全 | 更新任务状态 |
-| **AskUserQuestion** | — | 只读 | 不安全 | 向用户提问（阻塞式） |
+| **TaskGet** | — | 只读 | 安全 | **v0.8.0**：按 id 查单条全文详情（列表截断描述，Get 给全文） |
+| **BgTask** | — | 只读* | 安全 | **v0.8.0**：后台任务自管理——`action`: status（全部或按 `id` 单条）/ output（输出尾部）/ stop（杀进程组，default 模式走审批） |
+| **AskUserQuestion** | — | 只读 | 不安全 | 向用户提问（阻塞式，支持 Esc 取消） |
 | **ToolSearch** | — | 只读 | 安全 | 按关键词搜索可用工具 |
+| **agent**（动态） | — | 读写* | — | 并行子代理派发（默认开启，详见 3 节 agent 小节） |
+| **mcp__\<服务器\>__\<工具\>**（动态） | — | 视工具 | — | MCP 桥接工具（连接后自动注册） |
 
-扩展方式：在 `registry.zig` 的 `default_tools` 数组中添加新的 `ToolDefinition`。
+\* BgTask 的 stop 按操作分级走审批；agent 默认只读、`write:true` 全能力。
 
-### 5.4 工具编排 (Orchestration)
+系统提示词中的**工具清单由注册表动态生成**（v0.9.1 根治漂移）——MCP 桥接/agent 工具上下线，模型看到的清单自动同步，不再与实际注册集脱节。
 
-`orchestration.zig` 实现智能工具调用分组：
-- `partitionToolCalls()` — 将并发安全的调用分组在一起
-- **安全工具真并行执行**（e 上限线程池：FileRead、Glob、Grep 等；结果按原始调用顺序回收；池故障自动降级串行）
-- **auto 模式分类器缓存**：LLM 安全判定按 (工具+入参) 进程内缓存——重复 ask 级操作不再每次等待 LLM 分类（实测第二次判定零 LLM 请求）
-- **安全工具并行执行**：每调用一线程、按 e 函数分波限流（波宽 = effectiveConcurrency(0, hw)），spawn 失败单调用降级串行——替代旧"每批新建 hw/2 线程池 + nanosleep 轮询"模式
+### 5.4 工具编排与 Hooks
+
+`orchestration.zig` 智能分组：
+- `partitionToolCalls()` — 并发安全调用分组；**安全工具真并行**（e 上限线程池，结果按原始调用顺序回收，池故障自动降级串行）
 - **不安全工具串行执行**（Bash、FileWrite、FileEdit 等）
+- **auto 模式分类器缓存**：LLM 安全判定按 (工具+入参) 进程内缓存，重复 ask 级操作零额外请求
 
+**M6 Hooks**（v0.9.0）——工具调用前后的外部脚本钩子，三个执行口全走（REPL 回合 / 子代理 / /run 直达），顺序恒定：**权限判定 → PreToolUse → 执行 → PostToolUse**：
+
+```json
+// settings.json
+"hooks": {
+  "PreToolUse":  [{"matcher": "Bash",     "command": "./guard.sh"}],
+  "PostToolUse": [{"matcher": "FileEdit", "command": "make lint"}]
+}
 ```
-输入: [FileRead, FileRead, FileWrite, FileRead]
-分组: [safe: FileRead, FileRead] → [unsafe: FileWrite] → [safe: FileRead]
-```
+
+- `matcher` 精确匹配工具名；空/省略 = 全部工具
+- `command` 经 `/bin/sh -c` 执行，cwd = 当前目录，10s 超时强杀
+- stdin 喂 JSON：`{"tool": 名, "input": 原参数}`（Post 另带 `"output"`；载荷超 32K 截尾标记）
+- **PreToolUse 退出码**：0 = 放行；**2 = 阻断**（stderr 摘要回给模型，可改道重试）；其他非零 = 非阻断记日志
+- PostToolUse 退出码忽略（钩子不许破坏回合）
 
 ### 5.5 权限系统
 
-#### 授权模式
+6 种权限模式 + 6 步权限管道（见 3 节）。规则解析器支持 `"Bash(git status)"` 风格：
 
-6 种权限模式，通过 `/mode` 命令或 Shift+Tab 循环切换：
+- `"Bash"` — 匹配所有 Bash 调用；`"Bash(git status)"` — glob 匹配命令；`"Bash(*)"` — 通配
+- **链式命令分段匹配**：`cd x && git push --force` 会被 deny `git push*` 命中（任一段命中即拒绝）；allow 则要求**每一段**都被覆盖
+- auto 模式分类器：安全白名单（FileRead/Glob/Grep/ToolSearch/TaskList）始终允许，只读自动允许，破坏性自动阻止，灰区交 LLM 分类（缓存）
+- 拒绝追踪器：连续自动拒绝超过阈值自动回退提示模式，防死循环
 
-| 模式 | 行为 |
-|------|------|
-| **default** | 危险操作需要确认 |
-| **accept_edits** | 自动接受非破坏性文件操作 |
-| **plan** | 只读，阻止所有写操作 |
-| **bypass** | 跳过所有权限检查 |
-| **dont_ask** | 自动拒绝需要确认的操作 |
-| **auto** | 分类器自动决定 |
+### 5.6 消息压缩（提炼梯子）
 
-#### 权限管道
+上下文压力按**梯子**响应（v0.8.0 对齐 Claude Code 水位）：
 
-```
-工具调用请求
-  │
-  ├── Step 1: Deny rules — 匹配拒绝规则 → 直接拒绝
-  ├── Step 2: Ask rules — 匹配确认规则 → 提示用户
-  ├── Step 3: Tool check — 工具自身权限函数
-  ├── Step 4: Safety paths — 保护路径检测 (.git/, /etc/, etc.)
-  ├── Step 5: Mode behavior — 按当前模式决定
-  └── Step 6: Allow rules — 匹配允许规则 → 放行
-```
-
-#### 规则解析器 (rule_parser.zig)
-
-支持 `"Bash(git status)"` 风格的规则语法：
-- `"Bash"` — 匹配所有 Bash 调用
-- `"Bash(git status)"` — 匹配包含 "git status" 的 Bash 调用
-- `"Bash(*)"` — 通配符匹配
-
-#### 自动分类器 (classifier.zig)
-
-auto 模式下的工具分类：
-- 安全工具白名单（FileRead, Glob, Grep, ToolSearch, TaskList）始终允许
-- 只读工具自动允许
-- 破坏性操作自动阻止
-- 预留 LLM 集成接口
-
-#### 拒绝追踪器 (denial_tracker.zig)
-
-防止自动拒绝循环：连续拒绝超过阈值时自动回退到提示模式。
-
-### 5.6 消息压缩 (Compaction)
-
-`llm/compaction.zig` 提供两种已实现的压缩策略（φ 阈值数学为两者共用）：
-
-| 策略 | 触发 | 说明 |
+| 层级 | 触发 | 行为 |
 |------|------|------|
-| **summarize** | `/compact` 手动 | LLM 将对话总结为 8 节结构化摘要（`SUMMARY_INSTRUCTION`），摘要以单条 user 消息**替换** system 之后的历史——上下文被浓缩而非丢弃；任何失败（无 key/网络/空摘要）历史保持原样并提示回退 |
-| **phi_condense** | 自动（超 61.8% 阈值）+ `/compact phi` 手动 | 保留 system prompt + 最近 61.8% 消息，最旧的直接丢弃；无 LLM 调用，agent loop 每轮检查 |
-| **hybrid** | 预留 | 未实现（枚举占位） |
+| **不动** | ≤75%（COMPACT_ONSET） | 前缀缓存稳定优先——不折腾 |
+| **提炼压缩** | >75%（自动，`auto_deep_compact`）或 `/compact` 手动 | LLM 将较早历史摘要为结构化摘要 + **最近轮原文保留**（双侧折叠）；可带焦点文本引导重点；token 回收量可见（/stats） |
+| **φ 截断** | 提炼后仍超 / `auto_deep_compact` 关 / `/compact phi` | 保留 system + 最近 61.8% 消息，最旧丢弃（有损兜底） |
 
-触发条件：当前 token 使用量 > max_tokens x phi (61.8%)
+任何压缩失败历史保持原样（可观测、可回退）。压缩触发越少，网关前缀缓存越稳——/stats 的 Cache 行是直接指标。
 
 ### 5.7 异步任务系统
 
@@ -596,85 +581,66 @@ auto 模式下的工具分类：
 | **ThreadPool** | e 控制并发上限的工作线程池 |
 | **BoundedMPSC** | 无锁多生产者单消费者队列 (容量 256) |
 | **EventBus** | 事件发布/订阅，pi ring buffer 存储 |
-| **CronScheduler** | 定时任务，pi/phi/e 周期 |
+| **CronScheduler** | 定时任务；`cron.drainDue()` 在提示符循环顶 + 回合 UI 空闲片排水（马拉松回合不饿死） |
 
-> ✅ 已接线（2026-11-06 更正）：CronScheduler/EventBus/monitor 随 REPL 启动——`cron.drainDue()` 在提示符循环顶执行，且在回合的 UI 空闲片（流式/工具相位每 100ms poll 的安静片）也排水，马拉松回合不再饿死健康检查与记忆清扫（monitor 告警经 RegionWriter 打印，回合中落在活动区域上方不糊输入区）。
-> 反思触发仍为每轮查询后内联评估（每 10 轮或 π×10min，会话启动即武装）。
-
-内置定时任务间隔（设计值）：
-- 反思任务：pi x 10 min ≈ 31.4 min
-- 知识更新：phi x 60 min ≈ 37.1 min
-- 记忆衰减：e x 30 min ≈ 81.5 min
-- 健康检查：60 秒
-- 资源监控：30 秒
+内置定时任务间隔（设计值）：反思 pi×10min ≈ 31.4min · 知识更新 phi×60min ≈ 37.1min · 记忆衰减 e×30min ≈ 81.5min · 健康检查 60s · 资源监控 30s。反思触发每轮查询后内联评估（每 10 轮或 π×10min）。
 
 ### 5.8 三层记忆系统
 
-| 层 | 存储 | 用途 | 状态 |
-|----|------|------|------|
-| **工作记忆** | 内存 LRU | 当前会话上下文 | ✅ 已接线（store 持有防御拷贝） |
-| **情景记忆** | SQLite (`.ziv/memory.db`) | 跨会话记忆 | ✅ 已接线（全链路见下） |
-| **语义记忆** | 知识图谱 | 提取的结构化知识 | ✅ 已接线（提取建节点 + co_extracted 边，含去重） |
+| 层 | 存储 | 用途 |
+|----|------|------|
+| **工作记忆** | 内存 LRU | 当前会话上下文 |
+| **情景记忆** | SQLite (`.ziv/memory.db`) | 跨会话记忆；v0.9.0 内嵌 **sqlite-vec** 做语义 KNN——新记忆入库前与近邻做向量相似度判定，语义重复自动合并（不再同义反复堆库） |
+| **语义记忆** | 知识图谱 | 提取的结构化知识（节点 + co_extracted 边，含去重） |
 
-**情景记忆完整闭环（v0.3.x 已实现）**：
-- **提取**：`/quit`、`/clear` 时启发式扫描 user/assistant 消息（中英关键词：prefer/always/never/不要/总是/喜欢/解决/修复…），φ 浓缩只保重要性前 61.8% 后入库
-- **幂等**：id = 内容双 Wyhash，`INSERT OR REPLACE` —— 同一句话重复提及自动去重并刷新时间戳
-- **注入**：下次启动取最近 20 条，按 **0.5×e 衰减 + 0.5×与最新记忆的向量余弦**（64 维 hash 词袋嵌入）混合排序，token 预算 800 截断后拼入 system prompt（stderr 日志可见 `[INF] memory: injected N entries`，`./ziv 2>ziv.log` 落盘）
-- **查看**：`/memory` 命令
+**情景记忆闭环**：
+- **提取**：`/quit`、`/clear` 时启发式扫描（中英关键词），φ 浓缩后入库；**v0.9.0 延迟档**：默认退出零 LLM 等待（启发式毫秒完成 + 转录存档，LLM 深度提取下次启动后台补提）；`ZIV_EXIT_EXTRACT_MS>0` 可回到同步等待档（有死线帽）
+- **幂等**：id = 内容双 Wyhash，`INSERT OR REPLACE`；语义级另走 vec0 KNN
+- **注入**：启动取最近条目，按 0.5×e 衰减 + 0.5×向量余弦混合排序，预算 `memory_budget_tokens`（默认 1200，/config 可调 200-8000）截断后拼入 system prompt
+- **查看**：`/memory`
 
-**反思引擎（已接线）**：会话内维护查询窗口（≤20 条 + 工具/错误计数），每 10 轮或 π×10min 触发反思；`/quit` 时强制收尾。insights 以 `.feedback` 记忆入库，下会话自动注入——改进经验跨会话生效。
+**反思引擎**：会话内维护查询窗口，每 10 轮或 π×10min 触发；**经验回放**（π-均匀采样全史）+ **洞察质量门**（启发式洞察入库前经 LLM 校验，误诊零入库——罐头洞察不污染库）；`/quit` 强制收尾。insights 以 `.feedback` 记忆入库，跨会话生效。退出反思带实测数字（失败率/窗口/跨度）。
 
-### 5.9 运行时检测 (7 条规则)
+### 5.9 运行时检测
 
-| 规则 | 阈值 | 说明 |
-|------|------|------|
-| 内存使用 | sigmoid(2*(ratio-0.7)) > 0.8 | e 控制压力 |
-| API 限速 | 调用率 > 80% | 速率保护 |
-| 存储完整性 | SQLite integrity_check | 数据安全 |
-| 上下文溢出 | token 使用 > phi (61.8%) | phi 预警 |
-| 任务健康 | 失败率 > 1-phi (38.2%) | phi 阈值 |
-| 网络连通 | 超时 > 3 次 | 连接稳定性 |
-| 并发压力 | 使用率 > 90% | 资源饱和 |
-
-> v0.6.1 误报治理（P5）：上下文规则改按**当前模型真实上下文窗口**（`contextEstimate`）判定——此前误用 max_tokens（响应上限 4096），导致每个活跃会话都误报 "context near limit"；同签名告警**去重打印**（事件仍全量入 π 环，签名变化会再次打印）；每轮 FileWrite/FileEdit 上限 15 次，写马拉松回合显式收束而不是跑满 50 轮迭代刷爆上下文。设计中的「决策质量」规则因与上下文溢出同指标且阈值永不可达，已于 2026-10-29 审计删除；「知识冲突」规则缺冲突数据源，登记未实现。
+7 条规则（内存 sigmoid 压力、API 限速、SQLite 完整性、上下文溢出 φ 阈值、任务健康 1-φ、网络连通、并发饱和）。上下文规则按**当前模型真实上下文窗口**判定；同签名告警去重打印。`/context` 现场跑全部规则并给分级建议（可自动/需确认）；`/diagnose` 用 live 决策链（agent loop 7 阶段真实埋点）定位弱环节。
 
 ### 5.10 自诊断引擎
 
-`/diagnose <你的质疑>` 触发（live 决策链版）：
-1. 用**真实会话统计**构造决策链：记忆注入置信（注入 0 条 → 0.3）/ 工具错误率置信 / 生成置信
-2. SelfDiagnostic 找 confidence < phi 的弱步骤
-3. 输出 root cause + 改进建议，并与记忆系统真实联动（例：记忆库为空时会诊断出"检索环节薄弱"）
-
-> 决策链已升级为 agent loop 内 7 阶段真实埋点（检索/上下文组装/工具选择/执行/生成/后处理/反思触发）；/diagnose 优先使用 live trace，无查询时才用静态兜底。
+`/diagnose <你的质疑>`：live trace 优先（无查询时静态兜底），SelfDiagnostic 找 confidence < phi 的弱步骤，输出 root cause + 改进建议；喂实测指标（LLM 调用/429/工具错误/压缩次数/缓存命中/上下文水位）。
 
 ### 5.11 自主优化研究
 
-`/research <topic>` 触发（已真实联网）：
-1. φ 生成 3 组查询（原词 / 意图修饰词 / 技术角度）
-2. 并发搜索（BRAVE_API_KEY 有则 Brave，否则 DuckDuckGo 免 key；~30s 预算）
-3. φ 浓缩筛选方案，兼容性 ×0.4 + 相关性 ×0.3 + 复杂度 ×0.3 加权评分
-4. 输出方案列表（★ 推荐 + 理由）
+`/research <topic>`：φ 生成 3 组查询并发搜索（Brave/DuckDuckGo）→ φ 浓缩筛选 → 兼容性×0.4 + 相关性×0.3 + 复杂度×0.3 加权 → ★ 推荐 + 理由。
 
 ### 5.12 操作记录与回滚 (Checkpoint)
 
-`src/checkpoint/` 提供完整的操作审计和文件回滚：
+- FileWrite/FileEdit 前 `trackEdit()` 自动备份原始文件到 `.ziv/checkpoints/`（SHA256 校验；新文件记"新文件"，回滚时删除）
+- `/history` 查操作记录 → `/rewind` 列回滚点 → 预览影响 → 确认恢复（文件 + 对话双重回滚）
 
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| **FileHistory** | file_history.zig | SHA256 文件快照备份 + 恢复（trackEdit + restoreSnapshot） |
-| **OperationLog** | op_log.zig | 每次工具调用的操作记录引擎 |
-| **RollbackEngine** | rollback.zig | 完整回滚执行器（listRollbackPoints + previewRollback + rollbackTo） |
+### 5.13 MCP（stdio + Streamable HTTP 双传输）
 
-**工作流程：**
+```
+/mcp install playwright        # 内置 registry：playwright/filesystem/memory/fetch/sequential-thinking
+/mcp add <名> <command...>     # 自定义 stdio 服务器
+/mcp add <名> http(s)://…      # HTTP 服务器（自动识别）
+/mcp connect <名> / disconnect # 握手 + 工具桥接为 mcp__<名>__<工具>（走同一权限门，默认 ask）
+/mcp list / remove
+```
 
-1. 执行 FileWrite/FileEdit 前，`trackEdit()` 自动备份原始文件到 `.ziv/checkpoints/`
-2. 如果文件不存在（新建），记录为"新文件"（rollback 时会删除）
-3. `/history` 查看所有操作记录
-4. `/rewind` 列出回滚点 → 预览影响 → 确认后恢复文件
+- 配置持久化于 `~/.config/ziv/mcp.json`；env 全量继承
+- **启动自动连接**（v0.9.0）：配置过的服务器冷启动即握手桥接（短预算 3s，`ZIV_MCP_AUTOSTART_TIMEOUT_MS` 可调；`mcp_autostart: false` 或 `ZIV_MCP_AUTOSTART=0` 关闭）——不用再手敲 `/mcp connect`
+- **Playwright 接入**（真机已验收）：终端起服务 `npx -y @playwright/mcp@latest --port 18931`，`/mcp add playwright http://localhost:18931/mcp`（注意 `localhost`——服务默认监听 IPv6）；已知 npx 由 ziv 原生拉起的 stdio 形态握手不兼容，用 HTTP 方式即可
 
-**备份内容：** SHA256 哈希校验 + 文件内容备份，内容未变化时跳过备份。
+### 5.14 Skill（Claude SKILL.md 兼容）
 
-**回滚过程：** 反向遍历操作日志（最新优先），从每个快照恢复文件。
+- 目录：`~/.config/ziv/skills/<名>/SKILL.md`（全局）+ `.ziv/skills/<名>/`（项目级，同名覆盖）
+- frontmatter：name / description / when_to_use / **tools**（v0.9.0 起为**强制门**：声明后本回合只许清单内工具；空声明 = 不设限，老 skill 兼容）
+- 调用：`/<技能名> [任务参数]`——触发时先打印预览（步数 + 声明工具），正文注入对话，`$ARGUMENTS` 占位替换；`/skills` 列出
+
+### 5.15 tree-sitter 编辑后语法校验（v0.9.0）
+
+FileEdit/FileWrite 之后自动对产物做语法校验（语言集：**Python / JavaScript / TypeScript / TSX / Java / Zig**，`util/treesitter.zig`）——编辑引入的语法错误当场暴露给模型自愈，不用等编译。不认识的语言静默跳过。语法依赖以源码形式内嵌 `deps/tree-sitter/`，musl 交叉编译恒定 `-O2`。
 
 ---
 
@@ -682,44 +648,54 @@ auto 模式下的工具分类：
 
 ### 6.1 配置文件层级
 
-Ziv 支持 5 层配置源，后者覆盖前者：
+5 层配置源，后者覆盖前者：
 
 ```
-优先级（从低到高）：
-  user_settings    → ~/.config/ziv/settings.json
-  project_settings → .ziv/settings.json
-  local_settings   → .ziv/settings.local.json
-  cli_args         → 命令行参数
-  session          → 运行时设置
+user_settings    → ~/.config/ziv/settings.json
+project_settings → <项目根>/.ziv/settings.json
+local_settings   → <项目根>/.ziv/settings.local.json
+cli_args         → 命令行参数
+session          → 运行时设置
 ```
 
-**热重载（即时生效）**：每个提示符处 ziv 校对三个 settings 文件的内容指纹，检测到外部编辑（vim/脚本改配置）即整包重载并打印 `[settings reloaded | mode: …]`——改配置**无需重启**，下一个提示符即生效。ziv 自身的保存（/config、/model、/mode）会刷新基线，不会误触发。即时应用的字段：`permission_mode`（权限门当轮生效）、`allow/deny/ask_rules`、`api_keys`（key/网关变更会使对应 provider 缓存失效并按新凭据重建）、`max_tokens`。注意 `system_prompt` 已烘焙进会话历史，重载后需 `/clear` 或重启才替换。
+（项目级两层的「项目根」= 2.3 节的锚定根——子目录启动共享上级项目的配置。）
+
+**热重载（即时生效）**：每个提示符处校对 settings 文件内容指纹，外部编辑即整包重载并打印 `[settings reloaded | mode: …]`。即时应用：`permission_mode`、`allow/deny/ask_rules`、`api_keys`（provider 缓存失效重建）、`max_tokens`。`system_prompt` 烘焙进会话历史，重载后需 `/clear` 或重启。
 
 ### 6.2 配置文件格式
 
-`~/.config/ziv/settings.json` 或 `.ziv/settings.json`：
+`~/.config/ziv/settings.json`：
 
 ```json
 {
   "permission_mode": "default",
   "default_model": "gpt-4o",
-  "max_tokens": 4096,
+  "default_backend": null,
+  "max_tokens": 16384,
+  "output_style": "default",
+  "mcp_autostart": true,
+  "auto_fix": true,
+  "auto_deep_compact": true,
+  "agent_loop_limit": 50,
+  "memory_budget_tokens": 1200,
+  "subagent_concurrency": 4,
   "checkpointing_enabled": true,
-  "system_prompt": "You are a helpful coding assistant...",
+  "system_prompt": null,
   "api_keys": {
     "openai": "sk-...",
+    "openai_base_url": null,
     "anthropic": "sk-ant-...",
-    "brave": "BSA-..."
+    "anthropic_base_url": null,
+    "brave": "BSA-...",
+    "ollama_host": "http://localhost:11434"
   },
-  "allow_rules": [
-    "Bash(git status)",
-    "Bash(git log)",
-    "FileRead"
-  ],
-  "deny_rules": [
-    "Bash(rm -rf /)",
-    "Bash(dd if=/dev/zero)"
-  ]
+  "hooks": {
+    "PreToolUse":  [{"matcher": "Bash", "command": "./guard.sh"}],
+    "PostToolUse": [{"matcher": "FileEdit", "command": "make lint"}]
+  },
+  "allow_rules": ["Bash(git status)", "Bash(git log)", "FileRead"],
+  "deny_rules":  ["Bash(rm -rf /)", "Bash(dd if=/dev/zero)"],
+  "ask_rules":   ["Bash(curl *)"]
 }
 ```
 
@@ -729,70 +705,58 @@ Ziv 支持 5 层配置源，后者覆盖前者：
 |--------|------|--------|------|
 | `permission_mode` | string | `"default"` | 权限模式: default/accept_edits/plan/bypass/dont_ask/auto |
 | `default_model` | string | `"gpt-4o"` | 默认 LLM 模型 |
-| `max_tokens` | integer | `16384` | 单次响应输出上限 (1-128000)。思考型模型（GLM reasoning_content / Claude thinking）的思考 token 计入此预算——过低会导致「思考耗尽预算、正文为空」；发生时 ziv 自动翻倍预算重试（上限 32768） |
+| `default_backend` | string | null | 显式后端覆盖（"openai"/"claude"/"ollama"）——自定义模型名（glm-4.6 等）路由到已配网关，压过名字检测 |
+| `max_tokens` | integer | `16384` | 单次响应输出上限 (1-128000)。思考型模型的思考 token 计入此预算；耗尽时自动翻倍重试（上限 32768） |
+| `output_style` | string | `"default"` | 输出风格：default / **concise**（结果优先：省略开场白/过程叙述/结尾复述）；`/style` 命令切换，非法值回落 default |
+| `mcp_autostart` | boolean | `true` | 启动自动连接已配置的 MCP 服务器 |
+| `auto_fix` | boolean | `true` | 自动错误恢复（429/超时退避重试、溢出自动压缩）；关 → 错误直接进选择器 |
+| `auto_deep_compact` | boolean | `true` | 上下文压力下自动 LLM 提炼压缩（摘要+最近轮原文）；关 → 压力直落 φ 截断 |
+| `agent_loop_limit` | integer | `50` | 每回合 LLM 迭代上限（clamp 1..200）；到限预填「继续」 |
+| `memory_budget_tokens` | integer | `1200` | 跨会话记忆注入预算（200-8000，/config 可调） |
+| `subagent_concurrency` | number | `4` | agent 工具并发 worker（clamp 1..10，1=串行）；写型 dispatch 恒串行不受此值影响 |
 | `max_snapshots` | integer | `100` | 最大快照数量 |
-| `checkpointing_enabled` | boolean | `true` | 是否启用操作记录和检查点 |
-| `system_prompt` | string | null | 自定义系统提示词（null 则使用内置默认） |
-| `api_keys.openai` | string | null | OpenAI API Key（也支持 OPENAI_API_KEY 环境变量） |
-| `api_keys.openai_base_url` | string | null | OpenAI API 自定义地址（也支持 OPENAI_BASE_URL 环境变量） |
-| `api_keys.anthropic` | string | null | Anthropic API Key（也支持 ANTHROPIC_API_KEY 环境变量） |
-| `api_keys.anthropic_base_url` | string | null | Anthropic API 自定义地址（也支持 ANTHROPIC_BASE_URL 环境变量） |
-| `api_keys.brave` | string | null | Brave Search API Key（也支持 BRAVE_API_KEY 环境变量） |
+| `checkpointing_enabled` | boolean | `true` | 操作记录与检查点 |
+| `system_prompt` | string | null | 自定义系统提示词（null 用内置默认） |
+| `api_keys.openai` / `openai_base_url` | string | null | OpenAI Key / 兼容网关地址（env：OPENAI_API_KEY / OPENAI_BASE_URL） |
+| `api_keys.anthropic` / `anthropic_base_url` | string | null | Anthropic Key / 兼容网关地址（env：ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL） |
+| `api_keys.brave` | string | null | Brave Search Key（env：BRAVE_API_KEY） |
 | `api_keys.ollama_host` | string | `"http://localhost:11434"` | Ollama 服务地址 |
-| `subagent_concurrency` | number | `3` | agent 工具的并发子代理数（1-8；1=串行回退），`/config` 菜单可改 |
-| `allow_rules` | string[] | [] | 允许规则列表 |
-| `deny_rules` | string[] | [] | 拒绝规则列表 |
-| `ask_rules` | string[] | [] | 强制确认规则（bypass 模式也不豁免，语法同 allow/deny） |
+| `hooks` | object | null | M6 外部钩子（见 5.4；env 来源的 secret 永不落盘） |
+| `allow_rules` / `deny_rules` / `ask_rules` | string[] | [] | 权限规则（ask 强制确认，bypass 不豁免；链式命令分段匹配） |
 
-搜索后端 URL 可用环境变量覆盖（便于测试/代理）：`ZIV_DDGO_URL`、`ZIV_BRAVE_URL`、`ZIV_SEARXNG_URL`；搜索遇 429 自动退避 1s 重试一次。
+#### 环境变量
 
-运行时行为环境变量：`ZIV_LLM_TIMEOUT_MS`（LLM 请求**空闲**看护狗超时——距上一字节无数据才算超时，默认 180000，下限 1000；持续出数据的长流不会被杀，网关停摆时按超时报错恢复而不是永久挂死）；`ZIV_TTFT_TIMEOUT_MS`（首字节预算，默认 30000，下限 5000——网关收到请求后连响应头都不发时 30s 击杀自动重试×2、三次全灭放弃本回合并预填「继续」可一键接续；大上下文 prefill 慢或高峰期可调大如 60000）；`ZIV_TRACE`（回合决策链落盘 `.ziv/traces/*.jsonl`，含每步耗时/置信度，默认开，=0 关闭，`/trace` 命令直读）；`ZIV_CRON_SCALE`（定时任务时间线压缩倍数，仅测试用，如 600 把 81.5 分钟的记忆清扫压缩到 ~8 秒）；`ZIV_LOG`（日志级别 debug|info|warning，默认 notice，`2>ziv.log` 查看）。
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | — | OpenAI 后端凭据/网关 |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | — | Anthropic 后端凭据/网关 |
+| `BRAVE_API_KEY` | — | Brave 搜索 |
+| `ZIV_LLM_TIMEOUT_MS` | 180000 | LLM 请求**空闲**看护狗（距上一字节无数据才算超时；下限 1000） |
+| `ZIV_TTFT_TIMEOUT_MS` | 30000 | 首字节预算（预算随请求体伸缩；三连败入选择器；下限 5000） |
+| `ZIV_AGENT_TOOL` | 1 | `0`/`false` 关闭 agent 子代理工具 |
+| `ZIV_MCP_AUTOSTART` | 1 | `0` 关闭 MCP 启动自动连接 |
+| `ZIV_MCP_AUTOSTART_TIMEOUT_MS` | 3000 | 自动连接握手短预算 |
+| `ZIV_EXIT_EXTRACT_MS` | 0 | 退出记忆提取档：0 = 延迟档（默认，零 LLM 等待）；>0 = 同步等待死线（ms） |
+| `ZIV_TRACE` | 1 | 回合决策链落盘 `.ziv/traces/*.jsonl`；`0` 关闭 |
+| `ZIV_LOG` | notice | 日志级别 debug/info/warning（`2>ziv.log` 查看） |
+| `ZIV_CRON_SCALE` | 1 | 定时任务时间线压缩倍数（仅测试） |
+| `ZIV_DDGO_URL` / `ZIV_BRAVE_URL` / `ZIV_SEARXNG_URL` | — | 搜索后端 URL 覆盖（测试/代理） |
 
 ### 6.3 代码中配置
 
-#### LLM 后端配置
-
-在代码中创建 Provider 实例：
-
 ```zig
 // OpenAI
-const openai_cfg = llm.OpenAIConfig{
-    .api_key = "sk-...",
-    .model = "gpt-4o",
-};
+const openai_cfg = llm.OpenAIConfig{ .api_key = "sk-...", .model = "gpt-4o" };
 var openai = llm.OpenAIProvider.init(allocator, openai_cfg);
 const provider = openai.toProvider();
 
 // Ollama (本地)
-const ollama_cfg = llm.OllamaConfig{
-    .model = "llama3.2",
-    .base_url = "http://localhost:11434",
-};
+const ollama_cfg = llm.OllamaConfig{ .model = "llama3.2", .base_url = "http://localhost:11434" };
 var ollama = llm.OllamaProvider.init(allocator, ollama_cfg);
 const provider = ollama.toProvider();
 ```
 
-#### 数据库路径
-
-默认使用当前目录的 `data/ziv.db`。修改 `Database.init()` 的路径参数即可。
-
-#### 定时任务间隔
-
-在 `task/cron.zig` 中修改常量：
-
-```zig
-pub const REFLECTION_INTERVAL = @intFromFloat(PI * 10.0 * 60.0 * 1000.0); // ~31.4 min
-pub const KNOWLEDGE_UPDATE_INTERVAL = @intFromFloat(PHI * 60.0 * 60.0 * 1000.0); // ~37.1 min
-pub const MEMORY_DECAY_INTERVAL = @intFromFloat(E * 30.0 * 60.0 * 1000.0); // ~81.5 min
-```
-
-#### 工作记忆容量
-
-在 `memory/working.zig` 的 `init()` 中修改 `max_entries` 参数（默认 50）。
-
-#### 线程池并发上限
-
-由 `e_growth.zig` 的 `effectiveConcurrency()` 自动根据 CPU 核心数计算，使用 logistic 函数限制。
+数据库路径（`data/ziv.db`）、定时任务间隔（`task/cron.zig`）、工作记忆容量（`memory/working.zig` max_entries=50）、线程池并发（`e_growth.zig` logistic）均为源码级配置。
 
 ---
 
@@ -800,247 +764,59 @@ pub const MEMORY_DECAY_INTERVAL = @intFromFloat(E * 30.0 * 60.0 * 1000.0); // ~8
 
 ### 7.0 目录概览
 
-#### 顶层文件
-- 这是 agent/ 目录的结构概览
-
 | 文件/目录 | 说明 |
 |---|---|
 | `build.zig` | Zig 构建配置（主） |
 | `build_full.zig` | Zig 构建配置（完整版） |
-| `build.zig.zon` | Zig 包管理依赖声明 |
-| `DESIGN.md` | 设计文档 |
+| `build.zig.zon` | 包管理依赖声明 |
+| `DESIGN.md` | 设计文档（含对账表 v4） |
+| `USAGE.md` | 本文件 |
 | `TODO.md` | 待办事项 |
-| `USAGE.md` | 使用说明 |
+| `docs/` | 专题文档（tui-architecture / ziv-project-root / harness-efficiency-plan / config-ux-design / bug-patterns / ziv-roadmap 等） |
 
-#### `src/` — 源代码
+### 7.1 源码结构（`src/`）
 
 | 子目录 | 用途 |
 |---|---|
-| `llm/` | LLM 后端集成（Claude、OpenAI、Ollama、流式处理、消息压缩/compaction） |
-| `tools/` | 工具实现（bash、文件读写编辑、glob、grep、web搜索、任务管理、工具注册、权限控制等） |
-| `memory/` | 记忆系统（情景记忆、工作记忆、反思、提取、类型定义） |
-| `knowledge/` | 知识图谱（图结构、搜索） |
-| `checkpoint/` | 检查点/回滚机制（文件历史、操作日志） |
-| `storage/` | 存储层（SQLite 数据库、向量存储） |
-| `runtime/` | 运行时（规则引擎、错误处理、监控、自诊断） |
-| `task/` | 任务调度（cron、事件总线、线程池、消息队列） |
-| `math/` | 数学工具（常量、phi/pi/e 相关算法） |
-| `util/` | 工具函数（路径、HTTP、JSON、日志、子进程、ripgrep 封装、token 计数等） |
-| `research/` | 研究模块（优化研究器） |
-| `config.zig` | 配置管理 |
-| `main.zig` | 程序入口 |
-| `repl.zig` | REPL 交互循环 |
-| `system_prompt.zig` | 系统提示词构建 |
-
-#### 其他目录
-
-| 目录 | 说明 |
-|---|---|
-| `data/` | 数据文件（`prompts/` 提示词模板、`migrations/` 数据库迁移） |
-| `deps/` | 第三方依赖（`sqlite3`） |
-| `.zig-cache/` | Zig 编译缓存 |
-| `zig-out/` | 构建输出（编译产物 `bin/ziv`） |
-
-### 7.1 详细结构树
-
-```
-agent/
-├── build.zig              # 构建配置
-├── build.zig.zon          # 包元数据
-├── build_full.zig         # 完整构建配置
-├── DESIGN.md              # 完整设计文档
-├── USAGE.md               # 本文件
-├── TODO.md                # 待办事项
-├── deps/
-│   └── sqlite3/           # SQLite amalgamation
-├── data/
-│   └── migrations/        # SQL 迁移脚本
-└── src/
-    ├── main.zig           # 入口 + 自检
-    ├── repl.zig           # 交互式 REPL（v0.5.0 — 完整 Agent Loop）
-    ├── config.zig         # 五层配置层级 + saveSettings + env 回退
-    ├── system_prompt.zig  # 默认系统提示词
-    │
-    ├── math/              # 数学常数模块
-    │   ├── mod.zig        # 模块导出
-    │   ├── constants.zig  # pi, e, phi 定义
-    │   ├── pi_ring.zig    # pi 环形缓冲区
-    │   ├── e_growth.zig   # e 增长控制
-    │   └── phi_condense.zig # phi 知识浓缩
-    │
-    ├── llm/               # LLM 多模型层
-    │   ├── mod.zig        # 模块导出 + 模型工厂 + 后端检测
-    │   ├── provider.zig   # 统一接口 + vtable
-    │   ├── message.zig    # 消息序列化
-    │   ├── streaming.zig  # SSE 解析器
-    │   ├── openai.zig     # OpenAI 后端
-    │   ├── ollama.zig     # Ollama 后端
-    │   ├── claude.zig     # Claude/Anthropic 后端 (NEW)
-    │   └── compaction.zig # 消息压缩（phi 阈值触发）
-    │
-    ├── tools/             # 工具系统
-    │   ├── mod.zig        # 模块导出（12 工具）
-    │   ├── registry.zig   # comptime 注册器 + 增强接口
-    │   ├── orchestration.zig  # 工具编排（并行/串行）（NEW）
-    │   ├── auth_mode.zig  # 6 种授权模式 + 权限管道（NEW）
-    │   ├── rule_parser.zig    # 权限规则解析器（NEW）
-    │   ├── classifier.zig     # 自动模式分类器（NEW）
-    │   ├── denial_tracker.zig # 拒绝追踪器（NEW）
-    │   ├── bash.zig       # Shell 执行
-    │   ├── file_read.zig  # 文件读取
-    │   ├── file_write.zig # 文件写入
-    │   ├── glob.zig       # 目录遍历 + 模式匹配（NEW）
-    │   ├── grep.zig       # ripgrep/内置搜索（NEW）
-    │   ├── file_edit.zig  # 字符串替换编辑（NEW）
-    │   ├── web_search.zig # 网络搜索（NEW）
-    │   ├── task_create.zig    # 创建任务（NEW）
-    │   ├── task_list.zig  # 列出任务（NEW）
-    │   ├── task_update.zig    # 更新任务（NEW）
-    │   ├── ask_user.zig   # 向用户提问（NEW）
-    │   └── tool_search.zig    # 工具搜索（NEW）
-    │
-    ├── task/              # 异步任务
-    │   ├── mod.zig        # 模块导出
-    │   ├── thread_pool.zig
-    │   ├── mpsc_queue.zig
-    │   ├── event_bus.zig
-    │   └── cron.zig
-    │
-    ├── storage/           # 持久化
-    │   ├── mod.zig        # 模块导出
-    │   ├── database.zig   # SQLite 封装
-    │   └── vector.zig     # 向量存储
-    │
-    ├── memory/            # 记忆系统
-    │   ├── mod.zig        # 模块导出
-    │   ├── types.zig      # 记忆类型定义
-    │   ├── working.zig    # 工作记忆
-    │   ├── episodic.zig   # 情景记忆
-    │   ├── memory.zig     # 记忆协调器
-    │   ├── reflection.zig # 反思引擎
-    │   └── extraction.zig # 经验提取
-    │
-    ├── knowledge/         # 知识库
-    │   ├── mod.zig        # 模块导出
-    │   ├── graph.zig      # 知识图谱
-    │   └── search.zig     # 网络搜索
-    │
-    ├── runtime/           # 运行时
-    │   ├── decision_trace.zig  # 决策链记录
-    │   ├── rules.zig      # 检测规则接口
-    │   ├── builtin_rules.zig   # 8 条内置规则
-    │   ├── monitor.zig    # 运行时监控器
-    │   ├── self_diagnostic.zig # 自诊断引擎
-    │   └── error_handler.zig   # 错误反馈
-    │
-    ├── research/
-    │   └── optimization_researcher.zig # 优化研究引擎
-    │
-    ├── checkpoint/        # 操作记录与回滚（NEW）
-    │   ├── mod.zig        # 模块导出
-    │   ├── file_history.zig  # 文件快照备份
-    │   ├── op_log.zig     # 操作记录引擎
-    │   └── rollback.zig   # 回滚引擎
-    │
-    └── util/              # 工具库（NEW, 30+ 文件）
-        ├── mod.zig            # 模块导出
-        ├── cancel.zig         # CancelToken, ChildCancelToken, CombinedCancelToken
-        ├── shell_quote.zig    # quoteForShell, parseShellCommand, buildCommand
-        ├── hash.zig           # sha256, fingerprint, fnv1a
-        ├── uuid.zig           # v4, shortId
-        ├── log.zig            # 结构化日志
-        ├── format.zig         # bytes, tokens, cost, duration, percent 格式化
-        ├── string_utils.zig   # startsWith, endsWith, contains, truncate, indent
-        ├── path.zig           # extension, stem, normalize, join, isInsidePath, relative
-        ├── platform.zig       # OS/Arch 检测
-        ├── env.zig            # get, getOr, getInt, getBool, homeDir, editor
-        ├── system_dirs.zig    # XDG config/data/cache 目录
-        ├── json_helpers.zig   # getString, getInt, getFloat, getBool, parse, serialize
-        ├── tokens.zig         # estimateTokens, TokenBudget (phi 阈值)
-        ├── time.zig           # nowSeconds, nowMillis, formatIso, sleepMs
-        ├── file_cache.zig     # PiRingBuffer LRU 文件缓存
-        ├── binary_check.zig   # isBinary, hasBinaryExtension
-        ├── find_executable.zig # findExecutable, commandExists
-        ├── sanitization.zig   # sanitizeFilePath, isProtectedPath, isGitPath, detectInjection
-        ├── subprocess.zig     # exec, execShell, execQuiet
-        ├── cleanup.zig        # register, runAll shutdown handlers
-        ├── tempfile.zig       # create, createDir, writeAll
-        ├── diff.zig           # computeDiff, stats
-        ├── fs_ops.zig         # fileExists, dirExists, ensureDir, readFileAlloc, writeFile...
-        ├── lockfile.zig       # 文件互斥锁
-        ├── semver.zig         # Version parse/compare
-        ├── memoize.zig        # MemoCache 泛型缓存
-        ├── glob_match.zig     # match, matchPath (** 支持)
-        ├── ripgrep.zig        # search via rg/grep
-        └── http_client.zig    # HTTP GET with retry
-```
+| `llm/` | LLM 后端（Claude/OpenAI/Ollama、流式、压缩） |
+| `tools/` | 15 内置工具 + 注册器 + 权限 + 编排 + agent 派发 |
+| `agent/` | 子代理执行器（subagent）+ -p 一发模式（oneshot） |
+| `turn/` | 回合子系统：stream（流式+工具头）/ tools（执行+LastTools）/ history（压缩/计划锚点）/ ask（权限门）/ error_recovery |
+| `commands/` | 斜杠命令：dispatch（分发链）/ config_menu / history_cmds |
+| `session/` | session_store（sessions.db）/ model_switcher / memory_ops（提取/反思）/ input_history |
+| `hooks/` | M6 Pre/PostToolUse 外部钩子 |
+| `mcp/` | MCP 客户端（stdio + HTTP） |
+| `skills/` | SKILL.md 加载器 + 工具门 |
+| `task/` | 线程池 / MPSC / 事件总线 / cron |
+| `storage/` | SQLite / 向量存储 |
+| `memory/` | 三层记忆 + 反思 + 提取 |
+| `knowledge/` | 知识图谱 + 搜索 |
+| `runtime/` | 检测规则 / 监控 / 自诊断 / 决策链 |
+| `research/` | 优化研究引擎 |
+| `checkpoint/` | 文件快照 / 操作日志 / 回滚引擎 |
+| `math/` | pi/e/phi 算法 |
+| `util/` | 40+ 工具（lineinput 多行编辑器、menu、zivroot 锚定、uwidth utf8proc 宽度、treesitter、turn_clock 遥测、llm_watchdog…） |
+| `tests/` | E2E（agent_e2e）+ 集成测试 |
+| `config.zig` | 五层配置层级 |
+| `repl.zig` | REPL + TUI v2 状态机 |
+| `system_prompt.zig` | 系统提示词（输出风格/工具清单动态生成） |
 
 ---
 
 ## 8. 当前状态与待完成项
 
-### 已完成
-- [x] 数学核心 (pi/e/phi 全部实现+测试)
-- [x] comptime 工具系统 (12 工具)
-- [x] 增强工具接口 (并发安全、破坏性检测、输入验证、权限检查、别名)
-- [x] 工具编排 (并行/串行分组执行)
-- [x] 多 LLM 后端 (Claude, OpenAI, Ollama 全部完整实现)
-- [x] SSE 流式解析器
-- [x] SQLite 持久化 + 数据库迁移
-- [x] 向量存储 + 余弦相似度
-- [x] 三层记忆系统框架
-- [x] 反思引擎 + 经验提取
-- [x] 异步任务系统 (线程池, MPSC, 事件总线, 定时任务)
-- [x] 运行时检测 (8 条规则)
-- [x] 自诊断引擎 + 决策链
-- [x] 错误处理与用户反馈
-- [x] 网络搜索 (Brave/SearXNG/DuckDuckGo)
-- [x] 自主优化研究引擎
-- [x] 6 种授权执行模式 + 权限管道
-- [x] 规则解析器 + 自动分类器 + 拒绝追踪器
-- [x] 消息压缩 (phi 阈值触发)
-- [x] 五层配置层级
-- [x] 操作记录引擎 + 文件快照 + 完整回滚逻辑（trackEdit/restoreSnapshot/rollbackTo）
-- [x] 30+ 工具库 (util/)
-- [x] **v0.3.0 — 完整 Agent Loop**
-- [x] **v0.4.0 — 自学习闭环与引擎接线**（记忆/反思/图谱/研究/诊断/并行，详见 TODO P13-P21）
-- [x] 系统提示词 (system_prompt.zig)
-- [x] 对话历史保持 (多轮上下文)
-- [x] 工具调用循环 (tool_use → 权限检查 → 执行 → 结果回传)
-- [x] 压缩接入 (自动 + /compact 手动)
-- [x] 交互式配置菜单 (/config)
-- [x] API Key 环境变量回退 (OPENAI_API_KEY, ANTHROPIC_API_KEY, BRAVE_API_KEY, OPENAI_BASE_URL, ANTHROPIC_BASE_URL)
-- [x] 配置持久化保存
-- [x] 对话管理命令 (/compact, /clear, /context, /undo)
-- [x] Token 用量追踪
-- [x] 运行时模型切换 (/model <name>)
-- [x] LLM Provider 工厂 + 自动后端检测
+### 已完成（关键里程碑）
+- 数学核心 / comptime 工具系统 / 多 LLM 后端 / SSE 流式 / SQLite+向量 / 三层记忆 / 反思+提取 / 异步任务 / 运行时检测 / 自诊断 / 6 种权限模式 / 消息压缩 / 五层配置 / checkpoint 回滚（v0.3-v0.5）
+- 完整 Agent Loop、工具自动调用、记忆闭环（v0.5-v0.6）
+- 事件循环重构、稳定性批次（看护狗/TTFT/Bash 治理/raw 终端）（v0.7）
+- 会话恢复、提炼压缩梯子、错误选择器+auto_fix、后台任务、WebFetch、/tasks /last /trace、前缀缓存观测、子代理白名单/fork/max_turns、代码索引 FTS5、/config 重设计、TUI 可读性批次（v0.8.0）
+- utf8proc 宽度、sqlite-vec 语义去重、项目根锚定、MCP autostart、Skill 工具门、Hooks、-p 模式、tree-sitter 校验、退出零等待（v0.9.0）
+- TUI v2 框架、Concise 风格、全能力子代理、UTF-8 清洗、工具清单动态生成（v0.9.1）
 
-### 待完成
-- [x] EpisodicStore 参数化查询 (防 SQL 注入) — prepared statement + 注入往返测试
-- [x] KnowledgeGraph 参数化查询 — addNode/addEdge/pruneWeakEdges/nodeCount 全参数化且真实现
-- [x] MPSC Queue pop() 完整实现 (deinit 残留 tail 泄漏已修)
-- [x] 流式输出优化 (边读边解析 SSE)
-- [x] Checkpoint 目录自动创建（trackEdit 首次调用时 createDirPath）
-- [x] WebSearch API 接入 — DDG 免 key 实测可用，BRAVE_API_KEY 自动切 Brave
-- [x] 运行日志集成（ziv.log：LLM/工具/记忆/反思/研究全链路 [INF] 日志）
-- [x] 权限规则模式匹配 — glob 匹配 command/path，表驱动测试 ×8
-- [x] 记忆闭环（提取→SQLite→重启注入→/memory）
-- [x] 反思引擎接入（N/π 触发 + 会话结束收尾，经验跨会话）
-- [x] 任务管理工具真实现（会话级任务存储）
-- [x] /research、/diagnose 命令
-
-### 待办（2026-10-26 盘点，详见 TODO.md P19）
-- [x] `allocPrint` → `Allocator.print` 迁移（65 处全部完成，2026-10-26）
-- [x] repl 会话级 DOM 泄漏（history 深拷贝后立即释放响应 DOM，2026-10-26）
-- [x] agent loop 接入并行编排（两阶段权限门+线程池并行，2026-10-26）
-- [x] 知识图谱写入方（提取→节点+边+/knowledge，含多类型实体映射，2026-10-26/27）
-- [x] /diagnose 真实决策链（agent loop 7 阶段全埋点，live trace 优先）
-- [x] 注入向量相似度检索（64 维词袋嵌入 × e 衰减混合排序，2026-10-27）
-- [x] WebSearch 429 退避重试（2026-10-27）；Brave 实测仍需 API key
-- [x] memory facade 错误上抛（episodic 失败不再吞，2026-10-26）
-- [x] Linux 交叉编译（x86_64/aarch64-musl 静态 ELF 全过；实机运行待验）
-- [x] 流式输出实时化（REPL 接入 stream + peekGreedy 增量读，mock 实测逐块跟随，2026-10-27）
+### 已知边界
+- `/rewind` 序号/y-N 在管道模式消费后续行——交互模式使用（设计内）
+- MCP：npx 由 ziv 原生拉起的 stdio 形态握手不兼容，用 HTTP 方式接入
+- Workflow 编排（M5）目前为语法 spike（docs/workflow-spike.md），未产品化
 
 ---
 
@@ -1056,75 +832,10 @@ agent/
 
 | 后端 | 配置方式 | 说明 |
 |------|----------|------|
-| **Ollama**（最简单） | 本地安装 Ollama，运行 `ollama serve`，再 `ollama pull llama3.2` | 免费、离线、模型质量一般 |
-| **OpenAI** | `export OPENAI_API_KEY=sk-...` 或 `/config` 设置 | 需要 API Key |
-| **Anthropic** | `export ANTHROPIC_API_KEY=sk-ant-...` 或 `/config` 设置 | 需要 API Key |
+| **Ollama**（最简单） | 本地安装 Ollama，`ollama serve`，`ollama pull llama3.2` | 免费、离线、模型质量一般 |
+| **OpenAI** | `export OPENAI_API_KEY=sk-...` 或 `/config` 设置 | 需要 API Key；`OPENAI_BASE_URL` 可指向兼容网关 |
+| **Anthropic** | `export ANTHROPIC_API_KEY=sk-ant-...` 或 `/config` 设置 | 需要 API Key；`ANTHROPIC_BASE_URL` 同上 |
 
-也可以在 `~/.config/ziv/settings.json` 中写入配置：
+自定义网关模型（glm/deepseek 等）：配好对应 base_url + key，`/model glm-4.6` 时选后端，或 settings.json 直接设 `default_backend`。
 
-```json
-{
-  "default_model": "llama3.2",
-  "api_keys": {
-    "openai": "sk-...",
-    "anthropic": "sk-ant-..."
-  }
-}
-```
-
-**不配 API Key 也能用**：`/run` 直接执行工具不需要 LLM，文件读写、搜索、Bash 等工具都能正常工作。
-
-### 9.3 当前已知问题（2026-10-26 刷新）
-
-| 问题 | 影响 | 严重度 | 临时解决 |
-|------|------|--------|----------|
-| ~~/clear 后 system prompt 残留旧记忆注入块~~ 已修复（2026-10-26：clear 时重建 system message，实测 token 252→182）|
-| `/rewind` 序号/y-N 在管道模式消费后续行 | 管道脚本中的交互式确认不适配 | 无（设计内） | 交互模式使用 |
-
-
-## v0.5.0 — 工具自动调用（无需 /run）
-
-模型现在会**自主决定并调用工具**：请求携带全部 12 个工具声明，流式解析 tool_calls
-（OpenAI 分片累积 / Claude content_block_start+input_json_delta / Ollama tool_calls），
-经权限门确认后真实执行，结果以 tool result 回传模型继续推理——多轮直到回答完成。
-`/run <Tool> <json>` 仍保留，用于手动直执行。
-
-## 权限规则（settings.json）
-
-```json
-"allow_rules": ["Bash(git status*)", "FileRead"],
-"deny_rules":  ["Bash(rm *)"],
-"ask_rules":   ["Bash(curl *)"]
-```
-
-- 规则形如 `工具名(glob)` 或裸 `工具名`（放行/拒绝整个工具）
-- `ask_rules` 强制确认，**bypass 模式也不豁免**
-- **链式命令分段匹配**：`cd x && git push --force` 会被 deny `git push*` 命中（任一段命中即拒绝）；
-  allow 则要求**每一段**都被覆盖——`git status*` 不会放行 `git status && rm -rf /x`
-- 模式语义：default 全问；accept_edits 自动放行只读与文件编辑（Bash 仍需规则或确认，
-  白名单只读命令如 `ls`/`git status` 例外）；plan 只读（含只读 Bash 白名单）；bypass 全放
-  （ask 规则除外）
-
-
-## v0.5.1 — MCP 接入 + Skill 系统
-
-### MCP（stdio + Streamable HTTP 双传输）
-```
-/mcp install playwright          # 内置 registry：playwright/filesystem/memory/fetch/sequential-thinking
-/mcp add <名> <command...>       # 自定义 stdio 服务器
-/mcp add <名> http(s)://…        # HTTP 服务器（自动识别）
-/mcp connect <名> / disconnect   # 握手 + 工具桥接为 mcp__<名>__<工具>（走同一权限门，默认 ask）
-/mcp list / remove
-```
-- 配置持久化于 `~/.config/ziv/mcp.json`；env 全量继承（node/npx 可用）
-- 连接后工具进入 LLM tools 声明，调用→权限确认→执行→结果回传全自动
-- **Playwright 接入方式（真机已验收）**：终端起服务 `npx -y @playwright/mcp@latest --port 18931`，然后 `/mcp add playwright http://localhost:18931/mcp` + `/mcp connect playwright`（25 个 browser 工具自动桥接；注意用 `localhost`——服务默认监听 IPv6）
-- 已知限制：npx 由 ziv 原生拉起的 stdio 形态握手不兼容（深层 spawn 交互），用上述 HTTP 方式即可
-
-### Skill（Claude SKILL.md 兼容）
-- 目录：`~/.config/ziv/skills/<名>/SKILL.md`（全局）+ `.ziv/skills/<名>/`（项目级，同名覆盖）
-- frontmatter：name / description / when_to_use（未识别键忽略）
-- 调用：`/<技能名> [任务参数]`——正文注入对话，`$ARGUMENTS` 占位替换；`/skills` 列出
-
-### 指令高亮
-输入框中斜杠命令实时着色：已知命令青色、未完成/未知暗灰；打错命令给出 Did-you-mean 提示。
+**不配 API Key 也能用**：`/run` 直接执行工具不需要 LLM，文件读写、搜索、Bash、后台任务等工具都能正常工作。
