@@ -1235,6 +1235,80 @@ def s22_modal_exit_canonical():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s23_output_style():
+    """Concise Output Style: /style concise swaps the Communication section
+    of the system prompt (asserted on the WIRE via mock gateway); /style
+    default restores it; invalid value rejected; bare /style shows current."""
+    import threading, http.server, json as _json
+    seen_styles = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length', 0))
+            body = _json.loads(self.rfile.read(n)) if n else {}
+            for m in body.get("messages", []):
+                if m.get("role") == "system":
+                    c = m.get("content")
+                    c = c if isinstance(c, str) else _json.dumps(c)
+                    seen_styles.append(c)
+            if body.get("stream"):
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                for chunk in [{"content": "ok"}]:
+                    self.wfile.write(f"data: {_json.dumps({'choices': [{'index': 0, 'delta': chunk}]})}\n\n".encode())
+                fin = _json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 5, "completion_tokens": 1}})
+                self.wfile.write(f"data: {fin}\n\ndata: [DONE]\n\n".encode())
+                return
+            resp = _json.dumps({"choices": [{"message": {"role": "assistant", "content": "ok", "finish_reason": "stop"}, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 5, "completion_tokens": 1}}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    d = tempfile.mkdtemp(prefix="ziv-s23-")
+    try:
+        # S17 教训：settings 必须经构造器写入（手写会被构造器默认值覆写）。
+        z = ZivSession(reuse_dir=d, settings=_json.dumps({"permission_mode": "bypass",
+                                                          "api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{port}/v1"}}))
+        try:
+            z.wait_prompt()
+            # 非法值拒绝 + 无参显示当前。
+            z.send("/style loud\r")
+            z.read_until("未知风格", 10)
+            z.send("/style\r")
+            out = z.read_until("当前输出风格: default", 10)
+            # 切 concise → 首个请求的 system 必须含风格特征串。
+            z.clear_buf()
+            z.send("/style concise\r")
+            z.read_until("已切换: concise", 10)
+            z.send("hi\r")
+            z.read_until("完成", 60)
+            if not any("结果优先" in s and "Concise Output Style" in s for s in seen_styles):
+                raise Fail(f"concise style not on the wire; systems seen: {[s[:60] for s in seen_styles]}")
+            # 切回 default → 特征串消失。
+            seen_styles.clear()
+            z.send("/style default\r")
+            z.read_until("已切换: default", 10)
+            z.send("hi again\r")
+            z.read_until("完成", 60)
+            if any("Concise Output Style" in s for s in seen_styles):
+                raise Fail("concise style still on the wire after /style default")
+            quit_and_wait(z)
+            return "concise on/off verified on the wire ✓"
+        finally:
+            z.close()
+    finally:
+        srv.shutdown()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1258,6 +1332,7 @@ SCENARIOS = [
     ("S20 bgtool", s20_bgtool),
     ("S21 agent-live-status", s21_agent_live_status),
     ("S22 modal-exit", s22_modal_exit_canonical),
+    ("S23 output-style", s23_output_style),
 ]
 
 

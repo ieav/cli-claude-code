@@ -60,7 +60,7 @@ pub fn run(
 
     // 正式 system prompt（与 REPL 同源；oneshot 不做记忆注入——快速
     // 启动优先，注入是交互会话的增益）。
-    const sys_prompt = system_prompt_mod.buildSystemPrompt(alloc, switcher.settings.system_prompt) catch null;
+    const sys_prompt = system_prompt_mod.buildSystemPrompt(alloc, switcher.settings.system_prompt, switcher.settings.output_style) catch null;
     defer if (sys_prompt) |sp| alloc.free(sp);
 
     // 用户规则 + 模式；ask → 拒绝由 subagent 引擎的降级语义兜住

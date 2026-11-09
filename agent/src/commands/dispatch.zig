@@ -82,6 +82,7 @@ pub const ReplCtx = struct {
     sys_prompt: *[]const u8,
     sys_prompt_owned: *?[]u8,
     applied_prompt_setting: *?[]const u8,
+    applied_output_style: *[]const u8,
     memory_block: *?[]u8,
     facts_block: *?[]u8,
     plan_block: *?[]u8,
@@ -237,6 +238,39 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             }
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
+        } else if (std.mem.startsWith(u8, input, "/style")) {
+            // Concise Output Style：/style 查看；/style concise|default 切换
+            // （写 settings + 立即重建 system prompt，下一回合生效）。
+            const rest = std.mem.trim(u8, input[6..], " \t");
+            if (rest.len == 0) {
+                try std.Io.Writer.print(ctx.w, "  当前输出风格: {s}（default / concise；/style concise 切换）\n\n", .{ctx.switcher.settings.output_style});
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (!system_prompt_mod.styleValid(rest)) {
+                try std.Io.Writer.print(ctx.w, "  未知风格 {s}（可选：default, concise）\n\n", .{rest});
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            ctx.switcher.settings.output_style = try allocator.dupe(u8, rest);
+            config_mod.saveSettings(&ctx.switcher.settings, allocator, ctx.io) catch {};
+            // 立即重建提示——不等下一回合（reapply 的双键对比会命中）。
+            if (ctx.sys_prompt_owned.*) |old| allocator.free(old);
+            ctx.sys_prompt_owned.* = system_prompt_mod.buildSystemPrompt(allocator, ctx.switcher.settings.system_prompt, rest) catch null;
+            ctx.sys_prompt.* = ctx.sys_prompt_owned.* orelse system_prompt_mod.default_system_prompt;
+            ctx.applied_output_style.* = rest;
+            ctx.applied_prompt_setting.* = ctx.switcher.settings.system_prompt;
+            if (ctx.history.items.len > 0) {
+                const old_blocks = ctx.history.items[0].content;
+                const nb = try allocator.alloc(llm.ContentBlock, old_blocks.len);
+                nb[0] = .{ .text = ctx.sys_prompt.* };
+                for (old_blocks[1..], 1..) |b, i| nb[i] = b;
+                allocator.free(@constCast(old_blocks));
+                ctx.history.items[0].content = nb;
+            }
+            try std.Io.Writer.print(ctx.w, "  输出风格已切换: {s}（下一回合生效）\n\n", .{rest});
+            try std.Io.File.Writer.flush(ctx.file_writer);
+            return .handled;
         } else if (std.mem.eql(u8, input, "/tools")) {
             try std.Io.Writer.writeAll(ctx.w, "Registered tools:\n");
             for (ctx.reg.definitions()) |tool| {
@@ -387,7 +421,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             ctx.current_mode.* = ctx.switcher.settings.permission_mode;
             // A changed system prompt must reach the baked history[0]
             // this session, not after the next restart.
-            repl_mod.reapplySystemPromptIfNeeded(ctx.applied_prompt_setting, ctx.sys_prompt_owned, ctx.sys_prompt, ctx.history, allocator, ctx.switcher.settings.system_prompt);
+            repl_mod.reapplySystemPromptIfNeeded(ctx.applied_prompt_setting, ctx.applied_output_style, ctx.sys_prompt_owned, ctx.sys_prompt, ctx.history, allocator, ctx.switcher.settings.system_prompt, ctx.switcher.settings.output_style);
             return .handled;
         } else if (std.mem.eql(u8, input, "/compact") or std.mem.startsWith(u8, input, "/compact ")) {
             // Claude-style: LLM summarizes the OLDER conversation; the
@@ -451,7 +485,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 // sys_prompt_owned holds at scope exit, so swapping here
                 // stays single-ownership.)
                 if (ctx.sys_prompt_owned.*) |sp| allocator.free(sp);
-                ctx.sys_prompt_owned.* = system_prompt_mod.buildSystemPrompt(allocator, ctx.switcher.settings.system_prompt) catch null;
+                ctx.sys_prompt_owned.* = system_prompt_mod.buildSystemPrompt(allocator, ctx.switcher.settings.system_prompt, ctx.switcher.settings.output_style) catch null;
                 ctx.sys_prompt.* = ctx.sys_prompt_owned.* orelse system_prompt_mod.default_system_prompt;
                 const fresh_count: usize = 1 + @as(usize, @intFromBool(ctx.skill_manifest != null));
                 const fresh_blocks = try allocator.alloc(llm.ContentBlock, fresh_count);

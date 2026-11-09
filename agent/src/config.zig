@@ -24,6 +24,9 @@ pub const Settings = struct {
     /// MCP 启动自动连接（2026-11-10：配置了就该连上，不该让人再敲
     /// /mcp connect）。ZIV_MCP_AUTOSTART=0 可关。
     mcp_autostart: bool = true,
+    /// 输出风格（Concise Output Style）：default = 现行为；concise =
+    /// 结果优先（省略开场白/过程叙述/结尾复述）。非法值回落 default。
+    output_style: []const u8 = "default",
     allow_rules: []const auth_mode.PermissionRule = &.{},
     deny_rules: []const auth_mode.PermissionRule = &.{},
     ask_rules: []const auth_mode.PermissionRule = &.{},
@@ -219,6 +222,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     }
     if (json_helpers.getBool(value, "mcp_autostart")) |ma| {
         settings.mcp_autostart = ma;
+    }
+    if (json_helpers.getString(value, "output_style")) |os| {
+        if (@import("system_prompt.zig").styleValid(os)) {
+            settings.output_style = try allocator.dupe(u8, os);
+        }
     }
     if (json_helpers.getInt(value, "agent_loop_limit")) |al| {
         if (al >= 1 and al <= 200) {
@@ -490,6 +498,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};
     buf.print(allocator, "  \"mcp_autostart\": {},\n", .{settings.mcp_autostart}) catch {};
+    buf.print(allocator, "  \"output_style\": \"{s}\",\n", .{settings.output_style}) catch {};
     // permission_mode
     const mode_str = @tagName(settings.permission_mode);
     buf.print(allocator, "  \"permission_mode\": \"{s}\",\n", .{mode_str}) catch {};
@@ -626,4 +635,39 @@ test "hooks: parse + serialize round-trip survives a settings save" {
     const first = h.object.get("PreToolUse").?.array.items[0].object;
     try std.testing.expectEqualStrings("Bash", first.get("matcher").?.string);
     try std.testing.expectEqualStrings("./guard.sh \"quote\"", first.get("command").?.string);
+}
+
+test "output_style: parse, invalid fallback, serialize round-trip" {
+    const alloc = std.testing.allocator;
+    const parsed = try json_helpers.parse(alloc, "{\"output_style\":\"concise\"}");
+    defer parsed.deinit();
+    var settings = Settings{};
+    defer if (!std.mem.eql(u8, settings.output_style, "default")) alloc.free(settings.output_style);
+    try loadJsonFieldIntoSettingsForStyleTest(&settings, alloc, parsed.value);
+    try std.testing.expectEqualStrings("concise", settings.output_style);
+    // 非法值回落 default。
+    const bad = try json_helpers.parse(alloc, "{\"output_style\":\"shouty\"}");
+    defer bad.deinit();
+    var s2 = Settings{};
+    try loadJsonFieldIntoSettingsForStyleTest(&s2, alloc, bad.value);
+    try std.testing.expectEqualStrings("default", s2.output_style);
+    // 序列化往返（autoSave 不丢）。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    buf.append(alloc, '{') catch return error.OutOfMemory;
+    buf.print(alloc, "  \"output_style\": \"{s}\",\n", .{settings.output_style}) catch {};
+    buf.appendSlice(alloc, "  \"x\": 1}\n") catch {};
+    const reparsed = try json_helpers.parse(alloc, buf.items);
+    defer reparsed.deinit();
+    var s3 = Settings{};
+    try loadJsonFieldIntoSettingsForStyleTest(&s3, alloc, reparsed.value);
+    try std.testing.expectEqualStrings("concise", s3.output_style);
+}
+
+fn loadJsonFieldIntoSettingsForStyleTest(settings: *Settings, allocator: std.mem.Allocator, value: std.json.Value) !void {
+    if (json_helpers.getString(value, "output_style")) |os| {
+        if (@import("system_prompt.zig").styleValid(os)) {
+            settings.output_style = try allocator.dupe(u8, os);
+        }
+    }
 }

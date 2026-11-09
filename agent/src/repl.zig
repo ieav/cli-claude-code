@@ -347,12 +347,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // recovered from .ziv/memory.db (most recent first, token-budgeted).
     // The runtime build embeds the current date/time so date questions don't
     // cost a Bash round trip; on build failure fall back to the static prompt.
-    var sys_prompt_owned = system_prompt_mod.buildSystemPrompt(allocator, switcher.settings.system_prompt) catch null;
+    var sys_prompt_owned = system_prompt_mod.buildSystemPrompt(allocator, switcher.settings.system_prompt, switcher.settings.output_style) catch null;
     defer if (sys_prompt_owned) |sp| allocator.free(sp);
     var sys_prompt: []const u8 = sys_prompt_owned orelse system_prompt_mod.default_system_prompt;
     // What the baked history[0] prompt was built from — /config and the
     // settings hot reload compare against it to know when to rebuild.
     var applied_prompt_setting: ?[]const u8 = switcher.settings.system_prompt;
+    var applied_output_style: []const u8 = switcher.settings.output_style;
     var memory_block: ?[]u8 = null;
     defer if (memory_block) |mb| allocator.free(mb);
     // T1.3 topic-drift re-anchor state: baseline = the topic vector the
@@ -606,7 +607,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         logger.warning("reload: model switch to {s} failed: {}", .{ fresh.default_model, err });
                     };
                 }
-                reapplySystemPromptIfNeeded(&applied_prompt_setting, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt);
+                reapplySystemPromptIfNeeded(&applied_prompt_setting, &applied_output_style, &sys_prompt_owned, &sys_prompt, &history, allocator, switcher.settings.system_prompt, switcher.settings.output_style);
                 logger.info("settings reloaded: mode={s}", .{@tagName(current_mode)});
                 try std.Io.Writer.print(w, "  [settings reloaded | mode: {s}]\n\n", .{auth.modeLabel(current_mode)});
                 try std.Io.File.Writer.flush(&file_writer);
@@ -741,6 +742,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .sys_prompt = &sys_prompt,
         .sys_prompt_owned = &sys_prompt_owned,
         .applied_prompt_setting = &applied_prompt_setting,
+        .applied_output_style = &applied_output_style,
         .memory_block = &memory_block,
         .facts_block = &facts_block,
         .plan_block = &plan_block,
@@ -2108,16 +2110,21 @@ fn sameOptSlice(a: ?[]const u8, b: ?[]const u8) bool {
 /// "配置仅启动加载" (bug-patterns.md).
 pub fn reapplySystemPromptIfNeeded(
     applied: *?[]const u8,
+    applied_style: *[]const u8,
     owned: *?[]u8,
     prompt: *[]const u8,
     history: *std.ArrayList(llm.Message),
     alloc: std.mem.Allocator,
     setting: ?[]const u8,
+    style: []const u8,
 ) void {
-    if (sameOptSlice(applied.*, setting)) return;
+    // 双键对比：system_prompt 与 output_style 任一变化都要重建提示
+    // （T4 坑：漏 style 键则 /style 切换不生效——开发计划风险表 #2）。
+    if (sameOptSlice(applied.*, setting) and std.mem.eql(u8, applied_style.*, style)) return;
     applied.* = setting;
+    applied_style.* = style;
     if (owned.*) |sp| alloc.free(sp);
-    owned.* = system_prompt_mod.buildSystemPrompt(alloc, setting) catch null;
+    owned.* = system_prompt_mod.buildSystemPrompt(alloc, setting, style) catch null;
     prompt.* = owned.* orelse system_prompt_mod.default_system_prompt;
     if (history.items.len == 0) return;
     // Content blocks are const — rebuild the slice with the new prompt,
