@@ -102,6 +102,20 @@ const DIFF_READ_CAP: usize = 1024 * 1024; // diff-size consts moved to turn/tool
 /// observes a different fingerprint, the file was edited externally → reload.
 pub var settings_fp_baseline: u64 = 0;
 
+/// Ctrl+T 输出风格 toggle 的接线上下文：on_style_toggle 是无参回调
+/// （与 on_verbose_toggle 同形），只能经模块级取 run() 的常驻局部。
+/// 主循环开始前赋值；回调仅在按键时解引用，彼时必然已就绪。
+const StyleToggleCtx = struct {
+    switcher: *ModelSwitcher,
+    applied_prompt_setting: *?[]const u8,
+    applied_output_style: *[]const u8,
+    sys_prompt_owned: *?[]u8,
+    sys_prompt: *[]const u8,
+    history: *std.ArrayList(llm.Message),
+    io: std.Io,
+};
+var style_toggle_ctx: ?StyleToggleCtx = null;
+
 
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
     // Terminal-write serialization needs the Io instance (std.Io.Mutex
@@ -129,6 +143,28 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 "\x1b[2m[工具输出: 简要——长输出只出前 3 行（Ctrl+O 切详细）]\x1b[0m";
         }
     }.cb; // Ctrl-Z manual suspend needs it
+    // Ctrl+T toggles output style (default ↔ concise), prompt AND
+    // mid-turn — mirror of Ctrl+O's wiring above. Style settings live in
+    // the ModelSwitcher the ctx points at; ctx lands before the main
+    // loop (vars must exist first), and the callback only fires on a
+    // keypress inside readLine — never before.
+    lineinput.on_style_toggle = struct {
+        fn cb() []const u8 {
+            const c = style_toggle_ctx orelse return "\x1b[2m[风格切换未就绪]\x1b[0m";
+            const next: []const u8 = if (std.mem.eql(u8, c.switcher.settings.output_style, system_prompt_mod.STYLE_CONCISE))
+                system_prompt_mod.STYLE_DEFAULT
+            else
+                system_prompt_mod.STYLE_CONCISE;
+            dispatch_mod.applyOutputStyle(c.switcher, c.applied_prompt_setting, c.applied_output_style, c.sys_prompt_owned, c.sys_prompt, c.history, allocator, c.io, next) catch |e| {
+                logger.warning("style toggle failed: {}", .{e});
+                return "\x1b[2m[风格切换失败（详见日志）]\x1b[0m";
+            };
+            return if (std.mem.eql(u8, next, system_prompt_mod.STYLE_CONCISE))
+                "\x1b[2m[输出风格: concise——结果优先，省略开场白/过程/复述（Ctrl+T 切回）]\x1b[0m"
+            else
+                "\x1b[2m[输出风格: default——完整叙述（Ctrl+T 切 concise）]\x1b[0m";
+        }
+    }.cb;
     // Writer setup
     var write_buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.Writer.initStreaming(stdout_file, io, &write_buf);
@@ -577,6 +613,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // that never hit a tool-round injection point auto-sends as the next
     // turn — the main loop consumes it instead of calling readLine.
     var auto_submit: ?[]u8 = null;
+
+    // Ctrl+T style toggle goes live once every var it touches exists.
+    style_toggle_ctx = .{
+        .switcher = &switcher,
+        .applied_prompt_setting = &applied_prompt_setting,
+        .applied_output_style = &applied_output_style,
+        .sys_prompt_owned = &sys_prompt_owned,
+        .sys_prompt = &sys_prompt,
+        .history = &history,
+        .io = io,
+    };
 
     while (true) {
         // Turn boundary: persist whatever the finished turn appended (one
@@ -2195,6 +2242,7 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  多行粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
         \\  Esc / Ctrl-C 中断生成或撤回刚发的消息 · Ctrl-C 连按两次退出
         \\  Ctrl+O 工具输出 详细/简要 切换（提示符与回合中都可切）
+        \\  Ctrl+T 输出风格 default/concise 互切（同 /style）
         \\
         \\Example:
         \\  /config                       Open configuration menu

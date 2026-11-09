@@ -194,7 +194,7 @@ tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 - **TURN**：回合进行中，同一输入块保持 pinned 底部、全程可编辑（见下节），meta 行变为状态行（当前工具/子代理进度）
 - **MODAL**：菜单/面板（/config、/resume、/bg、模型选择器…）打开时 region 解除、菜单流内自绘；**退出必经统一收口**——清残留 → 重 arm region → 输入块规范重画。菜单退出后不再有字符残留/输入被吞
 
-工具调用在对话记录中呈现**统一工具头** `⏺ Name(args)`（/run 与 agent 回合同一格式）；工具输出暗色显示，**Ctrl+O 切换详细/简要**（默认详细；简要=长输出只出前 3 行 + `… +N 行` 折叠提示，提示符下与回合中都可切）。完整输出用 `/last` 回看。表格渲染用实心制表线（`┌─┬─┐` 全框），歧义宽度字符（em dash 等）按窄列对齐不劈叉。
+工具调用在对话记录中呈现**统一工具头** `⏺ Name(args)`（/run 与 agent 回合同一格式）；工具输出暗色显示，**Ctrl+O 切换详细/简要**（默认详细；简要=长输出只出前 3 行 + `… +N 行` 折叠提示，提示符下与回合中都可切）；**Ctrl+T 互切输出风格** default/concise（同 `/style`，同样两处可按，切换反馈行即时打印）。完整输出用 `/last` 回看。表格渲染用实心制表线（`┌─┬─┐` 全框），歧义宽度字符（em dash 等）按窄列对齐不劈叉。
 
 ### Esc / Ctrl-C 中断与撤回
 
@@ -215,7 +215,7 @@ tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/stats` | 会话统计：消息数/token 估算/操作数、代码上下文片段数、压缩次数与回收量、**前缀缓存命中率**（cached_tokens，网关支持时显示）、模式/模型/能力档、总 token |
 | `/tools` | 列出所有已注册工具（含安全属性） |
 | `/run <ToolName> <json>` | 直接执行工具（走同一权限门 + hooks，不再绕过 Plan 模式） |
-| `/style` | **输出风格开关**（v0.9.1）：`/style` 查看当前风格；`/style concise` 切换简洁模式（结果优先：省略开场白/过程叙述/结尾复述）；`/style default` 切回。写入 settings 并立即重建 system prompt，下一回合生效 |
+| `/style` | **输出风格开关**（v0.9.1）：`/style` 查看当前风格；`/style concise` 切换简洁模式（结果优先：省略开场白/过程叙述/结尾复述）；`/style default` 切回。**Ctrl+T 快捷键两态互切**（提示符与回合中都可按）。写入 settings 并立即重建 system prompt，下一回合生效；也可在 `/config` 菜单选择 |
 | **模型 & 配置** | |
 | `/model`、`/models` | **交互式模型选择器**（方向键 + Enter；q 显示纯文本列表） |
 | `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`，自定义名如 `glm-4.6` 可选后端接入） |
@@ -407,6 +407,7 @@ ziv> /model glm-4.6         # 识别不了的自定义名 + 已配网关 → 询
   权限模式: Default
   检查点: 开
   系统提示词: (默认)
+  输出风格: default
   自动错误修复: 开（429/超时退避重试）
   回合工具轮上限: 50
   上下文提炼压缩: 开（LLM 摘要优先，截断兜底）
@@ -707,7 +708,7 @@ session          → 运行时设置
 | `default_model` | string | `"gpt-4o"` | 默认 LLM 模型 |
 | `default_backend` | string | null | 显式后端覆盖（"openai"/"claude"/"ollama"）——自定义模型名（glm-4.6 等）路由到已配网关，压过名字检测 |
 | `max_tokens` | integer | `16384` | 单次响应输出上限 (1-128000)。思考型模型的思考 token 计入此预算；耗尽时自动翻倍重试（上限 32768） |
-| `output_style` | string | `"default"` | 输出风格：default / **concise**（结果优先：省略开场白/过程叙述/结尾复述）；`/style` 命令切换，非法值回落 default |
+| `output_style` | string | `"default"` | 输出风格：default / **concise**（结果优先：省略开场白/过程叙述/结尾复述）；`/style` 命令或 **Ctrl+T** 快捷键切换，`/config` 菜单可选；非法值回落 default |
 | `mcp_autostart` | boolean | `true` | 启动自动连接已配置的 MCP 服务器 |
 | `auto_fix` | boolean | `true` | 自动错误恢复（429/超时退避重试、溢出自动压缩）；关 → 错误直接进选择器 |
 | `auto_deep_compact` | boolean | `true` | 上下文压力下自动 LLM 提炼压缩（摘要+最近轮原文）；关 → 压力直落 φ 截断 |

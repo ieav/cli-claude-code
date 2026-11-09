@@ -797,6 +797,11 @@ pub fn setIo(io: std.Io) void {
 /// 回调返回新的详细态文案，供此处打印一行转录提示。
 pub var on_verbose_toggle: ?*const fn () []const u8 = null;
 
+/// Ctrl+T（Toggle 助记）：输出风格 default ↔ concise 互切。与
+/// on_verbose_toggle 同模式——lineinput 不懂风格语义，只管按键与
+/// 打印回调返回的反馈行。提示符与回合中都可按。
+pub var on_style_toggle: ?*const fn () []const u8 = null;
+
 fn ttyLock() void {
     const io = tty_io orelse return;
     tty_mu.lockUncancelable(io);
@@ -1120,7 +1125,7 @@ pub fn regionFreeze(w: *std.Io.Writer) void {
 /// 烂多字节字符（⏵/·/CJK），且字节位≠显示列。两个绘制点（regionApply
 /// 与 paintStatusRow）共用本函数——两处内联曾在 S22 开发中漂移过一次。
 fn paintHintRow(w: *std.Io.Writer) void {
-    const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
+    const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+T 风格 · Ctrl+R 搜索";
     const tw = currentTermWidth();
     var col: usize = 0;
     var i: usize = 0;
@@ -1892,6 +1897,14 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
                 // at the prompt — one muscle memory everywhere).
                 if (on_verbose_toggle) |cb| {
                     if (w) |ww| regionPrintLine(ww, cb()); // self-locking
+                }
+                if (w) |ww| renderPendingLine(ww);
+                continue;
+            }
+            if (c == 0x14) {
+                // Ctrl+T: output-style toggle (same pattern as Ctrl+O).
+                if (on_style_toggle) |cb| {
+                    if (w) |ww| regionPrintLine(ww, cb());
                 }
                 if (w) |ww| renderPendingLine(ww);
                 continue;
@@ -2718,6 +2731,15 @@ pub fn readLine(
             // regionPrintLine takes tty_mu itself — an outer lock here
             // self-deadlocks (Io.Mutex is NOT reentrant; found live).
             if (on_verbose_toggle) |cb| {
+                regionPrintLine(w, cb());
+            }
+            renderPendingLine(w);
+            continue;
+        }
+
+        if (c == 0x14) {
+            // Ctrl+T: output-style toggle at the prompt level.
+            if (on_style_toggle) |cb| {
                 regionPrintLine(w, cb());
             }
             renderPendingLine(w);

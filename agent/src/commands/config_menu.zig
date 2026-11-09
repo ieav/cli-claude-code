@@ -49,6 +49,7 @@ pub fn runConfigMenu(
         var b8: [96]u8 = undefined;
         var b9: [64]u8 = undefined;
         var b10: [112]u8 = undefined;
+        var b11: [64]u8 = undefined;
         const items = [_][]const u8{
             "API Keys",
             try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
@@ -58,6 +59,7 @@ pub fn runConfigMenu(
             try_std_fmt(&b3, "权限模式: {s}", .{auth.modeLabel(switcher.settings.permission_mode)}),
             try_std_fmt(&b4, "检查点: {s}", .{if (switcher.settings.checkpointing_enabled) "开" else "关"}),
             try_std_fmt(&b5, "系统提示词: {s}", .{if (switcher.settings.system_prompt != null) "(自定义)" else "(默认)"}),
+            try_std_fmt(&b11, "输出风格: {s}", .{switcher.settings.output_style}),
             try_std_fmt(&b8, "自动错误修复: {s}", .{if (switcher.settings.auto_fix) "开（429/超时退避重试）" else "关（直接出选择器）"}),
             try_std_fmt(&b9, "回合工具轮上限: {d}", .{switcher.settings.agent_loop_limit}),
             try_std_fmt(&b10, "上下文提炼压缩: {s}", .{if (switcher.settings.auto_deep_compact) "开（LLM 摘要优先，截断兜底）" else "关（压力直落 φ 截断）"}),
@@ -134,11 +136,22 @@ pub fn runConfigMenu(
                 }
             },
             8 => {
+                // 输出风格：菜单层只改 settings——system prompt 的重建由
+                // dispatch /config 分支的 reapplySystemPromptIfNeeded 双键
+                // 对比自动完成（与 settings 热重载同一条路径）。
+                const style_items = [_][]const u8{ "default — 完整叙述（现行为）", "concise — 结果优先（省略开场白/过程/结尾复述）" };
+                const st = (menu.select(w, r, file_writer, "输出风格（也可会话中 Ctrl+T 互切）:", &style_items, 0) catch continue) orelse continue;
+                const val: []const u8 = if (st == 0) "default" else "concise";
+                switcher.settings.output_style = try alloc.dupe(u8, val);
+                autoSaveSettings(w, file_writer, switcher, alloc, io);
+                try std.Io.Writer.print(w, "  输出风格: {s}（下一回合生效）\n", .{val});
+            },
+            9 => {
                 switcher.settings.auto_fix = !switcher.settings.auto_fix;
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
                 try std.Io.Writer.print(w, "  自动错误修复: {s}\n", .{if (switcher.settings.auto_fix) "开" else "关"});
             },
-            9 => {
+            10 => {
                 var lbuf: [32]u8 = undefined;
                 const lval = (menu.readLine(r, w, file_writer, "  回合工具轮上限 (1-200，50=默认，200=最宽): ", &lbuf) catch continue) orelse continue;
                 if (lval.len == 0) continue;
@@ -151,12 +164,12 @@ pub fn runConfigMenu(
                     autoSaveSettings(w, file_writer, switcher, alloc, io);
                 } else try std.Io.Writer.writeAll(w, "  超出范围（1-200）\n");
             },
-            10 => {
+            11 => {
                 switcher.settings.auto_deep_compact = !switcher.settings.auto_deep_compact;
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
                 try std.Io.Writer.print(w, "  上下文提炼压缩: {s}\n", .{if (switcher.settings.auto_deep_compact) "开" else "关"});
             },
-            11 => break,
+            12 => break,
             else => {},
         }
     }

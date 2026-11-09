@@ -106,6 +106,26 @@ pub const ReplCtx = struct {
     prompt: []const u8,
 };
 
+/// 输出风格切换的单一实现（/style 命令与 Ctrl+T 快捷键共用）：写
+/// settings 持久化，经 reapplySystemPromptIfNeeded 立即重建 system
+/// prompt 并替换 history[0] 的 system 块（memory/skill-manifest 等后续
+/// 块原样保留），下一回合生效。重复切到同值时 reapply 双键短路幂等。
+pub fn applyOutputStyle(
+    switcher: *ModelSwitcher,
+    applied_prompt_setting: *?[]const u8,
+    applied_output_style: *[]const u8,
+    sys_prompt_owned: *?[]u8,
+    sys_prompt: *[]const u8,
+    history: *std.ArrayList(llm.Message),
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    next_style: []const u8,
+) !void {
+    switcher.settings.output_style = try alloc.dupe(u8, next_style);
+    config_mod.saveSettings(&switcher.settings, alloc, io) catch {};
+    repl_mod.reapplySystemPromptIfNeeded(applied_prompt_setting, applied_output_style, sys_prompt_owned, sys_prompt, history, alloc, switcher.settings.system_prompt, next_style);
+}
+
 pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
     // ──── Meta commands ────
     // Multi-line input (pasted text, `\`+Enter drafts) is always a
@@ -240,10 +260,10 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             return .handled;
         } else if (std.mem.startsWith(u8, input, "/style")) {
             // Concise Output Style：/style 查看；/style concise|default 切换
-            // （写 settings + 立即重建 system prompt，下一回合生效）。
+            // （也绑 Ctrl+T 快捷键，两入口同一实现 applyOutputStyle）。
             const rest = std.mem.trim(u8, input[6..], " \t");
             if (rest.len == 0) {
-                try std.Io.Writer.print(ctx.w, "  当前输出风格: {s}（default / concise；/style concise 切换）\n\n", .{ctx.switcher.settings.output_style});
+                try std.Io.Writer.print(ctx.w, "  当前输出风格: {s}（default / concise；/style concise 或 Ctrl+T 切换）\n\n", .{ctx.switcher.settings.output_style});
                 try std.Io.File.Writer.flush(ctx.file_writer);
                 return .handled;
             }
@@ -252,22 +272,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 try std.Io.File.Writer.flush(ctx.file_writer);
                 return .handled;
             }
-            ctx.switcher.settings.output_style = try allocator.dupe(u8, rest);
-            config_mod.saveSettings(&ctx.switcher.settings, allocator, ctx.io) catch {};
-            // 立即重建提示——不等下一回合（reapply 的双键对比会命中）。
-            if (ctx.sys_prompt_owned.*) |old| allocator.free(old);
-            ctx.sys_prompt_owned.* = system_prompt_mod.buildSystemPrompt(allocator, ctx.switcher.settings.system_prompt, rest) catch null;
-            ctx.sys_prompt.* = ctx.sys_prompt_owned.* orelse system_prompt_mod.default_system_prompt;
-            ctx.applied_output_style.* = rest;
-            ctx.applied_prompt_setting.* = ctx.switcher.settings.system_prompt;
-            if (ctx.history.items.len > 0) {
-                const old_blocks = ctx.history.items[0].content;
-                const nb = try allocator.alloc(llm.ContentBlock, old_blocks.len);
-                nb[0] = .{ .text = ctx.sys_prompt.* };
-                for (old_blocks[1..], 1..) |b, i| nb[i] = b;
-                allocator.free(@constCast(old_blocks));
-                ctx.history.items[0].content = nb;
-            }
+            try applyOutputStyle(ctx.switcher, ctx.applied_prompt_setting, ctx.applied_output_style, ctx.sys_prompt_owned, ctx.sys_prompt, ctx.history, allocator, ctx.io, rest);
             try std.Io.Writer.print(ctx.w, "  输出风格已切换: {s}（下一回合生效）\n\n", .{rest});
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
