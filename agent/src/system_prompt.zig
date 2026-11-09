@@ -87,9 +87,17 @@ const weekday_names = [_][]const u8{
 pub fn buildSystemPrompt(allocator: std.mem.Allocator, custom: ?[]const u8, style: []const u8) ![]u8 {
     const concise = std.mem.eql(u8, style, STYLE_CONCISE);
     var base: []const u8 = undefined;
+    // custom+concise 的中间拼接串：终串 print 是内容拷贝，中间串必须
+    // 随函数释放（审查抓到的真泄漏——SafeAllocator 报了但没挂测试）。
+    var joined: ?[]u8 = null;
+    defer if (joined) |j| allocator.free(j);
     if (custom) |c| {
         // 自定义提示：风格段追加其后，不覆盖用户内容。
-        base = if (concise) try std.fmt.allocPrint(allocator, "{s}{s}", .{ c, concise_append }) else c;
+        base = if (concise) blk: {
+            const j = try std.fmt.allocPrint(allocator, "{s}{s}", .{ c, concise_append });
+            joined = j;
+            break :blk j;
+        } else c;
     } else {
         base = if (concise) prompt_head ++ communication_concise ++ prompt_tail else default_system_prompt;
     }

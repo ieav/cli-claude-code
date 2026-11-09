@@ -223,6 +223,7 @@ test "RuntimeRegistry: dynamic register, lookup, prefix removal" {
     var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_state.deinit();
     const res = try def.execute(std.testing.allocator, .null, io_state.io());
+    defer std.testing.allocator.free(res.output); // 3df5d90 起 output 恒堆分配
     try std.testing.expectEqualStrings("dyn-ok", res.output);
 
     // Concurrency opt-in is reflected in the definition.

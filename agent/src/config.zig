@@ -642,13 +642,17 @@ test "output_style: parse, invalid fallback, serialize round-trip" {
     const parsed = try json_helpers.parse(alloc, "{\"output_style\":\"concise\"}");
     defer parsed.deinit();
     var settings = Settings{};
-    defer if (!std.mem.eql(u8, settings.output_style, "default")) alloc.free(settings.output_style);
+    var s2 = Settings{};
+    var s3 = Settings{};
+    defer for ([_]*Settings{ &settings, &s2, &s3 }) |st| {
+        // dupe 的值释放；default 字面量不可 free（指针非堆）。
+        if (!std.mem.eql(u8, st.output_style, "default")) alloc.free(st.output_style);
+    };
     try loadJsonFieldIntoSettingsForStyleTest(&settings, alloc, parsed.value);
     try std.testing.expectEqualStrings("concise", settings.output_style);
     // 非法值回落 default。
     const bad = try json_helpers.parse(alloc, "{\"output_style\":\"shouty\"}");
     defer bad.deinit();
-    var s2 = Settings{};
     try loadJsonFieldIntoSettingsForStyleTest(&s2, alloc, bad.value);
     try std.testing.expectEqualStrings("default", s2.output_style);
     // 序列化往返（autoSave 不丢）。
@@ -659,7 +663,6 @@ test "output_style: parse, invalid fallback, serialize round-trip" {
     buf.appendSlice(alloc, "  \"x\": 1}\n") catch {};
     const reparsed = try json_helpers.parse(alloc, buf.items);
     defer reparsed.deinit();
-    var s3 = Settings{};
     try loadJsonFieldIntoSettingsForStyleTest(&s3, alloc, reparsed.value);
     try std.testing.expectEqualStrings("concise", s3.output_style);
 }

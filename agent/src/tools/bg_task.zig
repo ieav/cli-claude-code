@@ -78,8 +78,12 @@ pub fn bgTaskIsReadOnly(input: std.json.Value) bool {
 
 test "bgTaskIsReadOnly: only stop is a mutation" {
     try std.testing.expect(bgTaskIsReadOnly(.null));
-    const parsed_status = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, "{\"action\":\"status\"}", .{});
-    try std.testing.expect(bgTaskIsReadOnly(parsed_status));
-    const parsed_stop = try std.json.parseFromSliceLeaky(std.json.Value, std.testing.allocator, "{\"action\":\"stop\",\"id\":1}", .{});
-    try std.testing.expect(!bgTaskIsReadOnly(parsed_stop));
+    // parseFromSlice（非 Leaky）+ deinit——Leaky 版在 testing.allocator
+    // 上就是泄漏（审查抓到，5 条 SafeAllocator 报告的来源）。
+    const ps = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"action\":\"status\"}", .{});
+    defer ps.deinit();
+    try std.testing.expect(bgTaskIsReadOnly(ps.value));
+    const pst = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"action\":\"stop\",\"id\":1}", .{});
+    defer pst.deinit();
+    try std.testing.expect(!bgTaskIsReadOnly(pst.value));
 }
