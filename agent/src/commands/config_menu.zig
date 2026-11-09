@@ -96,7 +96,7 @@ pub fn runConfigMenu(
             },
             4 => {
                 var scbuf: [32]u8 = undefined;
-                const sval = (menu.readLine(r, w, file_writer, "  子代理并发数 (1-8，1=串行): ", &scbuf) catch continue) orelse continue;
+                const sval = (menu.readLine(r, w, file_writer, "  子代理并发数 (1-10，1=串行): ", &scbuf) catch continue) orelse continue;
                 if (sval.len == 0) continue;
                 const sc = std.fmt.parseInt(u32, sval, 10) catch {
                     try std.Io.Writer.writeAll(w, "  无效数字\n");

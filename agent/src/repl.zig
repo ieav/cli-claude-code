@@ -2144,7 +2144,7 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  /quit, /q         Exit ziv
         \\  /version          Show version
         \\  /stats            Show session statistics and token usage
-        \\  /tools            List registered tools (12 tools)
+        \\  /tools            List registered tools (built-in + MCP/agent dynamic)
         \\  /run <t> <json>   Execute a tool directly
         \\  /terminal-setup   Show Shift+Enter setup guide for this terminal
         \\
@@ -2153,14 +2153,17 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  /model <name>     Switch to a different model
         \\  /mode             Cycle permission mode
         \\  /config           Interactive configuration menu
+        \\  /style [name]     Output style: default | concise (results-first)
         \\
         \\Conversation:
         \\  /compact          Summarize the conversation (LLM) to free tokens
         \\  /compact phi      Truncate history to the recent 61.8% (no LLM call)
         \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
+        \\  /resume [id]      Resume a past session (picker when no id)
         \\  /context          Show current context/token usage
         \\  /trace            Show the last turn's per-step timing
         \\  /tasks            Show the task list and progress
+        \\  /bg               Background tasks panel (status/output/stop)
         \\  /last [N]         Show a recent tool's full output (N=1 newest)
         \\  /undo             Undo last exchange
         \\  /history          Show operation history
@@ -2186,6 +2189,12 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  Bypass        — Skip all permission checks
         \\  Don't Ask     — Auto-deny whatever would ask (reads still run)
         \\  Auto          — LLM classifier decides
+        \\
+        \\Keys:
+        \\  Enter 发送 · Shift+Enter / Ctrl+Enter / `\`+Enter / Ctrl+J 换行
+        \\  多行粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
+        \\  Esc / Ctrl-C 中断生成或撤回刚发的消息 · Ctrl-C 连按两次退出
+        \\  Ctrl+O 工具输出 详细/简要 切换（提示符与回合中都可切）
         \\
         \\Example:
         \\  /config                       Open configuration menu
