@@ -861,10 +861,7 @@ fn regionApply(w: *std.Io.Writer) void {
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     } else {
-        const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
-        const tw = currentTermWidth();
-        const cut = if (hint.len > tw) hint[0..@min(hint.len, tw)] else hint;
-        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{cut}) catch {};
+        paintHintRow(w);
     }
     writeEditorBlock(w);
     pending_shown = true;
@@ -1118,18 +1115,32 @@ pub fn regionFreeze(w: *std.Io.Writer) void {
 
 /// Paint the status row (absolute) and park the cursor back on the
 /// input row's end. Caller sets pending_status first.
+
+/// 输入区上边界 hint（空闲态的 meta 行）。列宽感知截断——字节切会砍
+/// 烂多字节字符（⏵/·/CJK），且字节位≠显示列。两个绘制点（regionApply
+/// 与 paintStatusRow）共用本函数——两处内联曾在 S22 开发中漂移过一次。
+fn paintHintRow(w: *std.Io.Writer) void {
+    const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
+    const tw = currentTermWidth();
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < hint.len) {
+        const next = nextChar(hint, i);
+        const cw = strWidth(hint[i..next]);
+        if (col + cw > tw) break;
+        col += cw;
+        i = next;
+    }
+    std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{hint[0..i]}) catch {};
+}
+
 fn paintStatusRow(w: *std.Io.Writer) void {
     const split = regionRows();
     std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     } else {
-        // 空闲态：meta 行=输入区上边界（hint）。回合中该行被回合状态
-        // 占用（regionStatus），两态共用同一行——账目不变。
-        const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+R 搜索";
-        const tw = currentTermWidth();
-        const cut = if (hint.len > tw) hint[0..@min(hint.len, tw)] else hint;
-        std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{cut}) catch {};
+        paintHintRow(w);
     }
     parkCursor(w);
 }
