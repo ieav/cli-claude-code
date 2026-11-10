@@ -420,6 +420,24 @@ pub const glob_tool: ToolDefinition = .{
     .search_hint = "find search files pattern glob",
 };
 
+/// DirTree: structural overview ("what does this tree look like") —
+/// Glob's complement for the first contact with an unfamiliar project.
+/// Shares Glob's prune list; stable dirs-first ordering.
+pub const dir_tree_tool: ToolDefinition = .{
+    .name = "DirTree",
+    .description = "Show a directory's structure as an indented tree (dirs first, vendored trees pruned). Use for project overviews; use Glob to find files matching a pattern",
+    .input_schema =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to overview (default: cwd)"},"maxDepth":{"type":"integer","description":"Maximum depth (default 3 — an overview, not an inventory)"},"maxEntries":{"type":"integer","description":"Entry cap (default 400, max 2000); truncation is visible"}},"required":[]}
+    ,
+    .execute_fn = @import("dir_tree.zig").execute,
+    .is_read_only = true,
+    .is_destructive = false,
+    .is_concurrency_safe_fn = alwaysConcurrencySafe,
+    .aliases = &.{ "Tree", "tree" },
+    .search_hint = "directory tree structure overview project layout",
+    .max_result_size = 100_000,
+};
+
 pub const grep_tool: ToolDefinition = .{
     .name = "Grep",
     .description = "Search file contents for a pattern",
@@ -547,15 +565,15 @@ pub const bg_task_tool: ToolDefinition = .{
 
 pub const ask_user_tool: ToolDefinition = .{
     .name = "AskUserQuestion",
-    .description = "Ask the user a question during execution",
+    .description = "Ask the user a question during execution. With `options` (2-8 short choices) the user picks a number instead of typing a free answer — prefer options for A-or-B style decisions",
     .input_schema =
-    \\{"type":"object","properties":{"question":{"type":"string","description":"Question to ask"}},"required":["question"]}
+    \\{"type":"object","properties":{"question":{"type":"string","description":"Question to ask"},"options":{"type":"array","items":{"type":"string"},"description":"Optional 2-8 short choices; the user answers by number (omit for free-text)"}},"required":["question"]}
     ,
     .execute_fn = @import("ask_user.zig").execute,
     .is_read_only = true,
     .is_destructive = false,
     .is_concurrency_safe_fn = neverConcurrencySafe,
-    .search_hint = "ask question user prompt",
+    .search_hint = "ask question user prompt choose option",
 };
 
 pub const tool_search_tool: ToolDefinition = .{
@@ -580,6 +598,7 @@ pub const default_tools = &[_]ToolDefinition{
     // File operations
     glob_tool,
     grep_tool,
+    dir_tree_tool,
     file_edit_tool,
 
     // Web
@@ -632,7 +651,7 @@ test "ToolRegistry has and getByName" {
 
 test "ToolRegistry count" {
     // +2 于 2026-11-09：TaskGet（任务详情）+ BgTask（后台任务自管理）。
-    try std.testing.expectEqual(@as(usize, 15), DefaultRegistry.count());
+    try std.testing.expectEqual(@as(usize, 16), DefaultRegistry.count());
 }
 
 test "ToolDefinition matchesName" {

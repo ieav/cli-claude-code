@@ -455,7 +455,7 @@ ziv> 已恢复会话 #41：24 条消息（~8100 tokens · 模型 gpt-4o · 模�
 Ziv Agent v0.9.1
 ├── math/           数学常数核心 (pi, e, phi)
 ├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 流式 + 消息压缩
-├── tools/          comptime 工具系统 (15 内置工具 + agent 动态工具) + 权限 + 编排
+├── tools/          comptime 工具系统 (16 内置工具 + agent 动态工具) + 权限 + 编排
 ├── agent/          子代理执行器 (subagent) + 非交互一发 (oneshot)
 ├── turn/           回合子系统 (流式/工具/历史压缩/ask)
 ├── commands/       斜杠命令分发 (dispatch/config_menu/history_cmds)
@@ -506,7 +506,7 @@ Ziv Agent v0.9.1
 
 **请求体 UTF-8 清洗**（v0.9.1）：非法 UTF-8 字节在出网前被清洗净化——网关对脏字节的 400 InvalidRequest 不再发生。
 
-### 5.3 工具系统（15 内置 + 动态）
+### 5.3 工具系统（16 内置 + 动态）
 
 comptime 泛型注册，零运行时开销。每个工具支持并发安全检查（输入级）、破坏性检测（输入级）、输入验证、权限检查、别名匹配。
 
@@ -518,6 +518,7 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 | **FileEdit** | Edit, sed | 读写 | 不安全 | 字符串查找替换编辑 |
 | **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配；构建/依赖目录整树剪枝，`maxDepth` 默认 10，结果上限 2000 |
 | **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置；后端一次判定，进程内缓存）；30s 超时、500 条截断 |
+| **DirTree** | Tree, tree | 只读 | 安全 | **目录结构概览**（v0.9.1 后）：缩进树形渲染，目录优先字母序；与 Glob 共享剪枝表（node_modules/.git 等整树不进）；`maxDepth` 默认 3、`maxEntries` 默认 400（截断可见）。摸陌生项目的第一步，补 Glob 只会模式匹配的短板 |
 | **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave；SearXNG 可配） |
 | **WebFetch** | Fetch | 只读 | 安全 | **v0.8.0**：抓取 URL 转 Markdown（搜索的下一步）；结果上限 40K |
 | **TaskCreate** | — | 读写 | 不安全 | 创建任务（`priority` 1-5，默认 3） |
@@ -525,7 +526,7 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 | **TaskUpdate** | — | 读写 | 不安全 | 更新任务状态 |
 | **TaskGet** | — | 只读 | 安全 | **v0.8.0**：按 id 查单条全文详情（列表截断描述，Get 给全文） |
 | **BgTask** | — | 只读* | 安全 | **v0.8.0**：后台任务自管理——`action`: status（全部或按 `id` 单条）/ output（输出尾部）/ stop（杀进程组，default 模式走审批） |
-| **AskUserQuestion** | — | 只读 | 不安全 | 向用户提问（阻塞式，支持 Esc 取消） |
+| **AskUserQuestion** | — | 只读 | 不安全 | 向用户提问（阻塞式，Esc 取消）。带 `options`（2-8 项）时渲染编号列表、按数字选择——选项原文回传模型；无 options 为自由文本行 |
 | **ToolSearch** | — | 只读 | 安全 | 按关键词搜索可用工具 |
 | **agent**（动态） | — | 读写* | — | 并行子代理派发（默认开启，详见 3 节 agent 小节） |
 | **mcp__\<服务器\>__\<工具\>**（动态） | — | 视工具 | — | MCP 桥接工具（连接后自动注册） |
@@ -790,7 +791,7 @@ const provider = ollama.toProvider();
 | 子目录 | 用途 |
 |---|---|
 | `llm/` | LLM 后端（Claude/OpenAI/Ollama、流式、压缩） |
-| `tools/` | 15 内置工具 + 注册器 + 权限 + 编排 + agent 派发 |
+| `tools/` | 16 内置工具 + 注册器 + 权限 + 编排 + agent 派发 |
 | `agent/` | 子代理执行器（subagent）+ -p 一发模式（oneshot） |
 | `turn/` | 回合子系统：stream（流式+工具头）/ tools（执行+LastTools）/ history（压缩/计划锚点）/ ask（权限门）/ error_recovery |
 | `commands/` | 斜杠命令：dispatch（分发链）/ config_menu / history_cmds |

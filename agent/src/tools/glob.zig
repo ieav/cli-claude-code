@@ -10,8 +10,10 @@ const registry = @import("registry.zig");
 const glob_match = @import("../util/glob_match.zig");
 
 /// Directory names pruned during traversal — entering them is pure waste
-/// for every realistic glob query.
-const excluded_dirs = [_][]const u8{
+/// for every realistic glob query. PUBLIC: DirTree shares the list (one
+/// source of truth — a tree overview that descended node_modules would be
+/// useless for the same reasons).
+pub const excluded_dirs = [_][]const u8{
     ".git",         ".hg",        ".svn",    "target", "build",
     "node_modules", ".zig-cache", "zig-out", "dist",   "out",
     "__pycache__",  ".venv",      ".cache",  ".next",
@@ -141,7 +143,7 @@ fn appendRel(state: *WalkState, name: []const u8) !void {
     state.rel_len += name.len;
 }
 
-fn isExcluded(name: []const u8) bool {
+pub fn isExcluded(name: []const u8) bool {
     for (excluded_dirs) |x| {
         if (std.mem.eql(u8, name, x)) return true;
     }

@@ -455,3 +455,11 @@
 - **文档对账（本日）**：① 两处过时注释统一改口——repl.zig T6.4 注释与 upgrade-plan 进度注记从"挂死未定位需 root 级工具"改为"已破案（网关停摆）+ 看护狗兜底 + 默认保守关（default-on E2E 复验后决策）"；② /help 补 /plan、/terminal-setup、/models 别名；③ USAGE：/agent 移出命令表改为表后说明（代码无该命令分支，agent 是动态注册的 LLM 工具）、命令表补 /plan 行、补 P4 生成中打字/粘贴行为、§5.9 对账（8→7 条，删已废弃"决策质量"行，补 P5 误报治理说明）；④ DESIGN 14.1 监控行更新为 P38 通电口径、14.2 任务系统两行闭环（cancel/retry/priority 已接线，残留仅 progress 字段）、14.4 基线 241→289；⑤ upgrade-plan T1~T8 共 23 行逐项勾选（T3.1/T3.3/T7.2 变体口径在进度注记）
 - **登记（沿袭，无变化）**：agent 默认开启复验待做；skill when_to_use 语义触发（$ARGUMENTS 基建已有）；monitor auto_fix 半环；knowledge_conflict 数据源；研究 Step1 本地预检/Step5 交互；alternatives 恒空；RoPE/φ 降维/黄金分割/ε 衰减；Windows 仅分析文档；Linux musl 实机待验；SIGSEGV 兜底（异步信号安全原因，接受）
 - **结果**：289 测试（284 pass / 5 skip / 0 fail）实测复核
+
+## P40（2026-11-11）工具面补强登记
+
+### 多模态读（FileRead 挡二进制，模型看不到图）
+- **状态**: ⬜ 待做（用户裁定：先记下，暂不实现）
+- **问题**: FileRead 经 binary_check 挡掉二进制文件；provider 层消息格式无图像通道。接 GLM-4v / Claude 等视觉模型时浪费一半能力——前端调试（截图比对）、设计稿对照类任务做不了。
+- **方案草图**: ① provider 层 ContentBlock 加 image 变体（base64 + media_type，OpenAI/Claude 双协议格式）；② FileRead 识别图像扩展名（png/jpg/webp/gif）时走图像分支：读文件→base64→图像块（受 max_result_size 类似的尺寸/大小上限约束）；③ 系统提示声明视觉能力按模型 capabilityTier 门控。
+- **前置**: 无硬前置；工程量集中在 provider 消息序列化与测试（mock 网关断言请求体含 image_url/source 格式）。
