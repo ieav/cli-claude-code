@@ -59,6 +59,11 @@ pub const DispatchCtx = struct {
     allow_rules: []const registry.PermissionRule = &.{},
     deny_rules: []const registry.PermissionRule = &.{},
     ask_rules: []const registry.PermissionRule = &.{},
+    /// 子代理每轮 LLM 输出预算（token）——与主会话同源（settings.
+    /// max_tokens）：思考型模型的思考 token 计入输出预算，固定小值
+    /// 会让思考模型"想完就没字"（subagent.zig response_budget 注释）。
+    /// REPL/oneshot 构造 ctx 时接线；0 = 让 subagent 用默认兜底。
+    response_budget: u32 = 0,
 };
 
 /// M4 fork 继承的 token 帽：父历史只取尾部（最新上下文最相关，
@@ -249,9 +254,9 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     };
     var old_int: std.posix.Sigaction = undefined;
     std.posix.sigaction(.INT, &int_act, &old_int);
-    active_cancel = &wctx.cancel;
+    active_cancel.store(&wctx.cancel, .release);
     defer {
-        active_cancel = null;
+        active_cancel.store(null, .release);
         std.posix.sigaction(.INT, &old_int, null);
     }
 
@@ -262,10 +267,18 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     while (spawned < conc - 1) : (spawned += 1) {
         threads[spawned] = std.Thread.spawn(.{}, workerMain, .{&wctx}) catch break;
     }
-    live_dispatch = &wctx; // UI 泵从这刻起可渲染子代理实时进度
+    // UI 泵从这刻起可渲染子代理实时进度（bump gen：让可能仍持有旧代
+    // 读数的一次 liveSummary 作废——见 live_dispatch 的 seqlock 注释）。
+    _ = live_gen.fetchAdd(1, .release);
+    live_dispatch.store(&wctx, .release);
     workerMain(&wctx); // the calling thread is the last worker
     for (threads[0..spawned]) |t| t.?.join();
-    live_dispatch = null; // join 完即撤——jobs 将随本函数栈销毁
+    // Teardown ORDER is the seqlock contract: clear the pointer FIRST,
+    // bump the generation SECOND. Jobs are then RETIRED (destroyed at
+    // the next dispatch's teardown) rather than freed — a stale-snapshot
+    // reader from THIS generation must still find live memory.
+    live_dispatch.store(null, .release);
+    _ = live_gen.fetchAdd(1, .release);
 
     const canceled = wctx.cancel.load(.acquire);
     if (ctx.bus) |b| {
@@ -281,7 +294,14 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
         }
     }
     const tr = try mergeJobs(alloc, ctx, jobs, n, canceled);
-    alloc.destroy(jobs);
+    // Retire, don't destroy: the previous generation dies here (its
+    // readers are long gone — a full dispatch lifetime has passed), this
+    // one stays readable for any stale-snapshot livenessSummary reader.
+    // The LAST retire before process exit leaks to the allocator's
+    // process teardown — smp_allocator has no leak gate; the alternative
+    // (grace-period tracking per reader) costs more than one array.
+    if (retired_jobs) |old| alloc.destroy(old);
+    retired_jobs = jobs;
     // 超限任务必须可见：静默丢弃会让模型以为全部已派（容量升到 10 后
     // 这个坑从"理论"变"现实"）——拼一行提示让它分批。
     if (tasks.items.len > n) {
@@ -307,19 +327,41 @@ const WorkerCtx = struct {
 };
 
 /// Active dispatch cancel flag for the SIGINT handler (async-signal-safe:
-/// the handler only does an atomic store). Null outside a dispatch, where
-/// SIGINT keeps its default disposition.
-var active_cancel: ?*std.atomic.Value(bool) = null;
+/// the handler only does an atomic store). Atomic POINTER: the handler can
+/// fire on any thread, and a plain var read could observe the stale value
+/// written at the previous dispatch's teardown — storing into that freed
+/// WorkerCtx would be a UAF write.
+var active_cancel: std.atomic.Value(?*std.atomic.Value(bool)) = std.atomic.Value(?*std.atomic.Value(bool)).init(null);
 
 /// 活跃 dispatch 的观测句柄（与 active_cancel 同生命周期）：REPL 工具
-/// 相位的 UI 泵每 500ms 读 liveSummary 渲染子代理实时进度。jobs 栈上
-/// 存活、join 后清空——UI 只在 tool_job.done 前读，无悬垂窗口。
-var live_dispatch: ?*WorkerCtx = null;
+/// 相位的 UI 泵每 500ms 读 liveSummary 渲染子代理实时进度。
+///
+/// 跨线程生命周期（2026-11-10 UAF 修复）：工具线程写、主线程 UI 循环
+/// 读。seqlock 模式——写侧换装（store）与拆除（store(null) + destroy
+/// jobs）之间递增 live_gen；读侧 gen1 → 读数据 → gen2 双检，gen 变化
+/// 即作废本次读（gen 未变 ⟹ 拆除未发生 ⟹ 数据全程有效）。指针本体
+/// atomic 存储，无撕裂。
+var live_dispatch: std.atomic.Value(?*WorkerCtx) = std.atomic.Value(?*WorkerCtx).init(null);
+var live_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Retired jobs array from the PREVIOUS dispatch. A seqlock reader may
+/// hold an entire coherent PRE-teardown snapshot (every load read values
+/// from before the teardown propagated) — the gen check then passes while
+/// the memory is already freed. Seqlock prevents torn reads, not
+/// read-after-free of a stale snapshot. Retiring keeps one generation
+/// alive: destroy happens at the NEXT dispatch's teardown, a full
+/// dispatch lifetime later — no reader that old survives.
+/// Cross-thread safety: dispatches run serially on (possibly different)
+/// tool threads; the handoff goes through the main thread's done-load /
+/// next-spawn chain, which establishes happens-before.
+var retired_jobs: ?*[MAX_SUBAGENTS]AgentJob = null;
 
 /// 子代理实时进度行（写入 buf，返回切片；无活跃 dispatch → null）。
 /// 只读原子量：progress（当前轮次）/ finished。最多列 6 个 + 省略号。
+/// seqlock 双检：换代即作废（数据可能已随旧 dispatch 销毁）。
 pub fn liveSummary(buf: []u8) ?[]const u8 {
-    const wctx = live_dispatch orelse return null;
+    const g1 = live_gen.load(.acquire);
+    const wctx = live_dispatch.load(.acquire) orelse return null;
     var fbs = std.Io.Writer.fixed(buf);
     const w = &fbs;
     const shown = @min(wctx.order_len, 6);
@@ -329,12 +371,16 @@ pub fn liveSummary(buf: []u8) ?[]const u8 {
         const j = &wctx.jobs[i];
         if (i > 0) w.writeAll(" · ") catch break;
         if (j.finished.load(.acquire)) {
-            w.print("#{d} ✓", .{i + 1}) catch break;
+            w.print("#{d} ✓", .{ i + 1 }) catch break;
         } else {
             w.print("#{d} t{d}", .{ i + 1, j.progress.load(.acquire) }) catch break;
         }
     }
     if (wctx.order_len > shown) w.writeAll(" · …") catch {};
+    // Generation moved under us → a teardown (or a new dispatch) happened
+    // mid-read; the summary may reference freed jobs. Drop it — the next
+    // 500ms tick renders the fresh state.
+    if (live_gen.load(.acquire) != g1) return null;
     return buf[0..w.end];
 }
 
@@ -347,7 +393,7 @@ fn countDone(wctx: *WorkerCtx) usize {
 }
 
 fn onDispatchSigint(_: std.posix.SIG) callconv(.c) void {
-    if (active_cancel) |c| c.store(true, .release);
+    if (active_cancel.load(.acquire)) |c| c.store(true, .release);
 }
 
 /// One worker: private io + provider created AND destroyed on THIS thread
@@ -388,6 +434,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
         .inherited = if (job.inherited.len > 0) job.inherited else null,
         .max_turns = job.max_turns,
         .perm_ctx = w.perm_ctx,
+        .response_budget = if (w.ctx.response_budget > 0) w.ctx.response_budget else 4096,
     });
     finishJob(&w.jobs[idx], res);
     // P3 retry: fail-FAST jobs (≤3 turns in) get exactly one 1s-backoff
@@ -412,6 +459,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
             .inherited = if (job.inherited.len > 0) job.inherited else null,
             .max_turns = job.max_turns,
             .perm_ctx = w.perm_ctx,
+            .response_budget = if (w.ctx.response_budget > 0) w.ctx.response_budget else 4096,
         });
         finishJob(&w.jobs[idx], res2);
     }
@@ -420,7 +468,9 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
 fn finishJob(job: *AgentJob, res: subagent.SubagentResult) void {
     job.finished.store(true, .release);
     job.result = res;
-    if (std.mem.startsWith(u8, res.summary, "subagent failed")) {
+    // Structured failure flag — NOT a "subagent failed" summary prefix
+    // (rewording the error text used to silently change retry semantics).
+    if (res.err) {
         job.failed = true;
         job.failed_turns = res.turns_used;
         res.deinit(job.ctx.alloc);
@@ -573,8 +623,9 @@ test "liveSummary renders per-subagent progress from atomics only" {
         .order_len = 3,
         .next = std.atomic.Value(u32).init(0),
     };
-    live_dispatch = &wctx;
-    defer live_dispatch = null;
+    _ = live_gen.fetchAdd(1, .release);
+    live_dispatch.store(&wctx, .release);
+    defer live_dispatch.store(null, .release);
     var buf: [128]u8 = undefined;
     const s = liveSummary(&buf) orelse return error.NoSummary;
     try std.testing.expect(std.mem.indexOf(u8, s, "agent 1/3") != null);
@@ -582,6 +633,7 @@ test "liveSummary renders per-subagent progress from atomics only" {
     try std.testing.expect(std.mem.indexOf(u8, s, "#2 t4") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "#3 t0") != null);
     // 无活跃 dispatch → null（UI 回落泛化状态行）。
-    live_dispatch = null;
+    live_dispatch.store(null, .release);
+    _ = live_gen.fetchAdd(1, .release);
     try std.testing.expect(liveSummary(&buf) == null);
 }

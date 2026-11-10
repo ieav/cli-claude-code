@@ -50,19 +50,19 @@ pub const CompleteOptions = struct {
     stop_sequences: ?[]const []const u8 = null,
     /// Tool declarations the model may call. null = plain chat (no tools).
     tools: ?[]const ToolSpec = null,
-    /// Interactive REPL streams only: cancellation plumbing owned by the
-    /// UI loop (see repl.StreamJob). The provider publishes the
-    /// connection's socket fd into `cancel_fd` once connected; the UI,
-    /// on Esc/Ctrl-C, sets the flag AND shutdown(2)s the fd — the pump
-    /// thread's BLOCKING read fails immediately, the stream unwinds, and
-    /// the killed-connection error maps to error.EscCancelled. The pump
-    /// never needs to poll anything; buffered body data is consumed with
-    /// correct reader semantics (the idle-poll design starved when
-    /// headers+body arrived in one TCP segment — the body sat in the
-    /// connection buffer while the poll watched an empty kernel socket
-    /// for 180s). Background callers (subagents, reflection) MUST leave
-    /// these null — there is no UI to cancel them.
-    cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// Cancellation plumbing. Two cooperative mechanisms:
+    /// · `cancel_fd` (REPL streams): the provider publishes the
+    ///   connection's socket fd once connected; the UI, on Esc/Ctrl-C,
+    ///   shutdown(2)s the fd — the pump thread's BLOCKING read fails
+    ///   immediately, the stream unwinds, and the killed-connection error
+    ///   maps to error.EscCancelled. Background callers leave it null.
+    /// · `cancel_flag` (headless callers too — subagent dispatches since
+    ///   2026-11-10): the per-request stall watchdog polls this flag on
+    ///   its 250ms tick and kills the socket when set; the transport
+    ///   error maps to error.EscCancelled. The flag must outlive the
+    ///   request (caller-frame or dispatch-scoped atomic).
+    /// Both null = uncancellable (the historical default).
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
     cancel_fd: ?*std.atomic.Value(i32) = null,
 };
 

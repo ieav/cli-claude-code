@@ -56,7 +56,7 @@ pub const OllamaProvider = struct {
         const body = try self.buildRequestBody(messages, opts, false);
         defer self.allocator.free(body);
 
-        const response_body = try self.sendRequest("/api/chat", body);
+        const response_body = try self.sendRequest("/api/chat", body, opts.cancel_flag);
         defer self.allocator.free(response_body);
 
         return self.parseChatResponse(response_body);
@@ -85,7 +85,7 @@ pub const OllamaProvider = struct {
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len, null);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -326,7 +326,7 @@ pub const OllamaProvider = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
+    fn sendRequest(self: *Self, path: []const u8, body: []const u8, cancel_flag: ?*const std.atomic.Value(bool)) ![]u8 {
         const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
@@ -342,14 +342,16 @@ pub const OllamaProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
+        // cancel_flag rides along (subagent dispatches) — see openai.zig.
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len, cancel_flag);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |e| {
+            if (wd.cancelledKilled()) return error.EscCancelled;
             provider.setErrorDetailIfEmpty("ollama: request failed: {s}", .{@errorName(e)});
             return e;
         };
@@ -364,7 +366,10 @@ pub const OllamaProvider = struct {
         // 64 KiB I/O buffer instead of a 1 MiB stack array — see openai.zig.
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = response.reader(&body_buf);
-        return reader.allocRemaining(self.allocator, .limited(1024 * 1024));
+        return reader.allocRemaining(self.allocator, .limited(1024 * 1024)) catch |e| {
+            if (wd.cancelledKilled()) return error.EscCancelled;
+            return e;
+        };
     }
 
     fn parseChatResponse(self: *Self, body: []const u8) !provider.CompleteResponse {

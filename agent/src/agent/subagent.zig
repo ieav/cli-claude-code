@@ -19,7 +19,10 @@ pub const MAX_TURNS: usize = 10;
 
 /// Tools a subagent may never see: session-scoped task tracking and
 /// interactive questions make no sense without the REPL around them.
-const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "AskUser", "agent" };
+/// Names are the registry's canonical ones — "AskUserQuestion", NOT the
+/// "AskUser" shorthand (exact-match deny let the real tool slip through
+/// until 2026-11-10).
+const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "TaskGet", "AskUserQuestion", "BgTask", "agent" };
 
 fn toolAllowed(name: []const u8) bool {
     for (deny_tools) |d| {
@@ -71,6 +74,12 @@ pub const SubagentConfig = struct {
     /// 义）。oneshot 传用户 settings 的规则与模式——ask 决策在无头环境
     /// 仍然降级为拒绝（无人在场，不允许悬停等待）。
     perm_ctx: ?*const registry.PermissionContext = null,
+    /// 每轮 LLM 输出预算（token）。默认值只是兜底——调用方应传"与主
+    /// 会话同源"的预算（settings.max_tokens）：思考型模型的思考 token
+    /// 计入输出预算，2048 级硬编码会让思考模型"想完就没字了"（主循环
+    /// 同因已默认 16384，见 config.zig max_tokens 注释）。dispatch 与
+    /// oneshot 都从各自的 settings 接线。
+    response_budget: u32 = 4096,
 };
 
 pub const SubagentResult = struct {
@@ -163,10 +172,21 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
             }
         }
         if (cfg.progress) |p| p.store(@intCast(turn + 1), .release);
-        const resp = try cfg.provider.complete(history.items, .{
-            .max_tokens = 2048,
+        // In-flight cancellation: the cancel flag rides into the request
+        // (watchdog-killed socket → error.EscCancelled) so an Esc'd
+        // dispatch stops a BLOCKED complete within one 250ms tick instead
+        // of waiting out the idle watchdog. Folded into the same
+        // "(canceled by user)" result as the turn-boundary check.
+        const resp = cfg.provider.complete(history.items, .{
+            .max_tokens = cfg.response_budget,
             .tools = specs.items,
-        });
+            .cancel_flag = cfg.cancel,
+        }) catch |e| {
+            if (e == error.EscCancelled) {
+                return .{ .summary = try alloc.dupe(u8, "(canceled by user)"), .turns_used = turn + 1, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };
+            }
+            return e;
+        };
         tokens_in += resp.usage.input_tokens;
         tokens_out += resp.usage.output_tokens;
         // The response (and its DOM arena) is NEVER freed inside the loop:
@@ -310,7 +330,11 @@ test "utf8TokenCut respects budget and rune boundaries" {
 
 test "toolAllowed whitelist (T6.2)" {
     try std.testing.expect(!toolAllowed("TaskCreate"));
-    try std.testing.expect(!toolAllowed("AskUser"));
+    try std.testing.expect(!toolAllowed("TaskGet"));
+    try std.testing.expect(!toolAllowed("BgTask"));
+    // Registry CANONICAL name — the "AskUser" shorthand never matched
+    // (exact eql) and let the real tool slip through (fixed 2026-11-10).
+    try std.testing.expect(!toolAllowed("AskUserQuestion"));
     try std.testing.expect(toolAllowed("Grep"));
     try std.testing.expect(toolAllowed("FileRead"));
     try std.testing.expect(toolAllowed("Bash"));
@@ -321,6 +345,7 @@ test "toolVisible: dispatch whitelist narrows, never widens (M4)" {
     // null = 继承全量（仍走 deny 过滤）。
     try std.testing.expect(toolVisible("Grep", null));
     try std.testing.expect(!toolVisible("TaskCreate", null));
+    try std.testing.expect(!toolVisible("AskUserQuestion", null));
     // 白名单命中才可见。
     const only = [_][]const u8{ "FileRead", "Grep" };
     try std.testing.expect(toolVisible("Grep", &only));

@@ -40,11 +40,15 @@ pub const SHUT_RDWR: c_int = 2;
 /// Why the watchdog killed a request's socket (per-request, caller-frame
 /// backed). .ttft → the provider maps the transport error to
 /// error.FirstByteTimeout for auto-retry; .idle → the error detail must
-/// say "ziv idle watchdog", not blame the gateway.
+/// say "ziv idle watchdog", not blame the gateway; .cancelled → a
+/// cooperative cancel flag (e.g. an Esc'd agent dispatch) asked for the
+/// kill — the provider maps it to error.EscCancelled so headless callers
+/// can fold it into "(canceled)" instead of "failed".
 pub const KillReason = enum(u8) {
     none = 0,
     ttft = 1,
     idle = 2,
+    cancelled = 3,
 };
 
 /// Per-request state, owned EXCLUSIVELY by the watchdog thread after arm:
@@ -73,6 +77,13 @@ const State = struct {
     /// Signed: nowMillis() is a wall clock and can step backwards — the
     /// idle subtraction must not wrap into a huge unsigned value.
     last_activity_ms: std.atomic.Value(i64),
+    /// Cooperative cancel (subagent dispatch etc.): while the flag is set
+    /// the watchdog kills the socket on its next 250ms tick — the blocked
+    /// read fails on the owning thread and the provider maps the transport
+    /// error to error.EscCancelled. Read-only here; the caller owns it and
+    /// keeps it alive for the whole request (same lifetime rule as
+    /// kill_reason).
+    cancel_flag: ?*const std.atomic.Value(bool),
     kill_reason: *std.atomic.Value(u8),
 };
 
@@ -118,6 +129,13 @@ pub const Guard = struct {
     pub fn idleKilled(self: Guard) bool {
         return self.killReason() == .idle;
     }
+
+    /// True when THIS request was killed by its cooperative cancel flag —
+    /// the caller maps the transport error to error.EscCancelled (user
+    /// cancel, not a failure).
+    pub fn cancelledKilled(self: Guard) bool {
+        return self.killReason() == .cancelled;
+    }
 };
 
 /// Arm a stall watchdog on a live request's connection. `kill_reason`
@@ -127,7 +145,7 @@ pub const Guard = struct {
 /// state) when there is no connection or the thread cannot spawn — a
 /// missing watchdog must never break the request itself.
 pub fn arm(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8)) Guard {
-    return armForBody(req, kill_reason, 0);
+    return armForBody(req, kill_reason, 0, null);
 }
 
 /// Body-scaled TTFT (2026-11-07): big prompts legitimately take longer to
@@ -144,7 +162,7 @@ pub fn ttftBudgetFor(body_len: usize) u64 {
     return @min(currentTtftMs() + scale_ms, 120_000);
 }
 
-pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8), body_len: usize) Guard {
+pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8), body_len: usize, cancel_flag: ?*const std.atomic.Value(bool)) Guard {
     const conn = req.connection orelse return .{ .state = null, .kill_reason = kill_reason };
     const s = std.heap.smp_allocator.create(State) catch return .{ .state = null, .kill_reason = kill_reason };
     s.* = .{
@@ -154,6 +172,7 @@ pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(
         .ttft_ms = ttftBudgetFor(body_len),
         .first_byte = std.atomic.Value(bool).init(false),
         .last_activity_ms = std.atomic.Value(i64).init(time_mod.nowMillis()),
+        .cancel_flag = cancel_flag,
         .kill_reason = kill_reason,
     };
     const t = std.Thread.spawn(.{}, watchdogThread, .{s}) catch {
@@ -166,6 +185,22 @@ pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(
 
 fn watchdogThread(s: *State) void {
     while (!s.done.load(.acquire)) {
+        // Cooperative cancel: flagged requests die on the next tick — the
+        // shutdown fails the owning thread's blocking read and the provider
+        // maps the transport error to error.EscCancelled (user cancel).
+        if (s.cancel_flag) |cf| {
+            if (cf.load(.acquire)) {
+                if (s.done.load(.acquire)) {
+                    std.heap.smp_allocator.destroy(s);
+                    return;
+                }
+                s.kill_reason.store(@backingInt(KillReason.cancelled), .release);
+                _ = std.c.shutdown(s.fd, SHUT_RDWR);
+                logger.info("llm: request canceled by user — socket shut down", .{});
+                std.heap.smp_allocator.destroy(s);
+                return;
+            }
+        }
         const now = time_mod.nowMillis();
         const idle: i64 = now - s.last_activity_ms.load(.acquire);
         const decision = killDecision(s.first_byte.load(.acquire), idle, s.ttft_ms, s.timeout_ms);
@@ -186,7 +221,7 @@ fn watchdogThread(s: *State) void {
             switch (reason) {
                 .ttft => logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{s.ttft_ms}),
                 .idle => logger.warning("llm: no data for {d}ms — connection killed by idle watchdog (a stream that keeps sending never hits this)", .{s.timeout_ms}),
-                .none => unreachable,
+                .cancelled, .none => unreachable,
             }
             std.heap.smp_allocator.destroy(s);
             return;

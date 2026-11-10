@@ -57,7 +57,7 @@ pub const OpenAIProvider = struct {
         const body = try self.buildRequestBody(messages, opts, false);
         defer self.allocator.free(body);
 
-        const response_body = try self.sendRequest("/chat/completions", body);
+        const response_body = try self.sendRequest("/chat/completions", body, opts.cancel_flag);
         defer self.allocator.free(response_body);
 
         return self.parseResponse(response_body);
@@ -104,7 +104,7 @@ pub const OpenAIProvider = struct {
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len, null);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -399,13 +399,13 @@ pub const OpenAIProvider = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    fn sendRequest(self: *Self, path: []const u8, body: []const u8) ![]u8 {
-        return sendRequestImpl(self, path, body, true);
+    fn sendRequest(self: *Self, path: []const u8, body: []const u8, cancel_flag: ?*const std.atomic.Value(bool)) ![]u8 {
+        return sendRequestImpl(self, path, body, cancel_flag, true);
     }
 
     /// Keep-alive race retry — see streamImpl (same rationale: pooled
     /// idle conn server-closed; request bytes never consumed).
-    fn sendRequestImpl(self: *Self, path: []const u8, body: []const u8, retry_ok: bool) ![]u8 {
+    fn sendRequestImpl(self: *Self, path: []const u8, body: []const u8, cancel_flag: ?*const std.atomic.Value(bool), retry_ok: bool) ![]u8 {
         const url = try self.allocator.print("{s}{s}", .{ self.config.base_url, path });
         defer self.allocator.free(url);
 
@@ -424,8 +424,11 @@ pub const OpenAIProvider = struct {
         defer req.deinit();
         // Stall watchdog: the gateway sometimes never answers — without
         // this the caller blocks in recvmsg forever (see llm_watchdog).
+        // cancel_flag rides along (subagent dispatches): a set flag kills
+        // the socket on the next watchdog tick — the blocked read below
+        // fails and maps to error.EscCancelled.
         var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
-        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len);
+        const wd = llm_watchdog.armForBody(&req, &kill_reason, body.len, cancel_flag);
         defer wd.finish();
 
         try req.sendBodyComplete(@constCast(body));
@@ -435,9 +438,10 @@ pub const OpenAIProvider = struct {
             // A TTFT kill (gateway never sent even the headers) surfaces
             // here as a transport error — map it so the caller retries.
             if (wd.ttftKilled()) return error.FirstByteTimeout;
+            if (wd.cancelledKilled()) return error.EscCancelled;
             if (retry_ok and !wd.ttftKilled() and !wd.idleKilled() and (e == error.HttpConnectionClosing or e == error.ConnectionResetByPeer)) {
                 logger.info("openai: pooled conn dead ({s}, no headers) — retrying once on a fresh connection", .{@errorName(e)});
-                return sendRequestImpl(self, path, body, false);
+                return sendRequestImpl(self, path, body, cancel_flag, false);
             }
             provider.setErrorDetailIfEmpty("openai: request failed: {s}", .{@errorName(e)});
             return e;
@@ -455,7 +459,10 @@ pub const OpenAIProvider = struct {
         // stacks; allocRemaining grows past the buffer as needed.
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = response.reader(&body_buf);
-        return reader.allocRemaining(self.allocator, .limited(1024 * 1024));
+        return reader.allocRemaining(self.allocator, .limited(1024 * 1024)) catch |e| {
+            if (wd.cancelledKilled()) return error.EscCancelled;
+            return e;
+        };
     }
 
     fn parseResponse(self: *Self, body: []const u8) !provider.CompleteResponse {

@@ -84,6 +84,9 @@ pub fn run(
         .max_turns = @max(1, switcher.settings.agent_loop_limit),
         .system_prompt = sys_prompt,
         .perm_ctx = &perm_ctx,
+        // 输出预算与交互会话同源（settings.max_tokens）——思考型模型的
+        // 思考 token 计入输出预算，小值会"想完就没字"（config.zig 同因）。
+        .response_budget = switcher.settings.max_tokens,
     });
     defer res.deinit(alloc);
 
