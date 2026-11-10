@@ -242,8 +242,9 @@ tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | `/diagnose <concern>` | 自诊断：对薄弱回答建立决策链（live 埋点优先），定位低于 φ 置信度的环节并给建议 |
 | `/knowledge` | 查看知识图谱统计（节点总数、最近节点、π 周期扫描出的孤立节点/断边） |
 | **MCP & Skill** | |
-| `/skills` | 列出已安装 Skill（详见 5.13） |
-| `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见 5.12） |
+| `/skills` | 列出已安装 Skill + 未加载原因（详见 5.14） |
+| `/skill <sub>` | Skill 管理：new / show / remove / **reload 热重扫**（详见 5.14） |
+| `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见 5.13） |
 
 输入框中斜杠命令实时着色：已知命令青色、未知暗灰；打错命令给出 Did-you-mean 提示。
 
@@ -284,8 +285,10 @@ ziv -p "..." || echo "回合失败"
 - **容量**：1-10 个子代理并行（`subagent_concurrency` 控制并发 worker，默认 4，clamp 1..10；`/config` 菜单可改）；dispatch 超过 10 条任务**可见化报错**而非静默丢弃
 - **只读默认 / 全能力**：默认只读（研究/验证 fan-out）；`write:true` 经**用户真实权限规则**放行写操作（无头纪律：ask 级仍拒绝），写型 dispatch 恒串行
 - **进度可见**（v0.9.1）：dispatch 期间状态行实时显示各 agent 状态
-- **Ctrl-C 协作取消**未完成的子任务；每个 LLM 请求由看护狗保护（默认 180s 空闲超时，持续出数据的长流不杀，`ZIV_LLM_TIMEOUT_MS` 可调）
-- 子代理不可递归 fan-out（agent 工具对子代理不可见）
+- **Ctrl-C 协作取消**：未开始的 job 直接跳过，**进行中的 LLM 请求由看护狗在 250ms 内击杀 socket**（取消即时生效，不再等超时）；取消结果折叠为 `(canceled by user)` 不计失败
+- **输出预算与主会话同源**：子代理每轮输出预算跟随 `settings.max_tokens`（默认 16384）——思考型模型的思考 token 计入输出预算，固定小值会"想完就没字"
+- **禁入工具**：TaskCreate/TaskList/TaskUpdate/TaskGet（会话级任务跟踪）、AskUserQuestion（交互提问）、BgTask（全局后台任务管理）、agent（防递归 fan-out）
+- 每个 LLM 请求由看护狗保护（默认 180s 空闲超时，持续出数据的长流不杀，`ZIV_LLM_TIMEOUT_MS` 可调）
 
 ### 权限模式 (Permission Modes)
 
@@ -631,13 +634,20 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 
 - 配置持久化于 `~/.config/ziv/mcp.json`；env 全量继承
 - **启动自动连接**（v0.9.0）：配置过的服务器冷启动即握手桥接（短预算 3s，`ZIV_MCP_AUTOSTART_TIMEOUT_MS` 可调；`mcp_autostart: false` 或 `ZIV_MCP_AUTOSTART=0` 关闭）——不用再手敲 `/mcp connect`
-- **Playwright 接入**（真机已验收）：终端起服务 `npx -y @playwright/mcp@latest --port 18931`，`/mcp add playwright http://localhost:18931/mcp`（注意 `localhost`——服务默认监听 IPv6）；已知 npx 由 ziv 原生拉起的 stdio 形态握手不兼容，用 HTTP 方式即可
+- **npx stdio 形态已可用**（2026-11-10 根治）：`/mcp add <名> npx -y <包名>` 直接拉起。旧版两个根因已修——读循环丢弃 peek 残余（>4KB 的 tools/list 响应尾部丢失 → 握手卡死至看门狗超时）+ 深层 spawn 孤儿（SIGKILL 杀不到 npx 的 node 子进程，现按进程组治理）。实测 `@modelcontextprotocol/server-memory` 9 工具全桥接
+- **Playwright 接入**（真机已验收）：终端起服务 `npx -y @playwright/mcp@latest --port 18931`，`/mcp add playwright http://localhost:18931/mcp`（注意 `localhost`——服务默认监听 IPv6）
 
 ### 5.14 Skill（Claude SKILL.md 兼容）
 
 - 目录：`~/.config/ziv/skills/<名>/SKILL.md`（全局）+ `.ziv/skills/<名>/`（项目级，同名覆盖）
 - frontmatter：name / description / when_to_use / **tools**（v0.9.0 起为**强制门**：声明后本回合只许清单内工具；空声明 = 不设限，老 skill 兼容）
 - 调用：`/<技能名> [任务参数]`——触发时先打印预览（步数 + 声明工具），正文注入对话，`$ARGUMENTS` 占位替换；`/skills` 列出
+- **管理命令族**（`/skill`）：
+  - `/skill new <名>`——生成模板到项目级 `.ziv/skills/<名>/SKILL.md`（frontmatter 骨架 + 步骤示例）
+  - `/skill show <名>`——查看全文
+  - `/skill remove <名>`——确认后删除整个技能目录
+  - `/skill reload`——**热重扫**：新增/删除/编辑技能即时生效（重建 system 提示清单并重注入会话，无需重启）
+- **失败可见**：SKILL.md 读取失败、frontmatter 无效、缺 description 的目录不再静默跳过——`/skills` 列表带 `⚠ 未加载` 段逐条给出原因
 
 ### 5.15 tree-sitter 编辑后语法校验（v0.9.0）
 

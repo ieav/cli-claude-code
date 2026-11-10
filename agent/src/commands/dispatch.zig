@@ -79,6 +79,9 @@ pub const ReplCtx = struct {
     mcp_sessions: *std.ArrayList(*mcp_mod.session.McpSession),
     skill_loader: *skills_mod.loader.SkillLoader,
     skill_manifest: ?[]u8,
+    /// /skill reload 的重建目标：指向 run() 的 skill_manifest 槽位
+    /// （值字段 skill_manifest 只是启动快照，reload 要改写本体）。
+    skill_manifest_slot: *?[]u8,
     sys_prompt: *[]const u8,
     sys_prompt_owned: *?[]u8,
     applied_prompt_setting: *?[]const u8,
@@ -198,7 +201,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                         break;
                     }
                 }
-                if (!found) try std.Io.Writer.print(ctx.w, "  Unknown package '{s}'. Known: playwright, filesystem, memory, fetch, sequential-thinking\n\n", .{want});
+                if (!found) try std.Io.Writer.print(ctx.w,
+                    \\  Unknown package '{s}'. Known: playwright, filesystem, memory, fetch, sequential-thinking
+                    \\  任意服务器直接装：/mcp add <名> npx -y <包名>   或   /mcp add <名> https://<host>/mcp
+                    \\
+                , .{want});
             } else if (std.mem.startsWith(u8, rest_mcp, "add ")) {
                 const args_str = std.mem.trim(u8, rest_mcp[4..], " \t");
                 const sp = std.mem.indexOfScalar(u8, args_str, ' ') orelse {
@@ -247,15 +254,205 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.eql(u8, input, "/skills")) {
-            if (ctx.skill_loader.skills.items.len == 0) {
-                try std.Io.Writer.writeAll(ctx.w, "  No skills found. Add SKILL.md packs under ~/.config/ziv/skills/<name>/ or .ziv/skills/<name>/\n\n");
+            if (ctx.skill_loader.skills.items.len == 0 and ctx.skill_loader.problems.items.len == 0) {
+                try std.Io.Writer.writeAll(ctx.w, "  No skills found. /skill new <名> 创建，或放 SKILL.md 到 ~/.config/ziv/skills/<名>/ 或 .ziv/skills/<名>/，然后 /skill reload\n\n");
             } else {
                 try std.Io.Writer.writeAll(ctx.w, "  Skills (invoke with /<name>):\n");
                 for (ctx.skill_loader.skills.items) |skill| {
                     try std.Io.Writer.print(ctx.w, "    /{s} — {s} [{s}]\n", .{ skill.name, skill.description, @tagName(skill.source) });
                 }
+                // Failed packs are visible, not silent: an invalid
+                // frontmatter used to look exactly like "not installed".
+                if (ctx.skill_loader.problems.items.len > 0) {
+                    try std.Io.Writer.writeAll(ctx.w, "  ⚠ 未加载（修复后 /skill reload）:\n");
+                    for (ctx.skill_loader.problems.items) |p| {
+                        try std.Io.Writer.print(ctx.w, "    {s}: {s}\n", .{ p.dir, p.reason });
+                    }
+                }
                 try std.Io.Writer.writeAll(ctx.w, "\n");
             }
+            try std.Io.File.Writer.flush(ctx.file_writer);
+            return .handled;
+        } else if (std.mem.eql(u8, input, "/skill") or std.mem.startsWith(u8, input, "/skill ")) {
+            // Skill 管理：new/show/remove/reload。注意与 /skills 及
+            // /<技能名> 调用的边界——本分支在前（内置命令优先），名为
+            // "skill" 的用户技能会被遮蔽（保留名）。
+            const rest = std.mem.trim(u8, input[6..], " \t");
+            if (rest.len == 0) {
+                try std.Io.Writer.writeAll(ctx.w,
+                    \\  用法:
+                    \\    /skill new <名>     创建技能模板（项目级 .ziv/skills/<名>/SKILL.md）
+                    \\    /skill show <名>    查看技能全文（frontmatter + 正文）
+                    \\    /skill remove <名>  删除技能（确认后删整个目录）
+                    \\    /skill reload       重扫技能目录，立即生效（无需重启会话）
+                    \\
+                    \\
+                );
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.eql(u8, rest, "reload")) {
+                ctx.skill_loader.reload();
+                // Manifest rebuild + re-inject into history[0] (same block
+                // layout as startup: system → memory → manifest). The old
+                // manifest slice is freed first; run()'s defer owns the new.
+                if (ctx.skill_manifest_slot.*) |old| allocator.free(old);
+                ctx.skill_manifest_slot.* = ctx.skill_loader.buildManifest(allocator, 300) catch null;
+                ctx.skill_manifest = ctx.skill_manifest_slot.*;
+                if (ctx.history.items.len > 0) {
+                    const old_blocks = ctx.history.items[0].content;
+                    var nblocks: usize = 1;
+                    if (ctx.memory_block.* != null) nblocks += 1;
+                    if (ctx.skill_manifest_slot.* != null) nblocks += 1;
+                    const nb = try allocator.alloc(llm.ContentBlock, nblocks);
+                    nb[0] = old_blocks[0]; // system text — externally owned
+                    var bi: usize = 1;
+                    if (ctx.memory_block.*) |mb| {
+                        nb[bi] = .{ .text = mb };
+                        bi += 1;
+                    }
+                    if (ctx.skill_manifest_slot.*) |sm| nb[bi] = .{ .text = sm };
+                    allocator.free(@constCast(old_blocks));
+                    ctx.history.items[0].content = nb;
+                }
+                try std.Io.Writer.print(ctx.w, "  已重扫：{d} 个技能", .{ctx.skill_loader.skills.items.len});
+                if (ctx.skill_loader.problems.items.len > 0) {
+                    try std.Io.Writer.print(ctx.w, "，{d} 个未加载（/skills 查看）", .{ctx.skill_loader.problems.items.len});
+                }
+                try std.Io.Writer.writeAll(ctx.w, "。system 提示清单已同步。\n\n");
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.startsWith(u8, rest, "new ")) {
+                const name = std.mem.trim(u8, rest[4..], " \t");
+                if (name.len == 0 or name.len > 64) {
+                    try std.Io.Writer.writeAll(ctx.w, "  名字长度需 1-64\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                }
+                // Path-safety: the name becomes a directory — reject
+                // separators and traversal outright.
+                for (name) |ch| {
+                    if (ch == '/' or ch == '\\' or ch < 0x20) {
+                        try std.Io.Writer.writeAll(ctx.w, "  名字不能包含路径分隔符\n\n");
+                        try std.Io.File.Writer.flush(ctx.file_writer);
+                        return .handled;
+                    }
+                }
+                if (std.mem.indexOf(u8, name, "..") != null) {
+                    try std.Io.Writer.writeAll(ctx.w, "  名字不能包含 ..\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                }
+                var pb: [std.fs.max_path_bytes]u8 = undefined;
+                const rel = std.fmt.bufPrint(&pb, "skills/{s}/SKILL.md", .{name}) catch {
+                    try std.Io.Writer.writeAll(ctx.w, "  路径过长\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                var zb: [std.fs.max_path_bytes]u8 = undefined;
+                const abs = zivroot.sub(&zb, rel);
+                var db: [std.fs.max_path_bytes]u8 = undefined;
+                const rel_dir = std.fmt.bufPrint(&db, "skills/{s}", .{name}) catch "";
+                if (rel_dir.len > 0) {
+                    var db2: [std.fs.max_path_bytes]u8 = undefined;
+                    const dir_abs = zivroot.sub(&db2, rel_dir);
+                    std.Io.Dir.cwd().createDirPath(ctx.io, dir_abs) catch {};
+                }
+                const tmpl = std.fmt.allocPrint(allocator,
+                    \\---
+                    \\name: {s}
+                    \\description: 一句话说明这个技能做什么（必填——无它模型无法判断何时使用）
+                    \\when_to_use: 什么场景下该触发这个技能
+                    \\tools: FileRead, Grep
+                    \\---
+                    \\
+                    \\# {s}
+                    \\
+                    \\- 步骤一
+                    \\- 步骤二
+                    \\
+                    \\任务参数经 $ARGUMENTS 占位注入正文。
+                    \\
+                , .{ name, name }) catch {
+                    try std.Io.Writer.writeAll(ctx.w, "  模板生成失败（内存）\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                defer allocator.free(tmpl);
+                std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = abs, .data = tmpl }) catch {
+                    try std.Io.Writer.print(ctx.w, "  写入失败: {s}\n\n", .{abs});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                try std.Io.Writer.print(ctx.w, "  已创建: {s}\n  编辑后运行 /skill reload 生效；/skills 查看。\n\n", .{abs});
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.startsWith(u8, rest, "show ")) {
+                const name = std.mem.trim(u8, rest[5..], " \t");
+                const skill = ctx.skill_loader.findByName(name) orelse {
+                    try std.Io.Writer.print(ctx.w, "  无此技能: {s}（/skills 列出）\n\n", .{name});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                const text = std.Io.Dir.cwd().readFileAlloc(ctx.io, skill.path, allocator, .limited(256 * 1024)) catch {
+                    try std.Io.Writer.print(ctx.w, "  读取失败: {s}\n\n", .{skill.path});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                defer allocator.free(text);
+                try std.Io.Writer.print(ctx.w, "  ── {s}（{s}）──\n", .{ skill.name, skill.path });
+                var at_ls = false;
+                try memory_ops.writeMarginLines(ctx.w, text, "  ", &at_ls);
+                if (!at_ls) try std.Io.Writer.writeAll(ctx.w, "\n");
+                try std.Io.Writer.writeAll(ctx.w, "\n");
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.startsWith(u8, rest, "remove ")) {
+                const name = std.mem.trim(u8, rest[7..], " \t");
+                const skill = ctx.skill_loader.findByName(name) orelse {
+                    try std.Io.Writer.print(ctx.w, "  无此技能: {s}（/skills 列出）\n\n", .{name});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                const dir_of = std.fs.path.dirname(skill.path) orelse {
+                    try std.Io.Writer.writeAll(ctx.w, "  路径异常，拒绝删除\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                // Destructive: explicit confirmation with the full path.
+                // Piped (non-TTY) sessions are REFUSED outright — the
+                // confirmation selector reads raw keys and would consume
+                // the piped command stream (a digit byte selects outright).
+                if (!menu.isTty()) {
+                    try std.Io.Writer.print(ctx.w, "  /skill remove 需要交互终端确认（管道模式拒绝）。路径: {s}\n\n", .{dir_of});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                }
+                const items = [_][]const u8{ "删除（整个目录）", "取消" };
+                const pick = (menu.select(ctx.w, ctx.r, ctx.file_writer, "确认删除？", &items, 1) catch null) orelse {
+                    try std.Io.Writer.writeAll(ctx.w, "  已取消\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                if (pick != 0) {
+                    try std.Io.Writer.writeAll(ctx.w, "  已取消\n\n");
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                }
+                std.Io.Dir.cwd().deleteTree(ctx.io, dir_of) catch {
+                    try std.Io.Writer.print(ctx.w, "  删除失败: {s}\n\n", .{dir_of});
+                    try std.Io.File.Writer.flush(ctx.file_writer);
+                    return .handled;
+                };
+                ctx.skill_loader.reload();
+                try std.Io.Writer.print(ctx.w, "  已删除 {s}（剩 {d} 个技能）\n\n", .{ dir_of, ctx.skill_loader.skills.items.len });
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            try std.Io.Writer.print(ctx.w, "  未知子命令: {s}（/skill 查看用法）\n\n", .{rest});
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.startsWith(u8, input, "/style")) {

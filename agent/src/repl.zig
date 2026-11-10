@@ -531,6 +531,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             .ollama => null,
         },
         .ollama_host = switcher.settings.api_keys.ollama_host,
+        // 子代理输出预算与主会话同源（思考型模型的思考 token 计入
+        // 输出预算——见 subagent.zig response_budget 注释）。
+        .response_budget = switcher.settings.max_tokens,
         // 全能力素材（write:true 用）：模式指针热切换实时生效；规则切片
         // 指向 settings（retired 不释放，生命周期安全）。auto 由 dispatch
         // 侧降级为 default（无头不做 LLM 分类审批）。
@@ -786,6 +789,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .mcp_sessions = &mcp_sessions,
         .skill_loader = &skill_loader,
         .skill_manifest = skill_manifest,
+        .skill_manifest_slot = &skill_manifest,
         .sys_prompt = &sys_prompt,
         .sys_prompt_owned = &sys_prompt_owned,
         .applied_prompt_setting = &applied_prompt_setting,
@@ -2222,6 +2226,8 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
         \\  /knowledge         Browse the knowledge graph (semantic tier)
         \\  /skills            List available skills (/<name> to invoke)
+        \\  /skill new|show|remove|reload   Manage skills (reload rescans
+        \\                     both roots — new packs take effect at once)
         \\  /mcp               MCP servers: list/connect/disconnect
         \\
         \\Models (use /model to switch):

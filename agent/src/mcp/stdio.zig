@@ -51,6 +51,12 @@ pub const StdioTransport = struct {
             .stdin = .{ .file = .{ .handle = in_pipe[0], .flags = .{ .nonblocking = false } } },
             .stdout = .{ .file = .{ .handle = out_pipe[1], .flags = .{ .nonblocking = false } } },
             .stderr = .ignore,
+            // Own process group (same discipline as the Bash tool): npx
+            // spawns the real server as a GRANDCHILD — killing npx's pid
+            // alone leaves the grandchild holding the stdout pipe, so the
+            // handshake-read never sees EOF and connect wedges forever
+            // (reproduced live 2026-11-10). kill(-pgid) takes the tree.
+            .pgid = 0,
             .environ_map = self.env_map,
         }) catch |err| {
             blockingFile(in_pipe[0]).close(io);
@@ -75,7 +81,11 @@ pub const StdioTransport = struct {
     /// unblocks any read parked on the stdout pipe (EOF after reaping).
     pub fn killPid(self: *Self) void {
         if (self.child.id) |pid| {
-            _ = std.c.kill(pid, .KILL);
+            // Process GROUP kill (spawn sets pgid=0 → group id = child pid):
+            // a single-pid SIGKILL lets deep-spawned grandchildren (npx →
+            // node) survive holding the pipe write end — EOF never arrives.
+            _ = std.c.kill(-pid, .KILL);
+            _ = std.c.kill(pid, .KILL); // direct child, in case setpgid raced
         }
     }
 
@@ -123,13 +133,22 @@ pub const StdioTransport = struct {
                 if (line.len == 0) continue;
                 return jsonrpc.parseIncoming(arena, line) orelse continue;
             }
-            // Pull more bytes from the pipe.
+            // Pull more bytes from the pipe. Consume EVERYTHING peeked:
+            // the reader (and its buffer) is stack-local per iteration —
+            // tossing only part of the peek discarded the remainder with
+            // it, so any single reply larger than the leftover window
+            // (tools/list easily exceeds 4 KiB) never saw its trailing
+            // bytes again and the next peek BLOCKED on fresh fd data until
+            // the watchdog killed the group (lived as "npx stdio 握手不
+            // 兼容" — root cause 2026-11-10).
             var fr = self.stdout_file.reader(io, &self.stdout_buf);
             const chunk = fr.interface.peekGreedy(1) catch return null; // EOF / pipe closed
             if (chunk.len == 0) return null;
-            const n = @min(chunk.len, 4096);
-            try self.pending.appendSlice(self.allocator, chunk[0..n]);
-            fr.interface.toss(n);
+            try self.pending.appendSlice(self.allocator, chunk);
+            fr.interface.toss(chunk.len);
+            // A hostile/buggy server streaming an endless line must not
+            // grow `pending` without bound.
+            if (self.pending.items.len > 4 * 1024 * 1024) return error.LineTooLong;
         }
     }
 
@@ -160,6 +179,11 @@ pub const StdioTransport = struct {
         }
         // Closing our write end signals EOF to a well-behaved server.
         self.stdin_file.close(io);
+        // Group kill first (deep-spawned grandchildren hold the pipes —
+        // see spawn's pgid note), then reap the direct child via std.
+        if (self.child.id) |pid| {
+            _ = std.c.kill(-pid, .KILL);
+        }
         if (self.child.id != null) {
             self.child.kill(io);
         }

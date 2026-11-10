@@ -23,12 +23,26 @@ pub const Skill = struct {
 
 pub const Source = enum { user, project };
 
+/// A skill directory that was SCANNED but did not load, with the reason.
+/// Silent skipping was invisible: a bad frontmatter looked like "the skill
+/// isn't there" and there was no way to tell (ZIV_SKILL_DEBUG aside).
+pub const Problem = struct {
+    /// Directory name under the skill root (owned).
+    dir: []const u8,
+    /// Human-readable reason (owned, static wording + path context).
+    reason: []const u8,
+};
+
 pub const SkillLoader = struct {
     allocator: std.mem.Allocator,
     skills: std.ArrayList(Skill) = .empty,
+    /// Scan problems from the LAST load/reload (owned; cleared each scan).
+    problems: std.ArrayList(Problem) = .empty,
     io: std.Io,
-    /// Test seam: overrides the user skill root (ZIV_SKILLS_DIR fallback).
+    /// Test seams: override the scan roots so tests don't pick up the
+    /// host's real skill directories (user root: ZIV_SKILLS_DIR fallback).
     user_dir_override: ?[]const u8 = null,
+    project_dir_override: ?[]const u8 = null,
 
     const Self = @This();
 
@@ -45,14 +59,54 @@ pub const SkillLoader = struct {
             self.allocator.free(s.path);
         }
         self.skills.deinit(self.allocator);
+        self.clearProblems();
+        self.problems.deinit(self.allocator);
     }
 
-    /// Scan both skill roots. Unreadable dirs are skipped silently — a bad
-    /// skill must never break startup.
+    fn clearProblems(self: *Self) void {
+        for (self.problems.items) |p| {
+            self.allocator.free(p.dir);
+            self.allocator.free(p.reason);
+        }
+        self.problems.clearRetainingCapacity();
+    }
+
+    fn addProblem(self: *Self, dir_name: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const reason = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        const dir = self.allocator.dupe(u8, dir_name) catch {
+            self.allocator.free(reason);
+            return;
+        };
+        self.problems.append(self.allocator, .{ .dir = dir, .reason = reason }) catch {
+            self.allocator.free(reason);
+            self.allocator.free(dir);
+        };
+    }
+
+    /// Scan both skill roots. Unreadable dirs are skipped — a bad skill
+    /// must never break startup — but every skip is RECORDED in problems
+    /// so /skills can surface it.
     pub fn load(self: *Self) void {
         self.loadRoot(true) catch {};
         self.loadRoot(false) catch {};
         // Name collisions were resolved during load (project replaced user).
+    }
+
+    /// Hot rescan: drop the current skill list and scan again. Used by
+    /// /skill reload so a freshly added/deleted pack takes effect without
+    /// restarting the session. Frees every owned skill field first — the
+    /// old list must not outlive the rescan (manifest rebuild follows).
+    pub fn reload(self: *Self) void {
+        for (self.skills.items) |s| {
+            self.allocator.free(s.name);
+            self.allocator.free(s.description);
+            if (s.when_to_use) |w| self.allocator.free(w);
+            if (s.tools.len > 0) self.allocator.free(s.tools);
+            self.allocator.free(s.path);
+        }
+        self.skills.clearRetainingCapacity();
+        self.clearProblems();
+        self.load();
     }
 
     fn loadRoot(self: *Self, user_root: bool) !void {
@@ -69,6 +123,7 @@ pub const SkillLoader = struct {
     }
 
     fn projectRoot(self: *Self) ![]u8 {
+        if (self.project_dir_override) |d| return self.allocator.dupe(u8, d);
         const zivroot = @import("../util/zivroot.zig");
             var sb: [std.fs.max_path_bytes]u8 = undefined;
             return self.allocator.dupe(u8, zivroot.sub(&sb, "skills"));
@@ -94,17 +149,24 @@ pub const SkillLoader = struct {
             defer self.allocator.free(skill_md);
             const text = std.Io.Dir.cwd().readFileAlloc(self.io, skill_md, self.allocator, .limited(256 * 1024)) catch |e| {
                 if (env_mod.get("ZIV_SKILL_DEBUG") != null) std.debug.print("[skill] read fail {s}: {}\n", .{ skill_md, e });
+                // Invisible skips were the #1 "installed but nothing
+                // happened" trap — record for /skills.
+                self.addProblem(entry.name, "SKILL.md 读取失败（{s}）", .{@errorName(e)});
                 continue;
             };
             defer self.allocator.free(text);
 
             const fm = parseFrontmatter(text) orelse {
                 if (env_mod.get("ZIV_SKILL_DEBUG") != null) std.debug.print("[skill] fm fail {s}\n", .{skill_md});
+                self.addProblem(entry.name, "frontmatter 无效——需 --- 包裹的 key: value 头（name/description）", .{});
                 continue;
             };
             // name defaults to the directory name; description is required
             // (without it the LLM can't decide when to use the skill).
-            if (fm.description.len == 0) continue;
+            if (fm.description.len == 0) {
+                self.addProblem(entry.name, "frontmatter 缺 description（无它模型无法判断何时使用，已跳过）", .{});
+                continue;
+            }
 
             const skill = Skill{
                 .name = self.allocator.dupe(u8, if (fm.name.len > 0) fm.name else entry.name) catch continue,
@@ -353,4 +415,45 @@ test "frontmatter tools hint parses and body steps count (T7.1)" {
     const fm2 = parseFrontmatter(legacy).?;
     try std.testing.expectEqualStrings("", fm2.tools);
     try std.testing.expectEqual(@as(usize, 0), countSteps("no lists"));
+}
+
+test "reload drops stale skills and surfaces problems" {
+    // tmp root: one good skill, one broken (no description) pack.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var io_state = std.Io.Threaded.init(a, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    const ts: u32 = @truncate(@as(u64, @bitCast(@import("../util/time.zig").nowMillis())));
+    const base = std.fmt.allocPrint(a, "/tmp/ziv_skill_reload_{d}", .{ts}) catch unreachable;
+    const good_dir = std.fmt.allocPrint(a, "{s}/good", .{base}) catch unreachable;
+    const bad_dir = std.fmt.allocPrint(a, "{s}/bad", .{base}) catch unreachable;
+    std.Io.Dir.cwd().createDirPath(io, good_dir) catch unreachable;
+    std.Io.Dir.cwd().createDirPath(io, bad_dir) catch unreachable;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(a, "{s}/SKILL.md", .{good_dir}) catch unreachable, .data = "---\nname: good\ndescription: works\n---\n- step" }) catch unreachable;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(a, "{s}/SKILL.md", .{bad_dir}) catch unreachable, .data = "---\nname: bad\ndescription:\n---\n- step" }) catch unreachable;
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    var loader = SkillLoader.init(std.testing.allocator, io);
+    defer loader.deinit();
+    loader.user_dir_override = base;
+    // Empty project root OUTSIDE base (a subdir of base would itself be
+    // scanned as a pack without SKILL.md — found live): without this
+    // override the test would also scan the HOST's real .ziv/skills.
+    const empty_root = std.fmt.allocPrint(a, "{s}_empty", .{base}) catch unreachable;
+    std.Io.Dir.cwd().createDirPath(io, empty_root) catch unreachable;
+    defer std.Io.Dir.cwd().deleteTree(io, empty_root) catch {};
+    loader.project_dir_override = empty_root;
+    loader.load();
+    try std.testing.expectEqual(@as(usize, 1), loader.skills.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loader.problems.items.len);
+    try std.testing.expectEqualStrings("bad", loader.problems.items[0].dir);
+
+    // Remove the good pack on disk; reload must drop it from the list
+    // (the stale-skill trap: pre-reload there was NO rescan path at all).
+    std.Io.Dir.cwd().deleteTree(io, good_dir) catch unreachable;
+    loader.reload();
+    try std.testing.expectEqual(@as(usize, 0), loader.skills.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loader.problems.items.len);
 }
