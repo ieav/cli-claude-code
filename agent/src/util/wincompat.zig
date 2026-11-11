@@ -67,9 +67,19 @@ pub fn sleepMs(ms: u64) void {
 /// stdin key probes and child-process pipe waits.
 pub fn pollFd(fd: anytype, timeout_ms: i32) i32 {
     if (builtin.os.tag == .windows) {
-        return -1; // L1 stub: fail closed
+        // Pipe/console handles are waitable objects; a signaled handle
+        // means ReadFile returns immediately (data or EOF).
+        const wait_c = struct {
+            extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
+        };
+        const h: std.os.windows.HANDLE = @ptrFromInt(@as(usize, @intCast(idAsI64(fd))));
+        return switch (wait_c.WaitForSingleObject(h, @intCast(timeout_ms))) {
+            0 => 1,
+            0x102 => 0, // WAIT_TIMEOUT
+            else => -1,
+        };
     } else {
-        var pfd = [1]std.c.pollfd{.{ .fd = @intCast(fd), .events = std.c.POLL.IN, .revents = 0 }};
+        var pfd = [1]std.c.pollfd{.{ .fd = @intCast(idAsI64(fd)), .events = std.c.POLL.IN, .revents = 0 }};
         return std.c.poll(&pfd, 1, timeout_ms);
     }
 }
@@ -123,13 +133,17 @@ pub fn killOne(id: anytype) void {
 }
 
 /// shutdown(2) on a socket/pipe fd — the cross-thread unblock trick the
-/// LLM watchdog and MCP cancellation rely on. L3 wires CancelIoEx.
+/// LLM watchdog and MCP cancellation rely on. The fd here is always a
+/// SOCKET: ws2_32.shutdown on windows, shutdown(2) on posix.
 pub fn shutdownFd(fd: anytype) void {
-    if (is_windows) {
-        logger.warning("wincompat: shutdownFd stub on windows (L3)", .{});
-        return;
+    if (builtin.os.tag == .windows) {
+        const sock_c = struct {
+            extern "ws2_32" fn shutdown(s: usize, how: c_int) callconv(.winapi) c_int;
+        };
+        _ = sock_c.shutdown(@intCast(idAsI64(fd)), 2); // SD_BOTH
+    } else {
+        _ = std.c.shutdown(@as(i32, @intCast(idAsI64(fd))), 2); // SHUT_RDWR
     }
-    _ = std.c.shutdown(fd, 2); // SHUT_RDWR
 }
 
 /// SIGINT routing for the agent-dispatch cooperative cancel. L1 wires

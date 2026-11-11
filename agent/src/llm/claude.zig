@@ -109,11 +109,13 @@ pub const ClaudeProvider = struct {
         // below (the pump thread never polls — see CompleteOptions docs).
         // Clear before return so a pooled-fd shutdown can never hit a
         // reused connection.
-        if (builtin.os.tag != .windows) {
-            if (opts.cancel_fd) |pfd| {
-                if (req.connection) |conn| {
-                    pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
-                }
+        if (opts.cancel_fd) |pfd| {
+            if (req.connection) |conn| {
+                // i64 holds either a posix fd or a 64-bit windows SOCKET
+                // handle — ws2_32.shutdown on the other end kills the
+                // BLOCKING read (the windows Esc-cancel path, previously
+                // degraded to watchdog-only).
+                pfd.store(if (builtin.os.tag == .windows) @intCast(@intFromPtr(conn.stream_reader.stream.socket.handle)) else @intCast(conn.stream_reader.stream.socket.handle), .release);
             }
         }
         defer if (opts.cancel_fd) |pfd| pfd.store(-1, .release);

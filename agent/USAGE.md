@@ -863,7 +863,7 @@ const provider = ollama.toProvider();
 
 | 主题 | 行为 |
 |------|------|
-| 安装 | `ziv-x86_64-windows-gnu.zip` 解压后运行 `install.ps1`（用户级装到 `%LOCALAPPDATA%\Programs\ziv` 并加 PATH，免管理员；`-Uninstall` 卸载） |
+| 安装 | `ziv-x86_64-windows-gnu.zip` 解压后运行 `install.ps1`（用户级装到 `%LOCALAPPDATA%\Programs\ziv` 并加 PATH，免管理员；`-Uninstall` 卸载）。**默认执行策略会拦脚本**：`powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 | 目录 | 全局配置 `%APPDATA%\ziv\`（settings.json / mcp.json / skills / ziv.md）；项目数据仍在工作目录 `.ziv\` |
 | Shell 工具 | PowerShell（`-NoProfile -NonInteractive`）；进程治理 = Job Object（杀树语义等价 posix kill(-pgid)）；PowerShell 转义（`'`→`''`） |
 | 终端 | UTF-8 代码页自动设置（CP65001）；kitty 键盘协议/粘贴折叠/CSI 与 macOS/Linux 同一套字节流逻辑；Ctrl-C 双击退出（1 秒窗口）同 |

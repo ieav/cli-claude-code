@@ -73,11 +73,6 @@ for t in "${targets[@]}"; do
   touch -t "$EPOCH_TS" "$OUT/ziv-$t"
   COPYFILE_DISABLE=1 tar -cf - -C "$OUT" "ziv-$t" | gzip -n > "$OUT/ziv-$VERSION-$t.tar.gz"
 done
-# Windows ships as .zip (Windows Explorer's native form).
-if [ -f "$OUT/ziv-x86_64-windows-gnu.exe" ]; then
-  touch -t "$EPOCH_TS" "$OUT/ziv-x86_64-windows-gnu.exe"
-  (cd "$OUT" && zip -q -X -9 "ziv-$VERSION-x86_64-windows-gnu.zip" "ziv-x86_64-windows-gnu.exe" install.ps1) || echo "⚠ zip not found — skip .zip"
-fi
 
 # ── macOS .pkg installer (universal arm64+x86_64, installs to /usr/local/bin/ziv)
 if command -v lipo >/dev/null && command -v pkgbuild >/dev/null; then
@@ -201,6 +196,14 @@ if ($userPath -notlike "*$dir*") {
 "per-project data lands in .ziv\ inside each working directory;"
 "global config in %APPDATA%\ziv\"
 PSEOF
+
+# ── Windows .zip (Explorer-native form) — AFTER install.ps1 exists
+# (the first version zipped before generating install.ps1 and the zip
+# error was swallowed — the shipped zip was missing its installer).
+if [ -f "$OUT/ziv-x86_64-windows-gnu.exe" ]; then
+  touch -t "$EPOCH_TS" "$OUT/ziv-x86_64-windows-gnu.exe"
+  (cd "$OUT" && zip -q -X -9 "ziv-$VERSION-x86_64-windows-gnu.zip" "ziv-x86_64-windows-gnu.exe" install.ps1) || echo "⚠ zip not found — skip .zip"
+fi
 
 # ── checksums (all artifacts in $OUT; dotfiles like .DS_Store excluded by glob)
 # POSIX-portable: the old `for f in *(N)` used a zsh-only glob qualifier and

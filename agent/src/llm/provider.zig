@@ -63,7 +63,7 @@ pub const CompleteOptions = struct {
     ///   request (caller-frame or dispatch-scoped atomic).
     /// Both null = uncancellable (the historical default).
     cancel_flag: ?*const std.atomic.Value(bool) = null,
-    cancel_fd: ?*std.atomic.Value(i32) = null,
+    cancel_fd: ?*std.atomic.Value(i64) = null,
 };
 
 pub const CompleteResponse = struct {

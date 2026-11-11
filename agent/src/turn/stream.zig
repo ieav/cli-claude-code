@@ -345,7 +345,7 @@ const StreamJob = struct {
     /// The pump publishes its connection's fd here once connected
     /// (-1 = none). The UI loop, on cancel, shutdown(2)s it — the pump's
     /// blocking read fails and the stream unwinds.
-    cancel_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    cancel_fd: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
     alloc: std.mem.Allocator,
 
     /// UI-loop side of cancellation: set the flag and kill the socket.
