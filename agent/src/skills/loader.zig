@@ -5,6 +5,8 @@
 /// budget. Skills are prompt-only in v1: invoking /<skill-name> injects
 /// the skill body into the conversation.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
+const time_mod = @import("../util/time.zig");
 const env_mod = @import("../util/env.zig");
 const tokens = @import("../util/tokens.zig");
 
@@ -338,7 +340,7 @@ test "SkillLoader discovers and dedupes by name (project wins)" {
     const io = io_state.io();
 
     // 0.17 has no Dir.realpath; use a unique absolute fixture dir instead.
-    const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/ziv_skill_fixture_{d}", .{std.c.getpid()});
+    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/ziv_skill_fixture_{d}", .{ time_mod.tmpRoot(), wincompat.pid() });
     defer std.testing.allocator.free(root);
     std.Io.Dir.cwd().createDirPath(io, root) catch {};
 
@@ -428,7 +430,7 @@ test "reload drops stale skills and surfaces problems" {
     defer io_state.deinit();
     const io = io_state.io();
     const ts: u32 = @truncate(@as(u64, @bitCast(@import("../util/time.zig").nowMillis())));
-    const base = std.fmt.allocPrint(a, "/tmp/ziv_skill_reload_{d}", .{ts}) catch unreachable;
+    const base = std.fmt.allocPrint(a, "{s}/ziv_skill_reload_{d}", .{ time_mod.tmpRoot(), ts }) catch unreachable;
     const good_dir = std.fmt.allocPrint(a, "{s}/good", .{base}) catch unreachable;
     const bad_dir = std.fmt.allocPrint(a, "{s}/bad", .{base}) catch unreachable;
     std.Io.Dir.cwd().createDirPath(io, good_dir) catch unreachable;

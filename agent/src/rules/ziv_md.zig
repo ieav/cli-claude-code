@@ -384,7 +384,7 @@ test "findInsensitive matches any case" {
     const io = io_state.io();
 
     const ts: u32 = @truncate(@as(u64, @bitCast(time_mod.nowMillis())));
-    const base = try std.fmt.allocPrint(a, "/tmp/ziv_rules_ci_{d}", .{ts});
+    const base = try std.fmt.allocPrint(a, "{s}/ziv_rules_ci_{d}", .{ time_mod.tmpRoot(), ts });
     std.Io.Dir.cwd().createDirPath(io, base) catch unreachable;
     defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
     // Uppercase on disk, lowercase needle.
@@ -418,7 +418,7 @@ test "syncExternal refreshes the fence but keeps the user section" {
 
     // Project root with a marker-fenced ziv.md + an AGENTS.md.
     const ts: u32 = @truncate(@as(u64, @bitCast(time_mod.nowMillis())));
-    const base = try std.fmt.allocPrint(a, "/tmp/ziv_rules_sync_{d}", .{ts});
+    const base = try std.fmt.allocPrint(a, "{s}/ziv_rules_sync_{d}", .{ time_mod.tmpRoot(), ts });
     std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(a, "{s}/.ziv", .{base})) catch unreachable;
     var saved_buf: [std.fs.max_path_bytes]u8 = undefined;
     const saved_len0 = std.process.currentPath(io, &saved_buf) catch return error.TestUnexpectedResult;

@@ -857,6 +857,22 @@ const provider = ollama.toProvider();
 
 ---
 
+## 10. Windows 支持（2026-11-12，beta）
+
+**平台决策**：PowerShell（Bash 工具的 shell）· 仅 Windows Terminal · windows-gnu（mingw 交叉编译，无需 Windows 机构建机）。
+
+| 主题 | 行为 |
+|------|------|
+| 安装 | `ziv-x86_64-windows-gnu.zip` 解压后运行 `install.ps1`（用户级装到 `%LOCALAPPDATA%\Programs\ziv` 并加 PATH，免管理员；`-Uninstall` 卸载） |
+| 目录 | 全局配置 `%APPDATA%\ziv\`（settings.json / mcp.json / skills / ziv.md）；项目数据仍在工作目录 `.ziv\` |
+| Shell 工具 | PowerShell（`-NoProfile -NonInteractive`）；进程治理 = Job Object（杀树语义等价 posix kill(-pgid)）；PowerShell 转义（`'`→`''`） |
+| 终端 | UTF-8 代码页自动设置（CP65001）；kitty 键盘协议/粘贴折叠/CSI 与 macOS/Linux 同一套字节流逻辑；Ctrl-C 双击退出（1 秒窗口）同 |
+| 输入法/中文 | 控制台输入输出均 UTF-8 |
+| MCP | stdio 形态暂未支持（M3 批次）；HTTP 形态可用 |
+| 已知边界 | Ctrl-Z 挂起无（Windows 无作业控制）；老 conhost 不保证（VT 处理已尽力启用） |
+
+**移植架构**：`util/wincompat.zig`（平台缝：sleep/poll/kill/管道/锁/pid）+ `util/termio.zig`（终端原语：raw/poll/尺寸/VT init）+ `util/winproc.zig`（Job Object 树杀）。posix 侧逐字平移原行为，双平台共用同一调用方代码。
+
 ## 9. 使用前须知
 
 ### 9.1 能用吗？

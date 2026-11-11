@@ -496,7 +496,7 @@ pub fn decodeMessage(alloc: std.mem.Allocator, role: llm.MessageRole, json: []co
 // ── tests ────────────────────────────────────────────────────────────
 
 fn tmpDbPath(buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/ziv_sess_{d}.db", .{util_time.nowMillis()}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}/ziv_sess_{d}.db", .{ util_time.tmpRoot(), util_time.nowMillis() }) catch unreachable;
 }
 
 test "session roundtrip: flush all four block kinds, resume loadMessages" {

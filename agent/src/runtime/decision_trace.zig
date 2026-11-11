@@ -2,6 +2,7 @@
 /// Enables self-diagnostic: when user questions a result, we can replay the decision chain
 /// and identify which step had a logic gap.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const time_mod = @import("../util/time.zig");
 const message = @import("../llm/message.zig");
 
@@ -186,7 +187,7 @@ test "trace jsonl carries per-step durations" {
     var io_state = std.Io.Threaded.init(a, .{});
     defer io_state.deinit();
     var dir_buf: [64]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/ziv_trace_test_{d}", .{std.c.getpid()}) catch return;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/ziv_trace_test_{d}", .{ @import("../util/time.zig").tmpRoot(), @import("../util/wincompat.zig").pid() }) catch return;
     t.writeJsonlFile(io_state.io(), dir, a) catch return; // fs-less envs: skip
     var fpath_buf: [128]u8 = undefined;
     const fpath = std.fmt.bufPrint(&fpath_buf, "{s}/{d}.jsonl", .{ dir, t.started_at }) catch return;

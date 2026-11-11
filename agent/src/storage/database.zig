@@ -364,7 +364,7 @@ test "Database init and migration" {
 test "runMigrations dedupes graph: remaps edges, keeps relations, enforces unique" {
     const alloc = std.testing.allocator;
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/ziv_mig_{d}.db", .{wincompat.pid()});
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/ziv_mig_{d}.db", .{ time_mod.tmpRoot(), wincompat.pid() });
     defer _ = @import("../util/fs_ops.zig").deleteFile(path);
 
     var db = try Database.init(alloc, path);

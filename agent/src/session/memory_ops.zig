@@ -1728,7 +1728,7 @@ test "reflection inbox drains, prints, and empties (T3.2 wiring)" {
     // the full last mile: push → drain stores a .feedback row, prints the
     // arrival, and a second drain is a no-op.
     var tmp: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&tmp, "/tmp/ziv_reflect_drain_{d}.db", .{util_time.nowMillis()}) catch return;
+    const path = std.fmt.bufPrint(&tmp, "{s}/ziv_reflect_drain_{d}.db", .{ util_time.tmpRoot(), util_time.nowMillis() }) catch return;
     defer _ = fs_ops.deleteFile(path);
     var db = try database_mod.Database.init(allocator, path);
     defer db.deinit();

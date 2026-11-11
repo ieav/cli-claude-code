@@ -75,6 +75,17 @@ fn isLeapYear(year: i32) bool {
     return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
 }
 
+/// Temp-dir root for tests/scratch: $TMPDIR (posix) / %TEMP% (windows),
+/// falling back to /tmp. Replaces hardcoded "/tmp/..." literals.
+pub fn tmpRoot() []const u8 {
+    const env = @import("env.zig");
+    if (@import("builtin").os.tag == .windows) {
+        if (env.get("TEMP")) |t| return t;
+    }
+    if (env.get("TMPDIR")) |t| return t;
+    return "/tmp";
+}
+
 /// Sleep for a given number of milliseconds (std.time.sleep is gone in
 /// 0.17 — nanosleep directly, same as the thread pool's poll backoff).
 pub fn sleepMs(ms: u64) void {

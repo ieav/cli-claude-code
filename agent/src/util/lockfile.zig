@@ -1,5 +1,6 @@
 /// Lockfile — simple file-based mutual exclusion.
 const std = @import("std");
+const time_mod = @import("time.zig");
 
 pub const LockFile = struct {
     path: []const u8,
@@ -61,8 +62,8 @@ pub fn create(allocator: std.mem.Allocator, path: []const u8) !*LockFile {
 
 test "LockFile acquire/release" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/ziv_test_lock";
-
+    const path = try std.fmt.allocPrint(alloc, "{s}/ziv_test_lock", .{time_mod.tmpRoot()});
+    defer alloc.free(path);
     var lock = LockFile{
         .path = path,
         .allocator = alloc,

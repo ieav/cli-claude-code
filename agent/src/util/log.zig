@@ -169,7 +169,7 @@ test "file sink records info lines at the default notice level" {
     const io = io_state.io();
 
     var dir_buf: [256]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/ziv_log_test_{d}", .{std.c.getpid()}) catch return;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/ziv_log_test_{d}", .{ @import("../util/time.zig").tmpRoot(), @import("../util/wincompat.zig").pid() }) catch return;
     var path_buf: [256]u8 = undefined;
     const log_path = std.fmt.bufPrint(&path_buf, "{s}/ziv.log", .{dir}) catch return;
 
