@@ -9,9 +9,12 @@ const safe_chars =
 
 /// Quote a single argument for shell execution.
 /// If the argument contains only safe characters, return as-is.
-/// Otherwise, wrap in single quotes and escape any internal single quotes.
+/// Otherwise, wrap in single quotes and escape any internal single quotes
+/// (POSIX '\'' splice vs PowerShell ''-doubling — decision ① 2026-11-12).
 /// Caller owns the returned slice.
 pub fn quoteForShell(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return quoteForPowerShell(allocator, arg);
     if (arg.len == 0) return allocator.dupe(u8, "''");
 
     // Check if all chars are safe
@@ -36,6 +39,20 @@ pub fn quoteForShell(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
         } else {
             try result.append(allocator, ch);
         }
+    }
+    try result.append(allocator, '\'');
+    return result.toOwnedSlice(allocator);
+}
+
+/// PowerShell escaping: single-quote the argument and DOUBLE any internal
+/// single quotes (`'` → `''`); double quotes stay literal inside.
+fn quoteForPowerShell(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(allocator);
+    try result.append(allocator, '\'');
+    for (arg) |ch| {
+        try result.append(allocator, ch);
+        if (ch == '\'') try result.append(allocator, '\'');
     }
     try result.append(allocator, '\'');
     return result.toOwnedSlice(allocator);
@@ -147,4 +164,11 @@ test "parseShellCommand" {
     try std.testing.expectEqualStrings("echo", args[0]);
     try std.testing.expectEqualStrings("hello world", args[1]);
     try std.testing.expectEqualStrings("foo", args[2]);
+}
+
+test "quoteForPowerShell doubles single quotes" {
+    const a = std.testing.allocator;
+    const q = try quoteForPowerShell(a, "it's");
+    defer a.free(q);
+    try std.testing.expectEqualStrings("'it''s'", q);
 }

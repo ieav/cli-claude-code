@@ -24,6 +24,7 @@
 //! worker）只读。回合中不存在换装窗口。
 
 const std = @import("std");
+const winproc = @import("../util/winproc.zig");
 const builtin = @import("builtin");
 const wincompat = @import("../util/wincompat.zig");
 const json_helpers = @import("../util/json_helpers.zig");
@@ -172,11 +173,15 @@ fn appendEscaped(w: *std.Io.Writer, s: []const u8) void {
 /// 预期短小，孤儿子进程风险由钩子作者自负）。
 fn runHook(alloc: std.mem.Allocator, io: std.Io, command: []const u8, payload: []const u8, timeout_ms: i64) HookRun {
     const child = std.process.spawn(io, .{
-        .argv = &.{ "/bin/sh", "-c", command },
+        .argv = if (builtin.os.tag == .windows)
+            &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command }
+        else
+            &.{ "/bin/sh", "-c", command },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch return .{ .code = -1, .stderr = alloc.dupe(u8, "hook spawn failed") catch "", .timed_out = false };
+    winproc.track(child.id);
     const pid: i32 = blk: {
         const raw = child.id orelse {
             if (child.stdout) |f| f.close(io);

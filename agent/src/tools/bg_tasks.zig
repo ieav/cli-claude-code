@@ -8,6 +8,7 @@
 //! kill -9 ziv 时日志丢失，可接受：进程都没了输出本就不完整）。
 
 const std = @import("std");
+const winproc = @import("../util/winproc.zig");
 const builtin = @import("builtin");
 const wincompat = @import("../util/wincompat.zig");
 const util_time = @import("../util/time.zig");
@@ -183,6 +184,7 @@ fn waiter(ctx: WaiterCtx) void {
         _ = wincompat.win32.waitFor(h, 0xFFFFFFFF);
         var ec: std.os.windows.DWORD = 0;
         if (@intFromEnum(wincompat.win32.exitCode(h, &ec)) != 0) status = @intCast(ec);
+        winproc.untrack(t.pid);
     } else {
         _ = std.c.waitpid(t.pid, &status, 0);
     }

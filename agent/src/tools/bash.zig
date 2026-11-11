@@ -6,6 +6,7 @@
 /// orphans after the timeout — the child now runs in its own process group
 /// (setpgid via SpawnOptions.pgid) and the watchdog kills the entire group.
 const std = @import("std");
+const winproc = @import("../util/winproc.zig");
 const builtin = @import("builtin");
 const wincompat = @import("../util/wincompat.zig");
 const registry = @import("registry.zig");
@@ -90,14 +91,21 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // P5 M1：后台任务——spawn 后立返任务号，不阻塞回合（见 bg_tasks）。
     const run_bg = getBoolField(input, "run_in_background") orelse false;
 
+    // POSIX: /bin/sh -c. Windows: PowerShell (decision ① 2026-11-12).
+    // argv-mode spawn passes the command VERBATIM as one argument — no
+    // re-quoting layer between ziv and the shell (same model as posix).
+    const shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command }
+    else
+        &.{ "/bin/sh", "-c", command };
     var spawn_opts: std.process.SpawnOptions = .{
-        .argv = &.{ "/bin/sh", "-c", command },
+        .argv = shell_argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     };
     // Own process group (posix): the watchdog can kill(-pgid) the whole
-    // tree. Windows: L2's Job Object replaces the group semantics.
+    // tree. Windows: winproc tracks the child in a Job Object (below).
     if (builtin.os.tag != .windows) spawn_opts.pgid = 0;
     if (getStringField(input, "working_directory")) |cwd| {
         if (cwd.len > 0) spawn_opts.cwd = .{ .path = cwd };
@@ -107,6 +115,8 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         const msg = alloc.print("Failed to execute: {}", .{err}) catch return error.OutOfMemory;
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
+    // Windows tree governance: own Job Object per child (posix uses pgid).
+    winproc.track(child.id);
     const pid: i32 = blk: {
         const raw = child.id orelse {
             // Spawn returned but no pid (already reaped) — nothing to run.
@@ -169,6 +179,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     } else {
         _ = std.c.waitpid(pid, &status, 0);
     }
+    if (builtin.os.tag == .windows) winproc.untrack(child.id);
     ActiveGroups.take(pid);
     watch.done.store(true, .release);
     if (watch_thread) |t| t.join();

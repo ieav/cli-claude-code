@@ -106,7 +106,7 @@ fn idAsI64(id: anytype) i64 {
 
 pub fn killGroup(id: anytype) void {
     if (builtin.os.tag == .windows) {
-        logger.warning("wincompat: killGroup stub on windows (L2 will wire Job Objects)", .{});
+        @import("winproc.zig").killTree(id);
     } else {
         const p: i32 = @intCast(idAsI64(id));
         _ = std.c.kill(-p, .KILL);
