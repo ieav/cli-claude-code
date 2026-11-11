@@ -86,7 +86,11 @@ pub var verbose_output = std.atomic.Value(bool).init(true);
 /// FileRead's output is source code — its language decides highlighting.
 /// Every other tool's body stays plain (dim); null lang = same.
 pub fn langForToolInput(tool_name: []const u8, input: ?std.json.Value) ?ts.Lang {
-    if (!std.mem.eql(u8, tool_name, "FileRead")) return null;
+    // ALL of FileRead's aliases — the model may call Read/cat and the
+    // first version matched only "FileRead" (alias calls lost highlighting).
+    if (!std.mem.eql(u8, tool_name, "FileRead") and
+        !std.mem.eql(u8, tool_name, "Read") and
+        !std.mem.eql(u8, tool_name, "cat")) return null;
     const inp = input orelse return null;
     const path = registry.getStringField(inp, "path") orelse return null;
     return ts.langForPath(path);
