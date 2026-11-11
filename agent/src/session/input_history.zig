@@ -124,7 +124,7 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
     defer if (contents_owned) |c| alloc.free(c);
     var history_locked = false;
     defer if (history_locked) {
-        if (builtin.os.tag != .windows) _ = std.c.flock(lock_file.?.handle, std.posix.LOCK.UN);
+        wincompat.lockUn(lock_file.?.handle);
     };
     if (lock_file != null) {
         // Bounded acquisition: a suspended (Ctrl-Z'd) holder never releases,
@@ -133,11 +133,7 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
         // semantics as the no-lock-file fallback.
         var tries: usize = 0;
         while (tries < 5) : (tries += 1) {
-            if (builtin.os.tag == .windows) {
-                // L4 wires LockFileEx; L0 proceeds without the cross-
-                // process lock (worst case: interleaved history lines).
-                break;
-            } else if (std.c.flock(lock_file.?.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0) {
+            if (wincompat.lockExNb(lock_file.?.handle)) {
                 history_locked = true;
                 break;
             }

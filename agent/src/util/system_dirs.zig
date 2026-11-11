@@ -1,10 +1,19 @@
-/// System directory paths — XDG-compliant paths for config, data, cache.
+/// System directory paths — XDG-compliant on posix, Known-Folder on
+/// Windows (%APPDATA%\ziv config / %LOCALAPPDATA%\ziv data+cache).
 const std = @import("std");
+const builtin = @import("builtin");
 const env = @import("env.zig");
 
-/// Get the config directory (~/.config/ziv or $XDG_CONFIG_HOME/ziv).
-/// Caller owns the returned slice.
+fn knownFolder(allocator: std.mem.Allocator, env_name: []const u8) ?[]u8 {
+    const v = env.get(env_name) orelse return null;
+    return std.fs.path.join(allocator, &.{ v, "ziv" }) catch null;
+}
+
+/// Get the config directory. Caller owns the returned slice.
 pub fn configDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return knownFolder(allocator, "APPDATA") orelse error.NoHomeDir;
+    }
     if (env.get("XDG_CONFIG_HOME")) |xdg| {
         return std.fs.path.join(allocator, &.{ xdg, "ziv" });
     }
@@ -15,6 +24,9 @@ pub fn configDir(allocator: std.mem.Allocator) ![]u8 {
 /// Get the data directory (~/.local/share/ziv or $XDG_DATA_HOME/ziv).
 /// Caller owns the returned slice.
 pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return knownFolder(allocator, "LOCALAPPDATA") orelse error.NoHomeDir;
+    }
     if (env.get("XDG_DATA_HOME")) |xdg| {
         return std.fs.path.join(allocator, &.{ xdg, "ziv" });
     }
@@ -25,6 +37,9 @@ pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
 /// Get the cache directory (~/.cache/ziv or $XDG_CACHE_HOME/ziv).
 /// Caller owns the returned slice.
 pub fn cacheDir(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return knownFolder(allocator, "LOCALAPPDATA") orelse error.NoHomeDir;
+    }
     if (env.get("XDG_CACHE_HOME")) |xdg| {
         return std.fs.path.join(allocator, &.{ xdg, "ziv" });
     }

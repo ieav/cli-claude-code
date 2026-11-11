@@ -118,8 +118,10 @@ pub const SkillLoader = struct {
     fn userRoot(self: *Self) ![]u8 {
         if (self.user_dir_override) |d| return self.allocator.dupe(u8, d);
         if (env_mod.get("ZIV_SKILLS_DIR")) |d| return self.allocator.dupe(u8, d);
-        const home = env_mod.homeDir() orelse return error.NoHome;
-        return std.fmt.allocPrint(self.allocator, "{s}/.config/ziv/skills", .{home});
+        // system_dirs knows the platform layout (XDG / %APPDATA%).
+        const cfg = try @import("../util/system_dirs.zig").configDir(self.allocator);
+        defer self.allocator.free(cfg);
+        return std.fs.path.join(self.allocator, &.{ cfg, "skills" });
     }
 
     fn projectRoot(self: *Self) ![]u8 {

@@ -206,13 +206,14 @@ pub fn loadStartup(alloc: std.mem.Allocator, io: std.Io, generate: bool) RulesSt
         s.generated_path = maybeGenerate(alloc, io);
     }
     // Global layer: hand-written only; absence is normal, no notice.
-    if (env_mod.homeDir()) |home| {
-        var gb: [std.fs.max_path_bytes]u8 = undefined;
-        const gdir = std.fmt.bufPrint(&gb, "{s}/.config/ziv", .{home}) catch "";
-        if (gdir.len > 0) {
-            if (findInsensitive(alloc, io, gdir, "ziv.md")) |name| {
+    // Path via system_dirs (XDG ~/.config/ziv / %APPDATA%\ziv).
+    {
+        const gdir = @import("../util/system_dirs.zig").configDir(alloc) catch null;
+        if (gdir) |gd| {
+            defer alloc.free(gd);
+            if (findInsensitive(alloc, io, gd, "ziv.md")) |name| {
                 defer alloc.free(name);
-                if (joinPath(alloc, gdir, name)) |p| {
+                if (joinPath(alloc, gd, name)) |p| {
                     if (loadLayer(alloc, io, p)) |l| {
                         s.global = l;
                     }
@@ -255,21 +256,19 @@ fn statLayer(io: std.Io, path: []const u8) struct { ms: i64, len: u64 } {
 /// finds either case, so the fallback never runs there).
 pub fn fingerprint(io: std.Io) Fingerprint {
     var fp = Fingerprint{};
-    if (env_mod.homeDir()) |home| {
+    if (@import("../util/system_dirs.zig").configDir(std.heap.smp_allocator) catch null) |gdir| {
+        defer std.heap.smp_allocator.free(gdir);
         var gb: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&gb, "{s}/.config/ziv/ziv.md", .{home})) |p| {
+        if (std.fmt.bufPrint(&gb, "{s}/ziv.md", .{gdir})) |p| {
             var st = statLayer(io, p);
             if (st.ms == 0 and st.len == 0) {
-                var dirb: [std.fs.max_path_bytes]u8 = undefined;
-                if (std.fmt.bufPrint(&dirb, "{s}/.config/ziv", .{home})) |gd| {
-                    if (findInsensitive(std.heap.smp_allocator, io, gd, "ziv.md")) |real| {
-                        defer std.heap.smp_allocator.free(real);
-                        if (joinPath(std.heap.smp_allocator, gd, real)) |rp| {
-                            defer std.heap.smp_allocator.free(rp);
-                            st = statLayer(io, rp);
-                        }
+                if (findInsensitive(std.heap.smp_allocator, io, gdir, "ziv.md")) |real| {
+                    defer std.heap.smp_allocator.free(real);
+                    if (joinPath(std.heap.smp_allocator, gdir, real)) |rp| {
+                        defer std.heap.smp_allocator.free(rp);
+                        st = statLayer(io, rp);
                     }
-                } else |_| {}
+                }
             }
             fp.g_ms = st.ms;
             fp.g_len = st.len;

@@ -172,6 +172,39 @@ pub const SigintGuard = struct {
     }
 };
 
+/// Cross-process exclusive file lock (input_history's single-writer
+/// discipline). posix: flock; windows: LockFileEx non-blocking.
+pub fn lockExNb(handle: anytype) bool {
+    if (builtin.os.tag == .windows) {
+        const lock_c = struct {
+            const OVERLAPPED = extern struct { internal: usize = 0, internal_high: usize = 0, offset: u32 = 0, offset_high: u32 = 0, h_event: ?*anyopaque = null };
+            const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+            const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+            extern "kernel32" fn LockFileEx(hFile: std.os.windows.HANDLE, dwFlags: u32, dwReserved: u32, nNumberOfBytesToLockLow: u32, nNumberOfBytesToLockHigh: u32, lpOverlapped: *OVERLAPPED) callconv(.winapi) std.os.windows.BOOL;
+            extern "kernel32" fn UnlockFileEx(hFile: std.os.windows.HANDLE, dwReserved: u32, nNumberOfBytesToUnlockLow: u32, nNumberOfBytesToUnlockHigh: u32, lpOverlapped: *OVERLAPPED) callconv(.winapi) std.os.windows.BOOL;
+        };
+        var ov: lock_c.OVERLAPPED = .{};
+        const h: std.os.windows.HANDLE = if (@typeInfo(@TypeOf(handle)) == .pointer) handle else @ptrFromInt(@as(usize, @intCast(@as(i64, @intCast(handle)))));
+        return @intFromEnum(lock_c.LockFileEx(h, lock_c.LOCKFILE_EXCLUSIVE_LOCK | lock_c.LOCKFILE_FAIL_IMMEDIATELY, 0, 0xFFFF_FFFF, 0, &ov)) != 0;
+    } else {
+        return std.c.flock(handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0;
+    }
+}
+
+pub fn lockUn(handle: anytype) void {
+    if (builtin.os.tag == .windows) {
+        const lock_c = struct {
+            const OVERLAPPED = extern struct { internal: usize = 0, internal_high: usize = 0, offset: u32 = 0, offset_high: u32 = 0, h_event: ?*anyopaque = null };
+            extern "kernel32" fn UnlockFileEx(hFile: std.os.windows.HANDLE, dwReserved: u32, nNumberOfBytesToUnlockLow: u32, nNumberOfBytesToUnlockHigh: u32, lpOverlapped: *OVERLAPPED) callconv(.winapi) std.os.windows.BOOL;
+        };
+        var ov: lock_c.OVERLAPPED = .{};
+        const h: std.os.windows.HANDLE = if (@typeInfo(@TypeOf(handle)) == .pointer) handle else @ptrFromInt(@as(usize, @intCast(@as(i64, @intCast(handle)))));
+        _ = lock_c.UnlockFileEx(h, 0, 0xFFFF_FFFF, 0, &ov);
+    } else {
+        _ = std.c.flock(handle, std.posix.LOCK.UN);
+    }
+}
+
 pub fn isTtyStdinStdout() bool {
     if (builtin.os.tag == .windows) {
         // L1 wires GetConsoleMode probing; L0 assumes a console when the

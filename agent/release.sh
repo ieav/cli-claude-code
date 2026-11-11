@@ -28,6 +28,7 @@ targets=(
   "x86_64-macos"
   "x86_64-linux-musl"
   "aarch64-linux-musl"
+  "x86_64-windows-gnu"
 )
 
 # 并行构建 4 个 target：瓶颈是 LLVM 全程序优化（~58s/目标，实测），多进程吃满多核。
@@ -47,7 +48,8 @@ wait
 fail=0
 for t in "${targets[@]}"; do
   if [ -f "$PFXROOT/$t.stamp" ]; then
-    cp "$PFXROOT/$t/bin/ziv" "$OUT/ziv-$t"
+    bin=ziv; [ "$t" = "x86_64-windows-gnu" ] && bin=ziv.exe
+    cp "$PFXROOT/$t/bin/$bin" "$OUT/ziv-$t${bin#ziv}"
     echo "✓ $t"
   else
     echo "✗ $t build failed — tail of log:"
@@ -67,9 +69,15 @@ done
 # 工具链无确定性开关——已知残留，SHA256SUMS 每次随 pkg 变动属预期。
 EPOCH_TS="202001010000"
 for t in "${targets[@]}"; do
+  [ "$t" = "x86_64-windows-gnu" ] && continue
   touch -t "$EPOCH_TS" "$OUT/ziv-$t"
   COPYFILE_DISABLE=1 tar -cf - -C "$OUT" "ziv-$t" | gzip -n > "$OUT/ziv-$VERSION-$t.tar.gz"
 done
+# Windows ships as .zip (Windows Explorer's native form).
+if [ -f "$OUT/ziv-x86_64-windows-gnu.exe" ]; then
+  touch -t "$EPOCH_TS" "$OUT/ziv-x86_64-windows-gnu.exe"
+  (cd "$OUT" && zip -q -X -9 "ziv-$VERSION-x86_64-windows-gnu.zip" "ziv-x86_64-windows-gnu.exe" install.ps1) || echo "⚠ zip not found — skip .zip"
+fi
 
 # ── macOS .pkg installer (universal arm64+x86_64, installs to /usr/local/bin/ziv)
 if command -v lipo >/dev/null && command -v pkgbuild >/dev/null; then
@@ -166,6 +174,33 @@ echo "installed: $BIN_DIR/ziv  (data dir .ziv/ is created per working directory)
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "note: add $BIN_DIR to PATH" ;; esac
 EOF
 chmod +x "$OUT/install.sh"
+
+# ── Windows PowerShell installer (user-scope, no admin needed)
+cat > "$OUT/install.ps1" <<'PSEOF'
+# Install ziv for the current user (no admin): copies ziv.exe to
+# %LOCALAPPDATA%\Programs\ziv and adds it to the user PATH.
+# Usage: .\install.ps1 [-Uninstall]
+param([switch]$Uninstall)
+$ErrorActionPreference = "Stop"
+$dir = Join-Path $env:LOCALAPPDATA "Programs\ziv"
+if ($Uninstall) {
+  if (Test-Path "$dir\ziv.exe") { Remove-Item -Recurse -Force $dir; "removed: $dir" }
+  else { "ziv not found at $dir" }
+  exit 0
+}
+$src = Join-Path $PSScriptRoot "ziv-x86_64-windows-gnu.exe"
+if (-not (Test-Path $src)) { "missing $src"; exit 1 }
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Copy-Item $src "$dir\ziv.exe" -Force
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$dir*") {
+  [Environment]::SetEnvironmentVariable("Path", "$userPath;$dir", "User")
+  "note: $dir added to PATH — open a NEW terminal for it to take effect"
+}
+"installed: $dir\ziv.exe"
+"per-project data lands in .ziv\ inside each working directory;"
+"global config in %APPDATA%\ziv\"
+PSEOF
 
 # ── checksums (all artifacts in $OUT; dotfiles like .DS_Store excluded by glob)
 # POSIX-portable: the old `for f in *(N)` used a zsh-only glob qualifier and
