@@ -109,7 +109,18 @@ pub fn rawEnter(saved: *Mode, no_sig: bool) bool {
         // live. Mouse likewise (ziv never enables mouse reporting).
         raw_mode &= ~w.ENABLE_WINDOW_INPUT;
         raw_mode &= ~w.ENABLE_MOUSE_INPUT;
-        return @intFromEnum(w.SetConsoleMode(in, raw_mode)) != 0;
+        // VT INPUT: arrow keys / Ctrl-combos must arrive as CSI byte
+        // sequences (\x1b[A …) for the editor's parser — without this bit
+        // legacy input translation may deliver nothing useful on ReadFile.
+        // Windows Terminal's conpty usually implies it; setting it
+        // explicitly is the stable contract. Older conhosts may reject the
+        // bit: fall back to the mode without it rather than failing raw.
+        raw_mode |= w.ENABLE_VIRTUAL_TERMINAL_INPUT;
+        if (@intFromEnum(w.SetConsoleMode(in, raw_mode)) == 0) {
+            raw_mode &= ~w.ENABLE_VIRTUAL_TERMINAL_INPUT;
+            return @intFromEnum(w.SetConsoleMode(in, raw_mode)) != 0;
+        }
+        return true;
     } else {
         if (std.c.tcgetattr(0, saved) != 0) return false;
         var raw = saved.*;
