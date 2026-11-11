@@ -244,6 +244,7 @@ tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | **MCP & Skill** | |
 | `/skills` | 列出已安装 Skill + 未加载原因（详见 5.14） |
 | `/skill <sub>` | Skill 管理：new / show / remove / **reload 热重扫**（详见 5.14） |
+| `/agents <sub>` | **项目规则管理**（ziv.md 单一源）：状态 / init（整合 AGENTS.md、CLAUDE.md 生成）/ sync（刷新外来内容区，专属节不动）/ reload（重读注入）——详见下文「项目规则」节 |
 | `/mcp <sub>` | MCP 服务器管理：install / add / connect / disconnect / list / remove（详见 5.13） |
 
 输入框中斜杠命令实时着色：已知命令青色、未知暗灰；打错命令给出 Did-you-mean 提示。
@@ -653,6 +654,27 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 ### 5.15 tree-sitter 编辑后语法校验（v0.9.0）
 
 FileEdit/FileWrite 之后自动对产物做语法校验（语言集：**Python / JavaScript / TypeScript / TSX / Java / Zig**，`util/treesitter.zig`）——编辑引入的语法错误当场暴露给模型自愈，不用等编译。不认识的语言静默跳过。语法依赖以源码形式内嵌 `deps/tree-sitter/`，musl 交叉编译恒定 `-O2`。
+
+### 5.16 项目规则 ziv.md（2026-11-11）
+
+ziv 的项目规则 = **`ziv.md` 单一事实源**（锚定根，ziv 可读写）；`AGENTS.md` / `CLAUDE.md` 为外来文件**只读识别**——仅作生成素材。三者**全大小写不敏感**（ziv.md/ZIV.md、agents.md、claude.md 都认）。
+
+| 层 | 路径 | 说明 |
+|----|------|------|
+| 全局 | `~/.config/ziv/ziv.md` | 个人偏好，纯手写不自动生成，注入在前 |
+| 项目 | `<锚定根>/ziv.md` | 项目规则，注入在后（更具体者靠后） |
+
+**行为**：
+
+- ziv.md 存在 → 注入之（独立 ContentBlock，system 块内），忽略外来文件
+- ziv.md 缺 + 外来存在 → **自动生成**：外来内容整篇拼接进 `<!-- ziv:external -->` 标记区 + 专属节模板，明示一行（整篇拼接，确定性零丢失，不做 LLM 提炼）
+- `/clear` 后规则块保留（规则不是会话状态）；**热重载**：编辑 ziv.md 后下一提示符按 mtime+size 检对自动重注入（`[ziv.md 已重载 · ~N tokens]`）
+- 每层独立 4000 tokens 预算，超限 UTF-8 边界截断 + 可见尾注
+- `ziv -p`（oneshot）同样注入（尾拼 system 字符串）但**不自动生成**（无头不在用户项目写文件）
+
+**`/agents` 命令族**：`/agents`（状态）/ `init`（手动生成整合）/ `sync`（只刷新标记区内外来内容，**标记区外的专属规则永不被动**；无标记的旧文件备份 ziv.md.bak 后重生）/ `reload`（立即重读注入）。
+
+规则文件进不进 git 自便：团队共享规则建议维护在 AGENTS.md（其他 agent 也认），个人/项目补充写 ziv.md 专属节——sync 标记区保证两边不打架。
 
 ---
 

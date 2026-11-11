@@ -19,6 +19,7 @@ const stream_mod = @import("turn/stream.zig");
 const turn_ask = @import("turn/ask.zig");
 const turn_tools = @import("turn/tools.zig");
 const turn_history = @import("turn/history.zig");
+pub const rules_mod = @import("rules/ziv_md.zig");
 const memory_ops = @import("session/memory_ops.zig");
 const config_menu = @import("commands/config_menu.zig");
 const history_cmds = @import("commands/history_cmds.zig");
@@ -116,6 +117,57 @@ const StyleToggleCtx = struct {
 };
 var style_toggle_ctx: ?StyleToggleCtx = null;
 
+
+/// ziv.md hot reload: refresh both layers and swap/append/remove the
+/// rules block in history[0]. Returns true when anything changed. The
+/// swap can legitimately fail (e.g. /clear rebuilt the system message and
+/// dropped the block) — that path degrades to append, self-healing.
+pub fn reloadRulesBlock(
+    history: *std.ArrayList(llm.Message),
+    rules_state: *rules_mod.RulesState,
+    rules_text: *?[]u8,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    file_writer: *std.Io.File.Writer,
+) bool {
+    rules_mod.freeRulesState(alloc, rules_state);
+    rules_state.* = rules_mod.loadStartup(alloc, io, false); // never generates on reload
+    const fresh = rules_mod.buildBlockText(alloc, rules_state);
+    if (fresh) |nt| {
+        if (rules_text.*) |ot| {
+            if (turn_history.swapMemoryBlockText(history, alloc, ot, nt)) {
+                alloc.free(ot);
+                rules_text.* = nt;
+            } else if (turn_history.appendSystemBlock(history, alloc, nt)) {
+                alloc.free(ot);
+                rules_text.* = nt;
+            } else {
+                alloc.free(nt); // block update failed; old text stays for the next tick
+            }
+        } else if (turn_history.appendSystemBlock(history, alloc, nt)) {
+            rules_text.* = nt;
+        } else {
+            alloc.free(nt);
+        }
+        if (rules_text.* != null and rules_text.*.?.ptr == nt.ptr) {
+            std.Io.Writer.print(w, "  [ziv.md 已重载 · ~{d} tokens]\n", .{tokens_mod.estimateTokens(nt)}) catch {};
+            std.Io.File.Writer.flush(file_writer) catch {};
+            return true;
+        }
+        return false;
+    }
+    // New content empty: drop the block if one exists.
+    if (rules_text.*) |ot| {
+        _ = turn_history.removeSystemBlockByText(history, alloc, ot);
+        alloc.free(ot);
+        rules_text.* = null;
+        std.Io.Writer.print(w, "  [ziv.md 已移除（内容为空/文件删除）]\n", .{}) catch {};
+        std.Io.File.Writer.flush(file_writer) catch {};
+        return true;
+    }
+    return false;
+}
 
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
     // Terminal-write serialization needs the Io instance (std.Io.Mutex
@@ -443,7 +495,27 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var skill_manifest: ?[]u8 = null;
     defer if (skill_manifest) |m| allocator.free(m);
     skill_manifest = skill_loader.buildManifest(allocator, 300) catch null;
-    const sys_block_count: usize = 1 + @as(usize, @intFromBool(memory_block != null)) + @as(usize, @intFromBool(skill_manifest != null));
+    // Project rules (ziv.md single source — global + project layers, each
+    // with its own budget; generated on demand from AGENTS.md/CLAUDE.md,
+    // see rules/ziv_md.zig). Loaded AFTER the manifest so the block order
+    // matches what appendSystemBlock produces on hot reload.
+    var rules_state = rules_mod.loadStartup(allocator, io, true);
+    defer rules_mod.freeRulesState(allocator, &rules_state);
+    if (rules_state.generated_path) |gp| {
+        try std.Io.Writer.print(w, "  [已生成 {s} —— 整合自外来规则文件（AGENTS.md/CLAUDE.md），此后以 ziv.md 为准；/agents 查看管理]\n", .{gp});
+        try std.Io.File.Writer.flush(&file_writer);
+    }
+    var rules_text: ?[]u8 = rules_mod.buildBlockText(allocator, &rules_state);
+    defer if (rules_text) |rt| allocator.free(rt);
+    var rules_fp_last = rules_mod.fingerprint(io);
+    if (rules_text) |rt| {
+        logger.info("rules: injected ~{d} tokens (global={s} project={s})", .{
+            tokens_mod.estimateTokens(rt),
+            if (rules_state.global != null) "y" else "n",
+            if (rules_state.project != null) "y" else "n",
+        });
+    }
+    const sys_block_count: usize = 1 + @as(usize, @intFromBool(memory_block != null)) + @as(usize, @intFromBool(skill_manifest != null)) + @as(usize, @intFromBool(rules_text != null));
     var sys_blocks = try allocator.alloc(llm.ContentBlock, sys_block_count);
     sys_blocks[0] = .{ .text = sys_prompt };
     var sys_i: usize = 1;
@@ -451,7 +523,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         sys_blocks[sys_i] = .{ .text = mb };
         sys_i += 1;
     }
-    if (skill_manifest) |sm| sys_blocks[sys_i] = .{ .text = sm };
+    if (skill_manifest) |sm| {
+        sys_blocks[sys_i] = .{ .text = sm };
+        sys_i += 1;
+    }
+    if (rules_text) |rt| sys_blocks[sys_i] = .{ .text = rt };
     try history.append(allocator, .{
         .role = .system,
         .content = sys_blocks,
@@ -674,6 +750,14 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // T8: sync the plan anchor with .ziv/plan.md (fingerprint-gated;
         // also covers the very first prompt — the file may predate us).
         turn_history.refreshPlanAnchor(&history, &plan_block, &plan_raw_last, allocator, io);
+        // ziv.md hot reload: mtime+size per layer (cheap; content hashing
+        // buys nothing at this cadence). Same tick as the settings reload
+        // and plan refresh — one prompt-boundary sweep.
+        const rfp = rules_mod.fingerprint(io);
+        if (!rules_mod.sameFingerprint(rfp, rules_fp_last)) {
+            rules_fp_last = rfp;
+            _ = reloadRulesBlock(&history, &rules_state, &rules_text, allocator, io, w, &file_writer);
+        }
 
         // T3.2: land any background-reflection insights that completed
         // since the last prompt (SQLite writes and printing stay on this
@@ -790,6 +874,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .skill_loader = &skill_loader,
         .skill_manifest = skill_manifest,
         .skill_manifest_slot = &skill_manifest,
+        .rules_state = &rules_state,
+        .rules_text = rules_text,
+        .rules_text_slot = &rules_text,
+        .rules_fp = &rules_fp_last,
         .sys_prompt = &sys_prompt,
         .sys_prompt_owned = &sys_prompt_owned,
         .applied_prompt_setting = &applied_prompt_setting,
@@ -2229,6 +2317,7 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  /skill new|show|remove|reload   Manage skills (reload rescans
         \\                     both roots — new packs take effect at once)
         \\  /mcp               MCP servers: list/connect/disconnect
+        \\  /agents            Project rules (ziv.md): status/init/sync/reload
         \\
         \\Models (use /model to switch):
         \\  Claude:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5

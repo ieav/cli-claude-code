@@ -47,6 +47,7 @@ const reflection_mod = @import("../memory/reflection.zig");
 const denial_tracker_mod = @import("../tools/denial_tracker.zig");
 const repl_mod = @import("../repl.zig");
 const ModelSwitcher = repl_mod.ModelSwitcher;
+const rules_mod = @import("../rules/ziv_md.zig");
 const allocator = std.heap.smp_allocator; // same stateless global as repl.zig
 
 /// One slash-command dispatch — carved out of run()'s loop body (P1 ⑦).
@@ -82,6 +83,12 @@ pub const ReplCtx = struct {
     /// /skill reload 的重建目标：指向 run() 的 skill_manifest 槽位
     /// （值字段 skill_manifest 只是启动快照，reload 要改写本体）。
     skill_manifest_slot: *?[]u8,
+    /// ziv.md 规则块（rules/ziv_md.zig）：state 指针与 text 槽位供
+    /// /agents reload；text 值快照供 /clear 重建 system 块时带上规则。
+    rules_state: *repl_mod.rules_mod.RulesState,
+    rules_text: ?[]const u8,
+    rules_text_slot: *?[]u8,
+    rules_fp: *repl_mod.rules_mod.Fingerprint,
     sys_prompt: *[]const u8,
     sys_prompt_owned: *?[]u8,
     applied_prompt_setting: *?[]const u8,
@@ -455,6 +462,86 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             try std.Io.Writer.print(ctx.w, "  未知子命令: {s}（/skill 查看用法）\n\n", .{rest});
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
+        } else if (std.mem.startsWith(u8, input, "/agents")) {
+            // Project rules management (rules/ziv_md.zig): ziv.md is the
+            // single source; AGENTS.md/CLAUDE.md are foreign bootstrap
+            // material. /agents sync refreshes only the fenced external
+            // region of ziv.md.
+            const rest_a = std.mem.trim(u8, input[7..], " \t");
+            if (rest_a.len == 0) {
+                const st = ctx.rules_state.*;
+                try std.Io.Writer.writeAll(ctx.w, "  项目规则（ziv.md 单一源，大小写不敏感识别）:\n");
+                if (st.global) |g| {
+                    const gt: []const u8 = if (g.truncated) "（已截断）" else "";
+                    try std.Io.Writer.print(ctx.w, "    全局: {s} · ~{d} tokens{s}\n", .{ g.path, g.full_tokens, gt });
+                } else {
+                    try std.Io.Writer.writeAll(ctx.w, "    全局: 无（~/.config/ziv/ziv.md，纯手写不自动生成）\n");
+                }
+                if (st.project) |p| {
+                    const pt: []const u8 = if (p.truncated) "（已截断）" else "";
+                    try std.Io.Writer.print(ctx.w, "    项目: {s} · ~{d} tokens{s}\n", .{ p.path, p.full_tokens, pt });
+                } else {
+                    try std.Io.Writer.writeAll(ctx.w, "    项目: 无（有 AGENTS.md/CLAUDE.md 时 /agents init 可整合生成）\n");
+                }
+                try std.Io.Writer.writeAll(ctx.w,
+                    \\  子命令: /agents init（生成/整合） · /agents sync（刷新外来内容区） · /agents reload（重读注入）
+                    \\
+                );
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.eql(u8, rest_a, "init")) {
+                if (rules_mod.maybeGenerate(allocator, ctx.io)) |gp| {
+                    defer allocator.free(gp);
+                    try std.Io.Writer.print(ctx.w, "  已生成 {s}（整合自 AGENTS.md/CLAUDE.md，此后以它为准）\n", .{gp});
+                    ctx.rules_fp.* = rules_mod.fingerprint(ctx.io);
+                    _ = repl_mod.reloadRulesBlock(ctx.history, ctx.rules_state, ctx.rules_text_slot, allocator, ctx.io, ctx.w, ctx.file_writer);
+                    ctx.rules_text = ctx.rules_text_slot.*;
+                } else {
+                    try std.Io.Writer.writeAll(ctx.w, "  未生成：ziv.md 已存在，或项目根没有 AGENTS.md/CLAUDE.md\n\n");
+                }
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.eql(u8, rest_a, "sync")) {
+                switch (rules_mod.syncExternal(allocator, ctx.io)) {
+                    .replaced => |r| {
+                        try std.Io.Writer.print(ctx.w, "  已刷新外来内容区（来源：{s}{s}{s}）；标记区外的专属规则原样保留\n", .{
+                            if (r.agents) "AGENTS.md" else "",
+                            if (r.agents and r.claude) " + " else "",
+                            if (r.claude) "CLAUDE.md" else "",
+                        });
+                    },
+                    .regenerated => |r| {
+                        try std.Io.Writer.print(ctx.w, "  ziv.md 无标记区——已备份到 ziv.md.bak 并重新整合（来源：{s}{s}{s}；自定义内容请从备份找回）\n", .{
+                            if (r.agents) "AGENTS.md" else "",
+                            if (r.agents and r.claude) " + " else "",
+                            if (r.claude) "CLAUDE.md" else "",
+                        });
+                    },
+                    .no_ziv_md => try std.Io.Writer.writeAll(ctx.w, "  项目根没有 ziv.md（先 /agents init）\n"),
+                    .no_foreign_files => try std.Io.Writer.writeAll(ctx.w, "  项目根没有 AGENTS.md/CLAUDE.md——没有可同步的外来内容\n"),
+                    .write_failed => try std.Io.Writer.writeAll(ctx.w, "  写入失败（权限/磁盘？）\n"),
+                }
+                ctx.rules_fp.* = rules_mod.fingerprint(ctx.io);
+                _ = repl_mod.reloadRulesBlock(ctx.history, ctx.rules_state, ctx.rules_text_slot, allocator, ctx.io, ctx.w, ctx.file_writer);
+                ctx.rules_text = ctx.rules_text_slot.*;
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (std.mem.eql(u8, rest_a, "reload")) {
+                if (repl_mod.reloadRulesBlock(ctx.history, ctx.rules_state, ctx.rules_text_slot, allocator, ctx.io, ctx.w, ctx.file_writer)) {
+                    ctx.rules_text = ctx.rules_text_slot.*;
+                } else {
+                    try std.Io.Writer.writeAll(ctx.w, "  ziv.md 无变化或无内容\n\n");
+                }
+                ctx.rules_fp.* = rules_mod.fingerprint(ctx.io);
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            try std.Io.Writer.print(ctx.w, "  未知子命令: {s}（/agents 查看用法）\n\n", .{rest_a});
+            try std.Io.File.Writer.flush(ctx.file_writer);
+            return .handled;
         } else if (std.mem.startsWith(u8, input, "/style")) {
             // Concise Output Style：/style 查看；/style concise|default 切换
             // （也绑 Ctrl+T 快捷键，两入口同一实现 applyOutputStyle）。
@@ -689,14 +776,21 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 if (ctx.sys_prompt_owned.*) |sp| allocator.free(sp);
                 ctx.sys_prompt_owned.* = system_prompt_mod.buildSystemPrompt(allocator, ctx.switcher.settings.system_prompt, ctx.switcher.settings.output_style) catch null;
                 ctx.sys_prompt.* = ctx.sys_prompt_owned.* orelse system_prompt_mod.default_system_prompt;
-                const fresh_count: usize = 1 + @as(usize, @intFromBool(ctx.skill_manifest != null));
+                const fresh_count: usize = 1 + @as(usize, @intFromBool(ctx.skill_manifest != null)) + @as(usize, @intFromBool(ctx.rules_text != null));
                 const fresh_blocks = try allocator.alloc(llm.ContentBlock, fresh_count);
                 fresh_blocks[0] = .{ .text = ctx.sys_prompt.* };
                 // The skill manifest must survive /clear — rebuilding a
                 // single-block message dropped it, leaving the model
                 // blind to every /<skill> until restart (the manifest
-                // string stays owned by the outer defer).
-                if (ctx.skill_manifest) |sm| fresh_blocks[1] = .{ .text = sm };
+                // string stays owned by the outer defer). Project rules
+                // (ziv.md) survive for the same reason: rules are not
+                // session state.
+                var fi: usize = 1;
+                if (ctx.skill_manifest) |sm| {
+                    fresh_blocks[fi] = .{ .text = sm };
+                    fi += 1;
+                }
+                if (ctx.rules_text) |rt| fresh_blocks[fi] = .{ .text = rt };
                 allocator.free(ctx.history.items[0].content);
                 ctx.history.items[0].content = fresh_blocks;
                 ctx.memory_block.* = null; // the end-of-session defer must not double-free

@@ -59,9 +59,25 @@ pub fn run(
     defer reg.deinit();
 
     // 正式 system prompt（与 REPL 同源；oneshot 不做记忆注入——快速
-    // 启动优先，注入是交互会话的增益）。
-    const sys_prompt = system_prompt_mod.buildSystemPrompt(alloc, switcher.settings.system_prompt, switcher.settings.output_style) catch null;
+    // 启动优先，注入是交互会话的增益）。项目规则（ziv.md）尾拼进同一
+    // 字符串——规则对无头任务同样生效；generate=false：不在用户项目
+    // 里自动写文件（生成是交互会话的行为）。
+    var sys_prompt = system_prompt_mod.buildSystemPrompt(alloc, switcher.settings.system_prompt, switcher.settings.output_style) catch null;
     defer if (sys_prompt) |sp| alloc.free(sp);
+    {
+        const rules_mod = @import("../rules/ziv_md.zig");
+        var rstate = rules_mod.loadStartup(alloc, io, false);
+        defer rules_mod.freeRulesState(alloc, &rstate);
+        if (rules_mod.buildBlockText(alloc, &rstate)) |rextra| {
+            defer alloc.free(rextra);
+            if (sys_prompt) |sp| {
+                if (std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ sp, rextra })) |joined| {
+                    sys_prompt = joined;
+                    alloc.free(sp);
+                } else |_| {}
+            }
+        }
+    }
 
     // 用户规则 + 模式；ask → 拒绝由 subagent 引擎的降级语义兜住
     // （无人在场，不允许悬停等待审批）。
