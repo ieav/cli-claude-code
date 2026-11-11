@@ -5,7 +5,8 @@
 > v0.4.0 — 自学习闭环 · v0.5.x — 工具自动调用 + MCP + Skill · v0.6.x — 输入系统重写（块渲染/kitty 协议/粘贴折叠）+ 记忆飞轮升级 · v0.6.1 — 稳定性（看护狗/任务系统/Ctrl-C 协作取消）· v0.7.x — 事件循环重构（回合中输入全程在线）、工具批次 Esc 取消、keep-alive 重试、raw 终端治理；
 > **v0.8.0 — 会话恢复（/resume）、提炼压缩梯子（onset 75% + /compact 焦点文本）、错误选择器 + auto_fix、后台任务（run_in_background + /bg + BgTask）、WebFetch、/tasks /last /trace 命令、前缀缓存观测（/stats）、子代理白名单/fork/max_turns、代码索引 FTS5、/config 中文菜单自动保存、TUI 可读性（配色五分类 + Ctrl+O 折叠）**；
 > **v0.9.0 — harness 效率批次：utf8proc 宽度判定、sqlite-vec 记忆语义去重、项目根锚定（子目录共享上级 .ziv）、MCP 启动自动连接、Skill tools 强制门、M6 Hooks（Pre/PostToolUse）、M7 `-p` 非交互一发模式、tree-sitter 编辑后语法校验、退出零 LLM 等待（延迟提取档）**；
-> **v0.9.1 — TUI v2 框架化（IDLE/TURN/MODAL 状态机、常驻输入区、模态退出零残留、统一工具头）、Concise 输出风格（/style）、全能力子代理（write:true、容量上限 10、实时进度行）、请求体 UTF-8 清洗**。
+> **v0.9.1 — TUI v2 框架化（IDLE/TURN/MODAL 状态机、常驻输入区、模态退出零残留、统一工具头）、Concise 输出风格（/style）、全能力子代理（write:true、容量上限 10、实时进度行）、请求体 UTF-8 清洗**；
+> **v0.9.2 — 并发审查五修复（子代理 LLM 请求 250ms 可取消 / live_dispatch 悬垂根治）、skill 命令族（new/show/remove/reload 热加载 + 失败可见化）、MCP stdio 根治（npx 形态可用，9 工具实测桥接）、项目规则 ziv.md（CLAUDE.md/AGENTS.md 兼容整合 + /agents 命令族 + 热重载）、DirTree 工具（第 16 个内置）、AskUserQuestion 选项化、/resume 两修复（ended_at 误报 + flush 收缩重建）、Ctrl-C 退出窗口 3s→1s**。
 
 ---
 
@@ -46,7 +47,7 @@ zig build install
 ```bash
 # ① 改版本号 —— 只改一处：版本单一事实源
 #    （启动 banner、/version、--version、MCP clientInfo、release.sh 全部读它）
-vim src/util/version.zig   # pub const version = "0.9.1";
+vim src/util/version.zig   # pub const version = "0.9.2";
 
 # ② 构建 + 安装包打包（唯一入口，产物见下方表格）
 ./release.sh
@@ -56,7 +57,7 @@ vim src/util/version.zig   # pub const version = "0.9.1";
 scp -r dist/ziv-vX.Y.Z user@server:             # 分发后在目标机 ./install.sh
 ```
 
-也可以显式传版本号 `./release.sh 0.9.1`，但**传参不构成 bump**——必须先改 `src/util/version.zig`，传参与源码不符会被拒绝。
+也可以显式传版本号 `./release.sh 0.9.2`，但**传参不构成 bump**——必须先改 `src/util/version.zig`，传参与源码不符会被拒绝。
 
 **版本防呆**：脚本从 `src/util/version.zig` 抽取版本；显式传参必须与源码一致，否则拒绝构建：
 
@@ -107,21 +108,21 @@ ziv --help          # 或 -h：打印用法退出
 四种安装方式按需选：
 
 ```bash
-cd agent/dist/ziv-v0.9.1
+cd agent/dist/ziv-v0.9.2
 
 # 方式一：离线安装脚本（自动识别平台；默认 /usr/local，无写权限自动回退 ~/.local）
 ./install.sh
 ./install.sh uninstall     # 卸载二进制（配置与 .ziv/ 数据保留，按需手动删）
 
 # 方式二：macOS 安装包（universal，装到 /usr/local/bin/ziv）
-sudo installer -pkg ziv-0.9.1-macos.pkg -target /        # 或双击安装
+sudo installer -pkg ziv-0.9.2-macos.pkg -target /        # 或双击安装
 sudo pkgutil --forget com.ziv.ziv                        # 卸载登记（另需 sudo rm /usr/local/bin/ziv）
 
 # 方式三：Linux .deb（卸载：sudo dpkg -r ziv）
-sudo dpkg -i ziv_0.9.1-1_amd64.deb
+sudo dpkg -i ziv_0.9.2-1_amd64.deb
 
 # 方式四：tar.gz / 裸二进制，解压即用
-tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
+tar xzf ziv-0.9.2-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 ```
 
 - 传输后确认执行位（`chmod +x`）；Linux musl 版为静态链接，目标机无需安装任何运行时
@@ -152,7 +153,7 @@ tar xzf ziv-0.9.1-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv — v0.9.1 | (Self-learning)      ║
+║  Ziv - v0.9.2 | (Self-learning)      ║
 ║  π 圆融 · e 增长 · φ 浓缩             ║
 ╚══════════════════════════════════════╝
   π   = 3.1415926536
@@ -453,7 +454,7 @@ ziv> 已恢复会话 #41：24 条消息（~8100 tokens · 模型 gpt-4o · 模�
 ## 4. 架构总览
 
 ```
-Ziv Agent v0.9.1
+Ziv Agent v0.9.2
 ├── math/           数学常数核心 (pi, e, phi)
 ├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 流式 + 消息压缩
 ├── tools/          comptime 工具系统 (16 内置工具 + agent 动态工具) + 权限 + 编排
@@ -519,7 +520,7 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 | **FileEdit** | Edit, sed | 读写 | 不安全 | 字符串查找替换编辑 |
 | **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配；构建/依赖目录整树剪枝，`maxDepth` 默认 10，结果上限 2000 |
 | **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置；后端一次判定，进程内缓存）；30s 超时、500 条截断 |
-| **DirTree** | Tree, tree | 只读 | 安全 | **目录结构概览**（v0.9.1 后）：缩进树形渲染，目录优先字母序；与 Glob 共享剪枝表（node_modules/.git 等整树不进）；`maxDepth` 默认 3、`maxEntries` 默认 400（截断可见）。摸陌生项目的第一步，补 Glob 只会模式匹配的短板 |
+| **DirTree** | Tree, tree | 只读 | 安全 | **目录结构概览**（v0.9.2）：缩进树形渲染，目录优先字母序；与 Glob 共享剪枝表（node_modules/.git 等整树不进）；`maxDepth` 默认 3、`maxEntries` 默认 400（截断可见）。摸陌生项目的第一步，补 Glob 只会模式匹配的短板 |
 | **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave；SearXNG 可配） |
 | **WebFetch** | Fetch | 只读 | 安全 | **v0.8.0**：抓取 URL 转 Markdown（搜索的下一步）；结果上限 40K |
 | **TaskCreate** | — | 读写 | 不安全 | 创建任务（`priority` 1-5，默认 3） |
