@@ -3,6 +3,7 @@
 /// conversation management (compact/clear/context/undo/rewind), and interactive config.
 /// Adapted for Zig 0.16 I/O API.
 const std = @import("std");
+const termio = @import("util/termio.zig");
 const wincompat = @import("util/wincompat.zig");
 const tools_mod = @import("tools/mod.zig");
 const orchestration_mod = @import("tools/orchestration.zig");
@@ -171,6 +172,8 @@ pub fn reloadRulesBlock(
 }
 
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
+    // Windows one-shot: VT output + UTF-8 console CP (posix no-op).
+    termio.init();
     // Terminal-write serialization needs the Io instance (std.Io.Mutex
     // lock/unlock take it) — inject before any region call below.
     lineinput.setIo(io);
@@ -1705,7 +1708,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         // UI loop while the tools run: editor + live clock.
                         var last_status: i64 = 0;
                         while (!tool_job.done.load(.acquire)) {
-                            const n = wincompat.pollFd(0, 100);
+                            const n = termio.pollInput(100);
                             if (n == 1) {
                                 if (lineinput.editorLiveKey(r, w) and !user_cancelled) {
                                     // Esc/Ctrl-C during tools: cancel the

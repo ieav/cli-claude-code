@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logger = @import("log.zig");
+const termio = @import("termio.zig");
 
 pub const is_windows = builtin.os.tag == .windows;
 
@@ -28,6 +29,9 @@ const w = if (builtin.os.tag == .windows) struct {
     pub extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
     pub extern "kernel32" fn GetExitCodeProcess(hProcess: std.os.windows.HANDLE, lpExitCode: *std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
     pub extern "kernel32" fn TerminateProcess(hProcess: std.os.windows.HANDLE, uExitCode: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn GetStdHandle(nStdHandle: std.os.windows.DWORD) callconv(.winapi) ?std.os.windows.HANDLE;
+    pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: std.os.windows.HANDLE, lpMode: *std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+    pub const STD_ERROR_HANDLE: std.os.windows.DWORD = @bitCast(@as(i32, -12));
 } else struct {};
 
 pub const win32 = if (builtin.os.tag == .windows) struct {

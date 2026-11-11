@@ -2,6 +2,7 @@
 /// StreamAgg event aggregation, the line-buffered live transcript, the
 /// tool-call preview, StreamJob pump + streamComplete UI loop.
 const std = @import("std");
+const termio = @import("../util/termio.zig");
 const wincompat = @import("../util/wincompat.zig");
 const llm = @import("../llm/mod.zig");
 const lineinput = @import("../util/lineinput.zig");
@@ -530,7 +531,7 @@ pub fn streamComplete(
                 //    (editorLiveKey drains everything available); a quiet
                 //    slice ticks the status row.
                 if (r) |rr| {
-                    const n = wincompat.pollFd(0, 100);
+                    const n = termio.pollInput(100);
                     if (n == 1) {
                         if (lineinput.editorLiveKey(rr, w)) {
                             job.requestCancel();

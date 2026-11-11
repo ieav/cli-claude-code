@@ -5,6 +5,7 @@
 /// timeout; on non-TTY stdin (pipes/tests) all bytes are already buffered,
 /// so the reader never blocks and sequences are read directly.
 const std = @import("std");
+const termio = @import("termio.zig");
 const builtin = @import("builtin");
 const wincompat = @import("./wincompat.zig");
 
@@ -48,7 +49,7 @@ pub fn readKey(r: *std.Io.Reader) !Key {
     // as a lone ESC — the on-TTY bug where arrow navigation "didn't work".
     if (r.bufferedLen() == 0) {
         if (is_tty) {
-            const ready = wincompat.pollFd(0, 25);
+            const ready = termio.pollInput(25);
             if (ready <= 0) return .quit;
         }
     }
@@ -64,9 +65,7 @@ pub fn readKey(r: *std.Io.Reader) !Key {
 }
 
 pub const RawGuard = struct {
-    // L0: posix stores the real termios; windows gets a placeholder until
-    // L1 lands SetConsoleMode (the guards are no-ops there for now).
-    orig: if (builtin.os.tag == .windows) [64]u8 else std.c.termios = undefined,
+    orig: termio.Mode = undefined,
     active: bool = false,
     installed_signal: bool = false,
 
@@ -82,35 +81,21 @@ pub const RawGuard = struct {
     }
 
     fn enterImpl(self: *RawGuard, no_sig: bool) void {
-        if (builtin.os.tag == .windows) return; // L1: SetConsoleMode
-        if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
-        var raw = self.orig;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        if (no_sig) raw.lflag.ISIG = false;
-        // IEXTEN off: the discipline otherwise consumes ^O (VDISCARD),
-        // ^V (VLNEXT) ITSELF — the byte never reaches the app (the Ctrl+O
-        // verbosity toggle silently dead, 2026-11-07). IXON off likewise:
-        // ^S/^Q are flow control, not keys.
-        raw.lflag.IEXTEN = false;
-        raw.iflag.IXON = false;
-        // Deliver Enter verbatim as CR. The line discipline's ICRNL flag
-        // (on in most cooked terminals) rewrites every \r to \n before the
-        // program sees it — the editor needs \r=submit vs \n=newline to be
-        // distinguishable (Ctrl+J / Shift+Enter).
-        raw.iflag.ICRNL = false;
-        raw.cc[@backingInt(std.c.V.MIN)] = 1;
-        raw.cc[@backingInt(std.c.V.TIME)] = 0;
-        if (std.c.tcsetattr(0, .NOW, &raw) == 0) self.active = true;
+        // Platform seam (termio): posix keeps the termios choreography
+        // (IEXTEN/IXON/ICRNL notes live there now); windows is
+        // SetConsoleMode. False = not a TTY (pipe) — quiet no-op.
+        if (termio.rawEnter(&self.orig, no_sig)) self.active = true;
         // Crash/kill-safety: without a handler a SIGINT/SIGSEGV in raw mode
         // left the terminal echo-less and unusable after the process died.
         // NESTING (session guard + menu/confirm guards since 2026-11-06):
         // only the OUTERMOST guard owns the signal-restore slot — a nested
         // guard's orig is already raw, and on its crash-restore the process
         // would die leaving the terminal raw.
-        if (self.active and signal_saved == null) {
-            installSignalRestore(&self.orig);
-            self.installed_signal = true;
+        if (builtin.os.tag != .windows) {
+            if (self.active and signal_saved == null) {
+                installSignalRestore(&self.orig);
+                self.installed_signal = true;
+            }
         }
         // NO SGR mouse reporting, ever: enabling ?1000/?1006 makes the
         // TERMINAL stop doing native click-drag text selection — copy from
@@ -120,8 +105,7 @@ pub const RawGuard = struct {
     }
 
     pub fn restore(self: *RawGuard) void {
-        if (builtin.os.tag == .windows) return;
-        if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
+        if (self.active) termio.rawRestore(&self.orig);
         if (self.installed_signal) removeSignalRestore();
     }
 };
@@ -132,29 +116,22 @@ pub const RawGuard = struct {
 /// no echo — a streamDelimiter(.., '\n') read would block forever and the
 /// user would type blind. Enter/restore is a no-op on non-TTY stdin.
 pub const CookedGuard = struct {
-    orig: if (builtin.os.tag == .windows) [64]u8 else std.c.termios = undefined,
+    orig: termio.Mode = undefined,
     active: bool = false,
 
     pub fn enter(self: *CookedGuard) void {
-        if (builtin.os.tag == .windows) return; // L1
-        if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
-        var cooked = self.orig;
-        cooked.lflag.ICANON = true; // driver line-edits (backspace works)
-        cooked.lflag.ECHO = true; // the user sees what they type
-        cooked.iflag.ICRNL = true; // Enter becomes \n — ends the read
-        if (std.c.tcsetattr(0, .NOW, &cooked) == 0) self.active = true;
+        if (termio.cookedEnter(&self.orig)) self.active = true;
     }
 
     pub fn restore(self: *CookedGuard) void {
-        if (builtin.os.tag == .windows) return;
-        if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
+        if (self.active) termio.rawRestore(&self.orig);
     }
 };
 
 /// Saved terminal settings for the signal handler. One slot, owned by the
 /// OUTERMOST active guard (session guard in repl.run since 2026-11-06);
 /// nested menu/confirm guards never overwrite it.
-var signal_saved: ?(if (builtin.os.tag == .windows) void else std.c.termios) = null;
+var signal_saved: ?(if (builtin.os.tag == .windows) u0 else std.c.termios) = null;
 
 fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
     if (builtin.os.tag == .windows) return;
@@ -178,9 +155,9 @@ fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
     }
 }
 
-fn installSignalRestore(orig: *const std.c.termios) void {
+fn installSignalRestore(orig: *const termio.Mode) void {
     if (builtin.os.tag == .windows) {
-        // L1: SetConsoleCtrlHandler
+        // L1: SetConsoleCtrlHandler (T7.1 verification)
     } else {
         installSignalRestorePosix(orig);
     }
@@ -378,7 +355,7 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
 fn escTailIsSequence(r: *std.Io.Reader) bool {
     if (r.bufferedLen() == 0) {
         if (!is_tty) return false; // piped/tests: bytes all pre-buffered
-        const ready = wincompat.pollFd(0, 25);
+        const ready = termio.pollInput(25);
         if (ready <= 0) return false;
     }
     const b = r.takeByte() catch return true;
