@@ -9,6 +9,8 @@ const lineinput = @import("../util/lineinput.zig");
 const logger = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const diff_util = @import("../util/diff.zig");
+const ts = @import("../util/treesitter.zig");
+const highlight = @import("../util/highlight.zig");
 const orchestration_mod = @import("../tools/orchestration.zig");
 const allocator = std.heap.smp_allocator;
 
@@ -81,7 +83,16 @@ pub const LastTools = struct {
 /// 工具线程池读，只需无撕裂，无需顺序保证（2026-11-07 审查 B 项加固）。
 pub var verbose_output = std.atomic.Value(bool).init(true);
 
-pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
+/// FileRead's output is source code — its language decides highlighting.
+/// Every other tool's body stays plain (dim); null lang = same.
+pub fn langForToolInput(tool_name: []const u8, input: ?std.json.Value) ?ts.Lang {
+    if (!std.mem.eql(u8, tool_name, "FileRead")) return null;
+    const inp = input orelse return null;
+    const path = registry.getStringField(inp, "path") orelse return null;
+    return ts.langForPath(path);
+}
+
+pub fn printToolBody(w: *std.Io.Writer, raw: []const u8, lang: ?ts.Lang) void {
     const max_lines: usize = 50;
     if (!verbose_output.load(.monotonic)) {
         // Brief mode: first 3 lines + fold marker (long single lines fold
@@ -108,14 +119,25 @@ pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
     var rest: []const u8 = raw[0..cut];
     var shown: usize = 0;
     // P3c 配色：工具体是参照物不是主信息——暗灰呈现，视线自然落在
-    // 白色助手文本与青色工具调用头上。
-    std.Io.Writer.writeAll(w, "\x1b[2m") catch {};
+    // 白色助手文本与青色工具调用头上。例外：FileRead 的源码在 TTY
+    // 上按 token 语法高亮（One Dark）——代码可读性优先于"暗参照物"，
+    // 高亮行不叠 dim（truecolor 会被 dim 压暗）；非 TTY/NO_COLOR 走
+    // 原暗灰路径，管道字节不变。
+    const hl = lang != null and highlight.enabled();
+    if (!hl) std.Io.Writer.writeAll(w, "\x1b[2m") catch {};
     while (rest.len > 0 and shown < max_lines) : (shown += 1) {
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        std.Io.Writer.print(w, "  {s}\n", .{std.mem.trimEnd(u8, rest[0..nl], " \t\r")}) catch {};
+        const line_txt = std.mem.trimEnd(u8, rest[0..nl], " \t\r");
+        if (hl) {
+            const colored = highlight.line(allocator, line_txt, lang) catch line_txt;
+            defer if (colored.ptr != line_txt.ptr) allocator.free(colored);
+            std.Io.Writer.print(w, "  {s}\n", .{colored}) catch {};
+        } else {
+            std.Io.Writer.print(w, "  {s}\n", .{line_txt}) catch {};
+        }
         rest = if (nl < rest.len) rest[nl + 1 ..] else "";
     }
-    std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+    if (!hl) std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
     const total_lines = std.mem.count(u8, raw, "\n") + @intFromBool(raw.len > 0 and raw[raw.len - 1] != '\n');
     // Byte-cap truncation (one huge line) shows no line-count difference —
     // `cut < raw.len` catches it (review ② 2026-11-06: an 8 KiB slice of a
@@ -128,7 +150,7 @@ pub fn printToolBody(w: *std.Io.Writer, raw: []const u8) void {
 test "printToolBody: verbatim body, cap marker, empty" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    printToolBody(&aw.writer, "one\ntwo\n");
+    printToolBody(&aw.writer, "one\ntwo\n", null);
     try std.testing.expectEqualStrings("\x1b[2m  one\n  two\n\x1b[0m", aw.written());
     // 55 lines: 50 shown + cap marker naming the true total.
     var buf: [300]u8 = undefined;
@@ -136,14 +158,14 @@ test "printToolBody: verbatim body, cap marker, empty" {
     var i: usize = 0;
     while (i < 55) : (i += 1) std.Io.Writer.print(&f, "l{d}\n", .{i}) catch unreachable;
     aw.clearRetainingCapacity();
-    printToolBody(&aw.writer, f.buffered());
+    printToolBody(&aw.writer, f.buffered(), null);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "  l49\n") != null); // 50th line shown
     try std.testing.expect(std.mem.indexOf(u8, out, "  l50\n") == null); // 51st not
     try std.testing.expect(std.mem.indexOf(u8, out, "显示 50/55 行") != null);
     // Empty output: no body, no marker.
     aw.clearRetainingCapacity();
-    printToolBody(&aw.writer, "");
+    printToolBody(&aw.writer, "", null);
     // Empty: just the style wrap pair, no rows.
     try std.testing.expectEqualStrings("\x1b[2m\x1b[0m", aw.written());
 }
@@ -213,7 +235,7 @@ pub fn finishToolCall(
         @divTrunc(elapsed_ms, 1000),
         @divTrunc(@mod(elapsed_ms, 1000), 100),
     }) catch {};
-    printToolBody(ow, raw);
+    printToolBody(ow, raw, langForToolInput(p.call.tool_name, p.call.input));
 
     // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
     // char boundary. A mid-char cut used to poison every later request:
@@ -299,13 +321,28 @@ pub fn renderCodeDiff(
         }
     }
 
+    // Token highlighting for supported languages on a TTY: the +/- prefix
+    // keeps its diff color, the CONTENT gets One Dark token colors (the
+    // old wall of solid green on new files was unreadable). Non-TTY keeps
+    // the byte-identical legacy rendering — pipes and tests see no change.
+    const hl_lang: ?ts.Lang = if (registry.getStringField(input, "path")) |p| ts.langForPath(p) else null;
+    const hl = hl_lang != null and highlight.enabled();
     var i: usize = 0;
     while (i < lines.items.len and i < DIFF_MAX_LINES) : (i += 1) {
         const trunc = try diffTruncLine(alloc, lines.items[i].content, DIFF_MAX_COLS);
-        switch (lines.items[i].kind) {
-            .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
-            .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
-            .equal => {},
+        if (hl) {
+            const colored = try highlight.line(alloc, trunc, hl_lang);
+            switch (lines.items[i].kind) {
+                .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- " ++ reset ++ "{s}\n", .{colored}),
+                .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ " ++ reset ++ "{s}\n", .{colored}),
+                .equal => {},
+            }
+        } else {
+            switch (lines.items[i].kind) {
+                .removed => try std.Io.Writer.print(w, "  " ++ red ++ "- {s}" ++ reset ++ "\n", .{trunc}),
+                .added => try std.Io.Writer.print(w, "  " ++ green ++ "+ {s}" ++ reset ++ "\n", .{trunc}),
+                .equal => {},
+            }
         }
     }
     if (i < lines.items.len) {

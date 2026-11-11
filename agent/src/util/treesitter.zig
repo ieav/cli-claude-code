@@ -27,7 +27,7 @@ pub const Lang = enum {
     java,
     zig,
 
-    fn language(self: Lang) *const c.TSLanguage {
+    pub fn language(self: Lang) *const c.TSLanguage {
         return switch (self) {
             .python => tree_sitter_python(),
             .javascript => tree_sitter_javascript(),

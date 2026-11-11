@@ -624,7 +624,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             // 备份之前：被阻断的编辑根本不该发生，也就不该留编辑前快照。
             if (hooks_mod.preToolUse(allocator, ctx.io, tool_name, parsed)) |block_msg| {
                 try std.Io.Writer.print(ctx.w, "  \x1b[31mBLOCKED by PreToolUse hook:\x1b[0m\n", .{});
-                turn_tools.printToolBody(ctx.w, block_msg);
+                turn_tools.printToolBody(ctx.w, block_msg, null);
                 try std.Io.Writer.writeAll(ctx.w, "\n");
                 allocator.free(block_msg);
                 _ = ctx.log.record(tool_name, "pre-hook", "blocked", null, false, ctx.history.items.len) catch {};
@@ -663,10 +663,10 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
 
             if (result.is_error) {
                 try std.Io.Writer.print(ctx.w, "  \x1b[31mERROR:\x1b[0m\n", .{});
-                turn_tools.printToolBody(ctx.w, result.output);
+                turn_tools.printToolBody(ctx.w, result.output, turn_tools.langForToolInput(tool_name, parsed));
                 try std.Io.Writer.writeAll(ctx.w, "\n");
             } else {
-                turn_tools.printToolBody(ctx.w, result.output); // dim + Ctrl+O fold, same as the agent-loop phase
+                turn_tools.printToolBody(ctx.w, result.output, turn_tools.langForToolInput(tool_name, parsed)); // dim + Ctrl+O fold, same as the agent-loop phase
                 try std.Io.Writer.writeAll(ctx.w, "\n");
             }
             _ = ctx.log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, ctx.history.items.len) catch {};
