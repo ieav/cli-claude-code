@@ -110,6 +110,28 @@ pub const SessionStore = struct {
         // "#N · 0 轮" noise in every listing).
         if (history.len == 0) return;
         if (history.len == 1 and history[0].role == .system) return;
+        // History SHRANK below the persisted baseline — compaction
+        // (summarize/phi), /undo or /rewind rewrote it; the rows on disk
+        // no longer match ANY prefix of the live history and the
+        // incremental contract is void. Without this branch the failure
+        // is two-fold and silent: new turns (len < persisted) never
+        // persist, and once len grows past the baseline again the flush
+        // writes LIVE rows at seqs whose DB neighbors are the PRE-compaction
+        // rows — a resumed session then stitches old-prefix + new-suffix
+        // into semantic garbage. Rebuild from scratch instead (compaction
+        // is rare; the write amplification is fine). /undo's ghost rows
+        // (reverted turns haunting the next resume) vanish with it.
+        if (history.len < self.persisted) {
+            const del = std.fmt.allocPrint(self.alloc, "DELETE FROM ziv_session_messages WHERE session_id={d}", .{self.session_id}) catch return;
+            defer self.alloc.free(del);
+            self.db.exec("BEGIN") catch return;
+            self.db.exec(del) catch {
+                self.db.exec("ROLLBACK") catch {};
+                return; // keep the old baseline — never write a mismatched mix
+            };
+            self.db.exec("COMMIT") catch {};
+            self.persisted = 0;
+        }
         if (self.persisted >= history.len) return;
         self.db.exec("BEGIN") catch return;
         var ok = true;
@@ -276,7 +298,14 @@ pub fn listRecent(alloc: std.mem.Allocator, db: *database_mod.Database, limit: u
         try out.append(alloc, .{
             .id = st.columnInt64(0),
             .started_at = st.columnInt64(1),
-            .ended_at = if (st.columnInt64(2) != 0 or st.columnText(2).len == 0) null else st.columnInt64(2),
+            // NULL detection via columnText: an EMPTY text IS the null
+            // marker. The old condition (`columnInt64 != 0 or ...`) was
+            // inverted — every NON-null ended_at read back as null, so all
+            // cleanly-exited sessions showed "未正常退出" in /resume and
+            // every startup raised a false crash-recovery hint (caught
+            // live 2026-11-11: db row had ended_at set, the hint said
+            // otherwise; the roundtrip test only asserted the NULL side).
+            .ended_at = if (st.columnText(2).len == 0) null else st.columnInt64(2),
             .clean = st.columnInt64(3) != 0,
             .model = get(alloc, st.columnText(4)),
             .permission_mode = get(alloc, st.columnText(5)),
@@ -552,6 +581,9 @@ test "session roundtrip: flush all four block kinds, resume loadMessages" {
     try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expectEqual(@as(usize, 4), list[0].rounds);
     try std.testing.expect(list[0].clean);
+    // The inversion bug's blind spot: a SET ended_at must read back
+    // non-null (every clean exit used to surface as "未正常退出").
+    try std.testing.expect(list[0].ended_at != null);
     try std.testing.expectEqualStrings("gpt-test", list[0].model);
 }
 
@@ -649,4 +681,75 @@ test "adopt + rotate: continue a session, /clear starts a fresh row" {
     try std.testing.expectEqual(@as(usize, 2), list.len);
     try std.testing.expect(list[0].id == store.session_id); // newest first
     try std.testing.expect(list[1].clean); // rotated-out row ended cleanly
+}
+
+test "history shrink (compaction/undo): flush rebuilds, later turns persist" {
+    const alloc = std.testing.allocator;
+    var pbuf: [128]u8 = undefined;
+    const path = tmpDbPath(&pbuf);
+    defer _ = fs_ops.deleteFile(path);
+    const store = SessionStore.open(alloc, path, "/tmp", "gpt-test", .default) orelse return error.TestUnexpectedResult;
+    defer store.close();
+
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    // [system, user, assistant] — 3 rows persisted.
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = b, .timestamp = 1 });
+    }
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "原始问题") };
+        try history.append(alloc, .{ .role = .user, .content = b, .timestamp = 2 });
+    }
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "原始回答") };
+        try history.append(alloc, .{ .role = .assistant, .content = b, .timestamp = 3 });
+    }
+    store.flush(history.items);
+    try std.testing.expectEqual(@as(usize, 3), store.persisted);
+
+    // Compaction rewrites to [system, summary] — len(2) < persisted(3):
+    // the old incremental-only flush returned here and the summary (and
+    // every later turn) silently never persisted.
+    for (history.items) |m| freeMessage(m, alloc);
+    history.clearRetainingCapacity();
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = b, .timestamp = 1 });
+    }
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "[summary] 摘要") };
+        try history.append(alloc, .{ .role = .user, .content = b, .timestamp = 4 });
+    }
+    store.flush(history.items);
+    try std.testing.expectEqual(@as(usize, 2), store.persisted);
+
+    // Post-compaction turns must append (the len-past-baseline mixup guard).
+    {
+        const b = try alloc.alloc(llm.ContentBlock, 1);
+        b[0] = .{ .text = try alloc.dupe(u8, "新回答") };
+        try history.append(alloc, .{ .role = .assistant, .content = b, .timestamp = 5 });
+    }
+    store.flush(history.items);
+    try std.testing.expectEqual(@as(usize, 3), store.persisted);
+
+    const loaded = try loadMessages(alloc, &store.db, store.session_id);
+    defer {
+        for (loaded) |m| freeMessage(m, alloc);
+        alloc.free(loaded);
+    }
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[1].content[0].text, "summary") != null);
+    try std.testing.expectEqualStrings("新回答", loaded[2].content[0].text);
+    // The pre-compaction ghosts are gone.
+    try std.testing.expect(std.mem.indexOf(u8, loaded[1].content[0].text, "原始") == null);
 }
