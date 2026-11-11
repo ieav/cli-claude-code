@@ -1,5 +1,6 @@
 /// Runtime monitor — periodically runs detection rules and reports issues.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const event_bus = @import("../task/event_bus.zig");
 const rules = @import("rules.zig");
 pub const FailedCheck = rules.FailedCheck;
@@ -132,8 +133,7 @@ pub const RuntimeMonitor = struct {
                 }
             }
 
-            var req: std.c.timespec = .{ .sec = 0, .nsec = @intCast(self.check_interval_ms * std.time.ns_per_ms) };
-            _ = std.c.nanosleep(&req, null);
+            wincompat.sleepMs(self.check_interval_ms);
         }
     }
 };

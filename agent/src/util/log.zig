@@ -1,6 +1,7 @@
 /// Structured logging — info, warning, error, debug levels.
 /// Writes to stderr. View with: ./ziv 2>ziv.log
 const std = @import("std");
+const wincompat = @import("./wincompat.zig");
 const time_mod = @import("time.zig");
 
 pub const Level = enum {
@@ -80,7 +81,7 @@ var stderr_quiet: ?bool = null;
 
 fn stderrMuted() bool {
     if (stderr_quiet) |q| return q;
-    const q = if (std.c.isatty(2) != 0)
+    const q = if (wincompat.isTtyStderr())
         !isLogStderrForced()
     else
         false;

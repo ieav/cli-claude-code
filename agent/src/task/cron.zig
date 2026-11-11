@@ -7,6 +7,7 @@
 /// main-thread). Tasks that miss a drain (inbox full) simply retry on
 /// the next tick.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const time_mod = @import("../util/time.zig");
 const math = @import("../math/mod.zig");
 const mpsc = @import("mpsc_queue.zig");
@@ -84,8 +85,7 @@ pub const CronScheduler = struct {
                 }
             }
 
-            var ts: std.c.timespec = .{ .sec = 1, .nsec = 0 };
-            _ = std.c.nanosleep(&ts, null);
+            wincompat.sleepMs(1000);
         }
     }
 
@@ -134,8 +134,7 @@ test "due tasks drain on the calling thread" {
     // wait until the scheduler thread queued it
     var spins: usize = 0;
     while (sched.due_inbox.isEmpty() and spins < 100) : (spins += 1) {
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&ts, null);
+        wincompat.sleepMs(20);
     }
     sched.drainDue();
     try std.testing.expect(T.ran_on != null);

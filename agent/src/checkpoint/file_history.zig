@@ -1,6 +1,7 @@
 /// File history — snapshot-based file backup and restore system.
 /// Tracks file changes and enables rollback to any checkpoint.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const hash_mod = @import("../util/hash.zig");
 const time_mod = @import("../util/time.zig");
 const logger = @import("../util/log.zig");
@@ -138,7 +139,7 @@ pub const FileHistoryState = struct {
             const basename = if (basename_start > 0) file_path[basename_start + 1 ..] else file_path;
             const backup_path = self.allocator.print("{s}/{d}_{d}_{s}", .{
                 self.checkpoint_dir,
-                std.c.getpid(),
+                wincompat.pid(),
                 self.sequence,
                 basename,
             }) catch return;

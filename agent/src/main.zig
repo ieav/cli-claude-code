@@ -137,7 +137,9 @@ pub fn main(init: std.process.Init) !void {
     // self-tests — `ziv --version` is a probe, not a REPL launch.
     // `-p` (M7 non-interactive) likewise exits before any TUI setup: raw
     // mode, banner and self-tests are all REPL-only concerns.
-    var args_it = std.process.Args.iterate(init.minimal.args);
+    // Windows needs the allocator variant (wargv → UTF-8 conversion).
+    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, std.heap.smp_allocator);
+    defer args_it.deinit();
     _ = args_it.next(); // skip argv[0]
     var print_prompt: ?[]const u8 = null;
     while (args_it.next()) |arg| {

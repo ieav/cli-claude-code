@@ -1,6 +1,8 @@
 /// stdio transport for MCP servers: spawns the server process and speaks
 /// newline-delimited JSON-RPC over its stdin/stdout pipes.
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("../util/wincompat.zig");
 const jsonrpc = @import("jsonrpc.zig");
 
 pub const StdioTransport = struct {
@@ -29,6 +31,14 @@ pub const StdioTransport = struct {
     /// python children are unaffected). Blocking pipes restore the POSIX
     /// contract for every child.
     pub fn spawn(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) anyerror!*Self {
+        if (builtin.os.tag == .windows) {
+            return error.StdioUnsupported; // M3: CreatePipe lands here
+        } else {
+            return spawnPosix(allocator, io, argv);
+        }
+    }
+
+    fn spawnPosix(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) anyerror!*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -37,8 +47,8 @@ pub const StdioTransport = struct {
             .stdin_file = undefined,
             .stdout_file = undefined,
         };
-        const in_pipe = std.Io.Threaded.pipe2(.{}) catch return error.PipeUnavailable;
-        const out_pipe = std.Io.Threaded.pipe2(.{}) catch {
+        const in_pipe = wincompat.pipeBlocking() catch return error.PipeUnavailable;
+        const out_pipe = wincompat.pipeBlocking() catch {
             blockingFile(in_pipe[0]).close(io);
             blockingFile(in_pipe[1]).close(io);
             return error.PipeUnavailable;
@@ -84,8 +94,8 @@ pub const StdioTransport = struct {
             // Process GROUP kill (spawn sets pgid=0 → group id = child pid):
             // a single-pid SIGKILL lets deep-spawned grandchildren (npx →
             // node) survive holding the pipe write end — EOF never arrives.
-            _ = std.c.kill(-pid, .KILL);
-            _ = std.c.kill(pid, .KILL); // direct child, in case setpgid raced
+            wincompat.killGroup(pid);
+            wincompat.killOne(pid); // direct child, in case setpgid raced
         }
     }
 
@@ -182,7 +192,7 @@ pub const StdioTransport = struct {
         // Group kill first (deep-spawned grandchildren hold the pipes —
         // see spawn's pgid note), then reap the direct child via std.
         if (self.child.id) |pid| {
-            _ = std.c.kill(-pid, .KILL);
+            wincompat.killGroup(pid);
         }
         if (self.child.id != null) {
             self.child.kill(io);

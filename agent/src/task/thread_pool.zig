@@ -1,6 +1,7 @@
 /// Thread pool — manages a pool of worker threads that execute tasks from a queue.
 /// Concurrency is bounded by e-based logistic function: max = sigmoid(pressure) × hw_threads.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const math = @import("../math/mod.zig");
 const mpsc = @import("mpsc_queue.zig");
 
@@ -142,8 +143,7 @@ pub const ThreadPool = struct {
                 // Queue empty: poll. The MPSC queue is lock-free, so a short
                 // sleep-then-retry replaces the old mutex/condition wait
                 // (Zig 0.17 moved Condition into std.Io).
-                var req: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = std.c.nanosleep(&req, null);
+                wincompat.sleepMs(1);
             }
         }
     }

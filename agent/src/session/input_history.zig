@@ -5,6 +5,8 @@
 //! (P1 step 7c, pure move).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("../util/wincompat.zig");
 const fs_ops = @import("../util/fs_ops.zig");
 const logger = @import("../util/log.zig");
 
@@ -122,7 +124,7 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
     defer if (contents_owned) |c| alloc.free(c);
     var history_locked = false;
     defer if (history_locked) {
-        _ = std.c.flock(lock_file.?.handle, std.posix.LOCK.UN);
+        if (builtin.os.tag != .windows) _ = std.c.flock(lock_file.?.handle, std.posix.LOCK.UN);
     };
     if (lock_file != null) {
         // Bounded acquisition: a suspended (Ctrl-Z'd) holder never releases,
@@ -131,12 +133,15 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
         // semantics as the no-lock-file fallback.
         var tries: usize = 0;
         while (tries < 5) : (tries += 1) {
-            if (std.c.flock(lock_file.?.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0) {
+            if (builtin.os.tag == .windows) {
+                // L4 wires LockFileEx; L0 proceeds without the cross-
+                // process lock (worst case: interleaved history lines).
+                break;
+            } else if (std.c.flock(lock_file.?.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0) {
                 history_locked = true;
                 break;
             }
-            var req: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&req, null);
+            wincompat.sleepMs(200);
         }
         if (!history_locked) {
             logger.warning("input history lock busy — saving without lock", .{});
@@ -170,7 +175,7 @@ pub fn saveInputHistory(alloc: std.mem.Allocator, history: *std.ArrayList([]u8))
     fs_ops.ensureDir(zivroot.sub(&ed, ".")) catch return;
     var tmp_buf: [128]u8 = undefined;
     var hp3: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp{d}", .{ zivroot.sub(&hp3, "input_history"), std.c.getpid() }) catch return;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp{d}", .{ zivroot.sub(&hp3, "input_history"), wincompat.pid() }) catch return;
     fs_ops.writeFile(tmp, buf.items) catch
         return logger.warning("input history save failed", .{});
     std.Io.Dir.rename(std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), zivroot.sub(&hp3, "input_history"), io_state.io()) catch {

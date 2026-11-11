@@ -2,6 +2,7 @@
 /// Supports multiple backends: Brave, SearXNG, DuckDuckGo (HTML fallback).
 /// Uses std.http.Client for real HTTP requests (Zig 0.16 API).
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const math = @import("../math/mod.zig");
 
 pub const SearchResult = struct {
@@ -72,8 +73,7 @@ pub const WebSearch = struct {
         return self.searchOnce(query, max_results) catch |err| {
             // Back off once on rate limiting instead of failing outright.
             if (err != error.RateLimited) return err;
-            var req: std.c.timespec = .{ .sec = 1, .nsec = 0 };
-            _ = std.c.nanosleep(&req, null);
+            wincompat.sleepMs(1000);
             return self.searchOnce(query, max_results);
         };
     }

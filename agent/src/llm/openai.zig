@@ -2,6 +2,7 @@
 /// Uses the Chat Completions API (https://api.openai.com/v1/chat/completions).
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
+const builtin = @import("builtin");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
 const logger = @import("../util/log.zig");
 const time_mod = @import("../util/time.zig");
@@ -112,9 +113,11 @@ pub const OpenAIProvider = struct {
         // P2 cancellation plumbing: publish the connection fd for the UI
         // loop; Esc/Ctrl-C shutdown(2)s it, failing the BLOCKING reads
         // below (the pump thread never polls — see CompleteOptions docs).
-        if (opts.cancel_fd) |pfd| {
-            if (req.connection) |conn| {
-                pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+        if (builtin.os.tag != .windows) {
+            if (opts.cancel_fd) |pfd| {
+                if (req.connection) |conn| {
+                    pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+                }
             }
         }
         defer if (opts.cancel_fd) |pfd| pfd.store(-1, .release);

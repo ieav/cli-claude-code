@@ -5,6 +5,7 @@
 /// every server tool into the RuntimeRegistry under
 /// `mcp__<server>__<tool>` with a ctx trampoline back to the session.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const stdio = @import("stdio.zig");
 const http_mod = @import("http.zig");
@@ -324,8 +325,7 @@ pub const McpSession = struct {
 fn handshakeWatchdog(t: *stdio.StdioTransport, done: *std.atomic.Value(bool), timeout_ms: u32) void {
     var elapsed: u32 = 0;
     while (elapsed < timeout_ms) : (elapsed += 100) {
-        var req: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&req, null);
+        wincompat.sleepMs(100);
         if (done.load(.acquire)) return;
     }
     // Timeout: kill the server; the parked read gets EOF and connect()

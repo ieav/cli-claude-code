@@ -2,6 +2,7 @@
 /// Uses the Messages API (https://api.anthropic.com/v1/messages).
 /// Compatible with Zig 0.16 HTTP Client API.
 const std = @import("std");
+const builtin = @import("builtin");
 const llm_watchdog = @import("../util/llm_watchdog.zig");
 const logger = @import("../util/log.zig");
 const time_mod = @import("../util/time.zig");
@@ -108,9 +109,11 @@ pub const ClaudeProvider = struct {
         // below (the pump thread never polls — see CompleteOptions docs).
         // Clear before return so a pooled-fd shutdown can never hit a
         // reused connection.
-        if (opts.cancel_fd) |pfd| {
-            if (req.connection) |conn| {
-                pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+        if (builtin.os.tag != .windows) {
+            if (opts.cancel_fd) |pfd| {
+                if (req.connection) |conn| {
+                    pfd.store(@intCast(conn.stream_reader.stream.socket.handle), .release);
+                }
             }
         }
         defer if (opts.cancel_fd) |pfd| pfd.store(-1, .release);

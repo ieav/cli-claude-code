@@ -16,6 +16,8 @@
 /// Falls back to plain single-line reading on non-TTY stdin (pipes/scripts
 /// keep the old behavior byte-for-byte).
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("wincompat.zig");
 const lineinput_cmds = @import("slash_commands.zig");
 const menu = @import("menu.zig");
 const util_time = @import("time.zig");
@@ -118,9 +120,7 @@ pub fn currentTermWidth() usize {
 
 /// Terminal column count via TIOCGWINSZ; 80 as the conservative fallback.
 fn termWidth() usize {
-    var ws: std.c.winsize = undefined;
-    if (std.c.ioctl(0, std.c.T.IOCGWINSZ, &ws) == 0 and ws.col > 0) return ws.col;
-    return 80;
+    return wincompat.termWidth();
 }
 
 /// Test hooks: nonzero overrides TIOCGWINSZ so renderer math is testable.
@@ -135,9 +135,7 @@ fn effWidth() usize {
 /// (the scroll-region math clamps on tiny terminals anyway).
 fn termHeight() usize {
     if (force_height != 0) return force_height;
-    var ws: std.c.winsize = undefined;
-    if (std.c.ioctl(0, std.c.T.IOCGWINSZ, &ws) == 0 and ws.row > 0) return ws.row;
-    return 24;
+    return wincompat.termHeight();
 }
 
 /// Physical rows the input block may occupy (prompt + wrapped lines). A
@@ -1631,8 +1629,7 @@ fn captureEscSeq(r: *std.Io.Reader) [16]u8 {
     var n: usize = 0;
     while (n < seq.len) {
         if (r.bufferedLen() == 0) {
-            var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-            if (std.c.poll(&p2, 1, 5) != 1 or (p2[0].revents & std.c.POLL.IN) == 0) break;
+                        if (wincompat.pollFd(0, 5) != 1) break;
         }
         const b = r.takeByte() catch break;
         seq[n] = b;
@@ -1849,8 +1846,7 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
             std.mem.copyForwards(u8, live_spool[0..live_spool_len], live_spool[1 .. live_spool_len + 1]);
         } else {
             if (r.bufferedLen() == 0) {
-                var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-                if (std.c.poll(&pfd, 1, 0) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+                                if (wincompat.pollFd(0, 0) != 1) return false;
             }
             c = r.takeByte() catch return false;
         }
@@ -1885,8 +1881,7 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
         if (c == 0x03) {
             // Ctrl-C cancels like Esc; swallow an immediately-following
             // second press so it cannot leak into the next prompt.
-            var p2 = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-            if (std.c.poll(&p2, 1, 5) == 1 and (p2[0].revents & std.c.POLL.IN) != 0) {
+                        if (wincompat.pollFd(0, 5) == 1) {
                 _ = r.takeByte() catch {};
             }
             return true;
@@ -1982,8 +1977,7 @@ const StyleState = struct {
 /// reported so the caller can handle it; anything else is dropped.
 fn tryTakeCsi(r: *std.Io.Reader, body: *[16]u8) ?struct { seq: []const u8, alt_enter: bool } {
     if (r.bufferedLen() == 0) {
-        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        if (std.c.poll(&pfd, 1, 5) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) return null;
+                if (wincompat.pollFd(0, 5) != 1) return null;
     }
     const c = r.takeByte() catch return null;
     if (c != '[') {
@@ -1993,8 +1987,7 @@ fn tryTakeCsi(r: *std.Io.Reader, body: *[16]u8) ?struct { seq: []const u8, alt_e
     var n: usize = 0;
     while (n < body.len) {
         if (r.bufferedLen() == 0) {
-            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-            if (std.c.poll(&pfd, 1, 5) != 1 or (pfd[0].revents & std.c.POLL.IN) == 0) break;
+                        if (wincompat.pollFd(0, 5) != 1) break;
         }
         const b = r.takeByte() catch break;
         body[n] = b;
@@ -2602,6 +2595,7 @@ fn drainRestOfLine(r: *std.Io.Reader) void {
 /// cooked line discipline, which echoed control keys as ^[[C/^R garbage
 /// and line-buffered input the editor never saw until Enter.)
 fn stdinIsTty() bool {
+    if (builtin.os.tag == .windows) return wincompat.isTtyStdinStdout();
     var t: std.c.termios = undefined;
     return std.c.tcgetattr(0, &t) == 0;
 }
@@ -3069,7 +3063,10 @@ pub fn readLine(
                 // Ctrl-Z: ISIG is off in raw mode, so suspend manually —
                 // restore the terminal, stop with the default disposition,
                 // then re-enter raw mode once the shell resumes us.
-                if (session_guard) |g| {
+                // Windows has no job control: the key is a no-op there.
+                if (builtin.os.tag == .windows) {
+                    continue;
+                } else if (session_guard) |g| {
                     if (g.active) {
                         g.restore();
                         const dfl_tstp: std.posix.Sigaction = .{

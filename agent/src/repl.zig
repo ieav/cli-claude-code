@@ -3,6 +3,7 @@
 /// conversation management (compact/clear/context/undo/rewind), and interactive config.
 /// Adapted for Zig 0.16 I/O API.
 const std = @import("std");
+const wincompat = @import("util/wincompat.zig");
 const tools_mod = @import("tools/mod.zig");
 const orchestration_mod = @import("tools/orchestration.zig");
 const auth = @import("tools/auth_mode.zig");
@@ -1704,9 +1705,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         // UI loop while the tools run: editor + live clock.
                         var last_status: i64 = 0;
                         while (!tool_job.done.load(.acquire)) {
-                            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-                            const n = std.c.poll(&pfd, 1, 100);
-                            if (n == 1 and (pfd[0].revents & std.c.POLL.IN) != 0) {
+                            const n = wincompat.pollFd(0, 100);
+                            if (n == 1) {
                                 if (lineinput.editorLiveKey(r, w) and !user_cancelled) {
                                     // Esc/Ctrl-C during tools: cancel the
                                     // batch. An in-flight Bash is group-

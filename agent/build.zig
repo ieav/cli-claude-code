@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
             },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
+            "-DUTF8PROC_STATIC",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
             "-DSQLITE_DEFAULT_journal_mode=WAL",
             "-DSQLITE_ENABLE_FTS5",
@@ -111,6 +112,7 @@ pub fn build(b: *std.Build) void {
             },
         .flags = &.{
             "-DSQLITE_THREADSAFE=0",
+            "-DUTF8PROC_STATIC",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
             "-DSQLITE_DEFAULT_journal_mode=WAL",
             "-DSQLITE_ENABLE_FTS5",

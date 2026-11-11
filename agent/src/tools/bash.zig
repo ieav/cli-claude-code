@@ -6,6 +6,8 @@
 /// orphans after the timeout — the child now runs in its own process group
 /// (setpgid via SpawnOptions.pgid) and the watchdog kills the entire group.
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("../util/wincompat.zig");
 const registry = @import("registry.zig");
 const util_time = @import("../util/time.zig");
 const cancel = @import("../util/cancel.zig");
@@ -53,8 +55,8 @@ const ActiveGroups = struct {
         for (&slots) |*s| {
             const pid = s.load(.acquire);
             if (pid > 0) {
-                _ = std.c.kill(-pid, .KILL);
-                _ = std.c.kill(pid, .KILL);
+                wincompat.killGroup(pid);
+                wincompat.killOne(pid);
             }
         }
     }
@@ -93,9 +95,10 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        // Own process group: the watchdog can kill(-pgid) the whole tree.
-        .pgid = 0,
     };
+    // Own process group (posix): the watchdog can kill(-pgid) the whole
+    // tree. Windows: L2's Job Object replaces the group semantics.
+    if (builtin.os.tag != .windows) spawn_opts.pgid = 0;
     if (getStringField(input, "working_directory")) |cwd| {
         if (cwd.len > 0) spawn_opts.cwd = .{ .path = cwd };
     }
@@ -104,17 +107,21 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         const msg = alloc.print("Failed to execute: {}", .{err}) catch return error.OutOfMemory;
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
-    const pid: i32 = child.id orelse {
-        // Spawn returned but no pid (already reaped) — nothing to run.
-        if (child.stdout) |f| f.close(io);
-        if (child.stderr) |f| f.close(io);
-        return registry.ToolResult{ .output = alloc.dupe(u8, "Failed to execute: no child pid") catch "", .is_error = true };
+    const pid: i32 = blk: {
+        const raw = child.id orelse {
+            // Spawn returned but no pid (already reaped) — nothing to run.
+            if (child.stdout) |f| f.close(io);
+            if (child.stderr) |f| f.close(io);
+            return registry.ToolResult{ .output = alloc.dupe(u8, "Failed to execute: no child pid") catch "", .is_error = true };
+        };
+        // posix: pid_t; windows: HANDLE-as-int (killGroup seam handles it).
+        break :blk if (builtin.os.tag == .windows) @intCast(@intFromPtr(raw)) else raw;
     };
 
     // 后台分支：交接管道给 bg_tasks（此后本函数不再触碰 child）。
     if (run_bg) {
         const id = bg_tasks.start(alloc, io, pid, child.stdout.?, child.stderr.?, command) catch |err| {
-            _ = std.c.kill(-pid, .KILL); // 交接失败：回杀整组，不留孤儿
+            wincompat.killGroup(pid); // 交接失败：回杀整组，不留孤儿
             if (child.stdout) |f| f.close(io);
             if (child.stderr) |f| f.close(io);
             const msg = switch (err) {
@@ -154,7 +161,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const watch_thread = std.Thread.spawn(.{}, Watchdog.run, .{&watch}) catch null;
 
     var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    if (builtin.os.tag == .windows) {
+        const h: std.os.windows.HANDLE = @ptrFromInt(@as(usize, @intCast(pid)));
+        _ = wincompat.win32.waitFor(h, 0xFFFFFFFF);
+        var ec: std.os.windows.DWORD = 0;
+        if (@intFromEnum(wincompat.win32.exitCode(h, &ec)) != 0) status = @intCast(ec);
+    } else {
+        _ = std.c.waitpid(pid, &status, 0);
+    }
     ActiveGroups.take(pid);
     watch.done.store(true, .release);
     if (watch_thread) |t| t.join();
@@ -166,7 +180,7 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     // off the pipe and flag the truncation in the result.
     var pipe_forced = false;
     if (!readersDone(&out_reader, &err_reader)) {
-        _ = std.c.kill(-pid, .KILL); // ESRCH when nothing survives — fine
+        wincompat.killGroup(pid); // ESRCH when nothing survives — fine
         const t0 = util_time.nowMillis();
         while (!readersDone(&out_reader, &err_reader) and util_time.nowMillis() - t0 < PIPE_EOF_GRACE_MS) sleepMs(25);
         if (!readersDone(&out_reader, &err_reader)) {
@@ -244,14 +258,13 @@ const PipeReader = struct {
         var rbuf: [8192]u8 = undefined;
         var fr = self.file.reader(self.io, &rbuf);
         const r = &fr.interface;
-        const fd: i32 = self.file.handle;
+        const fd: i32 = if (builtin.os.tag == .windows) @intCast(@intFromPtr(self.file.handle)) else self.file.handle;
         while (!self.stop.load(.acquire)) {
             // Readiness first: EOF arrives as POLLHUP instantly, a quiet
             // pipe costs at most one 200ms poll per loop, and a stop is
             // honored within the same cadence.
-            var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-            const n = std.c.poll(&pfd, 1, 200);
-            if (n != 1 or (pfd[0].revents & (std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR)) == 0) continue;
+                        const n = wincompat.pollFd(fd, 200);
+            if (n != 1) continue;
             const chunk = r.peekGreedy(1) catch break; // EOF / error
             if (chunk.len == 0) break;
             if (self.buf.items.len >= OUTPUT_LIMIT) {
@@ -306,14 +319,13 @@ const Watchdog = struct {
     /// Kill the group, then the leader directly in case setpgid lost a
     /// race we cannot observe. Both errors (ESRCH) are harmless.
     fn killGroup(self: *Watchdog) void {
-        _ = std.c.kill(-self.pid, .KILL);
-        _ = std.c.kill(self.pid, .KILL);
+        wincompat.killGroup(self.pid);
+        wincompat.killOne(self.pid);
     }
 };
 
 fn sleepMs(ms: u32) void {
-    var req: std.c.timespec = .{ .sec = 0, .nsec = @as(i64, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    wincompat.sleepMs(ms);
 }
 
 fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {

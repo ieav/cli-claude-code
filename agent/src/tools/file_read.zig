@@ -4,6 +4,7 @@
 /// formatting, and one shared allocation per unique read instead of one
 /// per line.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const registry = @import("registry.zig");
 const file_cache = @import("../util/file_cache.zig");
 const code_index = @import("../knowledge/code_index.zig");
@@ -70,8 +71,7 @@ fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {
 }
 
 fn sleepMs(ms: u32) void {
-    var req: std.c.timespec = .{ .sec = 0, .nsec = @as(i64, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    wincompat.sleepMs(ms);
 }
 
 test "FileRead formats with line numbers and caches repeats" {

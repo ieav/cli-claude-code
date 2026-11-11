@@ -13,6 +13,7 @@
 /// spawn failures degrade to fewer workers, never to a hang (the P1 stall
 /// watchdog caps every request).
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const registry = @import("registry.zig");
 const runtime_registry = @import("runtime_registry.zig");
 const llm = @import("../llm/mod.zig");
@@ -247,18 +248,10 @@ pub fn executeWithCtx(opaque_ctx: ?*anyopaque, alloc: std.mem.Allocator, input: 
     // P3 cancel: during a dispatch the terminal is in COOKED mode with
     // ISIG on, so Ctrl-C arrives as a real SIGINT — route it to the
     // cooperative flag instead of killing the session. Restored after.
-    const int_act: std.posix.Sigaction = .{
-        .handler = .{ .handler = onDispatchSigint },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    var old_int: std.posix.Sigaction = undefined;
-    std.posix.sigaction(.INT, &int_act, &old_int);
+    const sig_guard = wincompat.SigintGuard.install(onDispatchSigint);
+    defer sig_guard.restore();
     active_cancel.store(&wctx.cancel, .release);
-    defer {
-        active_cancel.store(null, .release);
-        std.posix.sigaction(.INT, &old_int, null);
-    }
+    defer active_cancel.store(null, .release);
 
     // 写型 dispatch 一律串行：并发只给只读研究型 fan-out。
     const conc = if (perm_ctx_storage != null) 1 else @min(@as(usize, @max(ctx.concurrency.*, 1)), n);
@@ -445,8 +438,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
         w.jobs[idx].failed_turns <= 3 and !w.cancel.load(.acquire))
     {
         w.jobs[idx].retried = true;
-        var ts: std.c.timespec = .{ .sec = 1, .nsec = 0 };
-        _ = std.c.nanosleep(&ts, null);
+        wincompat.sleepMs(1000);
         const res2 = subagent.run(.{
             .task = job.task_text,
             .alloc = w.ctx.alloc,

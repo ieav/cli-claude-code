@@ -25,6 +25,7 @@
 /// call is deliberately used directly — touching an Io instance from this
 /// thread is unsafe in 0.17 (see agent_dispatch.ProviderStorage).
 const std = @import("std");
+const wincompat = @import("./wincompat.zig");
 const env = @import("env.zig");
 const time_mod = @import("time.zig");
 const logger = @import("log.zig");
@@ -195,7 +196,7 @@ fn watchdogThread(s: *State) void {
                     return;
                 }
                 s.kill_reason.store(@backingInt(KillReason.cancelled), .release);
-                _ = std.c.shutdown(s.fd, SHUT_RDWR);
+                wincompat.shutdownFd(s.fd);
                 logger.info("llm: request canceled by user — socket shut down", .{});
                 std.heap.smp_allocator.destroy(s);
                 return;
@@ -217,7 +218,7 @@ fn watchdogThread(s: *State) void {
             // Fails the in-flight recvmsg on the owning thread; the error
             // surfaces through the provider's normal error path.
             s.kill_reason.store(@backingInt(reason), .release);
-            _ = std.c.shutdown(s.fd, SHUT_RDWR);
+            wincompat.shutdownFd(s.fd);
             switch (reason) {
                 .ttft => logger.warning("llm: no first byte in {d}ms — killed for auto-retry", .{s.ttft_ms}),
                 .idle => logger.warning("llm: no data for {d}ms — connection killed by idle watchdog (a stream that keeps sending never hits this)", .{s.timeout_ms}),
@@ -226,8 +227,7 @@ fn watchdogThread(s: *State) void {
             std.heap.smp_allocator.destroy(s);
             return;
         }
-        var poll_ts: std.c.timespec = .{ .sec = 0, .nsec = POLL_MS * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&poll_ts, null);
+        wincompat.sleepMs(POLL_MS);
     }
     std.heap.smp_allocator.destroy(s);
 }

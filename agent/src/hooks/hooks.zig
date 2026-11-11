@@ -24,6 +24,8 @@
 //! worker）只读。回合中不存在换装窗口。
 
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("../util/wincompat.zig");
 const json_helpers = @import("../util/json_helpers.zig");
 const logger = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
@@ -175,10 +177,15 @@ fn runHook(alloc: std.mem.Allocator, io: std.Io, command: []const u8, payload: [
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch return .{ .code = -1, .stderr = alloc.dupe(u8, "hook spawn failed") catch "", .timed_out = false };
-    const pid: i32 = child.id orelse {
-        if (child.stdout) |f| f.close(io);
-        if (child.stderr) |f| f.close(io);
-        return .{ .code = -1, .stderr = alloc.dupe(u8, "hook spawn: no pid") catch "", .timed_out = false };
+    const pid: i32 = blk: {
+        const raw = child.id orelse {
+            if (child.stdout) |f| f.close(io);
+            if (child.stderr) |f| f.close(io);
+            return .{ .code = -1, .stderr = alloc.dupe(u8, "hook spawn: no pid") catch "", .timed_out = false };
+        };
+        // posix: pid_t; windows: process HANDLE — store either as i64-ish
+        // for killOne/waitpid bookkeeping (L2 wires Job Objects properly).
+        break :blk if (builtin.os.tag == .windows) @intCast(@intFromPtr(raw)) else raw;
     };
 
     // stdin：载荷 ≤PAYLOAD_CAP < 管道缓冲，写完即关；钩子不读也不阻塞
@@ -202,12 +209,24 @@ fn runHook(alloc: std.mem.Allocator, io: std.Io, command: []const u8, payload: [
     const deadline = util_time.nowMillis() + timeout_ms;
     var status: c_int = 0;
     var timed_out = false;
-    while (true) {
+    if (builtin.os.tag == .windows) {
+        // One shot: wait up to the deadline, kill+reap on timeout.
+        const handle: std.os.windows.HANDLE = @ptrFromInt(@as(usize, @intCast(pid)));
+        const wait_ms: u32 = @intCast(@max(deadline - util_time.nowMillis(), 0));
+        const wr = wincompat.win32.waitFor(handle, wait_ms);
+        if (wr != 0) { // WAIT_TIMEOUT == 0x102; anything else treat as timeout path
+            timed_out = true;
+            wincompat.killOne(pid);
+            _ = wincompat.win32.waitFor(handle, 5000);
+        }
+        var exit_code: std.os.windows.DWORD = 0;
+        if (@intFromEnum(wincompat.win32.exitCode(handle, &exit_code)) != 0) status = @intCast(exit_code);
+    } else while (true) {
         const r = std.c.waitpid(pid, &status, std.posix.W.NOHANG);
         if (r == pid) break;
         if (util_time.nowMillis() > deadline) {
             timed_out = true;
-            _ = std.c.kill(pid, .KILL);
+            wincompat.killOne(pid);
             _ = std.c.waitpid(pid, &status, 0);
             break;
         }
@@ -223,7 +242,9 @@ fn runHook(alloc: std.mem.Allocator, io: std.Io, command: []const u8, payload: [
     if (err_t) |t| t.join();
 
     const ustatus: u32 = @bitCast(status);
-    const code: i32 = if (std.posix.W.IFEXITED(ustatus)) @intCast(std.posix.W.EXITSTATUS(ustatus)) else -1;
+    const code: i32 = if (builtin.os.tag == .windows)
+        status // set directly from GetExitCodeProcess above
+    else if (std.posix.W.IFEXITED(ustatus)) @intCast(std.posix.W.EXITSTATUS(ustatus)) else -1;
     // 管道读端由父进程持有——排水线程退出后必须 close（bash.zig 同款；
     // 漏关 = 每次钩子调用泄 2 个 fd，长会话最终 EMFILE）。
     out_drain.file.close(io);
@@ -246,11 +267,10 @@ const PipeDrain = struct {
         var rbuf: [4096]u8 = undefined;
         var fr = self.file.reader(self.io, &rbuf);
         const r = &fr.interface;
-        const fd: i32 = self.file.handle;
+        const fd: i32 = if (builtin.os.tag == .windows) @intCast(@intFromPtr(self.file.handle)) else self.file.handle;
         while (!self.stop.load(.acquire)) {
-            var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-            const n = std.c.poll(&pfd, 1, 100);
-            if (n != 1 or (pfd[0].revents & (std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR)) == 0) continue;
+                        const n = wincompat.pollFd(fd, 100);
+            if (n != 1) continue;
             const chunk = r.peekGreedy(1) catch break;
             if (chunk.len == 0) break;
             if (self.buf.items.len >= self.cap) break;
@@ -262,8 +282,7 @@ const PipeDrain = struct {
 };
 
 fn sleepMs(ms: u32) void {
-    var req: std.c.timespec = .{ .sec = 0, .nsec = @as(i64, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    wincompat.sleepMs(ms);
 }
 
 // ──── tests ────

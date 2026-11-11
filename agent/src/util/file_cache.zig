@@ -6,6 +6,7 @@
 /// exists for explicit callers but the stat validation is the real guard.
 /// Thread-safe: FileRead runs concurrently in parallel batches.
 const std = @import("std");
+const wincompat = @import("./wincompat.zig");
 const time_mod = @import("time.zig");
 
 pub const FileState = struct {
@@ -148,8 +149,7 @@ pub fn deinitGlobal() void {
 }
 
 fn sleepMs(ms: u32) void {
-    var req: std.c.timespec = .{ .sec = 0, .nsec = @as(i64, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    wincompat.sleepMs(ms);
 }
 
 test "FileStateCache put/get" {

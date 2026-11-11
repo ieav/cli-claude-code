@@ -8,6 +8,8 @@
 //! kill -9 ziv 时日志丢失，可接受：进程都没了输出本就不完整）。
 
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("../util/wincompat.zig");
 const util_time = @import("../util/time.zig");
 const cleanup = @import("../util/cleanup.zig");
 const system_dirs = @import("../util/system_dirs.zig");
@@ -127,7 +129,7 @@ pub fn start(
     };
     const w = std.Thread.spawn(.{}, waiter, .{ WaiterCtx{ .task = t, .pumps = .{ p0, p1 } } }) catch {
         // 极罕见：直接杀组让泵自然 EOF，任务标失败。
-        _ = std.c.kill(-pid, .KILL);
+        wincompat.killGroup(pid);
         p0.join();
         p1.join();
         mutex();
@@ -146,11 +148,10 @@ fn pump(ctx: PumpCtx) void {
     var rbuf: [8192]u8 = undefined;
     var fr = ctx.src.reader(t.io, &rbuf);
     const r = &fr.interface;
-    const fd: i32 = ctx.src.handle;
+    const fd: i32 = if (builtin.os.tag == .windows) @intCast(@intFromPtr(ctx.src.handle)) else ctx.src.handle;
     while (true) {
-        var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        const n = std.c.poll(&pfd, 1, 200);
-        if (n != 1 or (pfd[0].revents & (std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR)) == 0) {
+                const n = wincompat.pollFd(fd, 200);
+        if (n != 1) {
             if (t.done.load(.acquire)) return;
             continue;
         }
@@ -177,7 +178,14 @@ fn pump(ctx: PumpCtx) void {
 fn waiter(ctx: WaiterCtx) void {
     const t = ctx.task;
     var status: c_int = 0;
-    _ = std.c.waitpid(t.pid, &status, 0);
+    if (builtin.os.tag == .windows) {
+        const h: std.os.windows.HANDLE = @ptrFromInt(@as(usize, @intCast(t.pid)));
+        _ = wincompat.win32.waitFor(h, 0xFFFFFFFF);
+        var ec: std.os.windows.DWORD = 0;
+        if (@intFromEnum(wincompat.win32.exitCode(h, &ec)) != 0) status = @intCast(ec);
+    } else {
+        _ = std.c.waitpid(t.pid, &status, 0);
+    }
     // 泵收尾宽限：子孙占管道时强停（200ms 轮询内退出）。
     const t0 = util_time.nowMillis();
     while (util_time.nowMillis() - t0 < PUMP_GRACE_MS) sleepMs(25);
@@ -209,7 +217,7 @@ pub fn stop(id: u32) bool {
         const t = s.* orelse continue;
         if (t.id == id) {
             if (t.done.load(.acquire)) return false;
-            _ = std.c.kill(-t.pid, .KILL);
+            wincompat.killGroup(t.pid);
             return true;
         }
     }
@@ -289,7 +297,7 @@ fn killAll() void {
     defer unlock();
     for (&slots) |*s| {
         const t = s.* orelse continue;
-        if (!t.done.load(.acquire)) _ = std.c.kill(-t.pid, .KILL);
+        if (!t.done.load(.acquire)) wincompat.killGroup(t.pid);
     }
 }
 
@@ -319,8 +327,7 @@ fn freeTask(t: *Task) void {
 }
 
 fn sleepMs(ms: u64) void {
-    var req: std.c.timespec = .{ .sec = 0, .nsec = @as(i64, @intCast(ms)) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    wincompat.sleepMs(@intCast(@as(u128, (ms * std.time.ns_per_ms)) / std.time.ns_per_ms));
 }
 
 test "empty store: snapshot empty, stop unknown false" {

@@ -2,6 +2,7 @@
 /// StreamAgg event aggregation, the line-buffered live transcript, the
 /// tool-call preview, StreamJob pump + streamComplete UI loop.
 const std = @import("std");
+const wincompat = @import("../util/wincompat.zig");
 const llm = @import("../llm/mod.zig");
 const lineinput = @import("../util/lineinput.zig");
 const util_time = @import("../util/time.zig");
@@ -352,7 +353,7 @@ const StreamJob = struct {
     fn requestCancel(self: *StreamJob) void {
         self.cancel.store(true, .release);
         const fd = self.cancel_fd.load(.acquire);
-        if (fd >= 0) _ = std.c.shutdown(@intCast(fd), llm_watchdog.SHUT_RDWR);
+        if (fd >= 0) wincompat.shutdownFd(fd);
     }
 
     fn isDone(self: *StreamJob) bool {
@@ -529,9 +530,8 @@ pub fn streamComplete(
                 //    (editorLiveKey drains everything available); a quiet
                 //    slice ticks the status row.
                 if (r) |rr| {
-                    var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-                    const n = std.c.poll(&pfd, 1, 100);
-                    if (n == 1 and (pfd[0].revents & std.c.POLL.IN) != 0) {
+                    const n = wincompat.pollFd(0, 100);
+                    if (n == 1) {
                         if (lineinput.editorLiveKey(rr, w)) {
                             job.requestCancel();
                         }

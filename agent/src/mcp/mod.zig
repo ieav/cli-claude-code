@@ -172,17 +172,13 @@ test "MCP handshake watchdog kills a dead server" {
     };
     defer sess.deinit();
 
-    var ts0: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts0);
-    const t0 = ts0.sec * 1000 + @divTrunc(ts0.nsec, 1_000_000);
+    const t0 = @import("../util/time.zig").nowMillis();
     const result = sess.connect(io, .{
         .name = "dead",
         .argv = &.{ "python3", mock },
         .handshake_timeout_ms = 1500,
     });
-    var ts1: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts1);
-    const elapsed = ts1.sec * 1000 + @divTrunc(ts1.nsec, 1_000_000) - t0;
+    const elapsed = @import("../util/time.zig").nowMillis() - t0;
     try std.testing.expectError(error.HandshakeFailed, result);
     // Watchdog fired well before the default 20 s (allow scheduler slack).
     try std.testing.expect(elapsed < 10_000);

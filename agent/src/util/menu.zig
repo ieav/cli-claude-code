@@ -5,6 +5,8 @@
 /// timeout; on non-TTY stdin (pipes/tests) all bytes are already buffered,
 /// so the reader never blocks and sequences are read directly.
 const std = @import("std");
+const builtin = @import("builtin");
+const wincompat = @import("./wincompat.zig");
 
 pub const Key = union(enum) {
     up,
@@ -46,9 +48,8 @@ pub fn readKey(r: *std.Io.Reader) !Key {
     // as a lone ESC — the on-TTY bug where arrow navigation "didn't work".
     if (r.bufferedLen() == 0) {
         if (is_tty) {
-            var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-            const ready = std.c.poll(&pfd, 1, 25);
-            if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return .quit;
+            const ready = wincompat.pollFd(0, 25);
+            if (ready <= 0) return .quit;
         }
     }
 
@@ -63,7 +64,9 @@ pub fn readKey(r: *std.Io.Reader) !Key {
 }
 
 pub const RawGuard = struct {
-    orig: std.c.termios = undefined,
+    // L0: posix stores the real termios; windows gets a placeholder until
+    // L1 lands SetConsoleMode (the guards are no-ops there for now).
+    orig: if (builtin.os.tag == .windows) [64]u8 else std.c.termios = undefined,
     active: bool = false,
     installed_signal: bool = false,
 
@@ -79,6 +82,7 @@ pub const RawGuard = struct {
     }
 
     fn enterImpl(self: *RawGuard, no_sig: bool) void {
+        if (builtin.os.tag == .windows) return; // L1: SetConsoleMode
         if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
         var raw = self.orig;
         raw.lflag.ICANON = false;
@@ -116,6 +120,7 @@ pub const RawGuard = struct {
     }
 
     pub fn restore(self: *RawGuard) void {
+        if (builtin.os.tag == .windows) return;
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
         if (self.installed_signal) removeSignalRestore();
     }
@@ -127,10 +132,11 @@ pub const RawGuard = struct {
 /// no echo — a streamDelimiter(.., '\n') read would block forever and the
 /// user would type blind. Enter/restore is a no-op on non-TTY stdin.
 pub const CookedGuard = struct {
-    orig: std.c.termios = undefined,
+    orig: if (builtin.os.tag == .windows) [64]u8 else std.c.termios = undefined,
     active: bool = false,
 
     pub fn enter(self: *CookedGuard) void {
+        if (builtin.os.tag == .windows) return; // L1
         if (std.c.tcgetattr(0, &self.orig) != 0) return; // not a TTY (pipe)
         var cooked = self.orig;
         cooked.lflag.ICANON = true; // driver line-edits (backspace works)
@@ -140,6 +146,7 @@ pub const CookedGuard = struct {
     }
 
     pub fn restore(self: *CookedGuard) void {
+        if (builtin.os.tag == .windows) return;
         if (self.active) _ = std.c.tcsetattr(0, .NOW, &self.orig);
     }
 };
@@ -147,9 +154,10 @@ pub const CookedGuard = struct {
 /// Saved terminal settings for the signal handler. One slot, owned by the
 /// OUTERMOST active guard (session guard in repl.run since 2026-11-06);
 /// nested menu/confirm guards never overwrite it.
-var signal_saved: ?std.c.termios = null;
+var signal_saved: ?(if (builtin.os.tag == .windows) void else std.c.termios) = null;
 
 fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
+    if (builtin.os.tag == .windows) return;
     if (signal_saved) |*t| {
         // Async-signal-safety: ONLY tcsetattr here. Writing terminal
         // sequences (mouse-disable etc.) can BLOCK on a full pty buffer
@@ -171,6 +179,14 @@ fn restoreFromSignal(sig: std.posix.SIG) callconv(.c) void {
 }
 
 fn installSignalRestore(orig: *const std.c.termios) void {
+    if (builtin.os.tag == .windows) {
+        // L1: SetConsoleCtrlHandler
+    } else {
+        installSignalRestorePosix(orig);
+    }
+}
+
+fn installSignalRestorePosix(orig: *const std.c.termios) void {
     signal_saved = orig.*;
     const act: std.posix.Sigaction = .{
         .handler = .{ .handler = restoreFromSignal },
@@ -182,6 +198,14 @@ fn installSignalRestore(orig: *const std.c.termios) void {
 }
 
 fn removeSignalRestore() void {
+    if (builtin.os.tag == .windows) {
+        // L1
+    } else {
+        removeSignalRestorePosix();
+    }
+}
+
+fn removeSignalRestorePosix() void {
     signal_saved = null;
     const dfl_act: std.posix.Sigaction = .{
         .handler = .{ .handler = @ptrFromInt(0) },
@@ -265,7 +289,7 @@ pub fn select(
 /// selector on the byte stream, stdout piped (ziv | cat) renders frames
 /// into the pipe while the user types blind.
 pub fn isTty() bool {
-    return std.c.isatty(0) == 1 and std.c.isatty(1) == 1;
+    return wincompat.isTtyStdinStdout();
 }
 
 /// Read one line of text — for entering values after a menu selection.
@@ -354,9 +378,8 @@ pub fn readLine(r: *std.Io.Reader, w: *std.Io.Writer, file_writer: *std.Io.File.
 fn escTailIsSequence(r: *std.Io.Reader) bool {
     if (r.bufferedLen() == 0) {
         if (!is_tty) return false; // piped/tests: bytes all pre-buffered
-        var pfd = [1]std.c.pollfd{.{ .fd = 0, .events = std.c.POLL.IN, .revents = 0 }};
-        const ready = std.c.poll(&pfd, 1, 25);
-        if (ready <= 0 or (pfd[0].revents & std.c.POLL.IN) == 0) return false;
+        const ready = wincompat.pollFd(0, 25);
+        if (ready <= 0) return false;
     }
     const b = r.takeByte() catch return true;
     if (b == 'O') {
