@@ -2684,7 +2684,7 @@ pub fn readLine(
     ed.grow = alloc;
     ed.history = history;
 
-    var ctrl_c_at: i64 = 0; // last Ctrl-C press — two within 3s exit gracefully
+    var ctrl_c_at: i64 = 0; // last Ctrl-C press — two rapid presses (≤1s) exit gracefully
     // Ctrl+R reverse search state.
     var search_on = false;
     var search_q: [128]u8 = undefined;
@@ -3041,13 +3041,15 @@ pub fn readLine(
             0x03 => {
                 // Ctrl-C: a single press just clears the line (terminal users
                 // often hit Ctrl-C reflexively, e.g. copy attempts). Two
-                // presses within 3s return null = EOF, which the REPL treats
-                // to the full session-end cleanup — same as /quit.
+                // RAPID presses (≤1s — the old 3s window let a much later,
+                // unrelated press exit the session) return null = EOF, which
+                // the REPL treats to the full session-end cleanup — same as
+                // /quit.
                 const now = util_time.nowMillis();
                 // The status text prints at the BLOCK top, not at the parked
                 // cursor cell (mid-block splices into painted content).
                 try ed.clearBlock();
-                if (ctrl_c_at != 0 and now - ctrl_c_at <= 3000) {
+                if (ctrl_c_at != 0 and now - ctrl_c_at <= 1000) {
                     try ed.w.writeAll("^C\n");
                     try std.Io.File.Writer.flush(file_writer);
                     return null;
@@ -3057,7 +3059,7 @@ pub fn readLine(
                 ed.pos = 0;
                 ed.nav = null;
                 ed.browsing = false;
-                try ed.w.writeAll("^C  (再按一次 Ctrl-C 退出)\n");
+                try ed.w.writeAll("^C  (1 秒内再按一次 Ctrl-C 退出)\n");
                 // Status text moved the cursor out of the block — drop the
                 // block state so the next render starts on this fresh row.
                 ed.last_rows = 0;

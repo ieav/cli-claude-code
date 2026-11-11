@@ -2335,7 +2335,7 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\Keys:
         \\  Enter 发送 · Shift+Enter / Ctrl+Enter / `\`+Enter / Ctrl+J 换行
         \\  多行粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
-        \\  Esc / Ctrl-C 中断生成或撤回刚发的消息 · Ctrl-C 连按两次退出
+        \\  Esc / Ctrl-C 中断生成或撤回刚发的消息 · Ctrl-C 快速连按两次退出
         \\  Ctrl+O 工具输出 详细/简要 切换（提示符与回合中都可切）
         \\  Ctrl+T 输出风格 default/concise 互切（同 /style）
         \\
