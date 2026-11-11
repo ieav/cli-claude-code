@@ -58,15 +58,9 @@ pub fn pipeBlocking() ![2]i32 {
 /// don't have.) The comptime tag check keeps the posix arm from being
 /// type-checked on windows (std.c.timespec is void there).
 pub fn sleepMs(ms: u64) void {
-    if (builtin.os.tag == .windows) {
-        win32.sleepMs(@intCast(ms));
-    } else {
-        var req: std.c.timespec = .{
-            .sec = @intCast(ms / 1000),
-            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-        };
-        _ = std.c.nanosleep(&req, null);
-    }
+    // Single implementation lives in util/time.zig (kernel32 Sleep on
+    // windows, nanosleep on posix) — this used to be a duplicate.
+    @import("time.zig").sleepMs(ms);
 }
 
 /// poll(fd) readability: >0 = ready, 0 = timeout, -1 = error. Covers both
