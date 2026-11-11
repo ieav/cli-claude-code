@@ -301,8 +301,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             if (std.mem.eql(u8, rest, "reload")) {
                 ctx.skill_loader.reload();
                 // Manifest rebuild + re-inject into history[0] (same block
-                // layout as startup: system → memory → manifest). The old
-                // manifest slice is freed first; run()'s defer owns the new.
+                // layout as startup: system → memory → manifest → rules).
+                // The rules block MUST ride along — the first version
+                // rebuilt without it and one /skill reload silently
+                // dropped the injected project rules (code-review 2026-11-11).
+                // The old manifest slice is freed first; run()'s defer owns the new.
                 if (ctx.skill_manifest_slot.*) |old| allocator.free(old);
                 ctx.skill_manifest_slot.* = ctx.skill_loader.buildManifest(allocator, 300) catch null;
                 ctx.skill_manifest = ctx.skill_manifest_slot.*;
@@ -311,6 +314,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                     var nblocks: usize = 1;
                     if (ctx.memory_block.* != null) nblocks += 1;
                     if (ctx.skill_manifest_slot.* != null) nblocks += 1;
+                    if (ctx.rules_text_slot.* != null) nblocks += 1;
                     const nb = try allocator.alloc(llm.ContentBlock, nblocks);
                     nb[0] = old_blocks[0]; // system text — externally owned
                     var bi: usize = 1;
@@ -318,7 +322,11 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                         nb[bi] = .{ .text = mb };
                         bi += 1;
                     }
-                    if (ctx.skill_manifest_slot.*) |sm| nb[bi] = .{ .text = sm };
+                    if (ctx.skill_manifest_slot.*) |sm| {
+                        nb[bi] = .{ .text = sm };
+                        bi += 1;
+                    }
+                    if (ctx.rules_text_slot.*) |rt| nb[bi] = .{ .text = rt };
                     allocator.free(@constCast(old_blocks));
                     ctx.history.items[0].content = nb;
                 }

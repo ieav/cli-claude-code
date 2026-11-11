@@ -248,22 +248,45 @@ fn statLayer(io: std.Io, path: []const u8) struct { ms: i64, len: u64 } {
     return .{ .ms = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms)), .len = st.size };
 }
 
-/// Fingerprint by FIXED canonical paths (not the case-insensitive hits):
-/// a case rename changes the found name but not these stats — acceptable,
-/// a rename is a save in practice.
+/// Fingerprint by FIXED canonical paths first; on case-SENSITIVE
+/// filesystems (Linux) a ZIV.MD hit would stat-fail the lowercase path
+/// and its edits would never trigger the hot reload — fall back to the
+/// case-insensitive discovery for the real name (macOS statFile already
+/// finds either case, so the fallback never runs there).
 pub fn fingerprint(io: std.Io) Fingerprint {
     var fp = Fingerprint{};
     if (env_mod.homeDir()) |home| {
         var gb: [std.fs.max_path_bytes]u8 = undefined;
         if (std.fmt.bufPrint(&gb, "{s}/.config/ziv/ziv.md", .{home})) |p| {
-            const st = statLayer(io, p);
+            var st = statLayer(io, p);
+            if (st.ms == 0 and st.len == 0) {
+                var dirb: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&dirb, "{s}/.config/ziv", .{home})) |gd| {
+                    if (findInsensitive(std.heap.smp_allocator, io, gd, "ziv.md")) |real| {
+                        defer std.heap.smp_allocator.free(real);
+                        if (joinPath(std.heap.smp_allocator, gd, real)) |rp| {
+                            defer std.heap.smp_allocator.free(rp);
+                            st = statLayer(io, rp);
+                        }
+                    }
+                } else |_| {}
+            }
             fp.g_ms = st.ms;
             fp.g_len = st.len;
         } else |_| {}
     }
     var pb: [std.fs.max_path_bytes]u8 = undefined;
     const ppath = zivroot.sub(&pb, "ziv.md");
-    const pst = statLayer(io, ppath);
+    var pst = statLayer(io, ppath);
+    if (pst.ms == 0 and pst.len == 0) {
+        if (findInsensitive(std.heap.smp_allocator, io, zivroot.rootDir(), "ziv.md")) |real| {
+            defer std.heap.smp_allocator.free(real);
+            if (joinPath(std.heap.smp_allocator, zivroot.rootDir(), real)) |rp| {
+                defer std.heap.smp_allocator.free(rp);
+                pst = statLayer(io, rp);
+            }
+        }
+    }
     fp.p_ms = pst.ms;
     fp.p_len = pst.len;
     return fp;
@@ -384,4 +407,39 @@ test "generation template stitches foreign files between markers" {
     try std.testing.expect(std.mem.indexOf(u8, t, "ziv 专属规则") != null);
     // Sync replaces [fence) only: user text after fence.end survives.
     try std.testing.expect(f.end < t.len);
+}
+
+test "syncExternal refreshes the fence but keeps the user section" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var io_state = std.Io.Threaded.init(a, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    // Project root with a marker-fenced ziv.md + an AGENTS.md.
+    const ts: u32 = @truncate(@as(u64, @bitCast(time_mod.nowMillis())));
+    const base = try std.fmt.allocPrint(a, "/tmp/ziv_rules_sync_{d}", .{ts});
+    std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(a, "{s}/.ziv", .{base})) catch unreachable;
+    var saved_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const saved_len0 = std.process.currentPath(io, &saved_buf) catch return error.TestUnexpectedResult;
+    const saved0 = try a.dupe(u8, saved_buf[0..saved_len0]);
+    try std.process.setCurrentPath(io, base);
+    defer std.process.setCurrentPath(io, saved0) catch {};
+    zivroot.init(io);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "AGENTS.md", .data = "v1 rule" }) catch unreachable;
+    // Hand-shaped ziv.md WITH the fence + a user section after it.
+    const handmade = marker_start ++ "\n# 来自 AGENTS.md\nstale\n" ++ marker_end ++ "\n\n# 专属\n- 我的规则不可动\n";
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "ziv.md", .data = handmade }) catch unreachable;
+
+    switch (syncExternal(std.testing.allocator, io)) {
+        .replaced => |r| try std.testing.expect(r.agents),
+        else => return error.TestUnexpectedResult,
+    }
+    const after = std.Io.Dir.cwd().readFileAlloc(io, "ziv.md", a, .limited(64 * 1024)) catch return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, after, "v1 rule") != null); // fence refreshed
+    try std.testing.expect(std.mem.indexOf(u8, after, "stale") == null); // stale body gone
+    try std.testing.expect(std.mem.indexOf(u8, after, "我的规则不可动") != null); // user section survived
 }
