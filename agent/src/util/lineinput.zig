@@ -662,13 +662,22 @@ pub var recall_prefill = false;
 /// wanted to suggest next.
 pub var prefill_text: ?[]const u8 = null;
 pub var prefill_pending = false;
-/// When the last line was submitted (millis). The empty-prompt Esc recall
-/// fires within this window after it. 60s (2026-11-13 user call): the old
-/// 5s expired before most turns even ENDED — the prompt-level recall was
-/// effectively dead and Esc at an empty prompt did nothing; "Esc = take
-/// back what I just sent" now survives past the turn boundary.
-pub const RECALL_WINDOW_MS: i64 = 60_000;
+/// Esc-recall windows (2026-11-13, user-semantics fix): a SHORT second
+/// chance, not a standing undo. Both must hold —
+///   · RECALL_AT_PROMPT_MS: within this long of the prompt reappearing
+///     (the turn just ended; the user saw the reply and regrets the send).
+///     The prompt-level recall re-arms each time readLine opens.
+///   · RECALL_AFTER_SUBMIT_MS: hard cap from the submit itself — a message
+///     from many turns ago is never recallable.
+/// The old fixed 60s window let Esc yank back a message dozens of seconds
+/// old; the pre-fix 5s-from-submit expired before most turns ENDED (dead
+/// code). At-prompt re-arm + submit cap gives "just-sent regret" exactly.
+pub const RECALL_AT_PROMPT_MS: i64 = 10_000;
+pub const RECALL_AFTER_SUBMIT_MS: i64 = 120_000;
 pub var last_submit_ms: i64 = 0;
+/// When the current readLine opened (the prompt appeared). The Esc recall
+/// is valid only briefly after this.
+pub var prompt_shown_at_ms: i64 = 0;
 
 /// ── Turn-scoped live region state ─────────────────────────────────────
 /// The persistent editor IS the live draft (P1): keystrokes during a
@@ -3029,6 +3038,14 @@ pub fn setSessionGuard(g: *menu.RawGuard) void {
     session_guard = g;
 }
 
+/// The Esc recall is live: shortly after the prompt reappeared AND the
+/// submitted message is still fresh (see the consts above).
+fn recallWindowOpen() bool {
+    const now = util_time.nowMillis();
+    return now - prompt_shown_at_ms < RECALL_AT_PROMPT_MS and
+        now - last_submit_ms < RECALL_AFTER_SUBMIT_MS;
+}
+
 pub fn readLine(
     w: *std.Io.Writer,
     r: *std.Io.Reader,
@@ -3090,6 +3107,9 @@ pub fn readLine(
     ed.prompt = prompt;
     ed.grow = alloc;
     ed.history = history;
+    // Prompt reappeared: the Esc-recall decision window re-arms here
+    // (bounded overall by RECALL_AFTER_SUBMIT_MS from the submit itself).
+    prompt_shown_at_ms = util_time.nowMillis();
     // Stale mid-turn paste state (the turn ended before 201~ arrived):
     // absorb what was staged — the pasted bytes are user content and
     // belong in the editor, not on the floor — then clear the flag so
@@ -3294,7 +3314,7 @@ pub fn readLine(
                 const draft_is_prefill = prefill_text != null and
                     std.mem.eql(u8, ed.buf[0..ed.len], prefill_text.?);
                 if ((ed.len == 0 or draft_is_prefill) and recall_text != null and
-                    util_time.nowMillis() - last_submit_ms < RECALL_WINDOW_MS)
+                    recallWindowOpen())
                 {
                     if (draft_is_prefill) {
                         ed.len = 0; // REPLACE the suggestion, not append to it
@@ -3417,7 +3437,7 @@ pub fn readLine(
                     const draft_is_prefill = prefill_text != null and
                         std.mem.eql(u8, ed.buf[0..ed.len], prefill_text.?);
                     if ((ed.len == 0 or draft_is_prefill) and recall_text != null and
-                        util_time.nowMillis() - last_submit_ms < RECALL_WINDOW_MS)
+                        recallWindowOpen())
                     {
                         if (draft_is_prefill) {
                             ed.len = 0; // REPLACE the suggestion, not append
