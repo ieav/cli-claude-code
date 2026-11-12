@@ -1481,7 +1481,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             }
 
             // Record in operation log
-            _ = log.record("LLMResponse", input, "response", null, false, 0) catch {};
+            _ = log.record("LLMResponse", input, "response", null, false, 0, "") catch {};
             if (live_trace) |*t| {
                 traceAddStep(t, .response_postprocess, 0.95, "stream aggregation", "blocks appended to history", "REPL-owned copy", 0, allocator) catch {};
             }
@@ -1786,9 +1786,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     defer allocator.free(results);
 
                     var batch_errors: u32 = 0;
+                    // Fixed for the whole turn: the prompt every op in this
+                    // batch belongs to — /rewind shows it beside each point.
+                    const turn_label = turn_history.turnLabelAt(history.items, history.items.len);
                     for (prepared.items, 0..) |p, i| {
                         window_tools += 1;
-                        const errored = try turn_tools.finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0);
+                        const errored = try turn_tools.finishToolCall(p, results[i].result, allocator, &log, &result_blocks, w, ow, &file_writer, history.items.len, util_time.nowMillis() - batch_t0, turn_label);
                         if (errored) {
                             batch_errors += 1;
                             // expected_stop (timeout kill / user cancel / declined

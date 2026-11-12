@@ -132,7 +132,13 @@ pub fn rewindOperation(
     try std.Io.Writer.print(w, "  Rollback points ({d}):\n", .{rollback_points.len});
     try std.Io.Writer.writeAll(w, "    [0] Session start (undo all file changes)\n");
     for (rollback_points, 0..) |rp, i| {
-        try std.Io.Writer.print(w, "    [{d}] {s} (files: {d})\n", .{ i + 1, rp.tool_name, rp.files_affected });
+        var lb: [64]u8 = undefined;
+        const excerpt = labelExcerpt(&lb, rp.turn_label);
+        if (excerpt.len > 0) {
+            try std.Io.Writer.print(w, "    [{d}] {s} (files: {d}) — \x1b[2m{s}\x1b[0m\n", .{ i + 1, rp.tool_name, rp.files_affected, excerpt });
+        } else {
+            try std.Io.Writer.print(w, "    [{d}] {s} (files: {d})\n", .{ i + 1, rp.tool_name, rp.files_affected });
+        }
     }
     try std.Io.Writer.writeAll(w, "\n  Select rollback point (or Enter to cancel): ");
     try std.Io.File.Writer.flush(file_writer);
@@ -253,6 +259,76 @@ pub fn rewindOperation(
     });
 
     engine.freeResult(result);
+}
+
+/// One-line display excerpt of a rollback point's turn label: FIRST line
+/// only, inner whitespace runs collapsed, capped at 48 bytes on a UTF-8
+/// boundary with a trailing "…". Empty/blank → "" (the caller then omits
+/// the suffix entirely — old op-log records and non-turn ops carry no
+/// label).
+fn labelExcerpt(buf: []u8, label: []const u8) []const u8 {
+    const fl = std.mem.indexOfScalar(u8, label, '\n') orelse label.len;
+    const line = std.mem.trim(u8, label[0..fl], " \t\r");
+    if (line.len == 0) return "";
+
+    var f = std.Io.Writer.fixed(buf);
+    const cap = 48;
+    var i: usize = 0;
+    var pending_space = false;
+    var written: usize = 0;
+    var truncated = false;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == ' ' or c == '\t') {
+            pending_space = written > 0;
+            i += 1;
+            continue;
+        }
+        if (pending_space) {
+            std.Io.Writer.writeAll(&f, " ") catch break;
+            written += 1;
+            pending_space = false;
+        }
+        var l: usize = 1;
+        if (c >= 0xF0) {
+            l = 4;
+        } else if (c >= 0xE0) {
+            l = 3;
+        } else if (c >= 0xC0) {
+            l = 2;
+        }
+        l = @min(l, line.len - i); // malformed tail: never read past the line
+        if (written + l > cap) {
+            truncated = true;
+            break;
+        }
+        std.Io.Writer.writeAll(&f, line[i .. i + l]) catch break;
+        written += l;
+        i += l;
+    }
+    if (truncated) std.Io.Writer.writeAll(&f, "…") catch {};
+    return f.buffered();
+}
+
+test "labelExcerpt: first line, collapse, UTF-8-safe cap" {
+    var buf: [64]u8 = undefined;
+    // Multi-line keeps only the first line.
+    try std.testing.expectEqualStrings("修复登录", labelExcerpt(&buf, "修复登录\n第二步\n第三步"));
+    // Whitespace runs collapse; edges trimmed.
+    try std.testing.expectEqualStrings("a b c", labelExcerpt(&buf, "  a \t b   c  "));
+    // Blank → empty (caller omits the suffix).
+    try std.testing.expectEqualStrings("", labelExcerpt(&buf, "  \nsecond"));
+    try std.testing.expectEqualStrings("", labelExcerpt(&buf, ""));
+    // Byte cap cuts on a rune boundary — 30 CJK chars = 90 bytes > 48:
+    // the cut must land after a whole char and end with the ellipsis.
+    const long = "修修修修修修修修修修修修修修修修修修修修修修修修修修修修修修";
+    const got = labelExcerpt(&buf, long);
+    try std.testing.expect(got.len <= 48 + 3); // cap + "…"
+    try std.testing.expect(got[got.len - 3] == 0xE2); // "…" UTF-8 head
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < got.len - 3) : (i += 3) count += 1;
+    try std.testing.expectEqual(@as(usize, 16), count); // 48/3 whole chars
 }
 
 

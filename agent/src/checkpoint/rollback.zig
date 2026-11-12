@@ -16,6 +16,9 @@ pub const RollbackPoint = struct {
     /// epoch means the history was rewritten since (compact/clear/undo) and
     /// the dialogue part of the rewind must be skipped.
     epoch: u64,
+    /// The owning turn's user prompt (borrowed from the op log's record —
+    /// valid while the log owns its records). /rewind's display label.
+    turn_label: []const u8,
 };
 
 pub const RollbackResult = struct {
@@ -76,6 +79,7 @@ pub const RollbackEngine = struct {
                     .files_affected = files_affected,
                     .history_len = if (rec.history_len > 0) rec.history_len else 1,
                     .epoch = rec.epoch,
+                    .turn_label = rec.turn_label,
                 });
             }
         }

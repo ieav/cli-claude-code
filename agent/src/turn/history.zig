@@ -759,6 +759,27 @@ pub fn repairToolPairing(history: *std.ArrayList(llm.Message), alloc: std.mem.Al
     }
 }
 
+/// The user prompt of the turn that owned an operation recorded when the
+/// history had `upto` messages: scan backwards for the nearest user
+/// message carrying a non-blank text block (agent-loop tool-result user
+/// messages carry only tool_result blocks and are skipped). /rewind
+/// records this beside each rollback point so a bare index/tool-name
+/// list is identifiable — which business step each point belonged to.
+pub fn turnLabelAt(items: []const llm.Message, upto: usize) []const u8 {
+    var i = @min(upto, items.len);
+    while (i > 0) {
+        i -= 1;
+        const msg = items[i];
+        if (msg.role != .user) continue;
+        for (msg.content) |b| {
+            if (b == .text) {
+                if (std.mem.trim(u8, b.text, " \t\r\n").len > 0) return b.text;
+            }
+        }
+    }
+    return "";
+}
+
 pub fn clearHistory(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator) void {
     while (history.items.len > 1) {
         const msg = history.orderedRemove(1);
@@ -1634,4 +1655,50 @@ test "applyHybridLayout is byte-deterministic: same input → same output (T3.2)
     }
     // 梯子计数器只增不减、恒为非负（/stats 读它们）。
     try std.testing.expect(compacts_done >= 0 and tokens_reclaimed >= 0);
+}
+
+test "turnLabelAt finds the owning turn's prompt, skips tool-result users" {
+    const alloc = std.testing.allocator;
+    // [sys, user("修复登录校验"), assistant(tool_use), user(tool_result), assistant]
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer history.deinit(alloc);
+
+    const sys_b = try alloc.alloc(llm.ContentBlock, 1);
+    sys_b[0] = .{ .text = "sys" };
+    try history.append(alloc, .{ .role = .system, .content = sys_b, .timestamp = 0 });
+
+    const q_b = try alloc.alloc(llm.ContentBlock, 1);
+    q_b[0] = .{ .text = "修复登录校验" };
+    try history.append(alloc, .{ .role = .user, .content = q_b, .timestamp = 0 });
+
+    const tu_b = try alloc.alloc(llm.ContentBlock, 1);
+    tu_b[0] = .{ .tool_use = .{ .id = "c1", .name = "FileEdit", .input = .null } };
+    try history.append(alloc, .{ .role = .assistant, .content = tu_b, .timestamp = 0 });
+
+    const tr_b = try alloc.alloc(llm.ContentBlock, 1);
+    tr_b[0] = .{ .tool_result = .{ .tool_use_id = "c1", .content = "ok" } };
+    try history.append(alloc, .{ .role = .user, .content = tr_b, .timestamp = 0 });
+
+    const fin_b = try alloc.alloc(llm.ContentBlock, 1);
+    fin_b[0] = .{ .text = "done" };
+    try history.append(alloc, .{ .role = .assistant, .content = fin_b, .timestamp = 0 });
+
+    // From any depth of the turn, the label is that turn's prompt — the
+    // tool-result user message (no text block) is skipped, not matched.
+    try std.testing.expectEqualStrings("修复登录校验", turnLabelAt(history.items, 5));
+    try std.testing.expectEqualStrings("修复登录校验", turnLabelAt(history.items, 4));
+    try std.testing.expectEqualStrings("修复登录校验", turnLabelAt(history.items, 3));
+    // Before the prompt existed: nothing.
+    try std.testing.expectEqualStrings("", turnLabelAt(history.items, 1));
+    // Blank text blocks don't count as prompts.
+    const blank_b = try alloc.alloc(llm.ContentBlock, 1);
+    blank_b[0] = .{ .text = "  " };
+    try history.append(alloc, .{ .role = .user, .content = blank_b, .timestamp = 0 });
+    try std.testing.expectEqualStrings("修复登录校验", turnLabelAt(history.items, 6));
+
+    // All block payloads are static literals — only the content arrays
+    // were allocated.
+    for (history.items) |m| {
+        alloc.free(@constCast(m.content));
+    }
 }

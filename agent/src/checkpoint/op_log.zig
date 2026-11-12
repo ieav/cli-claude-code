@@ -23,6 +23,12 @@ pub const OperationRecord = struct {
     /// operations bump the epoch; points from a stale epoch rewind FILES
     /// ONLY.
     epoch: u64 = 0,
+    /// The user prompt of the turn this op belonged to (owned excerpt,
+    /// recorded at op time so it stays readable even after the history it
+    /// indexed was compacted/cleared — the epoch guard kills the dialogue
+    /// rewind, not the label). /rewind shows it beside each point: a bare
+    /// index/tool-name list gave no clue which business step was which.
+    turn_label: []const u8 = "",
 };
 
 pub const OperationLog = struct {
@@ -55,11 +61,13 @@ pub const OperationLog = struct {
             self.allocator.free(rec.tool_name);
             self.allocator.free(rec.input);
             self.allocator.free(rec.output);
+            if (rec.turn_label.len > 0) self.allocator.free(rec.turn_label);
         }
         self.records.deinit(self.allocator);
     }
 
-    /// Record a new operation.
+    /// Record a new operation. `turn_label` ("" when not applicable) is
+    /// the owning turn's user prompt — see OperationRecord.turn_label.
     pub fn record(
         self: *Self,
         tool_name: []const u8,
@@ -68,6 +76,7 @@ pub const OperationLog = struct {
         snapshot_id: ?[16]u8,
         rollback_safe: bool,
         history_len: usize,
+        turn_label: []const u8,
     ) ![16]u8 {
         // uuid, not timestamp-spice: two ops in the same millisecond used
         // to collide on op_id (uuid was imported but never used).
@@ -84,6 +93,7 @@ pub const OperationLog = struct {
             .rollback_safe = rollback_safe,
             .history_len = history_len,
             .epoch = self.epoch,
+            .turn_label = if (turn_label.len > 0) try self.allocator.dupe(u8, turn_label) else "",
         });
         self.current_position = @intCast(self.records.items.len);
         return id;

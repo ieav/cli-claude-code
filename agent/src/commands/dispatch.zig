@@ -627,7 +627,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 turn_tools.printToolBody(ctx.w, block_msg, null);
                 try std.Io.Writer.writeAll(ctx.w, "\n");
                 allocator.free(block_msg);
-                _ = ctx.log.record(tool_name, "pre-hook", "blocked", null, false, ctx.history.items.len) catch {};
+                _ = ctx.log.record(tool_name, "pre-hook", "blocked", null, false, ctx.history.items.len, "") catch {};
                 try std.Io.File.Writer.flush(ctx.file_writer);
                 return .handled;
             }
@@ -651,7 +651,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             const result = run_tool.execute(allocator, parsed, ctx.io) catch |err| {
                 logger.err("Tool /run failed: {s} error={}", .{ tool_name, err });
                 try std.Io.Writer.print(ctx.w, "  Tool error: {}\n\n", .{err});
-                _ = ctx.log.record(tool_name, "execution", "error", run_snap_id, false, ctx.history.items.len) catch {};
+                _ = ctx.log.record(tool_name, "execution", "error", run_snap_id, false, ctx.history.items.len, turn_history.turnLabelAt(ctx.history.items, ctx.history.items.len)) catch {};
                 try std.Io.File.Writer.flush(ctx.file_writer);
                 return .handled;
             };
@@ -669,7 +669,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
                 turn_tools.printToolBody(ctx.w, result.output, turn_tools.langForToolInput(tool_name, parsed)); // dim + Ctrl+O fold, same as the agent-loop phase
                 try std.Io.Writer.writeAll(ctx.w, "\n");
             }
-            _ = ctx.log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, ctx.history.items.len) catch {};
+            _ = ctx.log.record(tool_name, "executed", result.output, run_snap_id, run_snap_id != null, ctx.history.items.len, turn_history.turnLabelAt(ctx.history.items, ctx.history.items.len)) catch {};
             allocator.free(result.output);
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
@@ -807,7 +807,7 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             ctx.message_count.* = 0;
             ctx.total_input_tokens.* = 0;
             ctx.total_output_tokens.* = 0;
-            _ = ctx.log.record("ClearHistory", "/", "/", null, false, 0) catch {};
+            _ = ctx.log.record("ClearHistory", "/", "/", null, false, 0, "") catch {};
             try std.Io.Writer.writeAll(ctx.w, "  Conversation cleared. Starting fresh.\n\n");
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;

@@ -201,6 +201,7 @@ pub fn finishToolCall(
     file_writer: *std.Io.File.Writer,
     history_len: usize,
     elapsed_ms: i64,
+    turn_label: []const u8,
 ) !bool {
     // Wall time from batch dispatch — for a parallel batch this includes
     // queue wait and overlaps siblings; per-tool exclusive time would
@@ -262,7 +263,7 @@ pub fn finishToolCall(
             .is_error = result.is_error,
         },
     });
-    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null, history_len) catch {};
+    _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null, history_len, turn_label) catch {};
     if (truncated) {
         // History owns the dupe; the original (error or not) is spent.
         alloc.free(result.output);
