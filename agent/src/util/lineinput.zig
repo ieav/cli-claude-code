@@ -683,26 +683,6 @@ fn self_browsing() bool {
 /// Display-capped tail of the live draft, cut at a UTF-8 boundary and
 /// fitting the terminal width minus the prompt prefix (the input row must
 /// stay ONE row — an overflowing echo would wrap over the status row).
-/// Interim single-row view: the P3 renderer gives the editor its full
-/// multi-row block back.
-fn editorTail() []const u8 {
-    const s = liveDraft();
-    const tw = currentTermWidth(); // honors the force_width test hook
-    const budget: usize = if (tw > 4) tw - 2 else 16;
-    var i = s.len;
-    var cols: usize = 0;
-    while (i > 0) {
-        // walk back one rune
-        var start = i - 1;
-        while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
-        const rune_cols: usize = if (s[start] >= 0xE0) 2 else 1;
-        if (cols + rune_cols > budget) break;
-        cols += rune_cols;
-        i = start;
-    }
-    return s[i..];
-}
-
 /// ── P3: turn-scoped live region (DECSTBM scroll-region protocol) ────
 /// The terminal is split by a scroll region: rows [1, H-2] are the
 /// TRANSCRIPT (scrolls), the bottom TWO rows are PINNED (status above,
@@ -790,6 +770,18 @@ pub fn setIo(io: std.Io) void {
     tty_io = io;
 }
 
+/// The split row the CURRENTLY PAINTED pinned band sits below — from the
+/// PAINT-TIME ledgers (region_h + last_block_rows), NOT the live draft:
+/// submit empties the draft via takeLine BEFORE anyone repaints, so a
+/// plain regionRows() then under-reports the painted band and leaves the
+/// old rule/block rows orphaned (they ride the next arm's SU push into
+/// the transcript as junk — pty-verified 2026-11-12). Every eraser
+/// (regionEnd, regionApply re-apply) must clear down to THIS row.
+fn paintedSplit() usize {
+    if (region_h == 0) return regionRows();
+    return @max(@max(region_h, 4) -| (2 +| last_block_rows), 1);
+}
+
 /// P3c Ctrl+O（与 Claude Code 的 verbose 开关同键）：切换工具输出的
 /// 详细/简要。回调由 repl 装配（layering：util 层不 import turn 层）。
 /// 回调返回新的详细态文案，供此处打印一行转录提示。
@@ -827,6 +819,12 @@ fn flushReal(w: *std.Io.Writer) void {
 /// parks at the input block's end (the typing position).
 fn regionApply(w: *std.Io.Writer) void {
     const h = @max(termHeight(), 4);
+    // OLD layout, captured BEFORE the ledgers update: a SHRINKING block
+    // (line delete mid-edit, resize down) leaves its old rule/block rows
+    // orphaned ABOVE the new rule line; DECSTBM then expands over them
+    // and they scroll into the transcript as junk rows. The re-apply
+    // branch clears the union of old+new pinned bands below.
+    const prev_split = paintedSplit();
     region_h = h;
     const split = regionRows();
     last_block_rows = blockRows();
@@ -857,6 +855,15 @@ fn regionApply(w: *std.Io.Writer) void {
         // printed ONTO the input block and erased itself: "nothing
         // visible".)
         std.Io.Writer.print(w, "\x1b[1;{d}r", .{split}) catch {};
+        // Stale-band clear: wipe every row from the OLDER layout's rule
+        // line down (union of old and new pinned bands — at most 8+ rows,
+        // idempotent). Grow: old band ⊂ new band, harmless; shrink: the
+        // orphaned rows above the new rule die HERE instead of leaking
+        // into the transcript when DECSTBM expands over them.
+        var stale_row = @min(prev_split, split) + 1;
+        while (stale_row <= h) : (stale_row += 1) {
+            std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{stale_row}) catch {};
+        }
     }
     // Input-area frame: dim rule line ABOVE the block…
     paintRuleLine(w, split + 1);
@@ -872,12 +879,9 @@ fn regionApply(w: *std.Io.Writer) void {
     pending_status_shown = true;
 }
 
-/// Soft-wrapped display rows of the live draft (the SAME walk the painter
-/// and the mouse hit-test share — one source of truth).
-pub fn collectBlockRows(out: *[64][]const u8) usize {
-    return collectBlockRowsInto(out, currentTermWidth(), strWidth(pendingPrompt()));
-}
-
+/// Soft-wrapped display rows of the live draft — the painter's own walk
+/// (writeEditorBlock calls this with pw=0: CC layout, block rows carry no
+/// prompt prefix).
 fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
     var nrows: usize = 0;
     var first_logical = true;
@@ -1031,12 +1035,19 @@ fn regionPrintLineLocked(w: *std.Io.Writer, line: []const u8) void {
 /// Park the cursor at the end of the editor block's last visible row.
 fn parkCursor(w: *std.Io.Writer) void {
     // Park on the block's LAST display row (the screen bottom is the
-    // status line now), column modulo width (soft-wrapped tails).
+    // status line now). Column from the LAST LOGICAL LINE's full display
+    // width modulo tw — soft wrap puts the typing position at the end of
+    // the wrapped tail. The old editorTail budget-cap (tw-2) put the
+    // cursor at an arbitrary column for any line wider than the budget;
+    // width-exact lines sit in deferred wrap → clamp to the last column.
     const tw = @max(currentTermWidth(), 8);
-    const last = editorTail();
-    const cols = strWidth(last);
-    const row = region_h -| 1; // one status row below the block
-    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ row, cols % tw + 1 }) catch {};
+    const h = @max(region_h, 4);
+    const draft = liveDraft();
+    const last_nl = std.mem.lastIndexOfScalar(u8, draft, '\n');
+    const last_line = if (last_nl) |p| draft[p + 1 ..] else draft;
+    const wcols = strWidth(last_line);
+    const col: usize = if (wcols == 0) 1 else if (wcols % tw == 0) tw else wcols % tw + 1;
+    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ h - 1, col }) catch {};
 }
 
 /// In-place repaint of the pinned rows (keystroke path): status row only
@@ -1086,7 +1097,12 @@ fn regionEndLocked(w: *std.Io.Writer) void {
         pendingStatusSet("");
         return;
     }
-    const split = regionRows();
+    // Erase down to the OLDER of the draft-based and PAINT-based splits:
+    // after a submit the draft is already empty (takeLine ran first), so
+    // regionRows() alone claims a taller transcript than what was painted
+    // and the old rule/block rows survive — then the next arm's SU push
+    // rides them into the transcript as junk (the multi-line submit leak).
+    const split = @min(regionRows(), paintedSplit());
     // Erase every pinned row (status + block), reset the scroll region,
     // and leave the cursor AT THE FLOW POSITION — directly below the
     // transcript's last line, where the next prompt naturally prints.
@@ -1660,11 +1676,15 @@ pub fn regionEchoCommitted(w: *std.Io.Writer, line: []const u8) void {
     // Full multi-line echo: the typed block was erased on submit, this is
     // its only trace — a 380-byte single-string cap used to silently drop
     // most of a long paste. Per-line budget: ECHO_CAP_LINES lines /
-    // ECHO_CAP_BYTES bytes with an explicit "… 另有 N 行" marker.
-    var lines: usize = 1;
+    // ECHO_CAP_BYTES bytes with an explicit truncation marker (whole
+    // lines hidden → "另有 N 行"; a line SLICED mid-way by the byte cap →
+    // "本行已截断 N 字节" — the old condition missed the single-line
+    // case entirely: a >8K one-line paste truncated with NO marker).
     var rest = line;
     var shown_lines: usize = 0;
     var shown_bytes: usize = 0;
+    var eaten_nl: usize = 0;
+    var sliced = false; // byte cap cut a line mid-way (not at its \n)
     while (rest.len > 0 and shown_lines < ECHO_CAP_LINES and shown_bytes < ECHO_CAP_BYTES) {
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
         var cut = nl;
@@ -1679,13 +1699,21 @@ pub fn regionEchoCommitted(w: *std.Io.Writer, line: []const u8) void {
         }
         shown_lines += 1;
         shown_bytes += cut;
-        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
-        if (cut < nl) break;
+        if (cut < nl) sliced = true;
+        rest = if (nl < rest.len) blk: {
+            eaten_nl += 1;
+            break :blk rest[nl + 1 ..];
+        } else "";
+        if (sliced) break;
     }
-    lines = std.mem.count(u8, line, "\n") + 1;
-    if (shown_lines < lines or (rest.len > 0 and shown_bytes >= ECHO_CAP_BYTES)) {
-        var mb: [64]u8 = undefined;
-        const marker = std.fmt.bufPrint(&mb, "\x1b[2m… 另有 {d} 行（/last 或 ↑ 召回全文）\x1b[0m", .{lines -| shown_lines}) catch "";
+    const lines = std.mem.count(u8, line, "\n") + 1;
+    const whole_hidden = lines -| shown_lines; // whole lines never shown
+    if (whole_hidden > 0 or sliced) {
+        var mb: [96]u8 = undefined;
+        const marker = if (whole_hidden == 0)
+            std.fmt.bufPrint(&mb, "\x1b[2m… 本行已截断 {d} 字节（/last 或 ↑ 召回全文）\x1b[0m", .{line.len -| (shown_bytes + eaten_nl)}) catch ""
+        else
+            std.fmt.bufPrint(&mb, "\x1b[2m… 另有 {d} 行（/last 或 ↑ 召回全文）\x1b[0m", .{whole_hidden + @intFromBool(sliced)}) catch "";
         regionPrintLine(w, marker);
     }
 }
@@ -3058,9 +3086,11 @@ pub fn readLine(
                     try ed.insertBytes("\n");
                     ed.browsing = false;
                 } else {
-                    // Erase the painted block first (it may span many rows
-                    // now) — the echo below prints at the freed top row and
-                    // the cleared rows below are reused by the REPL output.
+                    // Armed: clearBlock only resets the RELATIVE ledger —
+                    // the absolute block rows stay visible (the user keeps
+                    // seeing what they sent) until the next regionApply;
+                    // its stale-band clear reaps them when the empty draft
+                    // re-splits. The echo below prints ABOVE the region.
                     try ed.clearBlock();
                     // P1: takeLine expands folded pastes, hands the line
                     // out as its own allocation, and leaves the persistent
@@ -3831,6 +3861,98 @@ test "live region: multi-line draft renders as a full editor block (P3b)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2Kb") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kc") != null);
     _ = ed;
+}
+
+test "live region: block shrink clears the stale band above the new rule" {
+    // The submit/Ctrl-C/delete path: blockRows 3 → 2 moves the rule DOWN
+    // one row; the OLD rule row (20) and old block rows are now transcript
+    // territory. regionApply's re-apply branch must wipe the union band —
+    // pty-verified pre-fix: the stale rule + first draft line scrolled
+    // into the transcript as junk after a multi-line submit.
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 100;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+
+    var fr = std.Io.Reader.fixed("a\nb\nc");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, &aw.writer)); // 3 rows: split 19
+    aw.clearRetainingCapacity();
+
+    // Delete 'c' and the newline → 2 rows → split 20; old rule row 20 is
+    // ABOVE the new rule (21) and only the stale-band clear reaps it.
+    ed.backspace();
+    ed.backspace();
+    renderPendingLine(&aw.writer);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;20r") != null); // re-split
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[20;1H\x1b[2K") != null); // old rule row reaped
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24;1H\x1b[2K") != null); // status repainted
+}
+
+test "regionEnd after multi-line submit clears the whole painted band" {
+    // readLine defers regionEnd AFTER takeLine already emptied the draft:
+    // a naive regionRows() split (1-row block → 21) would reap only rows
+    // 22-24 and orphan the painted rows 20-21 — the next arm's SU push
+    // then scrolls them into the transcript (the pty-verified leak).
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 100;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+
+    var fr = std.Io.Reader.fixed("a\nb\nc");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, &aw.writer)); // 3 rows: split 19
+    aw.clearRetainingCapacity();
+
+    ed.len = 0; // takeLine semantics: draft empty BEFORE regionEnd runs
+    ed.pos = 0;
+    regionEnd(&aw.writer);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[20;1H\x1b[2K") != null); // old rule row
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[21;1H\x1b[2K") != null); // old first block row
+    try std.testing.expect(std.mem.count(u8, out, "\x1b[2K") >= 5); // whole band 20..24
+}
+
+test "regionEchoCommitted: byte cap slices a long single line with a marker" {
+    // A >8K single-line paste (no newlines) truncated silently pre-fix:
+    // shown_lines == lines == 1 and rest consumed → the old marker
+    // condition never fired. The sliced path must say how much is hidden.
+    const alloc = std.testing.allocator;
+    resetPendingState();
+    defer resetPendingState();
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const big = try alloc.alloc(u8, ECHO_CAP_BYTES + 500);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    regionEchoCommitted(&aw.writer, big);
+    const out = aw.written();
+    // Exactly the byte cap shown (ASCII needs no UTF-8 backoff)…
+    try std.testing.expectEqual(ECHO_CAP_BYTES, std.mem.count(u8, out, "x"));
+    // …and the marker names the hidden remainder.
+    try std.testing.expect(std.mem.indexOf(u8, out, "已截断") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "500") != null);
 }
 
 test "live region: slash commands keep their colors in the pinned input row (P3c)" {
