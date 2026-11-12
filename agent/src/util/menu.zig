@@ -120,11 +120,21 @@ pub const CookedGuard = struct {
     active: bool = false,
 
     pub fn enter(self: *CookedGuard) void {
-        if (termio.cookedEnter(&self.orig)) self.active = true;
+        if (termio.cookedEnter(&self.orig)) {
+            self.active = true;
+            // Bracketed paste OFF while cooked (2026-11-12): the session
+            // pushes ?2004 for its whole lifetime, so a paste into a y/N
+            // or answer read would arrive wrapped in 200~/201~ markers
+            // and pollute the answer. Popped here, re-pushed on restore.
+            termio.writeBracketedPaste(false);
+        }
     }
 
     pub fn restore(self: *CookedGuard) void {
-        if (self.active) termio.rawRestore(&self.orig);
+        if (self.active) {
+            termio.rawRestore(&self.orig);
+            termio.writeBracketedPaste(true);
+        }
     }
 };
 

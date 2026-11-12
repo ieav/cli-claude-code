@@ -188,6 +188,25 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     tty_guard.enterNoSig();
     defer tty_guard.restore();
     lineinput.setSessionGuard(&tty_guard);
+    // SESSION-scoped keyboard protocols (2026-11-12): bracketed paste +
+    // kitty disambiguate + xterm modifyOtherKeys level 1. Pushed for the
+    // WHOLE session (not per-readLine — that left every mid-turn keystroke
+    // without them: Shift+Enter degraded to Enter = queue, pastes lost
+    // their 200~ wrapper = no folding). modifyOtherKeys L1 is what makes
+    // Shift+Enter/Ctrl+Enter arrive as CSI 13;2u/13;5u on xterm-family
+    // terminals (VS Code, Windows Terminal, VTE) — level 1 on purpose:
+    // it only re-encodes MODIFIED well-known keys, never plain letters,
+    // so Alt+letter etc. keep their legacy encodings. macOS Terminal.app
+    // honors none of these — the \`+Enter / Ctrl+J / Option+Enter
+    // fallbacks remain. Popped on every normal exit path (defer); a hard
+    // crash leaks the modes like mouse mode did — cosmetic, terminal
+    // reset clears it.
+    if (tty_guard.active) {
+        termio.writeProtocol(true); // push bracketed paste + kitty + modifyOtherKeys
+    }
+    defer if (tty_guard.active) {
+        termio.writeProtocol(false); // pop: terminal left as found
+    };
     // P3c: Ctrl+O toggles tool-output verbosity (prompt AND mid-turn).
     lineinput.on_verbose_toggle = struct {
         fn cb() []const u8 {
@@ -2339,8 +2358,9 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\  Auto          — LLM classifier decides
         \\
         \\Keys:
-        \\  Enter 发送 · Shift+Enter / Ctrl+Enter / `\`+Enter / Ctrl+J 换行
-        \\  多行粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
+        \\  Enter 发送 · Shift+Enter / Ctrl+Enter 换行（需终端支持 kitty/
+        \\  modifyOtherKeys 协议，否则用 `\`+Enter / Ctrl+J / Option+Enter）
+        \\  多行/超长粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
         \\  行编辑（提示符与回合中同样生效）：
         \\    Ctrl-A/E 行首/行尾 · Ctrl-B/F 左右移 · Ctrl-U/K 删至行首/行尾
         \\    Ctrl-W 删前一个词 · Ctrl-D 向前删 · Home/End/←→/↑↓ 历史

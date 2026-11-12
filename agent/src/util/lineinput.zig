@@ -279,10 +279,12 @@ fn moveVertically(buf: []const u8, pos: usize, dir: i8) ?usize {
 /// unforgeable marker (NUL, slot digit, NUL) and the full content lives in
 /// an Editor side slot. The renderer shows a one-line pill
 /// ("[📄 粘贴 · N 行 · B]"); submit expands markers back to the full text.
-/// Fold thresholds: a paste beyond EITHER becomes a pill. Small pastes
-/// keep today's behavior (raw text in the buffer).
-pub const PASTE_FOLD_LINES: usize = 8;
-pub const PASTE_FOLD_BYTES: usize = 1024;
+/// Fold thresholds: a paste beyond EITHER becomes a pill. Claude-Code-
+/// parity sizing (2026-11-12, user call): 3 lines / 512 bytes — the old
+/// 8/1024 let a half-screen paste still balloon the input box. Small
+/// pastes keep today's behavior (raw text in the buffer).
+pub const PASTE_FOLD_LINES: usize = 3;
+pub const PASTE_FOLD_BYTES: usize = 512;
 
 /// Simultaneous pills per prompt; a further big paste lands raw.
 pub const PASTE_SLOTS: usize = 4;
@@ -553,6 +555,7 @@ pub fn editorLive() ?*Editor {
 pub fn editorDeinit(alloc: std.mem.Allocator) void {
     if (live_ed) |ed| {
         ed.releaseSlots();
+        ed.liveStageDiscard();
         if (ed.draft_owned) |d| alloc.free(d);
         alloc.destroy(ed);
         live_ed = null;
@@ -715,8 +718,21 @@ fn liveBlockCap() usize {
 /// "↟ +N" marker row when clipped — the same reading model as the
 /// readLine editor, so a multi-line draft during a generation is fully
 /// legible (P3b).
+/// Display width of a slice counting paste markers as their pill width
+/// (same glyph semantics as collectBlockRowsInto / writeRowWithPills).
+fn glyphStrWidth(s: []const u8, pills: []const ?PasteStat) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        w += glyphWidth(s, i, pills);
+        i = nextGlyph(s, i);
+    }
+    return w;
+}
+
 fn blockRows() usize {
     if (liveDraft().len == 0) return 1;
+    const pills: [PASTE_SLOTS]?PasteStat = if (live_ed) |e| e.pasteStats() else @splat(null);
     var rows: usize = 0;
     var first = true;
     var it = std.mem.splitScalar(u8, liveDraft(), '\n');
@@ -725,7 +741,8 @@ fn blockRows() usize {
     // wrap budget here MUST match collectBlockRowsInto's (same-source
     // rule): space allocation and rendering both subtract the prompt's
     // width, or a line that fits the SPLIT's budget wraps in the painter
-    // and the extra row lands on the status line.
+    // and the extra row lands on the status line. Markers count as ONE
+    // glyph of their pill's width (same rule everywhere).
     const pw = strWidth(pendingPrompt());
     while (it.next()) |logical| {
         const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
@@ -735,14 +752,13 @@ fn blockRows() usize {
         var r: usize = 1;
         var i: usize = 0;
         while (i < logical.len) {
-            const next = nextChar(logical, i);
-            const cw = strWidth(logical[i..next]);
+            const cw = glyphWidth(logical, i, &pills);
             if (col > 0 and col + cw > avail) {
                 r += 1;
                 col = 0;
             }
             col += cw;
-            i = next;
+            i = nextGlyph(logical, i);
         }
         first = false;
         rows += r;
@@ -896,10 +912,13 @@ fn regionApply(w: *std.Io.Writer) void {
     pending_status_shown = true;
 }
 
-/// Soft-wrapped display rows of the live draft — the painter's own walk
-/// (writeEditorBlock calls this with pw=0: CC layout, block rows carry no
-/// prompt prefix).
+/// Soft-wrapped display rows of the live draft — the painter's own walk.
+/// Paste markers step as ONE glyph (nextGlyph) of their pill's width, so
+/// a marker can never be split across rows or leak its inner bytes into
+/// a row (the raw nextChar walk used to cut markers mid-triplet).
 fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
+    const ed = live_ed;
+    const pills: [PASTE_SLOTS]?PasteStat = if (ed) |e| e.pasteStats() else @splat(null);
     var nrows: usize = 0;
     var first_logical = true;
     var iter = std.mem.splitScalar(u8, liveDraft(), '\n');
@@ -910,8 +929,7 @@ fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
         var row_start: usize = 0;
         while (i <= logical.len) {
             if (i == logical.len or (col > 0 and blk: {
-                const next = nextChar(logical, i);
-                const cw = strWidth(logical[i..next]);
+                const cw = glyphWidth(logical, i, &pills);
                 break :blk col + cw > avail;
             })) {
                 if (nrows < out.len) {
@@ -922,14 +940,38 @@ fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
                 col = 0;
                 if (i == logical.len) break;
             }
-            const next = nextChar(logical, i);
-            col += strWidth(logical[i..next]);
-            i = next;
+            col += glyphWidth(logical, i, &pills);
+            i = nextGlyph(logical, i);
         }
         first_logical = false;
     }
     if (nrows == 0) nrows = 1; // empty draft: one blank input row
     return nrows;
+}
+
+/// Emit one display row: raw bytes when it holds no marker, otherwise a
+/// glyph walk that renders each marker as its cyan pill text. A marker's
+/// NUL bytes must NEVER reach the terminal raw (they used to leak as a
+/// literal '0' — the "paste shows garbage instead of a pill" defect).
+fn writeRowWithPills(w: *std.Io.Writer, row: []const u8, pills: []const ?PasteStat) void {
+    if (std.mem.indexOfScalar(u8, row, 0) == null) {
+        std.Io.Writer.writeAll(w, row) catch {};
+        return;
+    }
+    var i: usize = 0;
+    while (i < row.len) {
+        if (markerLen(row, i) == 3) {
+            const slot = row[i + 1] - '0';
+            var tb: [48]u8 = undefined;
+            const stat = pills[slot] orelse PasteStat{ .lines = 0, .bytes = 0 };
+            std.Io.Writer.print(w, "\x1b[36m{s}\x1b[0m", .{pillText(stat, &tb)}) catch {};
+            i += 3;
+        } else {
+            const n = nextChar(row, i);
+            std.Io.Writer.writeAll(w, row[i..n]) catch {};
+            i = n;
+        }
+    }
 }
 
 fn paintRuleLine(w: *std.Io.Writer, row: usize) void {
@@ -984,6 +1026,7 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
             slash_known = lineinput_cmds.isKnownCommand(draft[0..tok_end]);
         }
     }
+    const pills: [PASTE_SLOTS]?PasteStat = if (live_ed) |e| e.pasteStats() else @splat(null);
     var shown = start;
     while (shown < nrows and shown - start < cap) : (shown += 1) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
@@ -998,9 +1041,9 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
             std.Io.Writer.writeAll(w, if (slash_known) "\x1b[36m" else "\x1b[90m") catch {};
             std.Io.Writer.writeAll(w, row[0..slash_tok]) catch {};
             std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
-            std.Io.Writer.writeAll(w, row[slash_tok..]) catch {};
+            writeRowWithPills(w, row[slash_tok..], &pills);
         } else {
-            std.Io.Writer.writeAll(w, row) catch {};
+            writeRowWithPills(w, row, &pills);
         }
         row_idx += 1;
     }
@@ -1076,9 +1119,11 @@ fn parkCursor(w: *std.Io.Writer) void {
     const tw = @max(currentTermWidth(), 8);
     const h = @max(region_h, 4);
     const draft = liveDraft();
+    const pills: [PASTE_SLOTS]?PasteStat = if (live_ed) |e| e.pasteStats() else @splat(null);
     const last_nl = std.mem.lastIndexOfScalar(u8, draft, '\n');
     const last_line = if (last_nl) |p| draft[p + 1 ..] else draft;
-    const wcols = strWidth(last_line) + (if (last_nl == null) strWidth(pendingPrompt()) else 0);
+    // Pill-aware width (a marker parks as its whole pill, not 1 column).
+    const wcols = glyphStrWidth(last_line, &pills) + (if (last_nl == null) strWidth(pendingPrompt()) else 0);
     const col: usize = if (wcols == 0) 1 else if (wcols % tw == 0) tw else wcols % tw + 1;
     std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ h - 1, col }) catch {};
 }
@@ -1984,31 +2029,26 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
             c = r.takeByte() catch return false;
         }
         if (paste_active) {
-            // Paste content (no folding live: pills need the whole body
-            // staged at once; the prompt path folds). CR becomes a newline
-            // so a multi-line paste is ONE message; other control bytes
-            // drop. Markers arrive byte-wise through this same drain.
+            // Paste content, STAGED until 201~ (2026-11-12): the mid-turn
+            // pump folds big pastes exactly like the prompt path — bytes
+            // accumulate in liveStageByte, the terminator runs the shared
+            // absorbPasted fold decision. An in-paste ESC that is not the
+            // terminator is dropped (prompt-path parity: control bytes
+            // other than \n/\t never enter the buffer — it used to splice
+            // raw ESC+seq bytes into the editor, the one behavior that
+            // differed from the prompt path).
             if (c == 0x1b) {
                 const seq = captureEscSeq(r);
                 const sl = std.mem.sliceTo(&seq, 0);
                 if (classifyEscSeq(sl) == .paste_end) {
                     paste_active = false;
+                    ed.liveAbsorb() catch {};
                     if (w) |ww| renderPendingLine(ww);
                     continue;
                 }
-                ed.insertBytes("\x1b") catch {};
-                for (seq) |b| {
-                    if (b == 0) break;
-                    ed.insertBytes(&.{b}) catch {};
-                }
                 continue;
             }
-            if (c == '\r') {
-                ed.insertBytes("\n") catch {};
-            } else if (c >= 0x20 or c == '\n' or c == '\t') {
-                ed.insertBytes(&.{c}) catch {};
-            }
-            if (w) |ww| renderPendingLine(ww);
+            ed.liveStageByte(c) catch {};
             continue;
         }
         if (c == 0x03) {
@@ -2168,6 +2208,16 @@ const Editor = struct {
     /// Folded-paste side slots: full content behind each buffer marker.
     /// data is grow-allocator owned; readLine frees them on every exit.
     pastes: [PASTE_SLOTS]?PasteSlot = @splat(null),
+    /// Mid-turn paste staging (2026-11-12): bytes accumulate here
+    /// (CRLF-normalized, control-filtered — pasteBody's rules) until
+    /// 201~, then liveAbsorb runs the SAME fold decision as the prompt
+    /// path. Empty/&.{} between pastes; grow-owned while staging.
+    live_stage: []u8 = &.{},
+    live_stage_len: usize = 0,
+    /// Line count, seeded at 1 like pasteBody's plines (a body with no
+    /// newline is ONE line).
+    live_stage_lines: usize = 1,
+    live_skip_lf: bool = false,
     /// ── P1 (tui-event-loop): session-shared editor state ──
     /// The editor instance now outlives a single readLine call (the
     /// generation-period key pump drives the SAME buffer), so navigation
@@ -2188,6 +2238,47 @@ const Editor = struct {
             if (ps.*) |d| g.free(d.data);
             ps.* = null;
         }
+    }
+
+    /// Stage one raw byte of a mid-turn paste.
+    fn liveStageByte(self: *Editor, pc: u8) !void {
+        const g = self.grow orelse return;
+        const nb = pasteNormalize(pc, &self.live_skip_lf) orelse return;
+        if (nb < 0x20 and nb != '\t' and nb != '\n') return;
+        if (self.live_stage_len >= self.live_stage.len) {
+            if (self.live_stage.len >= INPUT_CAP) return; // cap: drop tail
+            const cap = @min(@max(self.live_stage.len * 2, 256), INPUT_CAP);
+            const grown = try g.realloc(self.live_stage, cap);
+            self.live_stage = grown;
+        }
+        self.live_stage[self.live_stage_len] = nb;
+        self.live_stage_len += 1;
+        if (nb == '\n') self.live_stage_lines += 1;
+    }
+
+    /// Fold decision for the staged body (shared with pasteBody), then
+    /// reset the staging state. Slot path: the (possibly realloc'd)
+    /// block's ownership moves into the paste slot.
+    fn liveAbsorb(self: *Editor) !void {
+        const g = self.grow orelse return;
+        var block = self.live_stage;
+        var is_slot = false;
+        try self.absorbPasted(block[0..self.live_stage_len], self.live_stage_lines, &block, &is_slot);
+        if (!is_slot) g.free(block);
+        self.live_stage = &.{};
+        self.live_stage_len = 0;
+        self.live_stage_lines = 1;
+    }
+
+    /// Drop a partially-staged paste (turn ended before 201~ arrived,
+    /// editor teardown) — frees the block and resets the counters.
+    fn liveStageDiscard(self: *Editor) void {
+        if (self.grow) |g| {
+            if (self.live_stage.len > 0) g.free(self.live_stage);
+        }
+        self.live_stage = &.{};
+        self.live_stage_len = 0;
+        self.live_stage_lines = 1;
     }
 
     /// Reset to a fresh empty draft: submit/queue handoff. Paste slots
@@ -2639,8 +2730,24 @@ const Editor = struct {
             slen = try stageBytes(g, &staged, slen, &[1]u8{pc}, &plines, &skip_lf);
         }
         const body_len = slen;
-        const big = plines > PASTE_FOLD_LINES or body_len > PASTE_FOLD_BYTES;
-        if (big and body_len > 0) {
+        try self.absorbPasted(staged[0..body_len], plines, &staged, &staged_is_slot);
+    }
+
+    /// Absorb a fully-staged, normalized paste body: fold decision +
+    /// slot placement (or raw insert). Shared by the prompt path
+    /// (pasteBody) and the mid-turn pump (editorLiveKey) — the SAME paste
+    /// folds the SAME way everywhere. `staged`/`staged_is_slot` are the
+    /// caller's staging buffer bookkeeping: on fold-to-slot the ownership
+    /// of the exact-sized body moves into the slot (caller skips its
+    /// free).
+    fn absorbPasted(self: *Editor, body: []u8, plines: usize, staged: *[]u8, staged_is_slot: *bool) !void {
+        const g = self.grow orelse {
+            try self.insertBytes(body);
+            self.browsing = false;
+            return;
+        };
+        const big = plines > PASTE_FOLD_LINES or body.len > PASTE_FOLD_BYTES;
+        if (big and body.len > 0) {
             var slot: ?usize = null;
             for (self.pastes, 0..) |p, i| {
                 if (p == null) {
@@ -2651,13 +2758,13 @@ const Editor = struct {
             if (slot) |s| {
                 // Shrink staging to the exact body; it becomes slot data.
                 var data: []u8 = undefined;
-                if (g.realloc(staged, body_len)) |exact| {
+                if (g.realloc(staged.*, body.len)) |exact| {
                     data = exact;
-                    staged_is_slot = true;
-                    staged = exact;
+                    staged_is_slot.* = true;
+                    staged.* = exact;
                 } else |_| {
-                    data = staged[0..body_len]; // shrink failed: keep block
-                    staged_is_slot = true;
+                    data = body; // shrink failed: keep the block
+                    staged_is_slot.* = true;
                 }
                 self.pastes[s] = .{ .data = data, .lines = plines };
                 var m: [3]u8 = undefined;
@@ -2667,7 +2774,7 @@ const Editor = struct {
             }
             // All slots taken: fall through, paste lands raw.
         }
-        try self.insertBytes(staged[0..body_len]);
+        try self.insertBytes(body);
         self.browsing = false;
     }
 
@@ -2789,20 +2896,12 @@ pub fn readLine(
         return try alloc.dupe(u8, buf[0..n]);
     }
 
-    // Advertise bracketed paste so multi-line pastes arrive wrapped in
-    // 200~…201~ markers, and push the kitty keyboard "disambiguate" mode
-    // so Shift+Enter arrives as CSI 13;2u (Esc as CSI 27u — handled below).
-    // CAUTION: disambiguate ALSO re-encodes every ctrl+letter as
-    // CSI <code>;5u (spec: "ctrl+c will no longer generate SIGINT") —
-    // ctrlLetterByte maps those back to C0 so all ctrl bindings survive.
-    // Enter, Backspace and unmodified arrows keep their legacy encodings.
-    // Popped on every exit path so the terminal is left as found.
-    try w.writeAll("\x1b[?2004h\x1b[>1u");
-    try std.Io.File.Writer.flush(file_writer);
-    defer {
-        w.writeAll("\x1b[<u\x1b[?2004l") catch {};
-        std.Io.File.Writer.flush(file_writer) catch {};
-    }
+    // Keyboard protocols (bracketed paste + kitty disambiguate +
+    // modifyOtherKeys) are SESSION-scoped now — pushed once in repl.run,
+    // alive across turns. readLine used to push/pop per call, which
+    // dropped them for every mid-turn keystroke: Shift+Enter degraded to
+    // Enter (= queue), and pastes lost their 200~ wrapper (= no folding
+    // during a turn). readLine just consumes what the session provides.
 
     // P1: the persistent session editor — the first call lazily creates
     // it; every later readLine AND the generation-period key pump
@@ -2832,6 +2931,14 @@ pub fn readLine(
     ed.prompt = prompt;
     ed.grow = alloc;
     ed.history = history;
+    // Stale mid-turn paste state (the turn ended before 201~ arrived):
+    // absorb what was staged — the pasted bytes are user content and
+    // belong in the editor, not on the floor — then clear the flag so
+    // the next prompt starts clean.
+    if (paste_active) {
+        paste_active = false;
+        ed.liveAbsorb() catch ed.liveStageDiscard();
+    }
 
     var ctrl_c_at: i64 = 0; // last Ctrl-C press — two rapid presses (≤1s) exit gracefully
     // Ctrl+R reverse search state.
@@ -3798,6 +3905,50 @@ test "editorLiveKey: paste feeds the draft as content, CR queues it" {
     try std.testing.expectEqualStrings("hello paste", queued_msgs[0][0..queued_lens[0]]);
     try std.testing.expectEqual(@as(usize, 0), ed.len);
     try std.testing.expect(!paste_active);
+}
+
+test "editorLiveKey: mid-turn big paste folds into a pill (prompt parity)" {
+    // 5 lines > PASTE_FOLD_LINES(3) → the SAME fold decision as the
+    // prompt path: marker in the buffer, body in a slot, expandPasted
+    // restores it on submit.
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const body = "one\ntwo\nthree\nfour\nfive";
+    const burst = "\x1b[200~" ++ body ++ "\x1b[201~";
+    var fr = std.Io.Reader.fixed(burst);
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    try std.testing.expect(!editorLiveKey(&fr, null));
+    try std.testing.expectEqual(@as(usize, 3), ed.len); // marker only
+    try std.testing.expect(markerLen(ed.buf[0..ed.len], 0) == 3);
+    const slot = ed.pastes[0].?;
+    try std.testing.expectEqualStrings(body, slot.data);
+    try std.testing.expectEqual(@as(usize, 5), slot.lines);
+    try std.testing.expect(!paste_active);
+    try std.testing.expectEqual(@as(usize, 0), ed.live_stage_len);
+}
+
+test "editorLiveKey: a partially-staged paste still lands in the draft" {
+    // Turn ended mid-paste (no 201~): readLine's stale-reset absorbs the
+    // staged bytes — user content belongs in the editor, not on the floor.
+    // This test drives the absorb half of that reset directly.
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var fr0 = std.Io.Reader.fixed("");
+    const ed = editorEnsure(alloc, &aw.writer, &fr0, "> ");
+    ed.insertBytes("x") catch {};
+    try ed.liveStageByte('a');
+    try ed.liveStageByte('\r'); // CRLF-normalized to \n while staging
+    try ed.liveStageByte('b');
+    try ed.liveAbsorb();
+    try std.testing.expectEqualStrings("xa\nb", ed.buf[0..ed.len]);
+    try std.testing.expectEqual(@as(usize, 0), ed.live_stage_len);
+    try std.testing.expectEqual(@as(usize, 0), ed.live_stage.len); // detached
 }
 
 test "editorLiveKey: queue submit confirms via status row, not transcript" {

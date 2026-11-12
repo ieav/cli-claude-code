@@ -145,6 +145,32 @@ pub fn rawRestore(saved: *const Mode) void {
     }
 }
 
+/// Session keyboard-protocol push/pop (2026-11-12). Pushed once for the
+/// whole session (bracketed paste ?2004 + kitty disambiguate >1u + xterm
+/// modifyOtherKeys level 1); popped on every normal exit. modifyOtherKeys
+/// L1 is what makes Shift+Enter/Ctrl+Enter arrive as CSI 13;2u/13;5u on
+/// xterm-family terminals (VS Code, Windows Terminal, VTE) — level 1
+/// only re-encodes MODIFIED well-known keys, never plain letters.
+/// POSIX: written to fd 1 directly (callers reach here before any writer
+/// exists). Windows: console API ignores VT input negotiation on the
+/// input side — a no-op there (the editor still parses whatever the
+/// terminal sends).
+pub fn writeProtocol(push: bool) void {
+    if (builtin.os.tag == .windows) return;
+    const seq = if (push)
+        "\x1b[?2004h\x1b[>1u\x1b[>4;1m"
+    else
+        "\x1b[<u\x1b[>4m\x1b[?2004l";
+    _ = std.c.write(1, seq.ptr, seq.len); // libc write: no writer exists at push time
+}
+
+/// Toggle ONLY bracketed paste (CookedGuard): a y/N or answer read must
+/// see a pasted answer verbatim, not wrapped in 200~/201~ markers.
+pub fn writeBracketedPaste(on: bool) void {
+    if (builtin.os.tag == .windows) return;
+    _ = std.c.write(1, if (on) "\x1b[?2004h" else "\x1b[?2004l", 8);
+}
+
 /// One cooked-with-echo confirmation read (menu.CookedGuard primitive).
 pub fn cookedEnter(saved: *Mode) bool {
     if (windows) {
