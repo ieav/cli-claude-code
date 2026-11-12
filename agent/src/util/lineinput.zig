@@ -688,9 +688,7 @@ fn self_browsing() bool {
 fn editorTail() []const u8 {
     const s = liveDraft();
     const tw = currentTermWidth(); // honors the force_width test hook
-    var budget: usize = if (tw > 40) tw - 40 else 16;
-    const pw = strWidth(pendingPrompt());
-    if (tw > pw + 2) budget = tw - pw - 2;
+    const budget: usize = if (tw > 4) tw - 2 else 16;
     var i = s.len;
     var cols: usize = 0;
     while (i > 0) {
@@ -732,9 +730,8 @@ fn blockRows() usize {
     var first = true;
     var it = std.mem.splitScalar(u8, liveDraft(), '\n');
     const tw = currentTermWidth();
-    const pw = strWidth(pendingPrompt());
     while (it.next()) |logical| {
-        const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
+        const avail: usize = tw; // no prompt prefix in the block anymore
         // Wrapped-row count by display width (wide chars never split —
         // count like scanLine but only the row total).
         var col: usize = 0;
@@ -757,10 +754,12 @@ fn blockRows() usize {
     return @max(rows, 1);
 }
 
-/// Split row = last transcript row = H - (1 status + block rows).
+/// Split row = last transcript row = H - (1 rule + 1 status + block rows).
+/// CC-style layout: dim rule line frames the input area from above, the
+/// status line (model/mode/keys) sits BELOW the block, at the bottom.
 fn regionRows() usize {
     const h = @max(region_h, 4);
-    const split = h -| (1 + blockRows());
+    const split = h -| (2 + blockRows());
     return @max(split, 1);
 }
 
@@ -859,9 +858,10 @@ fn regionApply(w: *std.Io.Writer) void {
         // visible".)
         std.Io.Writer.print(w, "\x1b[1;{d}r", .{split}) catch {};
     }
-    // Status/hint row (absolute), dim — 空闲态画输入区边界 hint（与
-    // paintStatusRow 同一规则，两处绘制点必须一致）。
-    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
+    // Input-area frame: dim rule line ABOVE the block…
+    paintRuleLine(w, split + 1);
+    // …status line (prompt info + keys) at the very bottom.
+    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{@max(region_h, 4)}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     } else {
@@ -911,6 +911,14 @@ fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
     return nrows;
 }
 
+fn paintRuleLine(w: *std.Io.Writer, row: usize) void {
+    const tw = @max(currentTermWidth(), 8);
+    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m", .{row}) catch {};
+    var i: usize = 0;
+    while (i < tw) : (i += 1) std.Io.Writer.writeAll(w, "─") catch {};
+    std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+}
+
 /// Paint the editor block into its pinned rows (absolute): every soft-
 /// wrapped display row of the draft, prompt sharing row 0, tail-windowed
 /// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
@@ -918,17 +926,17 @@ fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
 fn writeEditorBlock(w: *std.Io.Writer) void {
     const split = regionRows();
     const tw = currentTermWidth();
-    const pw = strWidth(pendingPrompt());
 
-    // Collect display rows first (tail window decision needs the total).
+    // CC-style: block rows carry NO prompt prefix (the prompt info lives
+    // on the bottom status line) — row 0 gets the full width.
     var rows_buf: [64][]const u8 = undefined;
-    const nrows: usize = collectBlockRowsInto(&rows_buf, tw, pw);
+    const nrows: usize = collectBlockRowsInto(&rows_buf, tw, 0);
 
     const hidden = nrows -| MAX_LIVE_BLOCK_ROWS;
     // View window: always the TAIL — the newest rows matter while typing;
     // the ↟ marker below states how many older rows are hidden above.
     const start = if (nrows > MAX_LIVE_BLOCK_ROWS) hidden else 0;
-    var row_idx = split + 2;
+    var row_idx = split + 2; // +1 transcript split, +1 rule line
     if (hidden > 0) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m↟ +{d} 行\x1b[0m", .{ row_idx, hidden }) catch {};
         row_idx += 1;
@@ -950,9 +958,6 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
     var shown = start;
     while (shown < nrows and shown - start < MAX_LIVE_BLOCK_ROWS) : (shown += 1) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
-        if (shown == 0 and hidden == 0) {
-            std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
-        }
         const row = rows_buf[shown];
         const color_head = shown == 0 and slash_tok > 0 and slash_tok <= row.len;
         if (color_head) {
@@ -968,7 +973,6 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
     if (nrows > 0 and start >= nrows) {
         // Degenerate (shouldn't happen): keep an empty input row.
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
-        std.Io.Writer.writeAll(w, pendingPrompt()) catch {};
     }
 }
 
@@ -1026,10 +1030,13 @@ fn regionPrintLineLocked(w: *std.Io.Writer, line: []const u8) void {
 
 /// Park the cursor at the end of the editor block's last visible row.
 fn parkCursor(w: *std.Io.Writer) void {
+    // Park on the block's LAST display row (the screen bottom is the
+    // status line now), column modulo width (soft-wrapped tails).
+    const tw = @max(currentTermWidth(), 8);
     const last = editorTail();
-    var cols = strWidth(pendingPrompt());
-    cols += strWidth(last);
-    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ region_h, cols + 1 }) catch {};
+    const cols = strWidth(last);
+    const row = region_h -| 1; // one status row below the block
+    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ row, cols % tw + 1 }) catch {};
 }
 
 /// In-place repaint of the pinned rows (keystroke path): status row only
@@ -1139,8 +1146,9 @@ fn paintHintRow(w: *std.Io.Writer) void {
 }
 
 fn paintStatusRow(w: *std.Io.Writer) void {
-    const split = regionRows();
-    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{split + 1}) catch {};
+    // CC layout: the status line is the BOTTOM row (region_h) — the row
+    // right above the block is the rule line. Must match regionApply.
+    std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{@max(region_h, 4)}) catch {};
     if (pending_status_len > 0) {
         std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{pending_status_buf[0..pending_status_len]}) catch {};
     } else {
@@ -1649,8 +1657,50 @@ fn captureEscSeq(r: *std.Io.Reader) [16]u8 {
 /// every user message looks alike in the transcript. Region-safe: prints
 /// ABOVE the live region when it is up.
 pub fn regionEchoCommitted(w: *std.Io.Writer, line: []const u8) void {
-    var buf: [640]u8 = undefined;
-    regionPrintLine(w, committedBuf(&buf, line));
+    // Full multi-line echo: the typed block was erased on submit, this is
+    // its only trace — a 380-byte single-string cap used to silently drop
+    // most of a long paste. Per-line budget: ECHO_CAP_LINES lines /
+    // ECHO_CAP_BYTES bytes with an explicit "… 另有 N 行" marker.
+    var lines: usize = 1;
+    var rest = line;
+    var shown_lines: usize = 0;
+    var shown_bytes: usize = 0;
+    while (rest.len > 0 and shown_lines < ECHO_CAP_LINES and shown_bytes < ECHO_CAP_BYTES) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        var cut = nl;
+        if (shown_bytes + nl > ECHO_CAP_BYTES) {
+            cut = ECHO_CAP_BYTES - shown_bytes;
+            while (cut > 0 and (rest[cut] & 0xC0) == 0x80) cut -= 1;
+        }
+        if (shown_lines == 0) {
+            regionPrintLine(w, echoLine(&echo_head_buf, pendingPrompt(), "\x1b[1;35m", rest[0..cut], "\x1b[0m", false));
+        } else {
+            regionPrintLine(w, echoLine(&echo_body_buf, "", "\x1b[1;35m", rest[0..cut], "\x1b[0m", false));
+        }
+        shown_lines += 1;
+        shown_bytes += cut;
+        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
+        if (cut < nl) break;
+    }
+    lines = std.mem.count(u8, line, "\n") + 1;
+    if (shown_lines < lines or (rest.len > 0 and shown_bytes >= ECHO_CAP_BYTES)) {
+        var mb: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&mb, "\x1b[2m… 另有 {d} 行（/last 或 ↑ 召回全文）\x1b[0m", .{lines -| shown_lines}) catch "";
+        regionPrintLine(w, marker);
+    }
+}
+
+var echo_head_buf: [8448]u8 = undefined;
+var echo_body_buf: [8448]u8 = undefined;
+
+fn echoLine(buf: []u8, head: []const u8, sgr: []const u8, text: []const u8, reset: []const u8, with_nl: bool) []const u8 {
+    var f = std.Io.Writer.fixed(buf);
+    std.Io.Writer.writeAll(&f, head) catch {};
+    std.Io.Writer.writeAll(&f, sgr) catch {};
+    std.Io.Writer.writeAll(&f, text) catch {};
+    std.Io.Writer.writeAll(&f, reset) catch {};
+    if (with_nl) std.Io.Writer.writeAll(&f, "\n") catch {};
+    return f.buffered();
 }
 
 /// Same echo at the cursor (region down — the auto-send path right after
@@ -2094,6 +2144,15 @@ const Editor = struct {
     /// (CUD, never \n — clearing must not scroll), and leave the cursor at
     /// the block's top row. Resets last_rows/park_row to 0.
     fn clearBlock(self: *Editor) !void {
+        // Armed (TUI v2 pinned area): the block lives on ABSOLUTE rows —
+        // a relative walk here would eat the status/hint row and the
+        // transcript (the multi-line ghosting root cause). Reset the
+        // ledger only; the pinned painter refreshes absolutely.
+        if (pending_shown) {
+            self.last_rows = 0;
+            self.park_row = 0;
+            return;
+        }
         try self.csi1("\x1b[{d}A", self.park_row);
         const n = @min(self.last_rows, CLEAR_ROW_CAP);
         if (n > 0) {
@@ -2121,6 +2180,14 @@ const Editor = struct {
     /// overwidth line used to smear one more full copy onto the screen).
     /// Huge buffers window around the cursor with ↟/↡ clipped counts.
     fn render(self: *Editor) !void {
+        // Armed: this editor IS the pinned draft (readLine registers it
+        // as live_ed) — repaint through the ABSOLUTE pinned-area painter.
+        // The relative ledger below is the flow-mode (region down) path.
+        if (pending_shown) {
+            renderPendingLineLocked(self.w);
+            flushReal(self.w);
+            return;
+        }
         const term_w = @max(effWidth(), 8);
         const had_block = self.last_rows > 0;
         try self.clearBlock();
@@ -3658,7 +3725,7 @@ test "editorLiveKey: queue submit confirms via status row, not transcript" {
     // The confirmation flashed into the ABSOLUTE status row (DECSTBM
     // protocol: status is a pinned row, not a transcript line).
     const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2K\x1b[2m↳ 已排队 1 条") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24;1H\x1b[2K\x1b[2m↳ 已排队 1 条") != null);
     try std.testing.expectEqual(@as(usize, 0), ed.len);
 }
 
@@ -3688,9 +3755,11 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     // 23 status, 24 input); the input row carries the REAL prompt prefix.
     regionBegin(w, "⏳ 等待响应 0.0s");
     const begin_out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[1;22r") != null);
-    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[23;1H\x1b[2K\x1b[2m⏳ 等待响应 0.0s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[24;1H\x1b[2Kziv (m) [10%] > ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[1;21r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[24;1H\x1b[2K\x1b[2m⏳ 等待响应 0.0s") != null);
+    // Input row carries NO prompt prefix anymore (CC layout: prompt info
+    // lives on the bottom status line).
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[23;1H\x1b[2K") != null);
     try std.testing.expect(std.mem.indexOf(u8, begin_out, "⌨") == null);
 
     // Keystrokes through the persistent editor: ONLY the input row
@@ -3700,7 +3769,7 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     const ed = editorEnsure(alloc, w, &fr, "ziv (m) [10%] > ");
     try std.testing.expect(!editorLiveKey(&fr, w));
     const typed = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, typed, "\x1b[24;1H\x1b[2Kziv (m) [10%] > hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "\x1b[23;1H\x1b[2Khi") != null);
     try std.testing.expect(std.mem.indexOf(u8, typed, "⏳") == null); // no status repaint
     _ = ed;
 
@@ -3722,16 +3791,16 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     aw.clearRetainingCapacity();
     regionStatus(w, "⏳ 本轮 1.2s");
     const ticked = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[23;1H\x1b[2K\x1b[2m⏳ 本轮 1.2s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[24;1H\x1b[2K\x1b[2m⏳ 本轮 1.2s") != null);
     // Editor block DID repaint (self-heal contract).
-    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[24;1H\x1b[2K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ticked, "\x1b[23;1H\x1b[2K") != null);
 
     // Turn end: scroll region reset, pinned rows erased, region down.
     aw.clearRetainingCapacity();
     regionEnd(w);
     const ended = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, ended, "\x1b[r") != null);
-    try std.testing.expect(std.mem.count(u8, ended, "\x1b[2K") == 2); // two pinned rows
+    try std.testing.expect(std.mem.count(u8, ended, "\x1b[2K") == 3); // rule + input + status
     try std.testing.expect(!regionUp());
 }
 
@@ -3755,12 +3824,12 @@ test "live region: multi-line draft renders as a full editor block (P3b)" {
     const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
     try std.testing.expect(!editorLiveKey(&fr, &aw.writer));
     const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;20r") != null); // DECSTBM re-split
-    // Each logical line paints its own absolute pinned row (22..24;
-    // 21 is the status row).
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2K> a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kb") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24;1H\x1b[2Kc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;19r") != null); // DECSTBM re-split
+    // Each logical line paints its own absolute pinned row (21..23; 20 is
+    // the rule line, 24 the status row) — no prompt prefix on block rows.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[21;1H\x1b[2Ka") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2Kb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kc") != null);
     _ = ed;
 }
 
@@ -4019,7 +4088,10 @@ test "readLine e2e: multi-line via Shift+Enter CSI-u, Enter submits" {
     try std.testing.expectEqualStrings("line1\nline2", line);
     // Committed echo shows the multi-line body (the typed block is erased
     // on submit — the echo is its only trace).
-    try std.testing.expect(std.mem.indexOf(u8, rig.aw.written(), "line1\nline2") != null);
+    // Per-line echo: the two lines are separate regionPrintLine writes
+    // (positioning sequences between them) — assert each survived.
+    try std.testing.expect(std.mem.indexOf(u8, rig.aw.written(), "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rig.aw.written(), "line2") != null);
 }
 
 test "readLine e2e: big paste folds to a pill, submit expands it back" {

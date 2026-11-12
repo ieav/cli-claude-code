@@ -193,22 +193,65 @@ fn removeSignalRestorePosix() void {
     std.posix.sigaction(.TERM, &dfl_act, null);
 }
 
+fn renderFirst(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: usize) !void {
+    // FIRST frame: paint downward from the cursor, NO scroll-up — the
+    // rows above belong to the caller (a parent menu's frame tail, the
+    // banner, the transcript). The old shared render() scrolled up on
+    // the first frame too, eating the parent's tail rows — the layered
+    // ghosting when entering/leaving /config submenus.
+    try w.writeAll("\r\x1b[J");
+    try paintFrame(w, title, items, idx);
+}
+
+var last_frame_rows: usize = 0;
+
+fn frameRows(items: []const []const u8, idx: usize) usize {
+    // title + items (+ selected hint) + control-hint row.
+    var rows = items.len + 2;
+    if (show_hints and hint_items.len > idx and hint_items[idx].len > 0) rows += 1;
+    return rows;
+}
+
 fn render(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: usize) !void {
-    // Move back to the top of the previous frame (title + items + hint),
-    // then redraw every line.
-    const lines_up = items.len + 2;
+    // Repaint: lift to the PREVIOUS frame's top by its own row count
+    // (hint rows come and go with the selection — a fixed items.len+2
+    // miscounts and smears), clear, redraw.
     var buf: [32]u8 = undefined;
-    const up = std.fmt.bufPrint(&buf, "\x1b[{d}A\x1b[J", .{lines_up}) catch "";
+    const up = std.fmt.bufPrint(&buf, "\x1b[{d}A\x1b[J", .{last_frame_rows}) catch "";
     try w.writeAll(up);
+    try paintFrame(w, title, items, idx);
+    last_frame_rows = frameRows(items, idx);
+}
+
+var show_hints: bool = false;
+var hint_items: []const []const u8 = &.{};
+
+fn paintFrame(w: *std.Io.Writer, title: []const u8, items: []const []const u8, idx: usize) !void {
     try w.print("{s}\n", .{title});
     for (items, 0..) |item, i| {
         if (i == idx) {
             try w.print("  \x1b[36m❯ {s}\x1b[0m\n", .{item});
+            if (show_hints and hint_items.len > i and hint_items[i].len > 0) {
+                try w.print("      \x1b[2m{s}\x1b[0m\n", .{hint_items[i]});
+            }
         } else {
             try w.print("    {s}\n", .{item});
         }
     }
     try w.writeAll("  ↑↓/jk 移动 · 1-9 直达 · Enter 确认 · Esc 取消\n");
+}
+
+/// select with per-item dim hints (one line under the selected item).
+pub fn selectWithHints(
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    file_writer: *std.Io.File.Writer,
+    title: []const u8,
+    items: []const []const u8,
+    hints: []const []const u8,
+    start: usize,
+) !?usize {
+    return selectInner(w, r, file_writer, title, items, start, true, hints);
 }
 
 /// Show an interactive menu. Returns the selected index, or null on cancel.
@@ -219,6 +262,19 @@ pub fn select(
     title: []const u8,
     items: []const []const u8,
     start: usize,
+) !?usize {
+    return selectInner(w, r, file_writer, title, items, start, false, &.{});
+}
+
+fn selectInner(
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    file_writer: *std.Io.File.Writer,
+    title: []const u8,
+    items: []const []const u8,
+    start: usize,
+    with_hints: bool,
+    hints: []const []const u8,
 ) !?usize {
     if (items.len == 0) return null; // @min(start, len-1) would underflow
     var guard = RawGuard{};
@@ -233,8 +289,11 @@ pub fn select(
     lineinput.modalEnter(w);
     defer lineinput.modalExit(w);
 
+    show_hints = with_hints and hints.len == items.len;
+    hint_items = hints;
     var idx = @min(start, items.len - 1);
-    try render(w, title, items, idx);
+    try renderFirst(w, title, items, idx);
+    last_frame_rows = frameRows(items, idx);
     try std.Io.File.Writer.flush(file_writer);
 
     while (true) {

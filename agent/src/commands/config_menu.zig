@@ -65,7 +65,24 @@ pub fn runConfigMenu(
             try_std_fmt(&b10, "上下文提炼压缩: {s}", .{if (switcher.settings.auto_deep_compact) "开（LLM 摘要优先，截断兜底）" else "关（压力直落 φ 截断）"}),
             "退出",
         };
-        const picked = (menu.select(w, r, file_writer, "=== Ziv 配置 ===", &items, 0) catch break) orelse break;
+        // 每项一行的 dim 说明（缺陷 A：菜单项此前只有名字没有解释）。
+        // 索引与 items 一一对应；menu.select 带 hints 时选中项下方显示。
+        const hints = [_][]const u8{
+            "各 LLM 后端的 API Key 与网关地址",
+            "默认使用的模型名（/model 可随时切换）",
+            "单次回复的输出上限——思考型模型要给足（思考也算 token）",
+            "每次会话注入多少历史记忆（跨会话记住的偏好）",
+            "agent 工具并行派发的子代理数量（1-10，1=串行）",
+            "工具执行的审批级别：default 询问 / plan 只读 / bypass 全放",
+            "文件改动前自动备份，/rewind 回滚用",
+            "覆盖内置人设（默认含代码纪律，自定义会整体替换）",
+            "default 完整叙述 / concise 结果优先（同 /style、Ctrl+T）",
+            "开=429/超时自动退避重试；关=弹出选择器人工决定",
+            "单回合 LLM 迭代上限，到限预填「继续」",
+            "上下文快满时先 LLM 摘要（保信息）再截断（有损兜底）",
+            "",
+        };
+        const picked = (menu.selectWithHints(w, r, file_writer, "=== Ziv 配置 ===", &items, &hints, 0) catch break) orelse break;
 
         switch (picked) {
             0 => try runApiKeysMenu(w, r, file_writer, switcher, alloc, io),
