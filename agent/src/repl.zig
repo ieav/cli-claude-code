@@ -1217,7 +1217,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     lineinput.regionEnd(w);
                     try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
-                    lineinput.recall_prefill = true;
+                    lineinput.prefill_text = last_sent;
+                    lineinput.prefill_pending = true;
                     try std.Io.File.Writer.flush(&file_writer);
                     break;
                 }
@@ -1351,8 +1352,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     };
                     // ignore / Esc: prefill 「继续」 so one Enter resumes
                     // once the user has fixed the environment.
-                    lineinput.recall_text = "继续";
-                    lineinput.recall_prefill = true;
+                    lineinput.prefill_text = "继续";
+                    lineinput.prefill_pending = true;
                 }
                 break;
             };
@@ -1406,7 +1407,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     lineinput.regionEnd(w);
                     try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
-                    lineinput.recall_prefill = true;
+                    lineinput.prefill_text = last_sent;
+                    lineinput.prefill_pending = true;
                     try std.Io.File.Writer.flush(&file_writer);
                     break;
                 }
@@ -1972,8 +1974,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Same recoverable-giveup shape as the TTFT triple-failure
             // path: history stays legal, one Enter resumes as a fresh
             // turn — the marathon's findings are never lost to a stop.
-            lineinput.recall_text = "继续";
-            lineinput.recall_prefill = true;
+            lineinput.prefill_text = "继续";
+            lineinput.prefill_pending = true;
         }
 
         // Skill 工具门解除（2026-11-10 C 项）：门只管 skill 生效的那一个

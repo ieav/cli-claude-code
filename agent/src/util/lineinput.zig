@@ -655,8 +655,19 @@ pub var recall_text: ?[]const u8 = null;
 /// armed (for the short-window Esc recall) but must NOT prefill the next
 /// prompt — only an Esc INTERRUPT does that.
 pub var recall_prefill = false;
+/// Prefill slot (2026-11-13 split from recall_text): recoverable-giveup
+/// paths ("继续" after an error-menu ignore, the agent-loop limit) preload
+/// the editor WITHOUT clobbering the Esc-recall source — Esc must keep
+/// meaning "take back what I JUST SENT", not whatever the recovery path
+/// wanted to suggest next.
+pub var prefill_text: ?[]const u8 = null;
+pub var prefill_pending = false;
 /// When the last line was submitted (millis). The empty-prompt Esc recall
-/// only fires within a short window after this.
+/// fires within this window after it. 60s (2026-11-13 user call): the old
+/// 5s expired before most turns even ENDED — the prompt-level recall was
+/// effectively dead and Esc at an empty prompt did nothing; "Esc = take
+/// back what I just sent" now survives past the turn boundary.
+pub const RECALL_WINDOW_MS: i64 = 60_000;
 pub var last_submit_ms: i64 = 0;
 
 /// ── Turn-scoped live region state ─────────────────────────────────────
@@ -1345,7 +1356,7 @@ pub fn regionFreeze(w: *std.Io.Writer) void {
 /// 烂多字节字符（⏵/·/CJK），且字节位≠显示列。两个绘制点（regionApply
 /// 与 paintStatusRow）共用本函数——两处内联曾在 S22 开发中漂移过一次。
 fn paintHintRow(w: *std.Io.Writer) void {
-    const hint = "⏵ Enter 发送 · Esc 中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+T 风格 · Ctrl+R 搜索";
+    const hint = "⏵ Enter 发送 · Esc 撤回/中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+T 风格 · Ctrl+R 搜索";
     const tw = currentTermWidth();
     var col: usize = 0;
     var i: usize = 0;
@@ -3100,7 +3111,14 @@ pub fn readLine(
     // any bytes typed ahead during generation. A normally completed turn
     // arms recall_text for the short-window Esc recall but does NOT
     // prefill — every prompt used to open with the previous message.
-    if (recall_prefill) {
+    if (prefill_pending) {
+        prefill_pending = false;
+        if (prefill_text) |t| {
+            ed.insertBytes(t) catch {};
+        } else if (recall_text) |t| {
+            ed.insertBytes(t) catch {};
+        }
+    } else if (recall_prefill) {
         recall_prefill = false;
         if (recall_text) |t| {
             ed.insertBytes(t) catch {};
@@ -3262,18 +3280,38 @@ pub fn readLine(
             // fall into the normal dispatch below.
         }
         if (c == 0x1b) {
-            const seq2 = ed.r.takeByte() catch {
-                // Lone Esc at an empty prompt, shortly after a submit:
-                // recall the just-sent message back into the editor.
-                if (ed.len == 0 and recall_text != null and
-                    util_time.nowMillis() - last_submit_ms < 5000)
+            // A LONE Esc (nothing follows within a few ms) is the Esc key:
+            // at an empty prompt inside the recall window it pulls the last
+            // message back into the editor. The old takeByte-catch form
+            // only fired on EOF — a blocking reader waits instead of
+            // returning EOS, so the prompt-level recall was DEAD CODE (and
+            // the byte after Esc got swallowed). Poll, menu.readKey-style.
+            if (ed.r.bufferedLen() == 0 and termio.pollInput(25) <= 0) {
+                // Empty draft OR a still-unedited prefill ("继续" after a
+                // recoverable error): the recall REPLACES the suggestion —
+                // Esc means "give me back what I sent", not "keep the
+                // recovery path's placeholder".
+                const draft_is_prefill = prefill_text != null and
+                    std.mem.eql(u8, ed.buf[0..ed.len], prefill_text.?);
+                if ((ed.len == 0 or draft_is_prefill) and recall_text != null and
+                    util_time.nowMillis() - last_submit_ms < RECALL_WINDOW_MS)
                 {
+                    if (draft_is_prefill) {
+                        ed.len = 0; // REPLACE the suggestion, not append to it
+                        ed.pos = 0;
+                        ed.nav = null;
+                        ed.browsing = false;
+                    }
                     ed.insertBytes(recall_text.?) catch {};
                     recall_text = null;
                     try ed.render();
                     continue;
                 }
-                try ed.render(); // lone ESC: ignore
+                try ed.render(); // lone ESC outside the recall case: ignore
+                continue;
+            }
+            const seq2 = ed.r.takeByte() catch {
+                try ed.render();
                 continue;
             };
             if (seq2 == '\r' or seq2 == '\n') {
@@ -3374,11 +3412,19 @@ pub fn readLine(
                 },
                 .esc => {
                     // CSI 27u = the Esc key on kitty keyboards. Same
-                    // short-window recall of the just-sent message as a
-                    // lone ESC byte; anything else just re-renders.
-                    if (ed.len == 0 and recall_text != null and
-                        util_time.nowMillis() - last_submit_ms < 5000)
+                    // recall rules as a lone ESC byte (see the poll branch:
+                    // empty draft or unedited prefill).
+                    const draft_is_prefill = prefill_text != null and
+                        std.mem.eql(u8, ed.buf[0..ed.len], prefill_text.?);
+                    if ((ed.len == 0 or draft_is_prefill) and recall_text != null and
+                        util_time.nowMillis() - last_submit_ms < RECALL_WINDOW_MS)
                     {
+                        if (draft_is_prefill) {
+                            ed.len = 0; // REPLACE the suggestion, not append
+                            ed.pos = 0;
+                            ed.nav = null;
+                            ed.browsing = false;
+                        }
                         ed.insertBytes(recall_text.?) catch {};
                         recall_text = null;
                     }
