@@ -380,9 +380,9 @@ pub const bash_tool: ToolDefinition = .{
 
 pub const file_read_tool: ToolDefinition = .{
     .name = "FileRead",
-    .description = "Read the contents of a file",
+    .description = "Read a file with 1-based line numbers. For files larger than a screen, pass offset (starting line) + limit (line count) to read just the slice you need instead of the whole file.",
     .input_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path"},"offset":{"type":"integer","description":"Starting line number (0-based)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"Starting line number, 1-based inclusive (default 1 = whole file from the top)"},"limit":{"type":"integer","description":"Maximum number of lines to return (use with offset for large files)"}},"required":["path"]}
     ,
     .execute_fn = @import("file_read.zig").execute,
     .is_read_only = true,
@@ -394,9 +394,9 @@ pub const file_read_tool: ToolDefinition = .{
 
 pub const file_write_tool: ToolDefinition = .{
     .name = "FileWrite",
-    .description = "Write content to a file, creating it if needed",
+    .description = "Write content to a file (full overwrite). The file is created if missing, and missing parent directories are created automatically — no mkdir needed.",
     .input_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"content":{"type":"string","description":"Full file content to write"}},"required":["path","content"]}
     ,
     .execute_fn = @import("file_write.zig").execute,
     .is_read_only = false,
@@ -454,9 +454,9 @@ pub const grep_tool: ToolDefinition = .{
 
 pub const file_edit_tool: ToolDefinition = .{
     .name = "FileEdit",
-    .description = "Find and replace strings in a file",
+    .description = "Replace an exact string in a file. Read the file first. old_string must match the file BYTE-FOR-BYTE (indentation, blank lines, trailing spaces) and must be UNIQUE in the file — include 2-5 surrounding context lines around the change to make it unique. If it is not unique, add more context or set replaceAll.",
     .input_schema =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path"},"old_string":{"type":"string","description":"String to find"},"new_string":{"type":"string","description":"String to replace with"},"replaceAll":{"type":"boolean","description":"Replace all occurrences"}},"required":["path","old_string","new_string"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"old_string":{"type":"string","description":"Exact text to find — copy it verbatim from the file, including surrounding context lines so it is unique"},"new_string":{"type":"string","description":"Replacement text (the context lines stay, change only what should change)"},"replaceAll":{"type":"boolean","description":"Replace every occurrence instead of requiring uniqueness"}},"required":["path","old_string","new_string"]}
     ,
     .execute_fn = @import("file_edit.zig").execute,
     .is_read_only = false,

@@ -45,6 +45,7 @@ const prompt_tail =
     \\Working with code:
     \\- Locate before you modify: Grep/Glob to find, FileRead to confirm context, then edit.
     \\- Prefer FileEdit (targeted replacement) over FileWrite (full rewrite); keep diffs minimal and reviewable.
+    \\- Batch your edits: when several independent edits are needed, emit ALL the tool calls in ONE response instead of one per turn — they run in order and save a round trip each.
     \\- After changing code, verify with the project's build/test command via Bash and report the actual result.
     \\- One logical change per edit; say what you changed and why in a sentence or two.
     \\- If a tool call fails, read the error and adapt — never repeat the identical call.
