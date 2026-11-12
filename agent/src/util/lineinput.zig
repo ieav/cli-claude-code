@@ -699,6 +699,17 @@ var region_h: usize = 0;
 /// transcript area on short terminals).
 const MAX_LIVE_BLOCK_ROWS: usize = 6;
 
+/// Effective block-row cap for the CURRENT window: never more display
+/// rows (↟ marker included) than the screen can spare after the rule +
+/// status rows and at least ONE transcript row. A short window (h < 10)
+/// used to paint the pinned band past the screen bottom — the
+/// "input area beyond the window" report class; the block now shrinks
+/// to fit instead of overflowing.
+fn liveBlockCap() usize {
+    const spare = @max(region_h, 4) -| 3; // rule + status + ≥1 transcript row
+    return @max(@min(MAX_LIVE_BLOCK_ROWS, spare), 1);
+}
+
 /// The editor block's CURRENT row count (>=1): soft-wrapped display rows
 /// of the persistent draft, prompt sharing row 0, tail-windowed with a
 /// "↟ +N" marker row when clipped — the same reading model as the
@@ -710,8 +721,14 @@ fn blockRows() usize {
     var first = true;
     var it = std.mem.splitScalar(u8, liveDraft(), '\n');
     const tw = currentTermWidth();
+    // Row 0 shares its first display row with the prompt prefix — the
+    // wrap budget here MUST match collectBlockRowsInto's (same-source
+    // rule): space allocation and rendering both subtract the prompt's
+    // width, or a line that fits the SPLIT's budget wraps in the painter
+    // and the extra row lands on the status line.
+    const pw = strWidth(pendingPrompt());
     while (it.next()) |logical| {
-        const avail: usize = tw; // no prompt prefix in the block anymore
+        const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
         // Wrapped-row count by display width (wide chars never split —
         // count like scanLine but only the row total).
         var col: usize = 0;
@@ -730,8 +747,8 @@ fn blockRows() usize {
         first = false;
         rows += r;
     }
-    if (rows > MAX_LIVE_BLOCK_ROWS) return MAX_LIVE_BLOCK_ROWS + 1; // + ↟ marker row
-    return @max(rows, 1);
+    if (rows > MAX_LIVE_BLOCK_ROWS) rows = MAX_LIVE_BLOCK_ROWS + 1; // + ↟ marker row
+    return @max(@min(rows, liveBlockCap()), 1); // short window: shrink to fit
 }
 
 /// Split row = last transcript row = H - (1 rule + 1 status + block rows).
@@ -924,22 +941,30 @@ fn paintRuleLine(w: *std.Io.Writer, row: usize) void {
 }
 
 /// Paint the editor block into its pinned rows (absolute): every soft-
-/// wrapped display row of the draft, prompt sharing row 0, tail-windowed
-/// to MAX_LIVE_BLOCK_ROWS with a dim "↟ +N" marker row when clipped.
-/// Cursor parks at the end of the LAST row's text — the typing position.
+/// wrapped display row of the draft, the prompt prefix sharing row 0,
+/// tail-windowed to the live block cap with a dim "↟ +N" marker row when
+/// clipped. Cursor parks at the end of the LAST row's text — the typing
+/// position.
 fn writeEditorBlock(w: *std.Io.Writer) void {
     const split = regionRows();
     const tw = currentTermWidth();
 
-    // CC-style: block rows carry NO prompt prefix (the prompt info lives
-    // on the bottom status line) — row 0 gets the full width.
+    // The REAL prompt ("ziv[bypass] (model) [N%] > ") prefixes row 0 —
+    // the input area identifies itself like a terminal prompt line. It
+    // used to render nowhere at all (only the committed echo carried it),
+    // which read as "not a real input box". Row 0's wrap budget gives the
+    // prompt its columns first.
+    const prompt = pendingPrompt();
+    const pw = strWidth(prompt);
     var rows_buf: [64][]const u8 = undefined;
-    const nrows: usize = collectBlockRowsInto(&rows_buf, tw, 0);
+    const nrows: usize = collectBlockRowsInto(&rows_buf, tw, pw);
 
-    const hidden = nrows -| MAX_LIVE_BLOCK_ROWS;
+    // Marker row shares the cap: (cap-1) content rows + ↟ = cap total.
+    const cap = liveBlockCap();
+    const hidden = nrows -| (cap -| 1);
     // View window: always the TAIL — the newest rows matter while typing;
     // the ↟ marker below states how many older rows are hidden above.
-    const start = if (nrows > MAX_LIVE_BLOCK_ROWS) hidden else 0;
+    const start = if (hidden > 0) hidden else 0;
     var row_idx = split + 2; // +1 transcript split, +1 rule line
     if (hidden > 0) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m↟ +{d} 行\x1b[0m", .{ row_idx, hidden }) catch {};
@@ -960,9 +985,14 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         }
     }
     var shown = start;
-    while (shown < nrows and shown - start < MAX_LIVE_BLOCK_ROWS) : (shown += 1) {
+    while (shown < nrows and shown - start < cap) : (shown += 1) {
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
         const row = rows_buf[shown];
+        // Row 0 carries the prompt prefix (cyan, like a shell prompt);
+        // continuation rows are bare.
+        if (shown == 0 and pw > 0) {
+            std.Io.Writer.print(w, "\x1b[36m{s}\x1b[0m", .{prompt}) catch {};
+        }
         const color_head = shown == 0 and slash_tok > 0 and slash_tok <= row.len;
         if (color_head) {
             std.Io.Writer.writeAll(w, if (slash_known) "\x1b[36m" else "\x1b[90m") catch {};
@@ -1040,12 +1070,15 @@ fn parkCursor(w: *std.Io.Writer) void {
     // the wrapped tail. The old editorTail budget-cap (tw-2) put the
     // cursor at an arbitrary column for any line wider than the budget;
     // width-exact lines sit in deferred wrap → clamp to the last column.
+    // A single-logical-line draft (no '\n') cannot be clipped by the tail
+    // window, and its display row 0 carries the prompt prefix — offset by
+    // the prompt's width so the caret sits right after the typed text.
     const tw = @max(currentTermWidth(), 8);
     const h = @max(region_h, 4);
     const draft = liveDraft();
     const last_nl = std.mem.lastIndexOfScalar(u8, draft, '\n');
     const last_line = if (last_nl) |p| draft[p + 1 ..] else draft;
-    const wcols = strWidth(last_line);
+    const wcols = strWidth(last_line) + (if (last_nl == null) strWidth(pendingPrompt()) else 0);
     const col: usize = if (wcols == 0) 1 else if (wcols % tw == 0) tw else wcols % tw + 1;
     std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ h - 1, col }) catch {};
 }
@@ -1809,6 +1842,41 @@ fn editorHistoryDown(ed: *Editor) void {
     }
 }
 
+/// Apply one C0 ctrl-letter binding to the editor (shared by the kitty
+/// CSI-u path in liveCsiEdit and the legacy raw-byte path in
+/// editorLiveKey — the SAME key must edit the SAME way everywhere).
+/// Ctrl-R search is prompt-only (its UI owns extra rows); Ctrl-C is the
+/// caller's cancel. Returns false for keys this layer ignores.
+fn applyCtrlEdit(ed: *Editor, b: u8) bool {
+    switch (b) {
+        0x01 => ed.pos = 0,
+        0x05 => ed.pos = ed.len,
+        0x02 => {
+            if (ed.pos > 0) ed.pos = prevGlyph(ed.buf[0..ed.len], ed.pos);
+        },
+        0x06 => {
+            if (ed.pos < ed.len) ed.pos = nextGlyph(ed.buf[0..ed.len], ed.pos);
+        },
+        0x17 => ed.deleteWordBack(),
+        0x15 => ed.deleteToStart(),
+        0x0b => ed.deleteToEnd(),
+        0x04 => ed.deleteAt(),
+        else => return false, // 0x12 (Ctrl-R) and friends: ignored live
+    }
+    return true;
+}
+
+/// True when `b` is a legacy-encoded ctrl byte the mid-turn editor edits
+/// with (the subset of C0 the prompt switch also binds, minus the keys
+/// with turn-specific semantics: Ctrl-C cancel, Ctrl-O/T toggles,
+/// Ctrl-R search, Ctrl-Z suspend).
+fn isLiveCtrlEdit(b: u8) bool {
+    return switch (b) {
+        0x01, 0x02, 0x04, 0x05, 0x06, 0x0b, 0x15, 0x17 => true,
+        else => false,
+    };
+}
+
 /// Apply one classified CSI body (without ESC/[) to the editor.
 /// Returns false when the sequence is NOT an editing key (caller treats
 /// it as a cancel — e.g. kitty CSI 27u = the Esc key).
@@ -1839,21 +1907,7 @@ fn liveCsiEdit(ed: *Editor, body: []const u8) bool {
             // search is prompt-only (its UI owns extra rows), Ctrl-C is
             // handled by the caller as cancel.
             const b = ctrlLetterByte(body) orelse return true;
-            switch (b) {
-                0x01 => ed.pos = 0,
-                0x05 => ed.pos = ed.len,
-                0x02 => {
-                    if (ed.pos > 0) ed.pos = prevGlyph(ed.buf[0..ed.len], ed.pos);
-                },
-                0x06 => {
-                    if (ed.pos < ed.len) ed.pos = nextGlyph(ed.buf[0..ed.len], ed.pos);
-                },
-                0x17 => ed.deleteWordBack(),
-                0x15 => ed.deleteToStart(),
-                0x0b => ed.deleteToEnd(),
-                0x04 => ed.deleteAt(),
-                else => {}, // 0x12 (Ctrl-R) and friends: ignored live
-            }
+            _ = applyCtrlEdit(ed, b);
         },
         .esc => return false,
         .ignore => {},
@@ -1988,6 +2042,13 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
             } else if (c == 0x7f or c == 0x08) {
                 ed.backspace();
                 ed.browsing = false;
+            } else if (isLiveCtrlEdit(c)) {
+                // Legacy-encoded ctrl keys (Ctrl-U/A/E/W/K/B/F/D on
+                // non-kitty terminals) used to fall through here silently
+                // — only the CSI-u re-encoding reached liveCsiEdit, so the
+                // mid-turn editor "lost" the prompt's readline bindings.
+                // Same key, same edit, both encodings.
+                _ = applyCtrlEdit(ed, c);
             } else if (c >= 0x20 or c == '\n') {
                 ed.insertBytes(&.{c}) catch {};
                 ed.browsing = false;
@@ -3787,9 +3848,9 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     const begin_out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[1;21r") != null);
     try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[24;1H\x1b[2K\x1b[2m⏳ 等待响应 0.0s") != null);
-    // Input row carries NO prompt prefix anymore (CC layout: prompt info
-    // lives on the bottom status line).
-    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[23;1H\x1b[2K") != null);
+    // Input row carries the REAL prompt prefix (cyan) — the input area
+    // identifies itself like a terminal prompt line.
+    try std.testing.expect(std.mem.indexOf(u8, begin_out, "\x1b[23;1H\x1b[2K\x1b[36mziv (m) [10%] > \x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, begin_out, "⌨") == null);
 
     // Keystrokes through the persistent editor: ONLY the input row
@@ -3799,7 +3860,7 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     const ed = editorEnsure(alloc, w, &fr, "ziv (m) [10%] > ");
     try std.testing.expect(!editorLiveKey(&fr, w));
     const typed = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, typed, "\x1b[23;1H\x1b[2Khi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "\x1b[23;1H\x1b[2K\x1b[36mziv (m) [10%] > \x1b[0mhi") != null);
     try std.testing.expect(std.mem.indexOf(u8, typed, "⏳") == null); // no status repaint
     _ = ed;
 
@@ -3834,6 +3895,45 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     try std.testing.expect(!regionUp());
 }
 
+test "blockRows and collectBlockRowsInto share the prompt row-0 budget" {
+    // Same-source contract: the SPACE ledger (blockRows → split → pinned
+    // row indices) and the PAINTER (collectBlockRowsInto → rows actually
+    // drawn) must wrap row 0 at the SAME budget (tw - prompt width). A
+    // pre-fix divergence — blockRows using full tw — let a boundary-width
+    // draft fit the split's 1-row budget while the painter drew 2 rows,
+    // the second landing on the status line.
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 20;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> "); // 2 cols → row-0 budget 18
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    // Arm first: liveBlockCap reads region_h, which only regionApply sets
+    // (resetPendingState does not touch it).
+    regionBegin(&aw.writer, "st");
+    var fr = std.Io.Reader.fixed("");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    ed.insertBytes("aaaaaaaaaaaaaaaaaaa") catch {}; // 19 cols > 18 → wraps
+    try std.testing.expectEqual(@as(usize, 2), blockRows());
+
+    var rows_buf: [64][]const u8 = undefined;
+    const painted = collectBlockRowsInto(&rows_buf, 20, 2);
+    try std.testing.expectEqual(@as(usize, 2), painted);
+
+    // Boundary from the other side: 18 cols exactly fills row 0 — one
+    // display row everywhere.
+    ed.clearForNewDraft();
+    ed.insertBytes("aaaaaaaaaaaaaaaaaa") catch {}; // 18 cols
+    try std.testing.expectEqual(@as(usize, 1), blockRows());
+    try std.testing.expectEqual(@as(usize, 1), collectBlockRowsInto(&rows_buf, 20, 2));
+}
+
 test "live region: multi-line draft renders as a full editor block (P3b)" {
     const alloc = std.testing.allocator;
     defer editorDeinit(alloc);
@@ -3856,8 +3956,8 @@ test "live region: multi-line draft renders as a full editor block (P3b)" {
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1;19r") != null); // DECSTBM re-split
     // Each logical line paints its own absolute pinned row (21..23; 20 is
-    // the rule line, 24 the status row) — no prompt prefix on block rows.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[21;1H\x1b[2Ka") != null);
+    // the rule line, 24 the status row) — row 0 carries the prompt prefix.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[21;1H\x1b[2K\x1b[36m> \x1b[0ma") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;1H\x1b[2Kb") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[23;1H\x1b[2Kc") != null);
     _ = ed;
