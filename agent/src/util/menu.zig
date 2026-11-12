@@ -19,18 +19,45 @@ pub const Key = union(enum) {
 };
 
 /// Map a single non-escape byte. vim convention: k = up, j = down.
+/// Ctrl-C (0x03) cancels like Esc/q — menus used to swallow it (the
+/// "can't get out of the menu" complaint; session-raw delivers it as a
+/// plain byte, ISIG is off).
 pub fn parseKey(b: u8) Key {
     return switch (b) {
         'k' => .up,
         'j' => .down,
         '\r', '\n' => .enter,
-        'q', 0x1b => .quit,
+        'q', 0x1b, 0x03 => .quit,
         '1'...'9' => .{ .digit = b - '1' },
         else => .ignore,
     };
 }
 
 var is_tty = false;
+
+/// Classify a CSI body (without ESC [): arrows stay legacy (A/B), and
+/// the kitty/xterm CSI-u encodings the session protocol now keeps alive
+/// WHILE MENUS ARE OPEN must resolve — Esc key = CSI 27u, ctrl+letter =
+/// CSI <code>;5u/;6u (reverse to C0 and reuse parseKey). Without this,
+/// Esc and Ctrl-C went dead in every menu on kitty-family terminals
+/// (regression of the session-scoped protocol push, 2026-11-12).
+fn classifyCsiBody(seq: []const u8) Key {
+    if (std.mem.eql(u8, seq, "A")) return .up;
+    if (std.mem.eql(u8, seq, "B")) return .down;
+    if (seq.len >= 3 and std.mem.startsWith(u8, seq, "27") and seq[seq.len - 1] == 'u') return .quit;
+    if (seq.len >= 4) {
+        const semi = std.mem.indexOfScalar(u8, seq, ';') orelse return .ignore;
+        const code = std.fmt.parseInt(u16, seq[0..semi], 10) catch return .ignore;
+        const mods = seq[semi + 1 ..];
+        if ((std.mem.eql(u8, mods, "5u") or std.mem.eql(u8, mods, "6u")) and
+            code >= 97 and code <= 122)
+        {
+            const c0: u8 = @intCast(code - 96);
+            return parseKey(c0); // ctrl+j → enter, ctrl+c → quit, …
+        }
+    }
+    return .ignore;
+}
 
 /// Read one logical key. ESC handling: in raw TTY mode a lone ESC is
 /// followed by nothing (poll times out) -> quit; ESC [ A/B -> up/down.
@@ -56,12 +83,18 @@ pub fn readKey(r: *std.Io.Reader) !Key {
 
     const next = r.takeByte() catch return .quit;
     if (next != '[') return parseKey(next); // ESC followed by a normal key
-    const final = r.takeByte() catch return .quit;
-    return switch (final) {
-        'A' => .up,
-        'B' => .down,
-        else => .ignore, // left/right/Home/etc unused
-    };
+    // CSI body: params until the final byte (letter). Multi-byte bodies
+    // (27u, 99;5u, 13;2u…) replace the old single-final-byte read, which
+    // stopped at the first digit and silently dropped every CSI-u key.
+    var body: [8]u8 = undefined;
+    var n: usize = 0;
+    while (n < body.len) {
+        const b = r.takeByte() catch break;
+        body[n] = b;
+        n += 1;
+        if (b >= 0x40 and b <= 0x7E and b != ';') break; // final byte
+    }
+    return classifyCsiBody(body[0..n]);
 }
 
 pub const RawGuard = struct {
@@ -518,12 +551,25 @@ test "parseKey mappings" {
     try std.testing.expect(parseKey('\n') == .enter);
     try std.testing.expect(parseKey('q') == .quit);
     try std.testing.expect(parseKey(0x1b) == .quit);
+    try std.testing.expect(parseKey(0x03) == .quit); // Ctrl-C cancels the menu
     try std.testing.expect(parseKey('k') == .up);
     try std.testing.expect(parseKey('j') == .down);
     const k = parseKey('2');
     try std.testing.expect(k == .digit);
     try std.testing.expect(k.digit == 1);
     try std.testing.expect(parseKey('x') == .ignore);
+}
+
+test "readKey resolves kitty CSI-u encodings (menus under session protocol)" {
+    // The session keeps kitty disambiguate up while menus are open, so
+    // Esc/Ctrl-C arrive CSI-u encoded on kitty-family terminals.
+    is_tty = false;
+    var seq = std.Io.Reader.fixed("\x1b[27u\x1b[99;5u\x1b[106;5u\x1b[13;2u\x1b[A");
+    try std.testing.expect((try readKey(&seq)) == .quit); // Esc key
+    try std.testing.expect((try readKey(&seq)) == .quit); // Ctrl-C
+    try std.testing.expect((try readKey(&seq)) == .enter); // Ctrl-J
+    try std.testing.expect((try readKey(&seq)) == .ignore); // Shift+Enter: unused here
+    try std.testing.expect((try readKey(&seq)) == .up); // legacy arrows unaffected
 }
 
 test "readKey parses arrow sequences from buffered input (non-tty path)" {
