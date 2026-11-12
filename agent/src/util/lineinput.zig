@@ -245,6 +245,81 @@ fn snapBack(buf: []const u8, pos: usize) usize {
 
 const LineSpan = struct { start: usize, end: usize };
 
+/// Move one DISPLAY row up (-1) / down (+1), keeping the display column
+/// and clamping to the target row's end — soft-wrap aware, so ↑/↓ work
+/// inside a long wrapped line exactly like between logical lines. Null
+/// on the first/last display row (the caller falls back to history
+/// navigation). This replaces the old logical-line-only moveVertically,
+/// whose '\n' check made ↑ on a wrapped single line jump to HISTORY.
+fn moveVerticallyDisplay(
+    buf: []const u8,
+    pos: usize,
+    dir: i8,
+    tw: usize,
+    pw: usize,
+    pills: []const ?PasteStat,
+) ?usize {
+    // Walk display rows once, remembering each row's [start,end) bytes.
+    var rows: [96]LineSpan = undefined;
+    var nrows: usize = 0;
+    {
+        var first = true;
+        var it = std.mem.splitScalar(u8, buf, '\n');
+        while (it.next()) |logical| {
+            const base: usize = @intFromPtr(logical.ptr) - @intFromPtr(buf.ptr);
+            const avail: usize = if (first) (if (tw > pw) tw - pw else 1) else tw;
+            var col: usize = 0;
+            var i: usize = 0;
+            var rs: usize = 0;
+            while (i <= logical.len) {
+                const cw = if (i < logical.len) glyphWidth(logical, i, pills) else 0;
+                if (i == logical.len or (col > 0 and col + cw > avail)) {
+                    if (nrows < rows.len) {
+                        rows[nrows] = .{ .start = base + rs, .end = base + i };
+                        nrows += 1;
+                    }
+                    rs = i;
+                    col = 0;
+                    if (i == logical.len) break;
+                }
+                col += cw;
+                i = nextGlyph(logical, i);
+            }
+            first = false;
+        }
+    }
+    if (nrows < 2) return null;
+    // Current row + column (caret at a row boundary belongs to the next
+    // row — same rule as collectBlockRowsCareting).
+    var cur: usize = 0;
+    for (rows[0..nrows], 0..) |r, ri| {
+        if (pos < r.end or (pos == r.end and ri == nrows - 1)) {
+            cur = ri;
+            break;
+        }
+    } else cur = nrows - 1;
+    // Column in DISPLAY units from the row start.
+    var col: usize = 0;
+    {
+        var i = rows[cur].start;
+        while (i < pos and i < rows[cur].end) : (i = nextGlyph(buf, i)) {
+            col += glyphWidth(buf, i, pills);
+        }
+    }
+    const target = if (dir < 0) cur -| 1 else @min(cur + 1, nrows - 1);
+    if (target == cur) return null; // already on the edge row
+    // Walk the target row to the same column.
+    var ti = rows[target].start;
+    var tc: usize = 0;
+    while (ti < rows[target].end) {
+        const cw = glyphWidth(buf, ti, pills);
+        if (tc + cw > col) break;
+        tc += cw;
+        ti = nextGlyph(buf, ti);
+    }
+    return snapBack(buf, ti);
+}
+
 /// Bounds of the line (newline-delimited span) containing `pos`.
 fn lineOf(buf: []const u8, pos: usize) LineSpan {
     var s = @min(pos, buf.len);
@@ -449,7 +524,7 @@ fn writeClipped(w: *std.Io.Writer, s: []const u8, budget: usize, pills: []const 
 }
 
 /// What a parsed CSI sequence asks the editor to do.
-const CsiAction = enum { up, down, left, right, home, end, delete, newline, esc, ctrl, paste_start, ignore };
+const CsiAction = enum { up, down, left, right, home, end, delete, newline, esc, ctrl, paste_start, word_left, word_right, ignore };
 
 /// kitty disambiguate mode re-encodes ctrl+letter as CSI <codepoint>;5u
 /// (ctrl+shift as ;6u). Reverse it to the C0 control byte the main key
@@ -501,6 +576,10 @@ fn classifyCsi(seq: []const u8) CsiAction {
     if (std.mem.eql(u8, seq, "B")) return .down;
     if (std.mem.eql(u8, seq, "C")) return .right;
     if (std.mem.eql(u8, seq, "D")) return .left;
+    // Ctrl+←/→ (xterm 1;5D/C) and Option+←/→ (iTerm2 1;3D/C): word hops —
+    // the most-missed everyday editing keys, previously .ignore.
+    if (std.mem.eql(u8, seq, "1;5D") or std.mem.eql(u8, seq, "1;3D")) return .word_left;
+    if (std.mem.eql(u8, seq, "1;5C") or std.mem.eql(u8, seq, "1;3C")) return .word_right;
     if (std.mem.eql(u8, seq, "H") or std.mem.eql(u8, seq, "1~")) return .home;
     if (std.mem.eql(u8, seq, "F") or std.mem.eql(u8, seq, "4~")) return .end;
     if (std.mem.eql(u8, seq, "3~")) return .delete;
@@ -698,9 +777,10 @@ fn self_browsing() bool {
 var region_h: usize = 0;
 
 /// Max editor block rows during a generation (prompt-identical window on
-/// the draft; matches MAX_VIEW_ROWS' spirit, smaller to keep the
-/// transcript area on short terminals).
-const MAX_LIVE_BLOCK_ROWS: usize = 6;
+/// the draft). Raised 6 → 12 (2026-11-13 user call: "only a few rows
+/// then it hides" — six rows buried most multi-line drafts behind the ↟
+/// marker); liveBlockCap still shrinks it on short terminals.
+const MAX_LIVE_BLOCK_ROWS: usize = 12;
 
 /// Effective block-row cap for the CURRENT window: never more display
 /// rows (↟ marker included) than the screen can spare after the rule +
@@ -912,6 +992,63 @@ fn regionApply(w: *std.Io.Writer) void {
     pending_status_shown = true;
 }
 
+/// Display-cell location of the caret: row index + column, computed by
+/// the SAME glyph walk that paints rows (single cursor model — the armed
+/// renderer used to have none, so ↑/← moved ed.pos while the visible
+/// caret stayed glued to the draft's tail).
+///
+/// Row membership: a caret at a soft-wrap boundary belongs to the NEXT
+/// row (col 0); at a logical line's end it stays on that line's last row
+/// (col = row width). The caret at draft.len lands on the final row.
+const CaretScan = struct { nrows: usize, caret_row: usize, caret_col: usize };
+
+fn collectBlockRowsCareting(
+    out: *[64][]const u8,
+    tw: usize,
+    pw: usize,
+    caret: usize,
+    pills: []const ?PasteStat,
+    draft: []const u8,
+) CaretScan {
+    var cs = CaretScan{ .nrows = 0, .caret_row = 0, .caret_col = 0 };
+    var caret_done = caret > draft.len; // out-of-range: park on the last row
+    var first_logical = true;
+    var iter = std.mem.splitScalar(u8, draft, '\n');
+    while (iter.next()) |logical| {
+        const base: usize = @intFromPtr(logical.ptr) - @intFromPtr(draft.ptr);
+        const avail: usize = if (first_logical) (if (tw > pw) tw - pw else 1) else tw;
+        var col: usize = 0;
+        var i: usize = 0;
+        var row_start: usize = 0;
+        while (i <= logical.len) {
+            const cw = if (i < logical.len) glyphWidth(logical, i, pills) else 0;
+            if (i == logical.len or (col > 0 and col + cw > avail)) {
+                const row_end = base + i; // exclusive (soft wrap) / line end
+                if (!caret_done and (caret < row_end or (caret == row_end and i == logical.len))) {
+                    caret_done = true; // first match wins — later rows must not overwrite
+                    cs.caret_row = cs.nrows;
+                    const cut = caret -| base;
+                    cs.caret_col = glyphStrWidth(logical[row_start..@min(cut, i)], pills) + (if (cs.nrows == 0) pw else 0);
+                }
+                if (cs.nrows < out.len) {
+                    out[cs.nrows] = logical[row_start..i];
+                    cs.nrows += 1;
+                }
+                row_start = i;
+                col = 0;
+                if (i == logical.len) break;
+            }
+            col += cw;
+            i = nextGlyph(logical, i);
+        }
+        first_logical = false;
+    }
+    if (cs.nrows == 0) cs.nrows = 1; // empty draft: one blank row
+    // Defensive: a caret past the end (or unmatched) parks on the last row.
+    if (cs.caret_row >= cs.nrows) cs.caret_row = cs.nrows - 1;
+    return cs;
+}
+
 /// Soft-wrapped display rows of the live draft — the painter's own walk.
 /// Paste markers step as ONE glyph (nextGlyph) of their pill's width, so
 /// a marker can never be split across rows or leak its inner bytes into
@@ -919,34 +1056,7 @@ fn regionApply(w: *std.Io.Writer) void {
 fn collectBlockRowsInto(out: *[64][]const u8, tw: usize, pw: usize) usize {
     const ed = live_ed;
     const pills: [PASTE_SLOTS]?PasteStat = if (ed) |e| e.pasteStats() else @splat(null);
-    var nrows: usize = 0;
-    var first_logical = true;
-    var iter = std.mem.splitScalar(u8, liveDraft(), '\n');
-    while (iter.next()) |logical| {
-        const avail: usize = if (first_logical) (if (tw > pw) tw - pw else 1) else tw;
-        var col: usize = 0;
-        var i: usize = 0;
-        var row_start: usize = 0;
-        while (i <= logical.len) {
-            if (i == logical.len or (col > 0 and blk: {
-                const cw = glyphWidth(logical, i, &pills);
-                break :blk col + cw > avail;
-            })) {
-                if (nrows < out.len) {
-                    out[nrows] = logical[row_start..i];
-                    nrows += 1;
-                }
-                row_start = i;
-                col = 0;
-                if (i == logical.len) break;
-            }
-            col += glyphWidth(logical, i, &pills);
-            i = nextGlyph(logical, i);
-        }
-        first_logical = false;
-    }
-    if (nrows == 0) nrows = 1; // empty draft: one blank input row
-    return nrows;
+    return collectBlockRowsCareting(out, tw, pw, std.math.maxInt(usize), &pills, liveDraft()).nrows;
 }
 
 /// Emit one display row: raw bytes when it holds no marker, otherwise a
@@ -1051,6 +1161,10 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         // Degenerate (shouldn't happen): keep an empty input row.
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
     }
+    // Park the caret at ed.pos's cell — every repaint ends with the
+    // caret visible where editing will continue, not wherever the last
+    // writeAll left it (the "arrow keys feel dead" root cause).
+    parkCursor(w);
 }
 
 /// True while the region is armed — REPL output funnels through
@@ -1105,27 +1219,33 @@ fn regionPrintLineLocked(w: *std.Io.Writer, line: []const u8) void {
     parkCursor(w);
 }
 
-/// Park the cursor at the end of the editor block's last visible row.
+/// Park the visible caret at ed.pos's display cell. The armed renderer
+/// used to hardcode the draft's TAIL (last logical line, end column) —
+/// ↑/←/Home moved the buffer position while the caret never followed,
+/// which read as "arrow keys don't work". Same glyph model as the row
+/// painter, prompt-prefix and tail-window offsets included.
 fn parkCursor(w: *std.Io.Writer) void {
-    // Park on the block's LAST display row (the screen bottom is the
-    // status line now). Column from the LAST LOGICAL LINE's full display
-    // width modulo tw — soft wrap puts the typing position at the end of
-    // the wrapped tail. The old editorTail budget-cap (tw-2) put the
-    // cursor at an arbitrary column for any line wider than the budget;
-    // width-exact lines sit in deferred wrap → clamp to the last column.
-    // A single-logical-line draft (no '\n') cannot be clipped by the tail
-    // window, and its display row 0 carries the prompt prefix — offset by
-    // the prompt's width so the caret sits right after the typed text.
     const tw = @max(currentTermWidth(), 8);
     const h = @max(region_h, 4);
+    const ed = live_ed;
     const draft = liveDraft();
-    const pills: [PASTE_SLOTS]?PasteStat = if (live_ed) |e| e.pasteStats() else @splat(null);
-    const last_nl = std.mem.lastIndexOfScalar(u8, draft, '\n');
-    const last_line = if (last_nl) |p| draft[p + 1 ..] else draft;
-    // Pill-aware width (a marker parks as its whole pill, not 1 column).
-    const wcols = glyphStrWidth(last_line, &pills) + (if (last_nl == null) strWidth(pendingPrompt()) else 0);
-    const col: usize = if (wcols == 0) 1 else if (wcols % tw == 0) tw else wcols % tw + 1;
-    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ h - 1, col }) catch {};
+    const pills: [PASTE_SLOTS]?PasteStat = if (ed) |e| e.pasteStats() else @splat(null);
+    const prompt = pendingPrompt();
+    const pw = strWidth(prompt);
+    const pos: usize = if (ed) |e| @min(e.pos, e.len) else 0;
+
+    var rows_buf: [64][]const u8 = undefined;
+    const cs = collectBlockRowsCareting(&rows_buf, tw, pw, pos, &pills, draft);
+    const cap = liveBlockCap();
+    const hidden = cs.nrows -| (cap -| 1);
+    const start = if (hidden > 0) hidden else 0;
+    // Screen row: split+2 (rule) + marker row + (caret_row - window start);
+    // a caret scrolled out of the tail window clamps onto its edge row.
+    var row = regionRows() + 2 + @intFromBool(hidden > 0) + (cs.caret_row -| start);
+    row = @min(row, h - 1);
+    var col = if (cs.caret_col == 0) 1 else cs.caret_col + 1;
+    col = @min(col, tw);
+    std.Io.Writer.print(w, "\x1b[{d};{d}H", .{ row, col }) catch {};
 }
 
 /// In-place repaint of the pinned rows (keystroke path): status row only
@@ -1925,6 +2045,17 @@ fn isLiveCtrlEdit(b: u8) bool {
 /// Apply one classified CSI body (without ESC/[) to the editor.
 /// Returns false when the sequence is NOT an editing key (caller treats
 /// it as a cancel — e.g. kitty CSI 27u = the Esc key).
+/// ↑/↓ inside a multi-display-row draft: move the caret one DISPLAY row
+/// (soft-wrap aware). True when handled; single-row drafts return false
+/// and the caller walks history instead.
+fn displayRowMove(ed: *Editor, dir: i8) bool {
+    const tw = @max(currentTermWidth(), 8);
+    const pills = ed.pasteStats();
+    const np = moveVerticallyDisplay(ed.buf[0..ed.len], ed.pos, dir, tw, strWidth(pendingPrompt()), &pills) orelse return false;
+    ed.pos = np;
+    return true;
+}
+
 fn liveCsiEdit(ed: *Editor, body: []const u8) bool {
     switch (classifyCsi(body)) {
         .right => {
@@ -1934,18 +2065,16 @@ fn liveCsiEdit(ed: *Editor, body: []const u8) bool {
             if (ed.pos > 0) ed.pos = prevChar(ed.buf[0..ed.len], ed.pos);
         },
         .up => {
-            if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
-                if (moveVertically(ed.buf[0..ed.len], ed.pos, -1)) |np| ed.pos = np;
-            } else editorHistoryUp(ed);
+            if (!displayRowMove(ed, -1)) editorHistoryUp(ed);
         },
         .down => {
-            if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
-                if (moveVertically(ed.buf[0..ed.len], ed.pos, 1)) |np| ed.pos = np;
-            } else editorHistoryDown(ed);
+            if (!displayRowMove(ed, 1)) editorHistoryDown(ed);
         },
         .home => ed.pos = 0,
         .end => ed.pos = ed.len,
         .delete => ed.deleteAt(),
+        .word_left => ed.wordLeft(),
+        .word_right => ed.wordRight(),
         .newline => ed.insertBytes("\n") catch {},
         .ctrl => {
             // Reuse the prompt's ctrl bindings where they edit; Ctrl-R
@@ -2089,7 +2218,7 @@ pub fn editorLiveKey(r: *std.Io.Reader, w: ?*std.Io.Writer) bool {
                 // mid-turn editor "lost" the prompt's readline bindings.
                 // Same key, same edit, both encodings.
                 _ = applyCtrlEdit(ed, c);
-            } else if (c >= 0x20 or c == '\n') {
+            } else if (c >= 0x20 or c == '\n' or c == '\t') {
                 ed.insertBytes(&.{c}) catch {};
                 ed.browsing = false;
             }
@@ -2642,6 +2771,25 @@ const Editor = struct {
         self.pos = p;
     }
 
+    /// Option+← / Ctrl+← / ESC b: caret back one word.
+    fn wordLeft(self: *Editor) void {
+        var p = self.pos;
+        while (p > 0 and self.buf[p - 1] == ' ') p = prevChar(self.buf[0..self.len], p);
+        while (p > 0 and self.buf[p - 1] != ' ') p = prevChar(self.buf[0..self.len], p);
+        self.pos = p;
+    }
+
+    /// Option+→ / Ctrl+→ / ESC f: caret forward to the NEXT word's start
+    /// (skip trailing spaces after the current word; the caret never
+    /// parks between words).
+    fn wordRight(self: *Editor) void {
+        var p = self.pos;
+        while (p < self.len and self.buf[p] == ' ') p = nextChar(self.buf[0..self.len], p);
+        while (p < self.len and self.buf[p] != ' ') p = nextChar(self.buf[0..self.len], p);
+        while (p < self.len and self.buf[p] == ' ') p = nextChar(self.buf[0..self.len], p);
+        self.pos = p;
+    }
+
     /// Ctrl-U: delete from cursor to line start.
     fn deleteToStart(self: *Editor) void {
         if (self.pos == 0) return;
@@ -3135,6 +3283,18 @@ pub fn readLine(
                 try ed.render();
                 continue;
             }
+            if (seq2 == 'b' or seq2 == 'B') {
+                // Option+b (emacs/readline word-back): caret one word left.
+                ed.wordLeft();
+                try ed.render();
+                continue;
+            }
+            if (seq2 == 'f' or seq2 == 'F') {
+                // Option+f: caret one word right.
+                ed.wordRight();
+                try ed.render();
+                continue;
+            }
             if (seq2 != '[') continue; // other alt-keys: ignore
             // Collect the CSI body: params until a final byte (letter/~).
             var seq: [16]u8 = undefined;
@@ -3160,15 +3320,16 @@ pub fn readLine(
                 .left => {
                     if (ed.pos > 0) ed.pos = prevChar(ed.buf[0..ed.len], ed.pos);
                 },
+                .word_left => ed.wordLeft(),
+                .word_right => ed.wordRight(),
                 .up => {
-                    // Multi-line buffer: move between lines first; from the
-                    // first line, Up walks history as before.
-                    if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
-                        if (moveVertically(ed.buf[0..ed.len], ed.pos, -1)) |np| {
-                            ed.pos = np;
-                            try ed.render();
-                            continue;
-                        }
+                    // Multi-display-row draft (soft wrap included): move
+                    // between rows first; from the top row, Up walks
+                    // history as before. The old '\n'-only check made ↑ on
+                    // a wrapped single line jump to HISTORY.
+                    if (displayRowMove(ed, -1)) {
+                        try ed.render();
+                        continue;
                     }
                     if (history.items.len == 0) continue;
                     if (ed.nav == null) {
@@ -3189,12 +3350,9 @@ pub fn readLine(
                     }
                 },
                 .down => {
-                    if (std.mem.indexOfScalar(u8, ed.buf[0..ed.len], '\n') != null) {
-                        if (moveVertically(ed.buf[0..ed.len], ed.pos, 1)) |np| {
-                            ed.pos = np;
-                            try ed.render();
-                            continue;
-                        }
+                    if (displayRowMove(ed, 1)) {
+                        try ed.render();
+                        continue;
                     }
                     if (ed.nav == null) continue;
                     if (ed.nav.? + 1 < history.items.len) {
@@ -3353,6 +3511,7 @@ pub fn readLine(
             },
             0x01 => ed.pos = 0, // Ctrl-A: line start
             0x05 => ed.pos = ed.len, // Ctrl-E: line end
+            '\t' => try ed.insert('\t'), // Tab: literal (pasted code/markdown tables need it)
             0x02 => { // Ctrl-B: back one display unit (pill = one unit)
                 if (ed.pos > 0) ed.pos = prevGlyph(ed.buf[0..ed.len], ed.pos);
             },
@@ -4044,6 +4203,79 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     try std.testing.expect(std.mem.indexOf(u8, ended, "\x1b[r") != null);
     try std.testing.expect(std.mem.count(u8, ended, "\x1b[2K") == 3); // rule + input + status
     try std.testing.expect(!regionUp());
+}
+
+test "caret parks at its own display row, not the draft's tail (armed)" {
+    // The armed renderer had NO cursor model: parkCursor hardcoded the
+    // LAST logical line, so ↑/← moved ed.pos but the visible caret never
+    // followed — "arrow keys don't work in the input box". The invariant:
+    // after any repaint the caret sits at ed.pos's display cell.
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 60;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+    var fr = std.Io.Reader.fixed("");
+    const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
+    ed.insertBytes("line1\nab") catch {};
+    ed.pos = 5; // caret at end of "line1" (display row 0)
+    aw.clearRetainingCapacity();
+    writeEditorBlock(&aw.writer);
+    const out = aw.written();
+    // blockRows=2 → split = 24-4 = 20 → rule 21, rows 22/23. Caret on
+    // display row 0 → screen row 22 (NOT the old hardcoded h-1 = 23).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;") != null);
+    // And the final park targets row 22 at the end of "line1".
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[22;8H")); // col = pw(2) + "line1"(5) + 1
+}
+
+test "display-line navigation: wrapped single line up/down stays in buffer" {
+    // A single logical line soft-wrapped to several display rows: ↑/↓
+    // used to check `indexOf('\n')` — found none, loaded HISTORY instead
+    // of moving within the wrapped text. Display-row semantics must move
+    // the caret regardless of how the rows came to be.
+    var buf: [256]u8 = undefined;
+    // 60-col width: "aaaa...70 chars" wraps to 2 display rows.
+    var ed = Editor{ .w = undefined, .file_writer = undefined, .r = undefined, .prompt = ">", .buf = &buf };
+    const as: [70]u8 = @splat('a');
+    ed.insertBytes(&as) catch {};
+
+    ed.pos = 65; // on the second display row
+    const up = moveVerticallyDisplay(ed.buf[0..ed.len], ed.pos, -1, 60, 0, &@as([PASTE_SLOTS]?PasteStat, @splat(null)));
+    try std.testing.expect(up != null); // moved up a display row (old code: history jump)
+    try std.testing.expectEqual(@as(usize, 5), up.?); // same column on row 0
+    const down = moveVerticallyDisplay(ed.buf[0..ed.len], up.?, 1, 60, 0, &@as([PASTE_SLOTS]?PasteStat, @splat(null)));
+    try std.testing.expectEqual(@as(usize, 65), down.?); // round trip
+    // Edges: top row up / bottom row down → null (history fallback).
+    try std.testing.expect(moveVerticallyDisplay(ed.buf[0..ed.len], 0, -1, 60, 0, &@as([PASTE_SLOTS]?PasteStat, @splat(null))) == null);
+    try std.testing.expect(moveVerticallyDisplay(ed.buf[0..ed.len], 70, 1, 60, 0, &@as([PASTE_SLOTS]?PasteStat, @splat(null))) == null);
+}
+
+test "wordLeft/wordRight hop words; tab inserts" {
+    var buf: [64]u8 = undefined;
+    var ed = Editor{ .w = undefined, .file_writer = undefined, .r = undefined, .prompt = ">", .buf = &buf };
+    ed.insertBytes("foo bar  baz") catch {};
+    ed.pos = ed.len;
+    ed.wordLeft();
+    try std.testing.expectEqual(@as(usize, 9), ed.pos); // before "baz"
+    ed.wordLeft();
+    try std.testing.expectEqual(@as(usize, 4), ed.pos); // before "bar"
+    ed.wordRight();
+    try std.testing.expectEqual(@as(usize, 9), ed.pos); // after "bar " → before baz
+    ed.wordRight();
+    try std.testing.expectEqual(@as(usize, ed.len), ed.pos);
+    // Tab inserts a literal tab (it used to fall through the < 0x20 filter).
+    ed.clearForNewDraft();
+    ed.insert('\t') catch {};
+    try std.testing.expectEqualStrings("\t", ed.buf[0..ed.len]);
 }
 
 test "blockRows and collectBlockRowsInto share the prompt row-0 budget" {
