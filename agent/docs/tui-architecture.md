@@ -51,9 +51,12 @@
 
 **唯一新增协议：MODAL 生命周期**
 - `modalEnter()`：region 解除（regionEnd）——菜单回到流内绘制（现行为）
-- `modalExit()`：清流位置以下（`\x1b[J`）→ 重 arm region → 输入块规范
-  重画。**不变量：任何 MODAL 退出后，屏幕 == IDLE 规范态**（无残留、
-  编辑器状态归位）
+- `modalExit()`：清流位置以下（`\x1b[J`）。**不重 arm region**（2026-11-13
+  修正：重 arm 会把光标 park 进编辑行，菜单调用方随后的业务写——/config
+  的读取提示、readLine 逐字节回显、结果行——全部打进输入区内部。region
+  维持解除，这些文本自然落在流位置=输入区上方）。**不变量：MODAL 退出后
+  region 必解除、流位置以下无残留；规范 IDLE 态由下一次 readLine 进入时
+  的 regionApply 重建**（dispatch 返回到 readLine 间只有亚毫秒窗口）
 
 **不变量清单**：
 1. IDLE 与 TURN 输入块是同一协议、同一绘制函数（只是 meta 行内容不同）

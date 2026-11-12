@@ -1120,11 +1120,39 @@ fn writeRowWithPills(w: *std.Io.Writer, row: []const u8, pills: []const ?PasteSt
     }
 }
 
+/// 输入区上边界横线的目录标签（2026-11-13 用户定纲：输入区显示当前
+/// 所在目录，只取上一级/当前两级，如 "proj/agent"）。REPL 在构建提示符
+/// 时设置；为空 = 纯横线（单测/非 TTY 形态）。cwd 会话内不变（工具的
+/// cd 跑在子进程里），提示符级刷新足够。
+pub var rule_dir_buf: [160]u8 = undefined;
+pub var rule_dir_len: usize = 0;
+
+pub fn regionDirSet(s: []const u8) void {
+    const n = @min(s.len, rule_dir_buf.len);
+    @memcpy(rule_dir_buf[0..n], s[0..n]);
+    rule_dir_len = n;
+}
+
 fn paintRuleLine(w: *std.Io.Writer, row: usize) void {
     const tw = @max(currentTermWidth(), 8);
     std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K\x1b[2m", .{row}) catch {};
-    var i: usize = 0;
-    while (i < tw) : (i += 1) std.Io.Writer.writeAll(w, "─") catch {};
+    const dir = rule_dir_buf[0..rule_dir_len];
+    if (dir.len == 0) {
+        var i: usize = 0;
+        while (i < tw) : (i += 1) std.Io.Writer.writeAll(w, "─") catch {};
+    } else {
+        // "─ dir " 前缀 + 横线补满：整行恒为 tw 显示列（标签按显示宽
+        // 截断，窄终端至少留 1 列横线收尾）。
+        var head: [192]u8 = undefined;
+        var f = std.Io.Writer.fixed(&head);
+        std.Io.Writer.writeAll(&f, "─ ") catch {};
+        writeClipped(&f, dir, @max(tw -| 4, 2), &.{}) catch {};
+        std.Io.Writer.writeAll(&f, " ") catch {};
+        const shown = f.buffered();
+        std.Io.Writer.writeAll(w, shown) catch {};
+        var fill = tw -| strWidth(shown);
+        while (fill > 0) : (fill -= 1) std.Io.Writer.writeAll(w, "─") catch {};
+    }
     std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
 }
 
@@ -1427,9 +1455,14 @@ pub fn regionStatus(w: *std.Io.Writer, status: []const u8) void {
 }
 
 /// MODAL 生命周期（TUI v2，docs/tui-architecture.md）：菜单/面板打开前
-/// 解除 region（菜单回到流内自绘——现行为）；退出时清流位置以下残留并
-/// 规范重 arm 输入区。不变量：任何 MODAL 退出后屏幕 == IDLE 规范态。
+/// 解除 region（菜单回到流内自绘——现行为）；退出时清流位置以下残留。
 /// 收口在这里，menu.select 的全部调用点自动覆盖。
+/// 不重 arm（2026-11-13 用户定纲：信息一律在输入区上方）：退出即
+/// regionApply 会把光标 park 进编辑行，调用方随后的业务写（/config 的
+/// 读取提示「回车=保留 · -=清除」、menu.readLine 的逐字节回显、结果
+/// 行）全部落进输入区内部。region 保持解除，这些文本自然走流位置
+/// （输入区上方）；规范 IDLE 态由下一次 readLine 进入时的 regionApply
+/// 重建——dispatch 返回到 readLine 之间只有亚毫秒的窗口。
 pub fn modalEnter(w: *std.Io.Writer) void {
     regionEnd(w);
 }
@@ -1437,9 +1470,8 @@ pub fn modalEnter(w: *std.Io.Writer) void {
 pub fn modalExit(w: *std.Io.Writer) void {
     ttyLock();
     defer ttyUnlock();
-    // 清掉菜单半绘残留（流位置以下），再按首次 arm 舞步规范重建输入区。
+    // 清掉菜单半绘残留（流位置以下）。region 维持解除（见上）。
     std.Io.Writer.writeAll(w, "\x1b[J") catch {};
-    regionApply(w);
     flushReal(w);
 }
 
@@ -4053,6 +4085,7 @@ fn resetPendingState() void {
     paste_active = false;
     pending_shown = false;
     pending_status_shown = false;
+    rule_dir_len = 0;
     queued_count = 0;
     queued_read = 0;
     @memset(&queued_lens, 0);
@@ -4292,6 +4325,39 @@ test "live region: DECSTBM split, pinned rows, transcript scrolls in region" {
     try std.testing.expect(std.mem.indexOf(u8, ended, "\x1b[r") != null);
     try std.testing.expect(std.mem.count(u8, ended, "\x1b[2K") == 3); // rule + input + status
     try std.testing.expect(!regionUp());
+}
+
+test "rule line carries the short cwd label, still exactly term-width" {
+    // 2026-11-13 用户定纲：输入区横线显示上一级/当前两级目录。空标签
+    // 保持纯横线（旧形态）；有标签时 "─ dir " 前缀 + 横线补满，整行
+    // 恒为终端宽——宽表/窄终端都不越界。
+    const alloc = std.testing.allocator;
+    defer editorDeinit(alloc);
+    resetPendingState();
+    defer resetPendingState();
+    force_width = 40;
+    defer force_width = 0;
+    force_height = 24;
+    defer force_height = 0;
+    regionPromptSet("> ");
+
+    // 空标签：纯横线 40 列。
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    regionBegin(&aw.writer, "st");
+    try std.testing.expect(std.mem.count(u8, aw.written(), "─") == 40);
+
+    // 有标签："─ ziv-repo/agent " 占 17 列（含标签首的 1 根横线），补 23
+    // 根 = 40；整行横线字形共 24。
+    regionEnd(&aw.writer);
+    regionDirSet("ziv-repo/agent");
+    defer regionDirSet("");
+    aw.clearRetainingCapacity();
+    regionBegin(&aw.writer, "st");
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2m─ ziv-repo/agent ") != null);
+    try std.testing.expect(std.mem.count(u8, out, "─") == 24);
+    regionEnd(&aw.writer);
 }
 
 test "caret parks at its own display row, not the draft's tail (armed)" {

@@ -326,8 +326,10 @@ fn selectInner(
     is_tty = guard.active;
 
     // MODAL 生命周期（TUI v2）：进入=解除 region（流内自绘）；退出=清残
-    // 留+规范重画输入区。Esc/Enter/错误三条出口都走 modalExit——菜单
-    // 残留类问题的收口点。
+    // 留（不重 arm——2026-11-13：重 arm 会把光标 park 进编辑行，调用方
+    // 随后的业务写全部打进输入区；规范 IDLE 态由下一次 readLine 重建，
+    // 权威契约见 lineinput.zig modalExit 的文档）。Esc/Enter/错误三条出
+    // 口都走 modalExit——菜单残留类问题的收口点。
     const lineinput = @import("lineinput.zig");
     lineinput.modalEnter(w);
     defer lineinput.modalExit(w);

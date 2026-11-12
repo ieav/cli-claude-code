@@ -298,25 +298,33 @@ def s6_command_smoke():
         z.send("/config\n")
         z.read_until("Ziv 配置", 10)
         # value-entry prompt: lone Esc cancels back to the menu (2026-11-07
-        # fix — Esc used to be swallowed as a literal byte with no way out)
+        # fix — Esc used to be swallowed as a literal byte with no way out).
+        # NOTE: wait for the POST-Esc marker "已取消" — never for a menu
+        # title, which is already in the buffer from the digit-key re-render
+        # and would match instantly BEFORE the cancel line lands (the
+        # lone-Esc litmus polls 25ms first; latent race exposed 2026-11-13
+        # when modalExit stopped re-arming and output volume shrank).
         z.send("3\r")  # digit moves, Enter selects → 最大 tokens prompt
         z.read_until("1-128000", 10)  # unique to the VALUE prompt
+        z.clear_buf()
         z.send("\x1b")
-        out = z.read_until("Ziv 配置", 10)
-        if "已取消" not in out:
-            raise Fail("config value prompt: lone Esc did not cancel")
+        z.read_until("已取消", 10)
+        z.read_until_seen("Ziv 配置", 10)  # menu frame back
         # open-to-VIEW then Esc at the FIRST field of a two-field edit
         # session: whole session must abort (no second prompt jumps in —
-        # the doc §3 rule "Esc 在任何层都退出且零写入")
+        # the doc §3 rule "Esc 在任何层都退出且零写入"). Same marker rule:
+        # wait for "已取消", then verify no Base URL prompt followed.
         z.clear_buf()
         z.send("1\r")  # API Keys
         z.read_until("模型接入配置", 10)
         z.clear_buf()
         z.send("1\r")  # OpenAI 接入 → first field = API Key
         z.read_until("回车=保留", 10)
+        z.clear_buf()
         z.send("\x1b")
-        out = z.read_until("模型接入配置", 10)
-        if "已取消" not in out or "Base URL" in out:
+        z.read_until("已取消", 10)
+        z.drain(0.6)  # a would-be second prompt prints within this window
+        if "Base URL" in z.buf.decode("utf-8", "replace"):
             raise Fail("two-field edit: Esc at first field must abort whole session")
         z.clear_buf()
         z.send("\x1b")  # viewing done — back out of the submenu too
@@ -434,10 +442,11 @@ def s8_crash_resume():
 
 
 def s9_error_selector():
-    """LLM error → auto backoff retries fire → interactive selector offers
-    real moves (roadmap P4). Dead-gateway injection: a key plus a base_url
-    on a closed port — ConnectionRefused is transient, so the ladder runs
-    first (1/2, 2/2), then the selector; Esc = ignore with 「继续」prefill."""
+    """LLM error surface（2026-11-13 对齐 CC，随 238b204 改版）：死网关注入
+    （key + 指向关闭端口的 base_url）——ConnectionRefused 属瞬态，自动退避
+    梯子先跑（1/2、2/2），耗尽后回合以一行红色标签 [API Error: …] 结束，
+    无恢复菜单；提示符（含 hint 行）回归，输入路径干净。旧断言的「如何
+    处理这个错误」四选项选择器已随 238b204 删除——本场景锁定新契约。"""
     d = tempfile.mkdtemp(prefix="ziv-p4-")
     try:
         z = ZivSession(reuse_dir=d, settings='{"permission_mode":"bypass","api_keys":{"openai":"test-key","openai_base_url":"http://127.0.0.1:1/v1"}}\n')
@@ -446,20 +455,24 @@ def s9_error_selector():
             z.send("probe the dead gateway\n")
             z.read_until("自动重试 1/2", 20)   # ladder fired
             z.read_until("自动重试 2/2", 20)   # budget spent
-            out = z.read_until("如何处理这个错误", 15)  # selector appeared
-            for label in ("重试本回合", "压缩历史后重试", "换模型", "忽略"):
-                if label not in out:
-                    raise Fail(f"selector missing option: {label}")
-            # Option 1 (retry) actually re-runs the turn: pick it, the
-            # retry notice prints, the error repeats, the selector comes
-            # back — proof the choice drives the loop, not just prints.
-            z.send("\r")  # select item 0 = 重试本回合
-            z.read_until("重试本回合…", 10)
-            z.read_until("如何处理这个错误", 15)
-            z.send("\x1b")  # Esc = ignore
-            z.drain(1.0)
+            out = z.read_until("[API Error:", 15)  # ONE red label, no menu
+            if "如何处理这个错误" in out:
+                raise Fail("recovery selector resurrected (removed by 238b204)")
+            # 提示符回归 + hint 行重 arm：回合结束回到规范 IDLE 态。
+            # clear_buf first — read_until_seen would vacuously match the
+            # FIRST prompt's hint row still buffered since session start
+            # (same stale-marker class the s6 comment above teaches).
+            z.clear_buf()
+            z.read_until("⏵ Enter", 10)
+            # Esc 取回 armed（错误回合的消息可取回重发）：空草稿 Esc 拉回
+            # 刚发送的文本。仅断言取回——↑ 历史路径的 rewind-on-recall
+            # （同步撤出会话）是另一条代码路径（lineinput ↑ 分支），不在此处。
+            z.clear_buf()
+            z.send("\x1b")
+            z.read_until("probe the dead gateway", 5)
+            z.drain(0.5)
             quit_and_wait(z)
-            return "auto backoff ×2 + selector 4 moves + retry takes effect ✓"
+            return "auto backoff ×2 + one-line red label + Esc takeback ✓"
         finally:
             z.close()
     finally:

@@ -44,6 +44,15 @@ pub fn backoffPlan(err: anyerror, auto_fix_on: bool, retries_used: u8) ?Backoff 
 
 /// Errors where the selector makes no sense: the user cancelled on
 /// purpose, or nothing can be retried (nothing sent).
+///
+/// DEAD CODE NOTICE (2026-11-13): selectorEligible/offerMenu lost their
+/// last production caller in 238b204 (the error surface became one red
+/// label + Esc takeback). Kept for the day a recovery UI returns — with
+/// ONE contract change to respect: if re-wired MID-TURN, menu.select's
+/// modalExit no longer re-arms the turn's live region, so regionStatus
+/// no-ops for the rest of the turn (status row vanishes). Re-arm
+/// explicitly (regionBegin) after a mid-turn menu, the way
+/// turn/ask.zig's gates do.
 pub fn selectorEligible(err: anyerror) bool {
     return switch (err) {
         // EscCancelled: the user stopped this on purpose; MissingApiKey:

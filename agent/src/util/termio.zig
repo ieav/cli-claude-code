@@ -37,6 +37,8 @@ const w = if (windows) struct {
     pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) callconv(.winapi) BOOL;
     pub extern "kernel32" fn SetConsoleCP(wCodePageID: DWORD) callconv(.winapi) BOOL;
     pub extern "kernel32" fn SetConsoleOutputCP(wCodePageID: DWORD) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn GetConsoleCP() callconv(.winapi) DWORD;
+    pub extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) DWORD;
     pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
     pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleHandle: HANDLE, lpInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) BOOL;
 
@@ -64,9 +66,30 @@ const w = if (windows) struct {
 } else struct {};
 
 var vt_initialized = false;
+/// VT processing actually enabled on the output console (windows).
+/// False = the TUI's escape-sequence layer (DECSTBM 滚动区、绝对定位、
+/// SGR) would print as raw bytes — main() gates the interactive REPL on
+/// this. Posix: always true.
+var vt_ok = !windows;
+/// Original console codepages, restored at exit — leaving a cmd window
+/// switched to 65001 changes how every later program prints (mojibake in
+/// the shell the user returns to).
+const Cp = if (windows) w.DWORD else u0;
+var orig_in_cp: Cp = 0;
+var orig_out_cp: Cp = 0;
+
+/// Whether the output terminal accepts VT sequences. Meaningful only on
+/// windows AFTER init(); posix terminals are VT by default.
+pub fn vtEnabled() bool {
+    return vt_ok;
+}
 
 /// One-shot at startup: enable VT processing + UTF-8 codepage on
 /// windows; no-op on posix (terminals are VT by default there).
+/// MUST run before the first byte of output (main() calls it first —
+/// the startup banner used to print before this, i.e. under the ORIGINAL
+/// console CP: on a default cmd.exe (GBK) the UTF-8 banner decoded as
+/// garbage — the "Windows 打开有乱码" report class, 2026-11-13).
 pub fn init() void {
     if (!windows or vt_initialized) return;
     vt_initialized = true;
@@ -74,14 +97,28 @@ pub fn init() void {
     var mode: w.DWORD = 0;
     if (@intFromEnum(w.GetConsoleMode(out, &mode)) != 0) {
         mode |= w.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        if (@intFromEnum(w.SetConsoleMode(out, mode)) == 0) {
+        vt_ok = @intFromEnum(w.SetConsoleMode(out, mode)) != 0;
+        if (!vt_ok) {
             logger.warning("termio: VT processing not enabled (legacy conhost?)", .{});
         }
     }
     // Console CP 65001: ReadFile on the input console returns UTF-8 —
-    // the byte-stream contract the whole editor layer assumes.
+    // the byte-stream contract the whole editor layer assumes — and
+    // WriteFile UTF-8 bytes render correctly.
+    orig_in_cp = w.GetConsoleCP();
+    orig_out_cp = w.GetConsoleOutputCP();
     _ = w.SetConsoleCP(65001);
     _ = w.SetConsoleOutputCP(65001);
+    // Exit politeness: hand the shell back its original codepages. LIFO
+    // cleanup registry (util/cleanup.zig) runs on every REPL exit path.
+    const cleanup = @import("cleanup.zig");
+    cleanup.register("termio-restore-cp", restoreConsoleCp) catch {};
+}
+
+fn restoreConsoleCp() void {
+    if (!windows or !vt_initialized) return;
+    if (orig_in_cp != 0 and orig_in_cp != 65001) _ = w.SetConsoleCP(orig_in_cp);
+    if (orig_out_cp != 0 and orig_out_cp != 65001) _ = w.SetConsoleOutputCP(orig_out_cp);
 }
 
 /// Saved terminal mode — ONE SLOT PER GUARD (nested session + confirm

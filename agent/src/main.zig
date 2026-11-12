@@ -120,9 +120,25 @@ test {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Windows console one-shot BEFORE any output byte: VT processing +
+    // UTF-8 codepage (posix no-op). The banner used to print first —
+    // under the ORIGINAL console CP — so on a default cmd.exe (GBK) the
+    // UTF-8 banner decoded as garbage ("Windows 打开有乱码", 2026-11-13).
+    const termio = @import("util/termio.zig");
+    termio.init();
+
     // Create I/O context (Zig 0.16 Threaded Io)
     var io_state = std.Io.Threaded.init(std.heap.smp_allocator, .{});
     defer io_state.deinit();
+    // Shutdown handlers: registered AFTER io_state's defer so runAll still
+    // executes while the io context is LIVE (LIFO — a handler that logs
+    // flushes through a live writer; running it post-deinit was UB), yet
+    // early enough to cover --version/--help/-p/VT-gate returns below —
+    // the console-codepage restore (registered inside termio.init on
+    // windows) must run on those exits too, or a probe leaves the shell
+    // switched to CP 65001. Empty registry = no-op on posix.
+    const cleanup = @import("util/cleanup.zig");
+    defer cleanup.runAll();
     const io: std.Io = io_state.io();
 
     const stdout_file = std.Io.File.stdout();
@@ -202,8 +218,29 @@ pub fn main(init: std.process.Init) !void {
         const code = oneshot.run(std.heap.smp_allocator, io, w, &ew_stream.interface, prompt) catch 1;
         try std.Io.File.Writer.flush(&file_writer);
         try std.Io.File.Writer.flush(&ew_stream);
-        if (code != 0) std.process.exit(code);
+        if (code != 0) {
+            cleanup.runAll(); // exit() skips the defer — restore the console CP
+            std.process.exit(code);
+        }
         return;
+    }
+
+    // VT gate (windows): the whole TUI is escape-sequence based (scroll
+    // regions, absolute addressing, SGR). A legacy conhost ("Use legacy
+    // console" checked) rejects ENABLE_VIRTUAL_TERMINAL_PROCESSING —
+    // without this gate ziv prints its UI as raw ESC-byte soup. ASCII-only
+    // message: the console may still be on a non-UTF-8 codepage here.
+    if (@import("builtin").os.tag == .windows and termio.stdoutIsTty() and !termio.vtEnabled()) {
+        try std.Io.Writer.writeAll(w,
+            \\ziv: this console does not support ANSI/VT escape sequences.
+            \\The interactive UI cannot render here.
+            \\Use Windows Terminal (recommended), or uncheck
+            \\"Use legacy console" in cmd.exe Properties > Terminal.
+            \\
+        );
+        try std.Io.File.Writer.flush(&file_writer);
+        cleanup.runAll(); // exit() skips the defer — restore the console CP
+        std.process.exit(1);
     }
 
     // Startup banner. Naming, for whoever reads this cold:
@@ -287,12 +324,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Start REPL. Every exit path (/quit, EOF, double Ctrl-C) unwinds to
-    // here — run registered shutdown handlers (bash tool group-kill and
-    // anything else registered via util/cleanup.zig) on the way out. The
-    // registry existed but runAll() was never wired, so nothing ever ran.
+    // the top-of-main cleanup defer (bash tool group-kill, console-CP
+    // restore, anything registered via util/cleanup.zig).
     const repl = @import("repl.zig");
-    const cleanup = @import("util/cleanup.zig");
-    defer cleanup.runAll();
     try repl.run(io, stdin_file, stdout_file);
 }
 

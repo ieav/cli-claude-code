@@ -120,6 +120,25 @@ const StyleToggleCtx = struct {
 var style_toggle_ctx: ?StyleToggleCtx = null;
 
 
+/// 输入区目录标签：上一级/当前两级（"proj/agent"）。根路径/盘根（"/"、
+/// "C:\"）取不到两级 → 空串 = 纯横线；分隔符兼容 Windows 的 '\'。
+/// 结果写入 out（放不下退化到当前级），调用方同步交给 regionDirSet
+/// 拷走。
+fn shortDirLabel(out: []u8, cwd: []const u8) []const u8 {
+    const sep = if (std.mem.lastIndexOfScalar(u8, cwd, '/')) |i| i else blk: {
+        const wi = std.mem.lastIndexOfScalar(u8, cwd, '\\') orelse return cwd;
+        break :blk wi;
+    };
+    const cur = cwd[sep + 1 ..];
+    const parent_part = cwd[0..sep];
+    const psep = if (std.mem.lastIndexOfScalar(u8, parent_part, '/')) |i| i else blk: {
+        const wi = std.mem.lastIndexOfScalar(u8, parent_part, '\\') orelse return cur;
+        break :blk wi;
+    };
+    const parent = parent_part[psep + 1 ..];
+    return std.fmt.bufPrint(out, "{s}/{s}", .{ parent, cur }) catch cur;
+}
+
 /// ziv.md hot reload: refresh both layers and swap/append/remove the
 /// rules block in history[0]. Returns true when anything changed. The
 /// swap can legitimately fail (e.g. /clear rebuilt the system message and
@@ -824,6 +843,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // The turn-scoped live region's input row renders with this SAME
         // prefix — one input area identity across turn and prompt.
         lineinput.regionPromptSet(prompt);
+        // 输入区横线的目录标签（2026-11-13 用户定纲）：只取上一级/当前
+        // 两级。cwd 会话内不变（工具的 cd 跑在子进程里），提示符级取一次。
+        {
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.process.currentPath(io, &cwd_buf)) |dlen| {
+                var label_buf: [160]u8 = undefined;
+                lineinput.regionDirSet(shortDirLabel(&label_buf, cwd_buf[0..dlen]));
+            } else |_| {}
+        }
 
         // Read line via the raw-mode editor: arrows move the cursor,
         // up/down walk history (or move between lines on multi-line input),
