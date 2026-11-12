@@ -141,3 +141,27 @@ error.OutOfMemory 或空串——free() 对零长 no-op 是唯一豁免）
 **命中次数**：1 次用户实崩（2026-11-09 v0.9.0 多 agent 场景）+ 存量
 36 处同类（含 2 天前新写的 bg_task 5 处——证明人工纪律挡不住再生）
 → 已上护栏
+
+### [TUI 渲染迁移] pinned 化丢掉旧渲染的隐式行为——光标定位无人认领
+
+**判别信号**：按键处理正确（缓冲区 pos 变了）但用户报"方向键不管
+用"；屏幕上可见光标永远停在内容末尾；grep 渲染函数找不到任何读
+ed.pos 的地方
+**触发条件**：从流式渲染（writeAll 自然位置 = 光标位置）迁到 pinned/
+绝对定位渲染时，只迁移了"画内容"，没有显式重建"定位光标"——
+流式下免费获得的行为在 pinned 下必须有专人负责
+**机制**：v0.9.2 TUI v2 arm 化把 unarmed render()（有 scanLine 光标
+cell 计算）换成 writeEditorBlock（纯内容绘制），parkCursor 硬编码
+草稿末行——ed.pos 与可见光标从此脱钩半年
+**排查动作**：PTY 发 `↑` 后 dump 字节流，看最后的 `\x1b[r;cH` 是
+否指向 pos 所在行；单测断言"重绘输出 endsWith 光标定位序列且行号
+= pos 的显示行"
+**不变量（L3）**：每次重绘以 park 结束，park = ed.pos 的显示 cell
+（collectBlockRowsCareting 与行绘制同一次 glyph 走查——光标模型
+与行模型天然同源，不另立口径）
+**护栏（L4）**：红测试 3 个入套件（caret parks at its own display
+row / display-line navigation 边界 / word hop）——任何破坏光标
+模型的改动直接挂测试
+**命中次数**：1（2026-11-13 用户报障"方向键不管用"）+ 修复过程
+中自己又踩两次（caret 判定被后续行覆盖、wordRight 落词间空格）
+——证明这类"隐式行为丢失"没有同源不变量就挡不住再生
