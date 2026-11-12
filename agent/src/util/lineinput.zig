@@ -662,6 +662,22 @@ pub var recall_prefill = false;
 /// wanted to suggest next.
 pub var prefill_text: ?[]const u8 = null;
 pub var prefill_pending = false;
+/// CC-parity rewind-on-recall (2026-11-13): true while the newest input
+/// history entry is a message the turn DIED on (error, no assistant
+/// reply). Recalling it with ↑ (or Esc-retracting it) then takes the
+/// message back OUT of the conversation in the same step — v2.1.73
+/// "restores the interrupted prompt and rewinds the conversation".
+/// The REPL arms it after a fatal error and disarms on the next submit.
+pub var rewind_pending: bool = false;
+/// Callback: remove the trailing (unanswered) user message from the
+/// conversation history. Set by repl.run with takeback_ctx = *ArrayList(Message).
+pub var takeback_ctx: ?*anyopaque = null;
+pub var on_takeback: ?*const fn (?*anyopaque) void = null;
+
+fn takebackLastMessage() void {
+    if (on_takeback) |cb| cb(takeback_ctx);
+    rewind_pending = false;
+}
 /// Esc-recall windows (2026-11-13, user-semantics fix): a SHORT second
 /// chance, not a standing undo. Both must hold —
 ///   · RECALL_AT_PROMPT_MS: within this long of the prompt reappearing
@@ -3403,6 +3419,12 @@ pub fn readLine(
                     }
                     if (ed.nav.? > 0) {
                         ed.nav.? -= 1;
+                        // Rewind-on-recall: the newest entry while the turn
+                        // died without a reply comes back together with its
+                        // removal from the conversation.
+                        if (rewind_pending and ed.nav.? == history.items.len - 1) {
+                            takebackLastMessage();
+                        }
                         ed.loadHistory(history.items[ed.nav.?]);
                         ed.browsing = true;
                     }
@@ -3501,6 +3523,7 @@ pub fn readLine(
                     try std.Io.File.Writer.flush(file_writer);
                     last_submit_ms = util_time.nowMillis();
                     recall_text = null; // submitted: recall window re-arms only via Esc interrupt
+                    rewind_pending = false; // a fresh submit settles the old one
                     if (line.len > 0 and (history.items.len == 0 or !std.mem.eql(u8, history.items[history.items.len - 1], line))) {
                         const duped = alloc.dupe(u8, line) catch null;
                         if (duped) |o| {

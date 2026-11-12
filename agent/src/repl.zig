@@ -289,6 +289,20 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // ──── Conversation history ────
     var history = std.ArrayList(llm.Message).empty;
     defer history.deinit(allocator);
+    // Rewind-on-recall callback (2026-11-13, CC v2.1.73 parity): ↑ / Esc
+    // taking back the newest unanswered message also removes it from the
+    // conversation — restore-and-rewind in one step, no resubmit dupes.
+    lineinput.takeback_ctx = @ptrCast(&history);
+    lineinput.on_takeback = struct {
+        fn cb(ctx: ?*anyopaque) void {
+            const h: *std.ArrayList(llm.Message) = @ptrCast(@alignCast(ctx orelse return));
+            if (h.items.len == 0) return;
+            const last = h.items[h.items.len - 1];
+            if (last.role != .user) return; // defensive: unanswered tail only
+            turn_history.freeMessage(last, allocator);
+            _ = h.pop();
+        }
+    }.cb;
 
     // ──── Persistent memory (episodic tier, cross-session) ────
     var injected_count: usize = 0;
@@ -1212,9 +1226,13 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // turn-CONTINUING paths print above it.
                 if (err == error.EscCancelled) {
                     // Esc: abort this exchange and pull the input back into
-                    // the editor (history keeps the user message; no
-                    // assistant reply was appended).
+                    // the editor — restore AND rewind in one step (CC
+                    // v2.1.73 parity): the unanswered user message also
+                    // leaves the conversation, so resubmitting never
+                    // duplicates it.
                     lineinput.regionEnd(w);
+                    if (lineinput.on_takeback) |cb| cb(lineinput.takeback_ctx);
+                    lineinput.rewind_pending = false;
                     try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
                     lineinput.prefill_text = last_sent;
@@ -1241,10 +1259,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     }
                     lineinput.regionEnd(w);
                     // 2026-11-07: three dead first-bytes = sustained outage,
-                    // not a blip — fall into the SHARED error path below
-                    // (classified report + P4 selector: 换模型 is exactly
-                    // what a dead gateway needs; ignore keeps the 「继续」
-                    // prefill semantics).
+                    // not a blip — fall into the shared error path below
+                    // (one red label; the next move — retry, /model, Esc
+                    // takeback — belongs to the user, CC-parity 2026-11-13).
                     try std.Io.Writer.print(ow, "\x1b[2m  [网关连续 3 次无首字节响应]\x1b[0m\n", .{});
                     try std.Io.File.Writer.flush(&file_writer);
                 }
@@ -1281,28 +1298,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 lineinput.regionEnd(w);
                 if (err == error.RateLimit) _ = live_llm_429s.fetchAdd(1, .monotonic); // monitor: real-429 evidence
-                try std.Io.Writer.print(ow, "  \x1b[31m[LLM error: {}]\x1b[0m\n", .{err});
-                // Designed error-feedback closure (§四): classified analysis
-                // + numbered fixes with the recommended one marked. The
-                // formatter existed since v0.3 with zero callers.
-                {
-                    const err_code: []const u8 = switch (err) {
-                        error.NetworkTimeout => "network_timeout",
-                        error.RateLimit => "api_rate_limit",
-                        error.ContextOverflow => "context_overflow",
-                        else => @errorName(err),
-                    };
-                    if (error_handler.formatErrorReport(allocator, err_code, @errorName(err))) |report| {
-                        defer {
-                            allocator.free(report.analysis);
-                            allocator.free(report.fixes);
-                        }
-                        try std.Io.Writer.print(ow, "  {s}\n", .{report.analysis});
-                        for (report.fixes) |f| {
-                            try std.Io.Writer.print(ow, "    [{d}] {s}{s}\n", .{ f.index, f.description, if (f.is_recommended) " ★" else "" });
-                        }
-                    } else |_| {}
-                }
+                // CC-parity error surface (2026-11-13, user call): retries
+                // ran (auto ladder above); what remains is ONE red label +
+                // the gateway's reason + the log pointer. The interactive
+                // recovery menu and the「继续」prefill are GONE — Claude
+                // Code ends the turn with a plain error label, keeps the
+                // message in the conversation, and leaves the next move to
+                // the user (Esc retract / ↑ rewind-on-recall, both armed
+                // via rewind_pending below).
+                lineinput.rewind_pending = true;
+                try std.Io.Writer.print(ow, "  \x1b[31m[API Error: {s}]\x1b[0m\n", .{@errorName(err)});
                 if (err == error.ContextOverflow) {
                     try std.Io.Writer.print(ow, "  [Still too long after compaction — try /compact phi or /clear]\n", .{});
                 }
@@ -1323,38 +1328,6 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 }
                 try std.Io.Writer.writeAll(ow, "\n");
                 try std.Io.File.Writer.flush(&file_writer);
-                // P4 (design §五): the numbered suggestions above become
-                // actionable — one arrow-key pick, no retyping. Esc = ignore.
-                if (error_recovery.selectorEligible(err)) {
-                    // 模态生命周期必须走裸 w（TUI v2）：RegionWriter 行原子缓冲会吞掉
-                    // modalEnter/Exit 的无换行转义舞步（S9 开发中实证——标题被吃）。
-                    if (error_recovery.offerMenu(w, r, &file_writer)) |choice| switch (choice) {
-                        .retry => {
-                            try std.Io.Writer.writeAll(ow, "  [重试本回合…]\n");
-                            try std.Io.File.Writer.flush(&file_writer);
-                            continue;
-                        },
-                        .compact_retry => {
-                            turn_history.applyFactsUpdate(&history, &facts_block, allocator, turn_history.compactHistoryImpl(&history, allocator, facts_block));
-                            _ = turn_history.slimToolResults(history.items, allocator);
-                            log.bumpEpoch();
-                            try std.Io.Writer.print(ow, "  [已压缩（φ+瘦身）— {d} 条消息，重试本回合…]\n", .{history.items.len});
-                            try std.Io.File.Writer.flush(&file_writer);
-                            continue;
-                        },
-                        .switch_model => {
-                            try config_menu.runModelPicker(w, r, &file_writer, &switcher, io);
-                            try std.Io.Writer.print(ow, "  [模型: {s} — 重试本回合…]\n", .{switcher.modelName()});
-                            try std.Io.File.Writer.flush(&file_writer);
-                            continue;
-                        },
-                        .ignore => {},
-                    };
-                    // ignore / Esc: prefill 「继续」 so one Enter resumes
-                    // once the user has fixed the environment.
-                    lineinput.prefill_text = "继续";
-                    lineinput.prefill_pending = true;
-                }
                 break;
             };
 
@@ -1403,8 +1376,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     if (!stream_mod.outputBudgetExhausted(response.stop_reason, response.usage.output_tokens, eff_cap)) break; // empty but not capped — escalating won't help
                 }
                 if (esc_after_retry) {
-                    // Same recall path as the main Esc branch above.
+                    // Same restore+rewind path as the main Esc branch above.
                     lineinput.regionEnd(w);
+                    if (lineinput.on_takeback) |cb| cb(lineinput.takeback_ctx);
+                    lineinput.rewind_pending = false;
                     try std.Io.Writer.print(ow, "\n  [Esc — 已中断，输入已撤回，可直接编辑重发]\n\n", .{});
                     lineinput.recall_text = last_sent;
                     lineinput.prefill_text = last_sent;
@@ -1970,12 +1945,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         }
 
         if (agent_iterations >= max_agent_iters) {
-            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached — 输入区已预填「继续」：Enter 接着跑，也可改发其他指令；上限经 settings.json 的 agent_loop_limit 调整]\x1b[0m\n", .{max_agent_iters});
-            // Same recoverable-giveup shape as the TTFT triple-failure
-            // path: history stays legal, one Enter resumes as a fresh
-            // turn — the marathon's findings are never lost to a stop.
-            lineinput.prefill_text = "继续";
-            lineinput.prefill_pending = true;
+            try std.Io.Writer.print(w, "\x1b[2m  [Agent loop limit ({d}) reached — 重发任意消息接着跑（↑ 可取回最后输入）；上限经 settings.json 的 agent_loop_limit 调整]\x1b[0m\n", .{max_agent_iters});
+            // Recoverable giveup: history stays legal, a fresh submit
+            // resumes — no prefill (CC-parity: suggestions are skipped
+            // after failures; the next move is the user's).
         }
 
         // Skill 工具门解除（2026-11-10 C 项）：门只管 skill 生效的那一个
