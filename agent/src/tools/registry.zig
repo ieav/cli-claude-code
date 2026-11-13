@@ -363,7 +363,7 @@ fn neverConcurrencySafe(_: std.json.Value) bool {
 
 pub const bash_tool: ToolDefinition = .{
     .name = "Bash",
-    .description = "Execute a shell command and return its output",
+    .description = "Execute a shell command and return its output. To wait for a long process or poll, use run_in_background and short checks instead of idling — bare foreground sleeps over 20s are rejected",
     .input_schema =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds (default 30, max 300; 0 = unlimited; ignored when run_in_background)"},"run_in_background":{"type":"boolean","description":"Run detached and return immediately with a task id (watch/dev-server/long builds). View or stop via /tasks; output lands in .ziv/tasks/<id>.log"},"working_directory":{"type":"string","description":"Working directory for the command (default: current)"}},"required":["command"]}
     ,

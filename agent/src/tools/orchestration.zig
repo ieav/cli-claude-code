@@ -329,9 +329,11 @@ test "executeBatches cancel short-circuits remaining calls (all ids keep results
 
     // Two serial Bash calls (Bash is never concurrency-safe → one batch
     // each): the first hangs with timeout 0, the second must NEVER run.
+    // 复合形态：裸 `sleep 30` 会被 bash 的前台 sleep 护栏在 spawn 前拒绝，
+    // 到不了被 cancel 打断的现场。
     var slow_obj: std.json.ObjectMap = .empty;
     defer slow_obj.deinit(alloc);
-    try slow_obj.put(alloc, "command", .{ .string = "sleep 30" });
+    try slow_obj.put(alloc, "command", .{ .string = "sleep 30; echo x" });
     try slow_obj.put(alloc, "timeout", .{ .integer = 0 });
     var ok_obj: std.json.ObjectMap = .empty;
     defer ok_obj.deinit(alloc);

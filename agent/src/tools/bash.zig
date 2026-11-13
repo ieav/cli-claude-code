@@ -26,6 +26,24 @@ const DEFAULT_TIMEOUT_S: i64 = 30;
 /// forever and the tool call never returned).
 const PIPE_EOF_GRACE_MS: i64 = 1000;
 
+/// 前台裸 sleep 护栏（B1，2026-11-13）：glm 曾用 ` sleep 240;` 在前台
+/// 空等 4 分钟——整轮阻塞、零产出。等待/轮询该走 run_in_background +
+/// 短间隔检查；失败退避该用一次短 sleep 重试。只拦「整条命令就是
+/// sleep N」的裸形态（strip 空白与结尾分号后）；复合命令（&& 链中
+/// 停顿）、`sleep $VAR`、GNU 后缀（240s/5m）等变体不拦——默认 30s
+/// 超时对它们兜底。
+const FOREGROUND_SLEEP_CAP_S: i64 = 20;
+
+/// 整条命令就是一个裸 sleep 时返回其秒数，否则 null。仅纯数字形态。
+fn bareSleepSeconds(command: []const u8) ?i64 {
+    var s = std.mem.trim(u8, command, " \t\r\n;");
+    if (!std.mem.startsWith(u8, s, "sleep")) return null;
+    s = std.mem.trim(u8, s["sleep".len..], " \t");
+    if (s.len == 0) return null;
+    for (s) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseInt(i64, s, 10) catch null;
+}
+
 /// Live tool groups (spawn → reap window), so ziv's EXIT can group-kill
 /// them: a session death mid-Bash used to orphan the whole tree (the
 /// mpmc_serial ×4 incident burned ~4 cores for 1h14m after the owning
@@ -90,6 +108,18 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     const timeout_s: i64 = @min(@max(getIntField(input, "timeout") orelse DEFAULT_TIMEOUT_S, 0), MAX_TIMEOUT_S);
     // P5 M1：后台任务——spawn 后立返任务号，不阻塞回合（见 bg_tasks）。
     const run_bg = getBoolField(input, "run_in_background") orelse false;
+    // 前台裸长 sleep 拒绝（B1）：后台 sleep 是定时器语义，无害，不拦。
+    // expected_stop 同 timeout 杀：设计内控制流，不得灌入反思窗口的
+    // 错误率（否则重试被拒的马拉松会被误诊「环境不稳定」，2026-11-06
+    // 教训）；模型侧 is_error 语义不变，照样能看到引导文案。
+    if (!run_bg) {
+        if (bareSleepSeconds(command)) |secs| {
+            if (secs > FOREGROUND_SLEEP_CAP_S) {
+                const msg = try alloc.print("Foreground sleep of {d}s rejected: don't idle-wait a whole turn. To wait for a long process, pass run_in_background:true and check its output with short sleeps (<=10s); to back off after a failure, retry after one short sleep instead.", .{secs});
+                return registry.ToolResult{ .output = msg, .is_error = true, .expected_stop = true };
+            }
+        }
+    }
 
     // POSIX: /bin/sh -c. Windows: PowerShell (decision ① 2026-11-12).
     // argv-mode spawn passes the command VERBATIM as one argument — no
@@ -377,7 +407,9 @@ test "bash timeout kills a hung command" {
     defer io_state.deinit();
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
-    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30" });
+    // 复合形态：裸 `sleep 30` 会被前台 sleep 护栏在 spawn 前拒绝，
+    // 到不了 watchdog——挂起段必须藏在复合命令里。
+    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30; echo done" });
     try obj.put(std.testing.allocator, "timeout", .{ .integer = 1 });
     const t0 = util_time.nowMillis();
     const result = try execute(std.testing.allocator, .{ .object = obj }, io_state.io());
@@ -387,6 +419,34 @@ test "bash timeout kills a hung command" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "timed out") != null);
     // Killed at ~1s, not 30s (allow generous scheduling slack).
     try std.testing.expect(elapsed < 10_000);
+}
+
+test "bareSleepSeconds matcher: bare form only" {
+    // 2026-11-13 实发形态：前导空格 + 结尾分号。
+    try std.testing.expectEqual(@as(?i64, 240), bareSleepSeconds(" sleep 240;"));
+    try std.testing.expectEqual(@as(?i64, 5), bareSleepSeconds("sleep 5"));
+    // 变体不拦：复合、变量、GNU 后缀、非 sleep 命令、内嵌字样。
+    try std.testing.expectEqual(@as(?i64, null), bareSleepSeconds("sleep 240 && echo x"));
+    try std.testing.expectEqual(@as(?i64, null), bareSleepSeconds("sleep $x"));
+    try std.testing.expectEqual(@as(?i64, null), bareSleepSeconds("sleep 5m"));
+    try std.testing.expectEqual(@as(?i64, null), bareSleepSeconds("sleepless night"));
+    try std.testing.expectEqual(@as(?i64, null), bareSleepSeconds("echo sleep 240"));
+}
+
+test "bare foreground sleep over cap is rejected before spawn" {
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "command", .{ .string = " sleep 240;" });
+    const t0 = util_time.nowMillis();
+    const result = try execute(std.testing.allocator, .{ .object = obj }, io_state.io());
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "rejected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "run_in_background") != null);
+    // 未 spawn——立即返回，等不到任何超时。
+    try std.testing.expect(util_time.nowMillis() - t0 < 5_000);
 }
 
 test "bash timeout kills the whole process group (compound command)" {
@@ -446,8 +506,9 @@ test "bash cancel kills an unlimited hung command" {
     var obj: std.json.ObjectMap = .empty;
     defer obj.deinit(std.testing.allocator);
     // timeout 0 = unlimited — previously uncancellable FOREVER; the only
-    // escape is the batch-cancel watchdog path this test locks.
-    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30" });
+    // escape is the batch-cancel watchdog path this test locks. 复合形态：
+    // 裸 `sleep 30` 会被前台 sleep 护栏在 spawn 前拒绝，到不了 watchdog。
+    try obj.put(std.testing.allocator, "command", .{ .string = "sleep 30; echo x" });
     try obj.put(std.testing.allocator, "timeout", .{ .integer = 0 });
     cancelAfter(300);
     const t0 = util_time.nowMillis();
