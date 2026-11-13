@@ -999,8 +999,13 @@ pub fn collectPendingExtraction(
         logger.info("pending extraction: unparseable reply dropped", .{});
         return;
     };
-    var out = parsed;
-    defer out.deinit(alloc);
+    // OWNERSHIP HANDOFF, like the :320 / :1099 callers: applyLlmExtraction
+    // deinits `out` itself. A `defer out.deinit(alloc)` here double-frees
+    // every string — the second free segfaults inside the allocator's
+    // poison-memset at startup whenever a .reply is ingested (2026-11-13
+    // crash report), and since the crash lands BEFORE deleteFile below,
+    // the file stays and EVERY launch crashes on the same spot.
+    const out = parsed;
     applyLlmExtraction(mem, kg, bus, w.?, out) catch return;
     std.Io.Dir.cwd().deleteFile(io, rpath) catch {};
     if (w) |ww| {

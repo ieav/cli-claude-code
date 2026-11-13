@@ -1370,7 +1370,15 @@ fn regionEndLocked(w: *std.Io.Writer) void {
     // transcript's last line, where the next prompt naturally prints.
     // (The old protocol parked on a PINNED row; the next turn's status
     // paint overwrote the message echoed there — "history invisible".)
-    std.Io.Writer.writeAll(w, "\x1b7") catch {}; // save flow
+    // ␛8 FIRST: every caller enters here PARKED on the input row (after
+    // regionPrintLine's parkCursor — submit→turn rebuild, regionFreeze,
+    // modalEnter), so a bare ␛7 would save the PARK position as "flow",
+    // clobbering the true flow slot regionPrintLine just saved. The next
+    // first-arm dance then derives a MID-ROW flow anchor and every turn
+    // line prints from column N onto the transcript — the committed
+    // echo gets overprinted ("sent message invisible", 2026-11-13 pyte
+    // repro). Restore the real flow, re-save it, then tear down.
+    std.Io.Writer.writeAll(w, "\x1b8\x1b7") catch {}; // to FLOW, re-save it
     var row = region_h;
     var b: [32]u8 = undefined;
     while (row > split) : (row -= 1) {
