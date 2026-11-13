@@ -136,7 +136,15 @@ pub fn applyOutputStyle(
     repl_mod.reapplySystemPromptIfNeeded(applied_prompt_setting, applied_output_style, sys_prompt_owned, sys_prompt, history, alloc, switcher.settings.system_prompt, next_style);
 }
 
-pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
+pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
+    // S2 submit shape: the popup's Tab adopt leaves "/name " (trailing
+    // space) and Enter sends it as-is — the exact-match arms below use
+    // eql and would reject it. Single-line slash inputs are uniformly
+    // right-trimmed; argument payloads keep their interior spacing.
+    const input = if (std.mem.startsWith(u8, input_orig, "/") and std.mem.indexOfScalar(u8, input_orig, '\n') == null)
+        std.mem.trim(u8, input_orig, " \t")
+    else
+        input_orig;
     // ──── Meta commands ────
     // Multi-line input (pasted text, `\`+Enter drafts) is always a
     // MESSAGE — a pasted blob that happens to start with '/' must not
@@ -181,6 +189,15 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             return .quit;
         } else if (std.mem.eql(u8, input, "/help") or std.mem.eql(u8, input, "/h")) {
             try repl_mod.printHelp(ctx.w);
+            // Dynamic catalog tail: skills are invocable commands (/<name>)
+            // but live in the loader, not the static table — list them so
+            // /help answers "what can I type" in one place.
+            if (ctx.skill_loader.skills.items.len > 0) {
+                try std.Io.Writer.writeAll(ctx.w, "\nSkills (invoke with /<name>, manage with /skills):\n");
+                for (ctx.skill_loader.skills.items) |skill| {
+                    try std.Io.Writer.print(ctx.w, "  /{s} — {s}\n", .{ skill.name, skill.description });
+                }
+            }
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.startsWith(u8, input, "/mcp")) {
@@ -300,6 +317,9 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             }
             if (std.mem.eql(u8, rest, "reload")) {
                 ctx.skill_loader.reload();
+                // Completion catalog follows the rescan (skills are /<name>
+                // commands in the popup and the coloring).
+                repl_mod.pushSkillsToPopup(ctx.skill_loader);
                 // Manifest rebuild + re-inject into history[0] (same block
                 // layout as startup: system → memory → manifest → rules).
                 // The rules block MUST ride along — the first version
@@ -1281,13 +1301,15 @@ pub fn dispatchSlash(ctx: *ReplCtx, input: []const u8) !DispatchOutcome {
             return .skill;
         } else {
             try std.Io.Writer.print(ctx.w, "Unknown command: {s}", .{input});
-            // Typo hints from the canonical command table.
+            // Typo hints from the canonical command table (same ranked
+            // filter as the completion popup: exact > prefix > substring,
+            // aliases included).
             if (slash_cmds.suggestMatching(allocator, input) catch null) |hits| {
                 defer allocator.free(hits);
                 if (hits.len > 0) {
                     try std.Io.Writer.writeAll(ctx.w, "\nDid you mean:");
                     for (hits[0..@min(hits.len, 5)]) |h| {
-                        try std.Io.Writer.print(ctx.w, " {s}", .{h});
+                        try std.Io.Writer.print(ctx.w, " /{s}", .{h});
                     }
                 }
             }

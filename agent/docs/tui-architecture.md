@@ -64,6 +64,11 @@
    本身，10 个调用点自动覆盖）
 3. 屏幕任何时刻只有一个写者家族活跃（状态决定）
 4. 工具调用块统一 `⏺ Name(args)` 头 + dim 体 + 折叠（printToolBody）
+5. 斜杠补全弹层（2026-11-13）行属 pinned 带：行数并入 regionRows /
+   last_block_rows 台账，只经 writeEditorBlock→writePopupRows 绘制，
+   无散装写者；状态机三态（S1 列表 / S2 参数提示 / S0 关闭）在
+   popupSyncFromDraft 单点收敛（每次 pinned 重画入口跑，幂等）；
+   仅提示符态存活（popup_enabled，回合中键泵恒关）。
 
 ## 3. 实现拆解（依赖序）
 

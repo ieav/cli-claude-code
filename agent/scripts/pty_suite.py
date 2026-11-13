@@ -1322,6 +1322,61 @@ def s23_output_style():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def s24_slash_popup():
+    """Completion popup (2026-11-13, Claude Code contract): '/' opens the
+    filtered catalog; typing refilters (exact-name first); Tab adopts
+    WITHOUT sending (lands in the S2 args-hint tier); Enter executes the
+    selection; Esc closes + mutes re-trigger, so Enter submits the raw
+    draft with did-you-mean; arrows drive the popup when >1 row shows."""
+    z = ZivSession()
+    try:
+        z.wait_prompt()
+        # bare '/' -> full catalog, table order, /help selected
+        z.clear_buf()
+        z.send("/")
+        z.read_until("❯ /help", 5)
+        # typing refilters; exact name outranks the /model prefix match
+        z.send("la")
+        z.read_until("❯ /last", 5)
+        # Tab adopts without sending → S2: args hint on the status row
+        z.send("\t")
+        z.read_until("补参数后 Enter 发送", 5)
+        # Enter submits "/last " → trailing-space trim → bare /last runs
+        z.clear_buf()
+        z.send("\r")
+        z.read_until("无记录", 10)
+        # Enter executes the selection: /ver → /version (no-arg adopt)
+        z.clear_buf()
+        z.send("/ver")
+        z.read_until("❯ /version", 5)
+        z.send("\r")
+        z.read_until("Ziv v", 10)
+        # Esc closes + mutes; Enter then submits the RAW draft
+        z.clear_buf()
+        z.send("/mo")
+        z.read_until("❯ /mode", 5)
+        z.send("\x1b")
+        z.drain(0.4)  # lone-Esc litmus poll window
+        z.clear_buf()
+        z.send("\r")
+        out = z.read_until("Did you mean", 10)
+        if "/mode" not in out and "/model" not in out:
+            raise Fail("did-you-mean lost /mode|/model after popup work")
+        # arrows belong to the popup while >1 row is visible
+        z.clear_buf()
+        z.send("/")
+        z.read_until("❯ /help", 5)
+        z.send("\x1b[B")  # Down → second catalog row
+        z.read_until("❯ /quit", 5)
+        # leave clean: Esc closes the popup, then the standard exit
+        z.send("\x1b")
+        z.drain(0.4)
+        quit_and_wait(z)
+        return "popup open/filter/Tab/Enter/Esc-mute/arrows ✓"
+    finally:
+        z.close()
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1346,6 +1401,7 @@ SCENARIOS = [
     ("S21 agent-live-status", s21_agent_live_status),
     ("S22 modal-exit", s22_modal_exit_canonical),
     ("S23 output-style", s23_output_style),
+    ("S24 slash-popup", s24_slash_popup),
 ]
 
 

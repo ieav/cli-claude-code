@@ -552,6 +552,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var skill_manifest: ?[]u8 = null;
     defer if (skill_manifest) |m| allocator.free(m);
     skill_manifest = skill_loader.buildManifest(allocator, 300) catch null;
+    // Completion catalog tail: skills are invocable commands (/<name>) —
+    // push them into the line editor for the popup + syntax coloring.
+    // (Re-pushed on every /skill reload; see dispatch.)
+    pushSkillsToPopup(&skill_loader);
     // Project rules (ziv.md single source — global + project layers, each
     // with its own budget; generated on demand from AGENTS.md/CLAUDE.md,
     // see rules/ziv_md.zig). Loaded AFTER the manifest so the block order
@@ -2305,48 +2309,60 @@ pub fn reapplySystemPromptIfNeeded(
     history.items[0].content = nb;
 }
 
+/// 把 loader 当前技能推给补全目录（lineinput 持有拷贝——loader reload
+/// 会重建列表，直接借用不安全）。启动与 /skill reload 两处调用。
+pub fn pushSkillsToPopup(loader: *skills_mod.loader.SkillLoader) void {
+    var items: std.ArrayList(lineinput.ExtraCmd) = .empty;
+    defer items.deinit(allocator);
+    for (loader.skills.items) |sk| {
+        items.append(allocator, .{ .name = sk.name, .desc = sk.description }) catch break;
+    }
+    lineinput.setExtraCommands(allocator, items.items);
+}
+
+/// Usage column for one catalog row: "/name, /alias <args>".
+fn helpUsageOf(w: *std.Io.Writer, c: slash_cmds.CommandSpec) !void {
+    try std.Io.Writer.print(w, "/{s}", .{c.name});
+    for (c.aliases) |a| {
+        try std.Io.Writer.print(w, ", /{s}", .{a});
+    }
+    if (c.args.len > 0) try std.Io.Writer.print(w, " {s}", .{c.args});
+}
+
 pub fn printHelp(w: *std.Io.Writer) !void {
+    try std.Io.Writer.writeAll(w, "Available commands:\n");
+    // Rendered from the canonical catalog (util/slash_commands.zig) so
+    // help can never drift from the completion popup or the editor's
+    // syntax coloring. Usage column width is measured across the WHOLE
+    // table once — stable alignment, no per-group jitter.
+    var usage_w: usize = 0;
+    for (slash_cmds.table) |c| {
+        var n: usize = 1 + c.name.len;
+        for (c.aliases) |a| n += 3 + a.len;
+        if (c.args.len > 0) n += 1 + c.args.len;
+        usage_w = @max(usage_w, n);
+    }
+    const groups = [_]slash_cmds.Group{ .meta, .model_config, .conversation, .task_bg, .memory, .mcp_skill };
+    for (groups) |g| {
+        var printed_header = false;
+        for (slash_cmds.table) |c| {
+            if (c.group != g) continue;
+            if (!printed_header) {
+                try std.Io.Writer.print(w, "\n{s}:\n", .{g.label()});
+                printed_header = true;
+            }
+            try std.Io.Writer.writeAll(w, "  ");
+            var b: [128]u8 = undefined;
+            var uw = std.Io.Writer.fixed(&b);
+            try helpUsageOf(&uw, c);
+            const usage = b[0..uw.end];
+            try std.Io.Writer.writeAll(w, usage);
+            var pad = usage_w - usage.len;
+            while (pad > 0) : (pad -= 1) try std.Io.Writer.writeAll(w, " ");
+            try std.Io.Writer.print(w, "  {s}\n", .{c.desc});
+        }
+    }
     try std.Io.Writer.writeAll(w,
-        \\Available commands:
-        \\  /help, /h         Show this help
-        \\  /quit, /q         Exit ziv
-        \\  /version          Show version
-        \\  /stats            Show session statistics and token usage
-        \\  /tools            List registered tools (built-in + MCP/agent dynamic)
-        \\  /run <t> <json>   Execute a tool directly
-        \\  /terminal-setup   Show Shift+Enter setup guide for this terminal
-        \\
-        \\Model & Config:
-        \\  /model, /models   Show current model and available models
-        \\  /model <name>     Switch to a different model
-        \\  /mode             Cycle permission mode
-        \\  /config           Interactive configuration menu
-        \\  /style [name]     Output style: default | concise (results-first)
-        \\
-        \\Conversation:
-        \\  /compact          Summarize the conversation (LLM) to free tokens
-        \\  /compact phi      Truncate history to the recent 61.8% (no LLM call)
-        \\  /clear            Clear conversation, start fresh (alias: /reset, /new)
-        \\  /resume [id]      Resume a past session (picker when no id)
-        \\  /context          Show current context/token usage
-        \\  /trace            Show the last turn's per-step timing
-        \\  /tasks            Show the task list and progress
-        \\  /bg               Background tasks panel (status/output/stop)
-        \\  /last [N]         Show a recent tool's full output (N=1 newest)
-        \\  /undo             Undo last exchange
-        \\  /history          Show operation history
-        \\  /rewind           Rewind files AND conversation to a checkpoint
-        \\  /plan <goal>      Create a plan file anchored into the system
-        \\                    prompt; /plan shows it, /plan off ends it
-        \\  /memory           Show injected and stored memories
-        \\  /research <topic> Web research with phi-curated solutions
-        \\  /diagnose <q>     Self-diagnose a weak answer vs your concern
-        \\  /knowledge         Browse the knowledge graph (semantic tier)
-        \\  /skills            List available skills (/<name> to invoke)
-        \\  /skill new|show|remove|reload   Manage skills (reload rescans
-        \\                     both roots — new packs take effect at once)
-        \\  /mcp               MCP servers: list/connect/disconnect
-        \\  /agents            Project rules (ziv.md): status/init/sync/reload
         \\
         \\Models (use /model to switch):
         \\  Claude:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
@@ -2364,6 +2380,7 @@ pub fn printHelp(w: *std.Io.Writer) !void {
         \\Keys:
         \\  Enter 发送 · Shift+Enter / Ctrl+Enter 换行（需终端支持 kitty/
         \\  modifyOtherKeys 协议，否则用 `\`+Enter / Ctrl+J / Option+Enter）
+        \\  敲 / 弹命令补全：↑↓ 选择 · Tab 补全不发送 · Enter 选中执行 · Esc 关闭
         \\  多行/超长粘贴自动折叠为一条消息（提交时展开） · Ctrl+R 历史搜索
         \\  行编辑（提示符与回合中同样生效）：
         \\    Ctrl-A/E 行首/行尾 · Ctrl-B/F 左右移 · Ctrl-U/K 删至行首/行尾

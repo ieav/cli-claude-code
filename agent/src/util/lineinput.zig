@@ -643,6 +643,10 @@ pub fn editorDeinit(alloc: std.mem.Allocator) void {
         alloc.free(live_ed_buf);
         live_ed_buf = &.{};
     }
+    // Popup extras outlive single readLine calls (module-level) — free
+    // them with the editor they serve.
+    setExtraCommands(alloc, &.{});
+    extra_alloc = null;
 }
 
 // ── Esc-to-recall handshake (set by the REPL, consumed by readLine) ──
@@ -888,7 +892,7 @@ fn blockRows() usize {
 /// status line (model/mode/keys) sits BELOW the block, at the bottom.
 fn regionRows() usize {
     const h = @max(region_h, 4);
-    const split = h -| (2 + blockRows());
+    const split = h -| (2 + blockRows() + popupVisibleRows());
     return @max(split, 1);
 }
 
@@ -919,6 +923,312 @@ pub fn setIo(io: std.Io) void {
     tty_io = io;
 }
 
+// ── Slash completion popup (Claude Code contract; 2026-11-13) ──
+//
+// Three states, mirroring Claude Code's typeahead:
+//   S0 plain input      — draft not /-headed (popup hidden)
+//   S1 list             — "/query" single line, no space: filtered list
+//                         pinned below the editor block, selection always
+//                         exists (default 0); ↑↓/Tab/Enter/Esc per CC
+//   S2 argument hint    — "/name " (exactly one trailing space) on a
+//                         known command: list closed, status row shows
+//                         the command's args hint instead of the keymap
+// Tab adopts without sending (no-arg commands fill "/name", arg-taking
+// ones "/name " → S2); Enter adopts and submits; Esc closes and mutes
+// re-triggering until the draft changes. Popup is PROMPT-ONLY: the
+// mid-turn key pump (editorLiveKey) keeps popup_enabled=false so ↑↓
+// keep their queue/history meaning during generation, and the flow-mode
+// renderer (non-pinned tests) never paints it.
+
+/// One popup row. Strings are either static catalog literals or
+/// extra_cmds entries (owned by setExtraCommands — stable for as long as
+/// the popup can reference them).
+pub const PopupItem = struct {
+    name: []const u8,
+    args: []const u8 = "",
+    desc: []const u8,
+    via_alias: ?[]const u8 = null,
+};
+
+/// Dynamic catalog tail (skills): injected by the REPL at startup and on
+/// every /skill reload. Dupes both strings — the loader's own slices die
+/// on reload.
+pub const ExtraCmd = struct { name: []const u8, desc: []const u8 };
+
+var extra_cmds: []ExtraCmd = &.{}; // valid prefix of extra_full
+var extra_full: []ExtraCmd = &.{}; // the actual allocation (free target)
+var extra_alloc: ?std.mem.Allocator = null;
+
+pub fn setExtraCommands(alloc: std.mem.Allocator, items: []const ExtraCmd) void {
+    if (extra_alloc) |a| {
+        for (extra_cmds) |ec| {
+            a.free(ec.name);
+            a.free(ec.desc);
+        }
+        a.free(extra_full);
+        extra_cmds = &.{};
+        extra_full = &.{};
+    }
+    extra_alloc = alloc;
+    const own = alloc.alloc(ExtraCmd, items.len) catch {
+        extra_alloc = null;
+        return;
+    };
+    var n: usize = 0;
+    outer: for (items) |it| {
+        const nm = alloc.dupe(u8, it.name) catch break :outer;
+        const ds = alloc.dupe(u8, it.desc) catch {
+            alloc.free(nm);
+            break :outer;
+        };
+        own[n] = .{ .name = nm, .desc = ds };
+        n += 1;
+    }
+    // OOM mid-way truncates the tail (skills are a convenience, not a
+    // correctness surface); members loop over the VALID prefix only.
+    extra_cmds = own[0..n];
+    extra_full = own;
+    popup_name_w = 0; // name-column cache must track the new extras
+}
+
+/// Extra-catalog name lookup (skills color like known commands).
+fn extraKnown(query: []const u8) bool {
+    for (extra_cmds) |ec| {
+        if (std.ascii.eqlIgnoreCase(ec.name, query)) return true;
+    }
+    return false;
+}
+
+const POPUP_MAX: usize = 48;
+var popup_items: [POPUP_MAX]PopupItem = undefined;
+var popup_n: usize = 0;
+var popup_open: bool = false;
+var popup_sel: usize = 0;
+var popup_top: usize = 0;
+var popup_enabled: bool = false; // readLine sets true; mid-turn pump stays false
+/// Esc-muted until the draft changes: a snapshot of the draft at dismiss
+/// time (empty length = not muted).
+var popup_muted_buf: [256]u8 = undefined;
+var popup_muted_len: usize = 0;
+/// S2: the command the current "/name " draft addresses ("" = not S2).
+var popup_hint_name: []const u8 = "";
+var popup_hint_args: []const u8 = "";
+
+/// Visible popup rows — the CC cap min(6, rows-3), floored at 3 so tiny
+/// terminals still show something. Counts into the pinned band height.
+fn popupVisibleRows() usize {
+    if (!popup_open or popup_n == 0) return 0;
+    const cap = @min(@as(usize, 6), @max(termHeight() -| 5, 3));
+    return @min(popup_n, cap);
+}
+
+/// Filter the catalog + extras for `query` (no slash) into the static
+/// popup array. Builtin rows keep Claude Code's rank order (exact name >
+/// exact alias > name prefix > alias prefix > description substring);
+/// skills (prefix > description) append after the builtin block. No
+/// allocation: a bounded insertion over ≤ 30+skills rows.
+fn popupFill(query: []const u8) void {
+    popup_n = 0;
+    var hits: [POPUP_MAX]lineinput_cmds.Match = undefined;
+    var nh: usize = 0;
+    // Builtin block via the shared ranked filter (insertion over a
+    // stack copy — filterRanked needs an allocator we may not have).
+    for (lineinput_cmds.table, 0..) |c, i| {
+        if (nh >= hits.len) break;
+        const via: ?[]const u8 = blk: {
+            if (query.len == 0) break :blk null;
+            if (std.ascii.eqlIgnoreCase(c.name, query)) break :blk null; // exact name
+            for (c.aliases) |a| {
+                if (std.ascii.eqlIgnoreCase(a, query)) break :blk a; // exact alias
+            }
+            break :blk null;
+        };
+        const rank = builtinRank(c, query);
+        if (rank == 255) continue;
+        hits[nh] = .{ .idx = i, .via_alias = via };
+        popup_ranks[nh] = rank;
+        popup_keys[nh] = rankKey(c, query, rank);
+        nh += 1;
+    }
+    // stable insertion sort by (rank, key)
+    var a: usize = 1;
+    while (a < nh) : (a += 1) {
+        const h = hits[a];
+        const r = popup_ranks[a];
+        const k = popup_keys[a];
+        var b: usize = a;
+        while (b > 0 and (popup_ranks[b - 1] > r or (popup_ranks[b - 1] == r and popup_keys[b - 1] > k))) : (b -= 1) {
+            hits[b] = hits[b - 1];
+            popup_ranks[b] = popup_ranks[b - 1];
+            popup_keys[b] = popup_keys[b - 1];
+        }
+        hits[b] = h;
+        popup_ranks[b] = r;
+        popup_keys[b] = k;
+    }
+    for (hits[0..nh]) |h| {
+        const c = lineinput_cmds.table[h.idx];
+        popup_items[popup_n] = .{ .name = c.name, .args = c.args, .desc = c.desc, .via_alias = h.via_alias };
+        popup_n += 1;
+    }
+    // Skills block: name prefix first, then description substring.
+    if (query.len == 0) {
+        for (extra_cmds) |ec| {
+            if (popup_n >= POPUP_MAX) break;
+            popup_items[popup_n] = .{ .name = ec.name, .desc = ec.desc };
+            popup_n += 1;
+        }
+        return;
+    }
+    for (extra_cmds) |ec| {
+        if (popup_n >= POPUP_MAX) break;
+        if (!std.ascii.startsWithIgnoreCase(ec.name, query)) continue;
+        popup_items[popup_n] = .{ .name = ec.name, .desc = ec.desc };
+        popup_n += 1;
+    }
+    if (query.len >= 2) {
+        for (extra_cmds) |ec| {
+            if (popup_n >= POPUP_MAX) break;
+            if (std.ascii.startsWithIgnoreCase(ec.name, query)) continue; // already added
+            if (!ciContains(ec.desc, query)) continue;
+            popup_items[popup_n] = .{ .name = ec.name, .desc = ec.desc };
+            popup_n += 1;
+        }
+    }
+}
+
+var popup_ranks: [POPUP_MAX]u8 = undefined;
+var popup_keys: [POPUP_MAX]usize = undefined;
+
+/// Rank of a builtin spec for query; 255 = no match. Mirrors
+/// slash_commands.rankQuery without allocation.
+fn builtinRank(c: lineinput_cmds.CommandSpec, q: []const u8) u8 {
+    if (q.len == 0) return 4; // whole catalog, uniform rank → table order
+    if (std.ascii.eqlIgnoreCase(c.name, q)) return 0;
+    for (c.aliases) |a| {
+        if (std.ascii.eqlIgnoreCase(a, q)) return 1;
+    }
+    if (std.ascii.startsWithIgnoreCase(c.name, q)) return 2;
+    for (c.aliases) |a| {
+        if (std.ascii.startsWithIgnoreCase(a, q)) return 3;
+    }
+    if (q.len >= 2 and ciContains(c.desc, q)) return 5;
+    return 255;
+}
+
+fn rankKey(c: lineinput_cmds.CommandSpec, q: []const u8, rank: u8) usize {
+    if (rank == 2) return c.name.len; // shorter prefix hit first
+    if (rank == 3) {
+        for (c.aliases) |a| {
+            if (std.ascii.startsWithIgnoreCase(a, q)) return a.len;
+        }
+    }
+    return 0;
+}
+
+/// Recompute the popup state from the live draft. Idempotent; runs at
+/// every pinned repaint (writeEditorBlock entry) so every edit path —
+/// typing, backspace, adopt, paste — converges without per-key hooks.
+fn popupSyncFromDraft() void {
+    popup_hint_name = "";
+    popup_hint_args = "";
+    if (!popup_enabled or !pending_shown) {
+        popup_open = false;
+        return;
+    }
+    const ed = live_ed orelse {
+        popup_open = false;
+        return;
+    };
+    const draft = ed.buf[0..ed.len];
+    // Un-mute once the draft differs from the muted snapshot.
+    if (popup_muted_len > 0 and !std.mem.eql(u8, draft, popup_muted_buf[0..popup_muted_len])) {
+        popup_muted_len = 0;
+    }
+    var want_open = false;
+    if (draft.len > 0 and draft[0] == '/' and !ed.browsing and
+        std.mem.indexOfScalar(u8, draft, '\n') == null)
+    {
+        if (std.mem.indexOfScalar(u8, draft, ' ')) |sp| {
+            // "/name " or "/name args…": S2 hint only for the exact
+            // one-trailing-space form of a KNOWN command (builtin only —
+            // skills carry no declared args).
+            if (sp + 1 == draft.len) {
+                if (lineinput_cmds.indexOfCommand(draft[1..sp])) |ti| {
+                    const c = lineinput_cmds.table[ti];
+                    if (c.args.len > 0) {
+                        popup_hint_name = c.name;
+                        popup_hint_args = c.args;
+                    }
+                }
+            }
+        } else if (ed.pos >= 1 and popup_muted_len == 0) {
+            // Cursor inside the token (not on the '/' itself).
+            want_open = true;
+        }
+    }
+    if (!want_open) {
+        popup_open = false;
+        return;
+    }
+    const prev_name: ?[]const u8 = if (popup_open and popup_sel < popup_n) popup_items[popup_sel].name else null;
+    popupFill(draft[1..]);
+    if (popup_n == 0) {
+        popup_open = false;
+        return;
+    }
+    // Selection preservation across refilters: find the same command by
+    // name (CC matches by id; name is our id). Fall back to 0.
+    popup_sel = 0;
+    if (prev_name) |pn| {
+        for (popup_items[0..popup_n], 0..) |it, i| {
+            if (std.mem.eql(u8, it.name, pn)) {
+                popup_sel = i;
+                break;
+            }
+        }
+    }
+    popup_open = true;
+}
+
+/// Adopt the selected row into the draft (Tab/Enter). No-arg commands
+/// fill "/name" (dispatch's exact-match arms would reject a trailing
+/// space); arg-taking ones fill "/name " which lands in S2 showing the
+/// args hint. The next sync closes S1 — Tab leaves the command unsent.
+fn popupAdopt(ed: *Editor) void {
+    if (popup_n == 0 or popup_sel >= popup_n) return;
+    const it = popup_items[popup_sel];
+    ed.len = 0;
+    ed.pos = 0;
+    ed.nav = null;
+    ed.browsing = false;
+    ed.insertBytes("/") catch {};
+    ed.insertBytes(it.name) catch {};
+    if (it.args.len > 0) ed.insertBytes(" ") catch {};
+    popup_open = false;
+    popup_muted_len = 0;
+}
+
+/// Close the popup and mute re-triggering for THIS draft (Esc). The
+/// snapshot un-mutes on the next edit (popupSyncFromDraft).
+fn popupMute(ed: *Editor) void {
+    popup_open = false;
+    const draft = ed.buf[0..ed.len];
+    const n = @min(draft.len, popup_muted_buf.len);
+    @memcpy(popup_muted_buf[0..n], draft[0..n]);
+    popup_muted_len = n;
+}
+
+/// True when the draft is a bare slash token ("/que", single line, no
+/// space, cursor inside) — the popup-eligible shape.
+fn draftSlashToken(ed: *Editor) bool {
+    const d = ed.buf[0..ed.len];
+    return d.len > 0 and d[0] == '/' and
+        std.mem.indexOfScalar(u8, d, ' ') == null and
+        std.mem.indexOfScalar(u8, d, '\n') == null and
+        ed.pos >= 1;
+}
+
 /// The split row the CURRENTLY PAINTED pinned band sits below — from the
 /// PAINT-TIME ledgers (region_h + last_block_rows), NOT the live draft:
 /// submit empties the draft via takeLine BEFORE anyone repaints, so a
@@ -929,6 +1239,12 @@ pub fn setIo(io: std.Io) void {
 fn paintedSplit() usize {
     if (region_h == 0) return regionRows();
     return @max(@max(region_h, 4) -| (2 +| last_block_rows), 1);
+}
+
+/// repaint hook: converge the popup state to the live draft before any
+/// pinned-band layout math (regionRows counts popupVisibleRows). Idempotent.
+fn popupSync() void {
+    popupSyncFromDraft();
 }
 
 /// P3c Ctrl+O（与 Claude Code 的 verbose 开关同键）：切换工具输出的
@@ -968,6 +1284,9 @@ fn flushReal(w: *std.Io.Writer) void {
 /// parks at the input block's end (the typing position).
 fn regionApply(w: *std.Io.Writer) void {
     const h = @max(termHeight(), 4);
+    // Popup state must converge BEFORE any split math (regionRows counts
+    // the popup rows) — same convergence point as the keystroke path.
+    popupSyncFromDraft();
     // OLD layout, captured BEFORE the ledgers update: a SHRINKING block
     // (line delete mid-edit, resize down) leaves its old rule/block rows
     // orphaned ABOVE the new rule line; DECSTBM then expands over them
@@ -976,7 +1295,7 @@ fn regionApply(w: *std.Io.Writer) void {
     const prev_split = paintedSplit();
     region_h = h;
     const split = regionRows();
-    last_block_rows = blockRows();
+    last_block_rows = blockRows() + popupVisibleRows();
     if (!pending_shown) {
         // FIRST ARM. The cursor sits at the FLOW position (right after
         // the committed echo) — on an UNKNOWN row R (full-screen shell
@@ -1156,6 +1475,73 @@ fn paintRuleLine(w: *std.Io.Writer, row: usize) void {
     std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
 }
 
+/// Popup name-column width — computed over the WHOLE catalog (+extras)
+/// so the column never jitters while the filter narrows (CC's stable
+/// maxColumnWidth). Lazily cached; invalidated when extras change.
+var popup_name_w: usize = 0;
+
+fn popupNameWidth() usize {
+    if (popup_name_w > 0) return popup_name_w;
+    var m: usize = 0;
+    for (lineinput_cmds.table) |c| {
+        var n: usize = 1 + c.name.len;
+        if (c.args.len > 0) n += 1 + c.args.len;
+        var amax: usize = 0;
+        for (c.aliases) |a| amax = @max(amax, a.len);
+        if (amax > 0) n += 3 + amax; // worst-case " (alias)" suffix
+        m = @max(m, n);
+    }
+    for (extra_cmds) |ec| m = @max(m, 1 + ec.name.len);
+    popup_name_w = m;
+    return m;
+}
+
+/// Paint the popup's visible rows at absolute rows starting
+/// `row_idx` — the band between the editor block and the status row.
+/// Selected row: cyan "❯ /name <args>"; others: dim, two-space gutter.
+/// Scroll window keeps the SELECTION centered (CC behavior).
+fn writePopupRows(w: *std.Io.Writer, row_idx: usize) void {
+    const vis = popupVisibleRows();
+    if (!popup_open or vis == 0) return;
+    if (popup_n <= vis) {
+        popup_top = 0;
+    } else {
+        var top = popup_sel -| (vis / 2);
+        if (top + vis > popup_n) top = popup_n - vis;
+        popup_top = top;
+    }
+    const tw = @max(currentTermWidth(), 8);
+    const nw = popupNameWidth();
+    var i: usize = 0;
+    var row = row_idx;
+    while (i < vis) : (i += 1) {
+        const it = popup_items[popup_top + i];
+        const sel = popup_top + i == popup_sel;
+        std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row}) catch {};
+        if (sel) {
+            std.Io.Writer.writeAll(w, "\x1b[36m❯ ") catch {};
+        } else {
+            std.Io.Writer.writeAll(w, "\x1b[2m  ") catch {};
+        }
+        var nb: [128]u8 = undefined;
+        var f = std.Io.Writer.fixed(&nb);
+        std.Io.Writer.print(&f, "/{s}", .{it.name}) catch {};
+        if (it.via_alias) |a| std.Io.Writer.print(&f, " ({s})", .{a}) catch {};
+        if (it.args.len > 0) std.Io.Writer.print(&f, " {s}", .{it.args}) catch {};
+        const name_field = nb[0..f.end];
+        std.Io.Writer.writeAll(w, name_field) catch {};
+        if (sel) std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+        var pad = nw -| name_field.len;
+        while (pad > 0) : (pad -= 1) std.Io.Writer.writeAll(w, " ") catch {};
+        std.Io.Writer.writeAll(w, "  ") catch {};
+        // Description: width-aware clip to what remains of the row.
+        const budget = tw -| @min(2 + nw + 2, tw);
+        writeClipped(w, it.desc, budget, &.{}) catch {};
+        std.Io.Writer.writeAll(w, "\x1b[0m") catch {};
+        row += 1;
+    }
+}
+
 /// Paint the editor block into its pinned rows (absolute): every soft-
 /// wrapped display row of the draft, the prompt prefix sharing row 0,
 /// tail-windowed to the live block cap with a dim "↟ +N" marker row when
@@ -1197,7 +1583,9 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
             const l0_len = std.mem.indexOfScalar(u8, draft, '\n') orelse draft.len;
             const tok_end = std.mem.indexOfScalar(u8, draft[0..l0_len], ' ') orelse l0_len;
             slash_tok = tok_end;
-            slash_known = lineinput_cmds.isKnownCommand(draft[0..tok_end]);
+            // Skills (extra catalog) color like builtin commands.
+            slash_known = lineinput_cmds.isKnownCommand(draft[0..tok_end]) or
+                (tok_end > 1 and extraKnown(draft[1..tok_end]));
         }
     }
     const pills: [PASTE_SLOTS]?PasteStat = if (live_ed) |e| e.pasteStats() else @splat(null);
@@ -1225,6 +1613,8 @@ fn writeEditorBlock(w: *std.Io.Writer) void {
         // Degenerate (shouldn't happen): keep an empty input row.
         std.Io.Writer.print(w, "\x1b[{d};1H\x1b[2K", .{row_idx}) catch {};
     }
+    // Completion popup band: between the editor block and the status row.
+    writePopupRows(w, row_idx);
     // Park the caret at ed.pos's cell — every repaint ends with the
     // caret visible where editing will continue, not wherever the last
     // writeAll left it (the "arrow keys feel dead" root cause).
@@ -1326,17 +1716,23 @@ fn renderPendingLineLocked(w: *std.Io.Writer) void {
     if (liveDraft().len == 0 and pending_status_len == 0) {
         // TUI v2 常驻输入区：空草稿只重画（提示符行仍在 pinned 块里），
         // 不再解除 region——旧自动解除是"输入区消失"类观感的来源。
-        if (pending_shown) writeEditorBlock(w);
+        if (pending_shown) {
+            popupSyncFromDraft();
+            writeEditorBlock(w);
+        }
         return;
     }
     if (!pending_shown) {
         regionApply(w);
         return;
     }
+    // Popup first: an open/closing popup changes the pinned band height
+    // the comparison below (and writeEditorBlock) must already see.
+    popupSyncFromDraft();
     // Terminal resize OR a draft whose row count changed (multi-line
-    // growth/shrink) re-applies the DECSTBM bounds; otherwise repaint
-    // only the block's rows.
-    if (termHeight() != region_h or blockRows() != last_block_rows) {
+    // growth/shrink — popup open/close included) re-applies the DECSTBM
+    // bounds; otherwise repaint only the block's rows.
+    if (termHeight() != region_h or blockRows() + popupVisibleRows() != last_block_rows) {
         regionApply(w);
         return;
     }
@@ -1416,19 +1812,33 @@ pub fn regionFreeze(w: *std.Io.Writer) void {
 /// 输入区上边界 hint（空闲态的 meta 行）。列宽感知截断——字节切会砍
 /// 烂多字节字符（⏵/·/CJK），且字节位≠显示列。两个绘制点（regionApply
 /// 与 paintStatusRow）共用本函数——两处内联曾在 S22 开发中漂移过一次。
+/// S2 参数提示态（"/name " 尾随空格）改显命令的参数形状。
 fn paintHintRow(w: *std.Io.Writer) void {
-    const hint = "⏵ Enter 发送 · Esc 撤回/中断 · ↑↓ 历史 · Ctrl+O 详简 · Ctrl+T 风格 · Ctrl+R 搜索";
+    if (popup_hint_args.len > 0) {
+        var hb: [96]u8 = undefined;
+        var f = std.Io.Writer.fixed(&hb);
+        std.Io.Writer.print(&f, "⏵ /{s} {s} — 补参数后 Enter 发送（Esc 关闭提示）", .{ popup_hint_name, popup_hint_args }) catch {};
+        const shown = f.buffered();
+        clipDimRow(w, shown);
+        return;
+    }
+    const hint = "⏵ Enter 发送 · / 命令面板 · ↑↓ 历史/选择 · Tab 补全 · Esc 撤回 · Ctrl+R 搜索";
+    clipDimRow(w, hint);
+}
+
+/// Width-aware dim row for the hint line (shared by both hint forms).
+fn clipDimRow(w: *std.Io.Writer, s: []const u8) void {
     const tw = currentTermWidth();
     var col: usize = 0;
     var i: usize = 0;
-    while (i < hint.len) {
-        const next = nextChar(hint, i);
-        const cw = strWidth(hint[i..next]);
+    while (i < s.len) {
+        const next = nextChar(s, i);
+        const cw = strWidth(s[i..next]);
         if (col + cw > tw) break;
         col += cw;
         i = next;
     }
-    std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{hint[0..i]}) catch {};
+    std.Io.Writer.print(w, "\x1b[2m{s}\x1b[0m", .{s[0..i]}) catch {};
 }
 
 fn paintStatusRow(w: *std.Io.Writer) void {
@@ -2663,7 +3073,8 @@ const Editor = struct {
             const l0_len = std.mem.indexOfScalar(u8, line, '\n') orelse line.len;
             const tok_end = std.mem.indexOfScalar(u8, line[0..l0_len], ' ') orelse l0_len;
             st.slash_tok = tok_end;
-            st.slash_known = lineinput_cmds.isKnownCommand(line[0..tok_end]);
+            st.slash_known = lineinput_cmds.isKnownCommand(line[0..tok_end]) or
+                (tok_end > 1 and extraKnown(line[1..tok_end]));
         }
 
         // ── Paint: top edge row, content rows through the walker, bottom
@@ -3176,6 +3587,11 @@ pub fn readLine(
     }
 
     var ctrl_c_at: i64 = 0; // last Ctrl-C press — two rapid presses (≤1s) exit gracefully
+    // Completion popup lives ONLY at the prompt: the mid-turn key pump
+    // (editorLiveKey) renders with this false, so ↑↓ keep their queue/
+    // history meaning while a turn runs. Every exit path resets it.
+    popup_enabled = true;
+    defer popup_enabled = false;
     // Ctrl+R reverse search state.
     var search_on = false;
     var search_q: [128]u8 = undefined;
@@ -3363,6 +3779,15 @@ pub fn readLine(
             // returning EOS, so the prompt-level recall was DEAD CODE (and
             // the byte after Esc got swallowed). Poll, menu.readKey-style.
             if (ed.r.bufferedLen() == 0 and termio.pollInput(25) <= 0) {
+                // Popup open: a lone Esc closes it (and mutes re-trigger
+                // for this draft) BEFORE the recall machinery gets a
+                // shot — CC's overlay priority (autocomplete before
+                // interrupt/recall).
+                if (popup_open) {
+                    popupMute(ed);
+                    try ed.render();
+                    continue;
+                }
                 // Empty draft OR a still-unedited prefill ("继续" after a
                 // recoverable error): the recall REPLACES the suggestion —
                 // Esc means "give me back what I sent", not "keep the
@@ -3437,6 +3862,14 @@ pub fn readLine(
                 .word_left => ed.wordLeft(),
                 .word_right => ed.wordRight(),
                 .up => {
+                    // Popup first (CC arbitration: >1 visible items and
+                    // the arrows belong to the list, wrap-around; history
+                    // keeps them otherwise).
+                    if (popup_open and popupVisibleRows() > 1) {
+                        popup_sel = (popup_sel + popup_n - 1) % popup_n;
+                        try ed.render();
+                        continue;
+                    }
                     // Multi-display-row draft (soft wrap included): move
                     // between rows first; from the top row, Up walks
                     // history as before. The old '\n'-only check made ↑ on
@@ -3470,6 +3903,12 @@ pub fn readLine(
                     }
                 },
                 .down => {
+                    // Popup navigation first (wrap-around), same arbitration as Up.
+                    if (popup_open and popupVisibleRows() > 1) {
+                        popup_sel = (popup_sel + 1) % popup_n;
+                        try ed.render();
+                        continue;
+                    }
                     if (displayRowMove(ed, 1)) {
                         try ed.render();
                         continue;
@@ -3493,9 +3932,13 @@ pub fn readLine(
                     ed.browsing = false;
                 },
                 .esc => {
-                    // CSI 27u = the Esc key on kitty keyboards. Same
-                    // recall rules as a lone ESC byte (see the poll branch:
-                    // empty draft or unedited prefill).
+                    // CSI 27u = the Esc key on kitty keyboards. Popup
+                    // closing outranks the recall rules here too.
+                    if (popup_open) {
+                        popupMute(ed);
+                    }
+                    // Same recall rules as a lone ESC byte (see the poll
+                    // branch: empty draft or unedited prefill).
                     const draft_is_prefill = prefill_text != null and
                         std.mem.eql(u8, ed.buf[0..ed.len], prefill_text.?);
                     if ((ed.len == 0 or draft_is_prefill) and recall_text != null and
@@ -3531,6 +3974,10 @@ pub fn readLine(
         }
         switch (c) {
             '\r' => {
+                // Popup selection is confirmation (CC's execute-on-return):
+                // adopt the highlighted command into the draft, then let
+                // the normal submit path run it.
+                if (popup_open and popup_n > 0) popupAdopt(ed);
                 if (ed.len > 0 and ed.buf[ed.len - 1] == '\\') {
                     // Trailing `\` + Enter = line continuation (Claude-Code
                     // fallback for terminals without Shift+Enter): drop the
@@ -3584,6 +4031,14 @@ pub fn readLine(
                 ed.browsing = false;
             },
             0x03 => {
+                // Ctrl-C: with the popup open, the first press only closes
+                // it (CC's overlay priority — Esc's sibling); it neither
+                // clears the line nor counts toward the double-press exit.
+                if (popup_open) {
+                    popupMute(ed);
+                    renderPendingLine(w);
+                    continue;
+                }
                 // Ctrl-C: a single press just clears the line (terminal users
                 // often hit Ctrl-C reflexively, e.g. copy attempts). Two
                 // RAPID presses (≤1s — the old 3s window let a much later,
@@ -3640,7 +4095,23 @@ pub fn readLine(
             },
             0x01 => ed.pos = 0, // Ctrl-A: line start
             0x05 => ed.pos = ed.len, // Ctrl-E: line end
-            '\t' => try ed.insert('\t'), // Tab: literal (pasted code/markdown tables need it)
+            '\t' => {
+                // Tab: popup accept (CC's autocomplete:accept — fill
+                // "/name" / "/name " WITHOUT sending); re-open a muted
+                // popup when the draft is still a bare slash token;
+                // otherwise the literal tab stays (pasted code/markdown
+                // tables need it).
+                if (popup_open and popup_n > 0) {
+                    popupAdopt(ed);
+                    try ed.render();
+                } else if (draftSlashToken(ed)) {
+                    popup_muted_len = 0; // Tab is an explicit summon
+                    popupSyncFromDraft();
+                    try ed.render();
+                } else {
+                    try ed.insert('\t');
+                }
+            },
             0x02 => { // Ctrl-B: back one display unit (pill = one unit)
                 if (ed.pos > 0) ed.pos = prevGlyph(ed.buf[0..ed.len], ed.pos);
             },
@@ -3652,6 +4123,7 @@ pub fn readLine(
             0x0b => ed.deleteToEnd(), // Ctrl-K
             0x12 => { // Ctrl+R: reverse history search (needs something to search)
                 if (history.items.len > 0) {
+                    popup_open = false; // the search row replaces the popup
                     search_on = true;
                     search_ql = 0;
                     search_from = history.items.len;
@@ -4958,4 +5430,22 @@ test "editorLiveKey: Shift+Enter during generation is a newline, not a cancel" {
     const ed = editorEnsure(alloc, &aw.writer, &fr, "> ");
     try std.testing.expect(!editorLiveKey(&fr, null));
     try std.testing.expectEqualStrings("\n", ed.buf[0..ed.len]);
+}
+
+test "popupFill: exact beats prefix, extras append, prefix finds skills" {
+    // GPA-checked: extras are dupe-owned and released by the reset call.
+    setExtraCommands(std.testing.allocator, &.{.{ .name = "deploy", .desc = "ship it" }});
+    defer setExtraCommands(std.testing.allocator, &.{});
+    popupFill("mode");
+    try std.testing.expect(popup_n >= 2);
+    try std.testing.expectEqualStrings("mode", popup_items[0].name); // exact name first
+    try std.testing.expectEqualStrings("model", popup_items[1].name); // prefix second
+    popupFill("");
+    try std.testing.expect(popup_n >= lineinput_cmds.table.len + 1); // catalog + skill
+    try std.testing.expectEqualStrings("deploy", popup_items[popup_n - 1].name);
+    popupFill("dep");
+    try std.testing.expectEqual(@as(usize, 1), popup_n); // skill prefix hit
+    try std.testing.expectEqualStrings("deploy", popup_items[0].name);
+    popupFill("zzz");
+    try std.testing.expectEqual(@as(usize, 0), popup_n);
 }
