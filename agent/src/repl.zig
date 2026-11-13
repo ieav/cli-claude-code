@@ -225,6 +225,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     }
     defer if (tty_guard.active) {
         termio.writeProtocol(false); // pop: terminal left as found
+        termio.discardPendingInput(); // 丢队列残留：旧协议编码的按键（9;5u 类）不得泄漏给 shell
     };
     // P3c: Ctrl+O toggles tool-output verbosity (prompt AND mid-turn).
     lineinput.on_verbose_toggle = struct {

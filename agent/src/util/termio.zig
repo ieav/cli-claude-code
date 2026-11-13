@@ -208,6 +208,23 @@ pub fn writeBracketedPaste(on: bool) void {
     _ = std.c.write(1, if (on) "\x1b[?2004h" else "\x1b[?2004l", 8);
 }
 
+/// 丢弃 tty 输入队列里未读的字节 —— 只在会话退出链上调用（弹协议
+/// 之后）。2026-11-13 实发：会话协议（kitty/modifyOtherKeys）激活期
+/// 间按下的组合键以 `ESC[9;5u`（Ctrl+Tab）等 CSI-u 编码进队列；ziv
+/// 退出不排空的话，zsh 继承这些字节又解析不了 CSI-u，可打印尾巴
+/// `9;5u` 被当字面文本插进提示符（实测 `~/temp/chat % 9;5u9;5u`）。
+/// 实现走 TCSAFLUSH 而非 tcflush：TCSA 枚举三值 Darwin/Linux 数值
+/// 一致（NOW=0/DRAIN=1/FLUSH=2，std.posix.TCSA 直接可用），而
+/// tcflush 的 TCIFLUSH 两平台值不同（darwin 1 / linux 0）且 std.c
+/// 未声明、还得自写 extern。原模式回放 = 只借 TCSAFLUSH 的「丢弃
+/// 未读输入」副作用，模式零变化。
+pub fn discardPendingInput() void {
+    if (builtin.os.tag == .windows) return; // ConPTY 输入是事件队列，泄漏形态不同，不在此修复面
+    var m: Mode = undefined;
+    if (std.c.tcgetattr(0, &m) != 0) return;
+    _ = std.c.tcsetattr(0, .FLUSH, &m);
+}
+
 /// One cooked-with-echo confirmation read (menu.CookedGuard primitive).
 pub fn cookedEnter(saved: *Mode) bool {
     if (windows) {
