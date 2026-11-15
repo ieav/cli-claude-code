@@ -428,6 +428,8 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
         .max_turns = job.max_turns,
         .perm_ctx = w.perm_ctx,
         .response_budget = if (w.ctx.response_budget > 0) w.ctx.response_budget else 4096,
+        // F4b：应急折叠阈值随实际模型的窗口走（32K 模型早折，200K 晚折）。
+        .context_ceiling = llm.provider.contextEstimate(w.ctx.model, w.ctx.backend),
     });
     finishJob(&w.jobs[idx], res);
     // P3 retry: fail-FAST jobs (≤3 turns in) get exactly one 1s-backoff
@@ -452,6 +454,7 @@ fn runJob(w: *WorkerCtx, idx: usize, provider: llm.Provider, wio: std.Io) void {
             .max_turns = job.max_turns,
             .perm_ctx = w.perm_ctx,
             .response_budget = if (w.ctx.response_budget > 0) w.ctx.response_budget else 4096,
+            .context_ceiling = llm.provider.contextEstimate(w.ctx.model, w.ctx.backend),
         });
         finishJob(&w.jobs[idx], res2);
     }

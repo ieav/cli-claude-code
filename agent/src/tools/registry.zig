@@ -267,6 +267,40 @@ pub fn getBool(input: std.json.Value, key: []const u8) ?bool {
     };
 }
 
+/// History-bound tool-output cap. Everything the model sees of a tool
+/// result passes through here (REPL finishToolCall AND headless
+/// subagents) — the cut MUST carry a marker so the model knows the output
+/// continues and how to page (FileRead offset/limit) or narrow (Bash/
+/// Grep). A silent cut made the model edit files it had only partially
+/// seen (2026-11-15 长链路/多文件排查, fix #1/#5). Under the cap the
+/// input slice is returned as-is (no copy, ownership unchanged); over it
+/// a fresh allocation comes back (caller frees the original).
+pub const HISTORY_OUTPUT_CAP: usize = 16 * 1024;
+
+pub fn capToolOutputForHistory(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len <= HISTORY_OUTPUT_CAP) return raw;
+    // Back off to a UTF-8 boundary — a mid-汉字 cut poisons every later
+    // request with "Invalid UTF-8 middle byte" (same lesson as the old
+    // finishToolCall inline logic).
+    var cut: usize = HISTORY_OUTPUT_CAP;
+    while (cut > 0 and (raw[cut] & 0xC0) == 0x80) cut -= 1;
+    const marker = try std.fmt.allocPrint(alloc, "\n[输出已截断：显示前 {d}/{d} 字节。FileRead 请传 offset/limit 分页续读；Bash/Grep 请收窄输出范围后重试]", .{ cut, raw.len });
+    defer alloc.free(marker);
+    return std.mem.concat(alloc, u8, &.{ raw[0..cut], marker });
+}
+
+/// True for the write-family tool names (canonical + wire aliases) — the
+/// calls whose ARGUMENTS are the edit trail (old_string/new_string,
+/// content). Shared by the TUI diff preview and the fold policy (F3:
+/// history keeps these inputs unfolded — the model needs its own edit
+/// record when revisiting a file mid-marathon).
+pub fn isFileModifyingToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "FileWrite") or
+        std.mem.eql(u8, name, "FileEdit") or
+        std.mem.eql(u8, name, "Write") or
+        std.mem.eql(u8, name, "Edit");
+}
+
 // ──── Behavioral function helpers for existing tools ────
 
 /// Bash tool: never concurrency-safe.
@@ -380,7 +414,7 @@ pub const bash_tool: ToolDefinition = .{
 
 pub const file_read_tool: ToolDefinition = .{
     .name = "FileRead",
-    .description = "Read a file with 1-based line numbers. For files larger than a screen, pass offset (starting line) + limit (line count) to read just the slice you need instead of the whole file.",
+    .description = "Read a file with 1-based line numbers. Whole-file reads cap at 400 lines / 15 KiB — the tail marker names the file's true line count and the next offset; page large files with offset (starting line) + limit (line count).",
     .input_schema =
     \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"Starting line number, 1-based inclusive (default 1 = whole file from the top)"},"limit":{"type":"integer","description":"Maximum number of lines to return (use with offset for large files)"}},"required":["path"]}
     ,
@@ -723,4 +757,33 @@ test "guard: no static-literal ToolResult outputs (free-safety)" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), offenders);
+}
+
+test "capToolOutputForHistory: under cap passes through, over cap cuts with marker" {
+    const alloc = std.testing.allocator;
+    // Under the cap: same slice back, no allocation, no marker.
+    const small = "hello world";
+    const same = try capToolOutputForHistory(alloc, small);
+    try std.testing.expectEqual(small.ptr, same.ptr);
+
+    // Over the cap: fresh slice, ends with the marker naming both sizes,
+    // never cuts mid-UTF-8.
+    const fat = try alloc.alloc(u8, HISTORY_OUTPUT_CAP + 3000);
+    defer alloc.free(fat);
+    @memset(fat[0 .. fat.len - 6], 'x');
+    @memcpy(fat[fat.len - 6 ..], "字尾"); // 6-byte CJK tail: the cut must land on a boundary
+    const capped = try capToolOutputForHistory(alloc, fat);
+    defer alloc.free(capped);
+    try std.testing.expect(capped.len < fat.len + 200);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "输出已截断") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "offset/limit") != null);
+    // Size report: shown bytes are the pre-marker body length (the UTF-8-
+    // backed-off cut), which is also where the marker starts.
+    const marker_start = std.mem.lastIndexOf(u8, capped, "\n[输出已截断").?;
+    const shown_fmt = try std.fmt.allocPrint(alloc, "显示前 {d}/{d} 字节", .{ marker_start, fat.len });
+    defer alloc.free(shown_fmt);
+    try std.testing.expect(std.mem.indexOf(u8, capped, shown_fmt) != null);
+    // Valid UTF-8 up to the marker start (the cut body must not end mid-rune).
+    const body = capped[0..marker_start];
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
 }

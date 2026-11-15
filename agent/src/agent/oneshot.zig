@@ -19,6 +19,7 @@ const model_switcher = @import("../session/model_switcher.zig");
 const registry = @import("../tools/registry.zig");
 const runtime_registry = @import("../tools/runtime_registry.zig");
 const hooks_mod = @import("../hooks/hooks.zig");
+const llm = @import("../llm/mod.zig");
 const subagent = @import("subagent.zig");
 const system_prompt_mod = @import("../system_prompt.zig");
 const zivroot = @import("../util/zivroot.zig");
@@ -103,6 +104,11 @@ pub fn run(
         // 输出预算与交互会话同源（settings.max_tokens）——思考型模型的
         // 思考 token 计入输出预算，小值会"想完就没字"（config.zig 同因）。
         .response_budget = switcher.settings.max_tokens,
+        // F4b：应急折叠阈值——用户覆盖（settings.context_window）优先。
+        .context_ceiling = if (switcher.settings.context_window > 0)
+            switcher.settings.context_window
+        else
+            llm.provider.contextEstimate(switcher.modelName(), switcher.backend),
     });
     defer res.deinit(alloc);
 

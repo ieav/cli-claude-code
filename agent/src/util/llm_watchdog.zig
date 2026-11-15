@@ -164,13 +164,29 @@ pub fn ttftBudgetFor(body_len: usize) u64 {
 }
 
 pub fn armForBody(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8), body_len: usize, cancel_flag: ?*const std.atomic.Value(bool)) Guard {
+    return armImpl(req, kill_reason, currentTimeoutMs(), ttftBudgetFor(body_len), cancel_flag);
+}
+
+/// Web 工具专用臂（2026-11-15 阻塞审计修复）：WebFetch/WebSearch 的 HTTP
+/// 路径原先零超时——服务器连上后挂起不发字节时，尺寸帽永远打不中、
+/// readSliceShort 永久挂住整个工具波次与回合。网页/搜索端点应在秒级
+/// 响应：20s 首字节 + 30s 块间空闲，量级各放 10 倍；kill 归因走同一
+/// kill_reason 机制，调用方以 idleKilled()/ttftKilled() 转成明确错误。
+pub const WEB_TTFT_MS: u64 = 20_000;
+pub const WEB_IDLE_MS: u64 = 30_000;
+
+pub fn armWeb(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8)) Guard {
+    return armImpl(req, kill_reason, WEB_IDLE_MS, WEB_TTFT_MS, null);
+}
+
+fn armImpl(req: *std.http.Client.Request, kill_reason: *std.atomic.Value(u8), timeout_ms: u64, ttft_ms: u64, cancel_flag: ?*const std.atomic.Value(bool)) Guard {
     const conn = req.connection orelse return .{ .state = null, .kill_reason = kill_reason };
     const s = std.heap.smp_allocator.create(State) catch return .{ .state = null, .kill_reason = kill_reason };
     s.* = .{
         .fd = conn.stream_reader.stream.socket.handle,
         .done = std.atomic.Value(bool).init(false),
-        .timeout_ms = currentTimeoutMs(),
-        .ttft_ms = ttftBudgetFor(body_len),
+        .timeout_ms = timeout_ms,
+        .ttft_ms = ttft_ms,
         .first_byte = std.atomic.Value(bool).init(false),
         .last_activity_ms = std.atomic.Value(i64).init(time_mod.nowMillis()),
         .cancel_flag = cancel_flag,

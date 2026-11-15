@@ -4,6 +4,7 @@
 const std = @import("std");
 const wincompat = @import("../util/wincompat.zig");
 const math = @import("../math/mod.zig");
+const llm_watchdog = @import("../util/llm_watchdog.zig");
 
 pub const SearchResult = struct {
     title: []const u8,
@@ -111,17 +112,26 @@ pub const WebSearch = struct {
             },
         });
         defer req.deinit();
+        // 阻塞审计修复（2026-11-15）：搜索端点原先零超时——挂死的服务器
+        // 永久卡住工具波次与回合。
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.armWeb(&req, &kill_reason);
+        defer wd.finish();
         try req.sendBodiless();
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            if (wd.ttftKilled()) return error.SearchTimeout;
+            return e;
+        };
+        wd.firstByte();
 
         if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try self.readResponseBody(&response);
+        const response_body = try self.readResponseBody(&response, wd);
         defer self.allocator.free(response_body);
 
         return self.parseBraveResults(response_body, max_results);
@@ -192,17 +202,25 @@ pub const WebSearch = struct {
             },
         });
         defer req.deinit();
+        // 同 Brave：请求级看门狗（阻塞审计修复 2026-11-15）。
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.armWeb(&req, &kill_reason);
+        defer wd.finish();
         try req.sendBodiless();
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            if (wd.ttftKilled()) return error.SearchTimeout;
+            return e;
+        };
+        wd.firstByte();
 
         if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try self.readResponseBody(&response);
+        const response_body = try self.readResponseBody(&response, wd);
         defer self.allocator.free(response_body);
 
         return self.parseSearXNGResults(response_body, max_results);
@@ -266,6 +284,10 @@ pub const WebSearch = struct {
             },
         });
         defer req.deinit();
+        // 同 Brave/SearXNG：请求级看门狗（阻塞审计修复 2026-11-15）。
+        var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+        const wd = llm_watchdog.armWeb(&req, &kill_reason);
+        defer wd.finish();
 
         // Send POST body
         req.transfer_encoding = .{ .content_length = post_body.len };
@@ -275,24 +297,30 @@ pub const WebSearch = struct {
         try req.connection.?.flush();
 
         var redirect_buf: [4096]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
+        var response = req.receiveHead(&redirect_buf) catch |e| {
+            if (wd.ttftKilled()) return error.SearchTimeout;
+            return e;
+        };
+        wd.firstByte();
 
         if (response.head.status == .too_many_requests) return error.RateLimited;
         if (response.head.status.class() != .success) {
             return error.SearchRequestFailed;
         }
 
-        const response_body = try self.readResponseBody(&response);
+        const response_body = try self.readResponseBody(&response, wd);
         defer self.allocator.free(response_body);
 
         return self.parseDuckDuckGoHTML(response_body, max_results);
     }
 
-    /// Read the full response body into an allocated buffer.
-    fn readResponseBody(self: *Self, response: *std.http.Client.Response) ![]u8 {
+    /// Read the full response body into an allocated buffer. `wd`：请求级
+    /// 看门狗（阻塞审计修复 2026-11-15）——每块推进空闲线，击杀转
+    /// error.SearchTimeout 而非静默挂死/截断。
+    fn readResponseBody(self: *Self, response: *std.http.Client.Response, wd: llm_watchdog.Guard) ![]u8 {
         var transfer_buf: [8192]u8 = undefined;
         const reader = response.reader(&transfer_buf);
-        const raw = try readAllCapped(reader, self.allocator);
+        const raw = try readAllCapped(reader, self.allocator, wd);
         errdefer self.allocator.free(raw);
 
         // Decompress transparently. Some servers (DDG over HTTP/1.1) send
@@ -311,7 +339,7 @@ pub const WebSearch = struct {
             var in_reader = std.Io.Reader.fixed(raw);
             var window: [std.compress.flate.max_window_len]u8 = undefined;
             var d = std.compress.flate.Decompress.init(&in_reader, c, &window);
-            return readAllCapped(&d.reader, self.allocator);
+            return readAllCapped(&d.reader, self.allocator, wd);
         }
         return raw;
     }
@@ -319,14 +347,19 @@ pub const WebSearch = struct {
     /// Read a body chunk-by-chunk instead of allocRemaining: some servers
     /// (DDG) close the stream without the standard chunked terminator, which
     /// makes allocRemaining fail even though the body arrived intact.
-    /// Keep whatever was read; cap at 4 MB.
-    fn readAllCapped(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]u8 {
+    /// Keep whatever was read; cap at 4 MB. 看门狗击杀（块间空闲/首字节
+    /// 超时）转 error.SearchTimeout；其他传输错误维持原行为（保留已读）。
+    fn readAllCapped(reader: *std.Io.Reader, allocator: std.mem.Allocator, wd: llm_watchdog.Guard) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
         var chunk: [8192]u8 = undefined;
         while (list.items.len < 4 * 1024 * 1024) {
-            const n = reader.readSliceShort(&chunk) catch break;
+            const n = reader.readSliceShort(&chunk) catch {
+                if (wd.idleKilled() or wd.ttftKilled()) return error.SearchTimeout;
+                break;
+            };
             if (n == 0) break;
+            wd.firstByte(); // 每块推进空闲线：健康慢流不死
             try list.appendSlice(allocator, chunk[0..n]);
         }
         return list.toOwnedSlice(allocator);

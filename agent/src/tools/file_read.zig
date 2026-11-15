@@ -9,6 +9,15 @@ const registry = @import("registry.zig");
 const file_cache = @import("../util/file_cache.zig");
 const code_index = @import("../knowledge/code_index.zig");
 
+/// 2026-11-15 fix #2（多文件准确度）：全量读的行帽与两条路径共用的字节
+/// 帽。此前全量读会把 ≤1 MiB 的文件整份格式化，再被历史层静默砍到
+/// 4096 字节——模型不知道文件还有后半段，基于残缺视图编辑。现在帽子
+/// 落在本工具内并附带续读标记；字节帽留出余量，使「内容 + 标记」稳
+/// 稳落在 registry.HISTORY_OUTPUT_CAP（16 KiB）之下，历史层的标记对
+/// FileRead 永不重复触发。
+pub const DEFAULT_LINE_CAP: usize = 400;
+pub const SLICE_BYTE_CAP: usize = 15 * 1024;
+
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = getStringField(input, "path") orelse
         return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'path' field is required") catch "", .is_error = true };
@@ -50,14 +59,12 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         code_index.upsertFile(alloc, io, path, @intCast(s.mtime.nanoseconds), @intCast(s.size), contents);
     }
 
-    // Format with line numbers — one allocating writer for the whole pass
-    // (the old loop allocated and freed one string per line).
+    // Format with line numbers, capped (fix #2): the continuation marker
+    // names the file's real line count so the model knows where to page.
     var aw: std.Io.Writer.Allocating = .init(alloc);
-    const pw = &aw.writer;
-    var line_num: usize = 1;
-    var iter = std.mem.splitSequence(u8, contents, "\n");
-    while (iter.next()) |line| : (line_num += 1) {
-        pw.print("{d:6}\t{s}\n", .{ line_num, line }) catch break;
+    const capped = writeCappedLines(&aw, contents, 1, DEFAULT_LINE_CAP, SLICE_BYTE_CAP);
+    if (capped.shown > 0 and capped.shown < capped.total) {
+        aw.writer.print("(showing lines 1-{d} of {d}; pass offset={d} to continue)\n", .{ capped.shown, capped.total, capped.shown + 1 }) catch {};
     }
     alloc.free(contents);
 
@@ -72,6 +79,37 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     }
 
     return registry.ToolResult{ .output = formatted_slice };
+}
+
+/// Capped line formatter shared by the full-read and slice paths.
+/// Formats lines from `start_line` (1-based) with `{d:6}\t` numbering into
+/// `aw`, stopping after `max_lines` shown lines or once `max_bytes` of
+/// formatted output is reached (at least one line always shows, so a
+/// single huge line still surfaces — the history layer's own cap+marker
+/// covers that tail). Returns shown/total; the caller appends the
+/// continuation marker when shown < total.
+fn writeCappedLines(aw: *std.Io.Writer.Allocating, contents: []const u8, start_line: usize, max_lines: usize, max_bytes: usize) struct { shown: usize, total: usize } {
+    // True line count: newlines + 1, minus the trailing-newline artifact
+    // ("a\nb\n" is 2 lines, "a\nb" is 2 too, "" is 0).
+    const total: usize = if (contents.len == 0)
+        0
+    else
+        std.mem.count(u8, contents, "\n") + @intFromBool(contents[contents.len - 1] != '\n');
+    var line_num: usize = 1;
+    var shown: usize = 0;
+    var it = std.mem.splitSequence(u8, contents, "\n");
+    while (it.next()) |line| : (line_num += 1) {
+        // line_num > total: the split artifact after a trailing newline.
+        if (line_num > total) break;
+        if (line_num < start_line) continue;
+        if (shown >= max_lines) break;
+        // +16 covers the "{d:6}\t" prefix and "\n"; check between lines so
+        // the cut stays line-atomic (from the 2nd shown line on).
+        if (shown > 0 and aw.written().len + line.len + 16 > max_bytes) break;
+        aw.writer.print("{d:6}\t{s}\n", .{ line_num, line }) catch break;
+        shown += 1;
+    }
+    return .{ .shown = shown, .total = total };
 }
 
 fn getStringField(input: std.json.Value, key: []const u8) ?[]const u8 {
@@ -94,7 +132,10 @@ fn getIntField(input: std.json.Value, key: []const u8) ?usize {
 /// Either may be absent (offset defaults to 1, limit to "rest of file").
 /// The tail marker names the file's real line count so the model knows
 /// whether (and where) to page next — a silent truncation used to send
-/// it re-reading the whole file.
+/// it re-reading the whole file. An explicit limit is honored up to the
+/// shared byte cap (fix #2): past it the same continuation marker fires,
+/// so an oversized slice request degrades honestly instead of feeding
+/// the history layer a silent cut.
 fn readSlice(alloc: std.mem.Allocator, io: std.Io, path: []const u8, opt_offset: ?usize, opt_limit: ?usize, max_size: usize) !registry.ToolResult {
     const start_line: usize = if (opt_offset) |o| @max(o, 1) else 1;
     const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, std.Io.Limit.limited(max_size)) catch |err| {
@@ -106,24 +147,10 @@ fn readSlice(alloc: std.mem.Allocator, io: std.Io, path: []const u8, opt_offset:
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     const pw = &aw.writer;
-    // True line count: newlines + 1, minus the trailing-newline artifact
-    // ("a\nb\n" is 2 lines, "a\nb" is 2 too, "" is 0).
-    const total_lines: usize = if (contents.len == 0)
-        0
-    else
-        std.mem.count(u8, contents, "\n") + @intFromBool(contents[contents.len - 1] != '\n');
-    var line_num: usize = 1;
-    var shown: usize = 0;
     const limit: usize = opt_limit orelse std.math.maxInt(usize);
-    var it = std.mem.splitSequence(u8, contents, "\n");
-    while (it.next()) |line| : (line_num += 1) {
-        // line_num > total: the split artifact after a trailing newline.
-        if (line_num > total_lines) break;
-        if (line_num < start_line) continue;
-        if (shown >= limit) break;
-        pw.print("{d:6}\t{s}\n", .{ line_num, line }) catch break;
-        shown += 1;
-    }
+    const capped = writeCappedLines(&aw, contents, start_line, limit, SLICE_BYTE_CAP);
+    const total_lines = capped.total;
+    const shown = capped.shown;
     if (start_line > total_lines) {
         const msg = try alloc.print("offset {d} is past the end of the file (it has {d} lines)", .{ start_line, total_lines });
         return registry.ToolResult{ .output = msg, .is_error = true };
@@ -185,6 +212,71 @@ test "FileRead offset/limit slices with accurate totals" {
     const r3 = try execute(alloc, mk(alloc, 11, null), io);
     try std.testing.expect(r3.is_error);
     try std.testing.expect(std.mem.indexOf(u8, r3.output, "it has 10 lines") != null);
+}
+
+test "FileRead whole-file read caps at DEFAULT_LINE_CAP with a continuation marker" {
+    defer code_index.closeGlobal();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const tmp = "/tmp/ziv_fileread_cap_test.txt";
+    var body_aw: std.Io.Writer.Allocating = .init(alloc);
+    for (1..1001) |i| try body_aw.writer.print("line{d}\n", .{i});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = body_aw.written() });
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    file_cache.globalInit(std.testing.allocator);
+    defer file_cache.deinitGlobal();
+
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(alloc, "path", .{ .string = tmp });
+    const r = try execute(alloc, .{ .object = obj }, io);
+    // Exactly the cap's lines shown, plus a marker naming the true total
+    // and the next offset — never a silent cut.
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "  400\tline400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "  401\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "showing lines 1-400 of 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "pass offset=401 to continue") != null);
+    // The whole capped output (content + marker) must fit the history cap
+    // so the history layer's own marker never double-fires for FileRead.
+    try std.testing.expect(r.output.len < registry.HISTORY_OUTPUT_CAP);
+    // Slicing continues where the cap stopped.
+    var sobj: std.json.ObjectMap = .empty;
+    try sobj.put(alloc, "path", .{ .string = tmp });
+    try sobj.put(alloc, "offset", .{ .integer = 401 });
+    try sobj.put(alloc, "limit", .{ .integer = 2 });
+    const rs = try execute(alloc, .{ .object = sobj }, io);
+    try std.testing.expect(std.mem.indexOf(u8, rs.output, "  401\tline401") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs.output, "  402\tline402") != null);
+}
+
+test "FileRead byte cap trumps an oversized explicit limit, honestly" {
+    defer code_index.closeGlobal();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const tmp = "/tmp/ziv_fileread_bytecap_test.txt";
+    var body_aw: std.Io.Writer.Allocating = .init(alloc);
+    // 600 lines × ~40 chars ≈ 24 KiB formatted — over SLICE_BYTE_CAP but
+    // under the 400-line cap, so the byte cap is the binding one.
+    for (1..601) |i| try body_aw.writer.print("padding-content-line-number-{d:04}-xxxxxxxx\n", .{i});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = body_aw.written() });
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(alloc, "path", .{ .string = tmp });
+    try obj.put(alloc, "limit", .{ .integer = 5000 }); // absurd ask
+    const r = try execute(alloc, .{ .object = obj }, io);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "to continue") != null);
+    try std.testing.expect(r.output.len < registry.HISTORY_OUTPUT_CAP);
 }
 
 test "FileRead formats with line numbers and caches repeats" {

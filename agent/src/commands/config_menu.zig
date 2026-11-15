@@ -50,6 +50,12 @@ pub fn runConfigMenu(
         var b9: [64]u8 = undefined;
         var b10: [112]u8 = undefined;
         var b11: [64]u8 = undefined;
+        var b12: [80]u8 = undefined;
+        var cwbuf: [24]u8 = undefined;
+        const cw_label: []const u8 = if (switcher.settings.context_window > 0)
+            (std.fmt.bufPrint(&cwbuf, "{d} tokens", .{switcher.settings.context_window}) catch "自定义")
+        else
+            "自动（按模型名估）";
         const items = [_][]const u8{
             "API Keys",
             try_std_fmt(&b1, "默认模型: {s}", .{switcher.settings.default_model}),
@@ -62,6 +68,7 @@ pub fn runConfigMenu(
             try_std_fmt(&b11, "输出风格: {s}", .{switcher.settings.output_style}),
             try_std_fmt(&b8, "自动错误修复: {s}", .{if (switcher.settings.auto_fix) "开（429/超时退避重试）" else "关（直接出选择器）"}),
             try_std_fmt(&b9, "回合工具轮上限: {d}", .{switcher.settings.agent_loop_limit}),
+            try_std_fmt(&b12, "上下文窗口: {s}", .{cw_label}),
             try_std_fmt(&b10, "上下文提炼压缩: {s}", .{if (switcher.settings.auto_deep_compact) "开（LLM 摘要优先，截断兜底）" else "关（压力直落 φ 截断）"}),
             "退出",
         };
@@ -79,6 +86,7 @@ pub fn runConfigMenu(
             "default 完整叙述 / concise 结果优先（同 /style、Ctrl+T）",
             "开=429/超时自动退避重试；关=弹出选择器人工决定",
             "单回合 LLM 迭代上限，到限预填「继续」",
+            "0=按内置表估；表外模型被按 32K 误算时在此显式指定（如 131072）",
             "上下文快满时先 LLM 摘要（保信息）再截断（有损兜底）",
             "",
         };
@@ -182,11 +190,25 @@ pub fn runConfigMenu(
                 } else try std.Io.Writer.writeAll(w, "  超出范围（1-200）\n");
             },
             11 => {
+                var cwbuf2: [32]u8 = undefined;
+                const cwal = (menu.readLine(r, w, file_writer, "  上下文窗口 tokens（0=自动按模型估，如 131072，上限一千万）: ", &cwbuf2) catch continue) orelse continue;
+                if (cwal.len == 0) continue;
+                const cw = std.fmt.parseInt(u32, cwal, 10) catch {
+                    try std.Io.Writer.writeAll(w, "  无效数字\n");
+                    continue;
+                };
+                if (cw <= 10_000_000) {
+                    switcher.settings.context_window = cw;
+                    autoSaveSettings(w, file_writer, switcher, alloc, io);
+                    try std.Io.Writer.print(w, "  上下文窗口: {s}\n", .{if (cw > 0) "已设（下一回合起提示符 % 与压缩梯子按此口径）" else "自动（按模型名估）"});
+                } else try std.Io.Writer.writeAll(w, "  超出范围（0-10000000）\n");
+            },
+            12 => {
                 switcher.settings.auto_deep_compact = !switcher.settings.auto_deep_compact;
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
                 try std.Io.Writer.print(w, "  上下文提炼压缩: {s}\n", .{if (switcher.settings.auto_deep_compact) "开" else "关"});
             },
-            12 => break,
+            13 => break,
             else => {},
         }
     }

@@ -249,10 +249,8 @@ pub const OllamaProvider = struct {
                         if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
                         try content_buf.appendSlice(self.allocator, t);
                     },
-                    .thinking => |t| {
-                        if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
-                        try content_buf.appendSlice(self.allocator, t);
-                    },
+                    // F5（2026-11-15）：同 openai.zig——历史 thinking 不回传。
+                    .thinking => {},
                     .tool_use => |tu| {
                         has_tool_use = true;
                         try id_names.append(self.allocator, .{ .id = tu.id, .name = tu.name });

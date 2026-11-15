@@ -19,10 +19,8 @@ const DIFF_MAX_COLS: usize = 110;
 const DIFF_MAX_DIFFABLE_LINES: usize = 800;
 
 pub fn isFileModifyingTool(tool_name: []const u8) bool {
-    return std.mem.eql(u8, tool_name, "FileWrite") or
-        std.mem.eql(u8, tool_name, "FileEdit") or
-        std.mem.eql(u8, tool_name, "Write") or
-        std.mem.eql(u8, tool_name, "Edit");
+    // F3: one source of truth in the registry (the fold policy shares it).
+    return registry.isFileModifyingToolName(tool_name);
 }
 
 /// Execute a single tool call and record result.
@@ -222,10 +220,13 @@ pub fn finishToolCall(
         renderCodeDiff(ow, diff_arena.allocator(), p.call.input, p.old_content) catch {};
     }
 
-    // Truncate large outputs for history — must dupe before freeing
-    const max_result = 4096;
+    // Truncate large outputs for history — must dupe before freeing.
+    // 2026-11-15 fix #1: the cap moved to registry.capToolOutputForHistory
+    // (4096 → 16 KiB) and now carries a truncation marker — the old silent
+    // cut left the model editing files it had only partially seen.
     const raw = result.output;
-    const truncated = raw.len > max_result;
+    const content_for_history: []const u8 = try registry.capToolOutputForHistory(alloc, raw);
+    const truncated = content_for_history.ptr != raw.ptr;
 
     // Full-body display (2026-11-06, user call — supersedes the ③ 80-col
     // one-liner): the preview made every interesting output a /last
@@ -242,17 +243,9 @@ pub fn finishToolCall(
     }) catch {};
     printToolBody(ow, raw, langForToolInput(p.call.tool_name, p.call.input));
 
-    // History copy: truncate at 4096 bytes — but BACK OFF to a UTF-8
-    // char boundary. A mid-char cut used to poison every later request:
-    // the gateway's JSON parser rejected the whole session with
-    // "Invalid UTF-8 middle byte" (tool outputs full of CJK comments hit
-    // the 4096th byte mid-汉字 all the time).
-    var hist_cut: usize = max_result;
-    while (hist_cut > 0 and hist_cut < raw.len and (raw[hist_cut] & 0xC0) == 0x80) hist_cut -= 1;
-    const content_for_history: []const u8 = if (truncated)
-        try alloc.dupe(u8, raw[0..hist_cut])
-    else
-        raw; // ownership transfers, no dupe needed
+    // History copy: the UTF-8-boundary back-off and the truncation marker
+    // both live in capToolOutputForHistory now (a mid-char cut used to
+    // poison every later request with "Invalid UTF-8 middle byte").
 
     try result_blocks.append(alloc, .{
         .tool_result = .{
@@ -265,7 +258,7 @@ pub fn finishToolCall(
     });
     _ = log.record(p.call.tool_name, "executed", result.output, p.snap_id, p.snap_id != null, history_len, turn_label) catch {};
     if (truncated) {
-        // History owns the dupe; the original (error or not) is spent.
+        // History owns the capped copy; the original (error or not) is spent.
         alloc.free(result.output);
     }
     // If not truncated, content_for_history == result.output; ownership moved into history

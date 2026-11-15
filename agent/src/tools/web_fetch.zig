@@ -6,6 +6,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const html_md = @import("../util/html_md.zig");
+const llm_watchdog = @import("../util/llm_watchdog.zig");
 
 /// 输出预算：超长页面截断并标注未读量（A7/T2.1 验收）。
 pub const OUTPUT_BUDGET: usize = 30_000;
@@ -28,11 +29,23 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         return registry.ToolResult{ .output = try alloc.print("fetch failed: {s}", .{@errorName(err)}), .is_error = true };
     };
     defer req.deinit();
+    // 阻塞审计修复（2026-11-15）：Web 路径原先零超时——服务器连上后挂起
+    // 不发字节时，下载帽永远打不中，readSliceShort 永久挂住整个工具波次
+    // 与回合（Esc 批取消只在调用间检查，救不了执行中的 fetch）。套上
+    // 看门狗：20s 首字节 / 30s 块间空闲，击杀以明确错误浮出而非静默截
+    // 断。redirect 若在 receiveHead 内部换连接则新连接短暂脱管（与
+    // provider 路径同一边界，接受）。
+    var kill_reason = std.atomic.Value(u8).init(@backingInt(llm_watchdog.KillReason.none));
+    const wd = llm_watchdog.armWeb(&req, &kill_reason);
+    defer wd.finish();
     try req.sendBodiless();
     var redirect_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch |err| {
+        if (wd.ttftKilled())
+            return registry.ToolResult{ .output = try alloc.print("fetch timed out: no response within {d}s (ziv watchdog) — {s}", .{ llm_watchdog.WEB_TTFT_MS / 1000, url }), .is_error = true };
         return registry.ToolResult{ .output = try alloc.print("fetch failed (no response): {s}", .{@errorName(err)}), .is_error = true };
     };
+    wd.firstByte(); // 头已到：解除 TTFT 子线，空闲线从现在起算
     const status: u16 = @backingInt(response.head.status);
     if (response.head.status.class() != .success) {
         return registry.ToolResult{
@@ -44,18 +57,28 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     var body: std.ArrayList(u8) = .empty;
     errdefer body.deinit(alloc);
     var truncated_download = false;
+    var stalled = false;
     {
         var transfer_buf: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer_buf); // 只许调用一次（断言锁定）
         var chunk: [16 * 1024]u8 = undefined;
         while (body.items.len < DOWNLOAD_CAP) {
-            const n = reader.readSliceShort(&chunk) catch break;
+            const n = reader.readSliceShort(&chunk) catch {
+                // 看门狗击杀（块间空闲超 30s）→ 明确报错；其他传输错误维
+                // 持原行为（跳出循环，按已有内容继续——错误页面常带部分体）。
+                if (wd.idleKilled() or wd.ttftKilled()) stalled = true;
+                break;
+            };
             if (n == 0) break;
+            wd.firstByte(); // 每个数据块推进空闲线：健康慢流不死
             try body.appendSlice(alloc, chunk[0..n]);
             if (body.items.len >= DOWNLOAD_CAP) truncated_download = true;
         }
     }
     defer body.deinit(alloc);
+    if (stalled) {
+        return registry.ToolResult{ .output = try alloc.print("fetch stalled: no data for {d}s mid-body (ziv watchdog, {d} bytes received) — {s}", .{ llm_watchdog.WEB_IDLE_MS / 1000, body.items.len, url }), .is_error = true };
+    }
 
     // 透明解压（同 knowledge/search.zig 的 readResponseBody）：有服务器
     // 不带 Content-Encoding 也发 gzip，魔法字节嗅探兜底。

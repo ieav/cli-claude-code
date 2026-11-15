@@ -6,6 +6,7 @@
 > **v0.8.0 — 会话恢复（/resume）、提炼压缩梯子（onset 75% + /compact 焦点文本）、错误选择器 + auto_fix、后台任务（run_in_background + /bg + BgTask）、WebFetch、/tasks /last /trace 命令、前缀缓存观测（/stats）、子代理白名单/fork/max_turns、代码索引 FTS5、/config 中文菜单自动保存、TUI 可读性（配色五分类 + Ctrl+O 折叠）**；
 > **v0.9.0 — harness 效率批次：utf8proc 宽度判定、sqlite-vec 记忆语义去重、项目根锚定（子目录共享上级 .ziv）、MCP 启动自动连接、Skill tools 强制门、M6 Hooks（Pre/PostToolUse）、M7 `-p` 非交互一发模式、tree-sitter 编辑后语法校验、退出零 LLM 等待（延迟提取档）**；
 > **v0.9.1 — TUI v2 框架化（IDLE/TURN/MODAL 状态机、常驻输入区、模态退出零残留、统一工具头）、Concise 输出风格（/style）、全能力子代理（write:true、容量上限 10、实时进度行）、请求体 UTF-8 清洗**；
+> **v0.9.3 — 效率与准确度批次（长链路/多文件/大批量）：模型可见性三修（工具输出 16 KiB 帽+截断标记 / FileRead 400 行帽+续读标记 / 子代理同帽）、前缀缓存（代码上下文改请求时尾注入——历史字节跨请求恒定）、压缩校准（实测 usage EMA 归真 + context_window 覆盖 + 梯子每迭代重估）、折叠诚实化与写类豁免、子代理护栏（触顶兜底摘要 + 16 轮 + 应急折叠不碰 fork 借用区）、Web 看门狗（WebFetch/WebSearch 20s 首字节 / 30s 空闲，挂死服务器不再卡回合）**。
 > **v0.9.2 — 并发审查五修复（子代理 LLM 请求 250ms 可取消 / live_dispatch 悬垂根治）、skill 命令族（new/show/remove/reload 热加载 + 失败可见化）、MCP stdio 根治（npx 形态可用，9 工具实测桥接）、项目规则 ziv.md（CLAUDE.md/AGENTS.md 兼容整合 + /agents 命令族 + 热重载）、DirTree 工具（第 16 个内置）、AskUserQuestion 选项化、/resume 两修复（ended_at 误报 + flush 收缩重建）、Ctrl-C 退出窗口 3s→1s**。
 
 ---
@@ -47,7 +48,7 @@ zig build install
 ```bash
 # ① 改版本号 —— 只改一处：版本单一事实源
 #    （启动 banner、/version、--version、MCP clientInfo、release.sh 全部读它）
-vim src/util/version.zig   # pub const version = "0.9.2";
+vim src/util/version.zig   # pub const version = "0.9.3";
 
 # ② 构建 + 安装包打包（唯一入口，产物见下方表格）
 ./release.sh
@@ -153,7 +154,7 @@ tar xzf ziv-0.9.2-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 
 ```
 ╔══════════════════════════════════════╗
-║  Ziv - v0.9.2 | (Self-learning)      ║
+║  Ziv - v0.9.3 | (Self-learning)      ║
 ║  π 圆融 · e 增长 · φ 浓缩             ║
 ╚══════════════════════════════════════╝
   π   = 3.1415926536
@@ -284,7 +285,7 @@ ziv -p "..." || echo "回合失败"
   "tools": ["FileRead", "Grep"],          // 可选：工具白名单（只收窄）
   "fork": true,                            // 可选：继承最近对话尾部 ~16K tokens
   "write": true,                           // 可选：全能力模式（默认 false 只读）
-  "max_turns": 10                          // 可选：每个子代理回合上限 1-10
+  "max_turns": 16                          // 可选：每个子代理回合上限 1-16（默认上限 2026-11-15 由 10 提至 16——委派编码任务在 10 轮内经常做不完）
 }
 ```
 
@@ -458,7 +459,7 @@ ziv> 已恢复会话 #41：24 条消息（~8100 tokens · 模型 gpt-4o · 模�
 ## 4. 架构总览
 
 ```
-Ziv Agent v0.9.2
+Ziv Agent v0.9.3
 ├── math/           数学常数核心 (pi, e, phi)
 ├── llm/            多 LLM 后端 (Claude, OpenAI, Ollama) + 流式 + 消息压缩
 ├── tools/          comptime 工具系统 (16 内置工具 + agent 动态工具) + 权限 + 编排
@@ -519,14 +520,14 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 | 工具 | 别名 | 类型 | 并发安全 | 说明 |
 |------|------|------|----------|------|
 | **Bash** | Shell, sh | 读写/破坏性 | 不安全 | 执行 shell 命令。`timeout`（秒，默认 30、上限 300、0=不限）；`run_in_background`（v0.8.0：脱离执行立即返回任务 id，watch/dev-server/长构建用，输出落 `.ziv/tasks/<id>.log`，`/bg` 或 BgTask 管理）；`working_directory`；stdout/stderr 各限 256 KiB |
-| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页）；重复读取未变更文件走 FileStateCache |
+| **FileRead** | Read, cat | 只读 | 安全 | 读取文件（带行号、分页）；全量读上限 400 行 / 15 KiB，尾部带真实总行数与续读 offset 的标记（2026-11-15：此前超限输出被历史层静默砍半，模型不知道文件还有后半段）；重复读取未变更文件走 FileStateCache |
 | **FileWrite** | Write | 读写 | 不安全 | 写入文件 |
 | **FileEdit** | Edit, sed | 读写 | 不安全 | 字符串查找替换编辑 |
 | **Glob** | find | 只读 | 安全 | 目录遍历 + 模式匹配；构建/依赖目录整树剪枝，`maxDepth` 默认 10，结果上限 2000 |
 | **Grep** | search | 只读 | 安全 | 正则内容搜索（优先 ripgrep，回退内置；后端一次判定，进程内缓存）；30s 超时、500 条截断 |
 | **DirTree** | Tree, tree | 只读 | 安全 | **目录结构概览**（v0.9.2）：缩进树形渲染，目录优先字母序；与 Glob 共享剪枝表（node_modules/.git 等整树不进）；`maxDepth` 默认 3、`maxEntries` 默认 400（截断可见）。摸陌生项目的第一步，补 Glob 只会模式匹配的短板 |
 | **WebSearch** | — | 只读 | 安全 | 网络搜索（DuckDuckGo 免 key；设 BRAVE_API_KEY 自动切 Brave；SearXNG 可配） |
-| **WebFetch** | Fetch | 只读 | 安全 | **v0.8.0**：抓取 URL 转 Markdown（搜索的下一步）；结果上限 40K |
+| **WebFetch** | Fetch | 只读 | 安全 | **v0.8.0**：抓取 URL 转 Markdown（搜索的下一步）；结果上限 30K 字符、下载帽 512 KiB；**2026-11-15**：请求级看门狗（20s 首字节 / 30s 块间空闲）——挂死的服务器不再卡住整个回合 |
 | **TaskCreate** | — | 读写 | 不安全 | 创建任务（`priority` 1-5，默认 3） |
 | **TaskList** | — | 只读 | 安全 | 列出所有任务 |
 | **TaskUpdate** | — | 读写 | 不安全 | 更新任务状态 |
@@ -716,6 +717,7 @@ session          → 运行时设置
   "auto_fix": true,
   "auto_deep_compact": true,
   "agent_loop_limit": 50,
+  "context_window": 0,
   "memory_budget_tokens": 1200,
   "subagent_concurrency": 4,
   "checkpointing_enabled": true,
@@ -751,6 +753,7 @@ session          → 运行时设置
 | `auto_fix` | boolean | `true` | 自动错误恢复（429/超时退避重试、溢出自动压缩）；关 → 错误直接进选择器 |
 | `auto_deep_compact` | boolean | `true` | 上下文压力下自动 LLM 提炼压缩（摘要+最近轮原文）；关 → 压力直落 φ 截断 |
 | `agent_loop_limit` | integer | `50` | 每回合 LLM 迭代上限（clamp 1..200）；到限预填「继续」 |
+| `context_window` | integer | `0` | 模型上下文窗口覆盖（tokens，0=按内置表估）。表外模型一律被按 32K 算（真窗口更大 → 会话被过早压缩）；表内但实际窗口更小的变体会撞 400——显式配置最准。提示符 % 与压缩梯子共用此口径（2026-11-15） |
 | `memory_budget_tokens` | integer | `1200` | 跨会话记忆注入预算（200-8000，/config 可调） |
 | `subagent_concurrency` | number | `4` | agent 工具并发 worker（clamp 1..10，1=串行）；写型 dispatch 恒串行不受此值影响 |
 | `max_snapshots` | integer | `100` | 最大快照数量 |

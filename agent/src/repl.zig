@@ -190,6 +190,46 @@ pub fn reloadRulesBlock(
     return false;
 }
 
+/// F1（2026-11-15）：代码上下文尾注的固定前缀——显式声明"这是当前问题
+/// 的参照材料，不是新请求"，防止模型把尾随的 user 消息当成新指令作答。
+const code_context_wrap_prefix = "Reference context for the current question (from the workspace index — not a new request):\n";
+
+/// F1：请求消息 = 稳定历史 + 可选的临时尾消息。块文本由会话态
+/// `code_block` 拥有（跨回合存活）；这里只分配消息数组与块数组，由
+/// freeCodeContextOverlay 成对释放。时间戳取回合固定值——回合内多次
+/// 迭代的请求字节完全一致，网关前缀缓存全程保留。
+fn codeContextOverlay(
+    alloc: std.mem.Allocator,
+    history_items: []const llm.Message,
+    block_text: ?[]const u8,
+    ts: i64,
+) !?[]llm.Message {
+    const bt = block_text orelse return null;
+    const blocks = try alloc.alloc(llm.ContentBlock, 1);
+    errdefer alloc.free(blocks);
+    blocks[0] = .{ .text = bt };
+    const arr = try alloc.alloc(llm.Message, history_items.len + 1);
+    errdefer alloc.free(arr);
+    @memcpy(arr[0..history_items.len], history_items);
+    arr[history_items.len] = .{ .role = .user, .content = blocks, .timestamp = ts };
+    return arr;
+}
+
+fn freeCodeContextOverlay(alloc: std.mem.Allocator, overlay: []llm.Message) void {
+    if (overlay.len == 0) return;
+    alloc.free(@constCast(overlay[overlay.len - 1].content));
+    alloc.free(overlay);
+}
+
+/// F2②（2026-11-15）：settings.context_window > 0 时优先于静态表。静态
+/// 表（provider.contextEstimate）对表外模型一律按 32K 算（真窗口更大
+/// → 过早压缩、摘要套摘要信息衰减），对表内但实际窗口更小的变体会撞
+/// 400——用户显式配置的窗口永远最准。显示与梯子共用此口径。
+fn effectiveContextCeiling(switcher: *ModelSwitcher) u32 {
+    if (switcher.settings.context_window > 0) return switcher.settings.context_window;
+    return llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
+}
+
 pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void {
     // Windows one-shot: VT output + UTF-8 console CP (posix no-op).
     termio.init();
@@ -509,11 +549,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     var mem_topic_baseline: ?[]f32 = null;
     defer if (mem_topic_baseline) |v| allocator.free(v);
     var mem_block_rebuilt = false;
-    // P6-③: per-question code context block (index-backed). Swapped only
-    // when the new question's block differs byte-wise — prompt-cache warm
-    // while the topic holds (same philosophy as the memory re-anchor).
+    // P6-③ + F1: per-question code context text (index-backed). NEVER enters
+    // history — injected as an ephemeral request tail (codeContextOverlay)
+    // so persisted bytes stay identical across requests and the gateway
+    // prefix cache survives question changes. Rebuilt only when the raw
+    // snippets differ; freed/nil when the index has no fresh hits.
     var code_block: ?[]u8 = null;
     defer if (code_block) |cb| allocator.free(cb);
+    // F2（2026-11-15）：字符估算 ↔ 网关实测的会话校准系数（1.0 = 未校
+    // 准）。每个响应后用 usage.input_tokens 更新；压力梯子读
+    // applyCalibration(est_ctx, token_calib)。
+    var token_calib: f64 = 1.0;
     // T8: plan-file anchor — .ziv/plan.md summarized into the system
     // prompt (own 150-token budget), refreshed by content fingerprint.
     var plan_block: ?[]u8 = null;
@@ -838,11 +884,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         };
         var est_ctx = turn_history.estimateHistoryTokens(history.items);
         live_est_tokens.store(@intCast(@min(est_ctx, std.math.maxInt(u32))), .monotonic); // P3: health-check context signal
-        // Parity: the prompt % uses the SAME adaptive ceiling as maybeCompact
-        // (contextEstimate of the active model) — display and decision must
-        // not diverge on small-context models.
-        const ctx_ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
-        const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ctx_ceiling)) * 100.0));
+        // Parity: the prompt % uses the SAME adaptive ceiling and the SAME
+        // calibrated estimate as the pressure ladder — display and decision
+        // must not diverge on small-context models.
+        const ctx_ceiling = effectiveContextCeiling(&switcher);
+        const ctx_pct = @as(u32, @intFromFloat(@as(f64, @floatFromInt(turn_history.applyCalibration(est_ctx, token_calib))) / @as(f64, @floatFromInt(ctx_ceiling)) * 100.0));
         var prompt_buf: [160]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "{s} ({s}) [{d}%] > ", .{ mode_str, switcher.modelName(), ctx_pct }) catch "> ";
         // The turn-scoped live region's input row renders with this SAME
@@ -1020,42 +1066,40 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             traceAddStep(t, .memory_retrieval, if (injected_count > 0) 0.8 else 0.3, "session start", "memory block", if (injected_count > 0) "recency-ranked e-decay injection" else "no memories injected", 0, allocator) catch {};
         }
 
-        // P6-③: refresh the code context block from the index for THIS
-        // question. Skip the swap when byte-identical (cache); drop the
-        // block when the index has nothing fresh to offer.
+        // P6-③ + F1（2026-11-15 前缀缓存修复）：per-question code context
+        // 改为「请求时尾注入」——不再写进 history[0]（system 消息内部）。
+        // 按问题变化的块放在消息序列头部，等于每个新问题都击穿网关前缀
+        // 缓存（其后整段会话全价重读，M3 的阈值调优挡不住这种频率）。
+        // 现在历史字节跨请求恒定；块以临时 user 消息追加在请求末尾随发
+        // 随弃（见 codeContextOverlay），回合内多次迭代共享同一份字节。
+        // 无命中时照旧清空——陈旧的代码上下文会误导。
         {
             const nb = code_index.buildContextBlock(allocator, io, input, 8);
-            if (nb) |new_text| {
+            if (nb) |raw| {
+                defer allocator.free(raw);
                 var swap_needed = true;
                 if (code_block) |cb| {
-                    if (std.mem.eql(u8, cb, new_text)) swap_needed = false;
+                    // Compare the RAW tail under the fixed preamble — the
+                    // stored text is preamble + raw (wrapped below).
+                    if (cb.len >= code_context_wrap_prefix.len and
+                        std.mem.eql(u8, cb[0..code_context_wrap_prefix.len], code_context_wrap_prefix) and
+                        std.mem.eql(u8, cb[code_context_wrap_prefix.len..], raw))
+                    {
+                        swap_needed = false;
+                    }
                 }
                 if (swap_needed) {
-                    if (code_block) |cb| {
-                        if (turn_history.swapMemoryBlockText(&history, allocator, cb, new_text)) {
-                            allocator.free(cb);
-                            code_block = new_text;
-                        } else if (turn_history.appendSystemBlock(&history, allocator, new_text)) {
-                            allocator.free(cb);
-                            code_block = new_text;
-                        } else {
-                            allocator.free(new_text); // keep old block
-                        }
-                    } else if (turn_history.appendSystemBlock(&history, allocator, new_text)) {
-                        code_block = new_text;
-                    } else {
-                        allocator.free(new_text);
+                    // A trailing user message needs an explicit "reference,
+                    // not a new request" frame so the model doesn't answer it.
+                    const wrapped = std.fmt.allocPrint(allocator, "{s}{s}", .{ code_context_wrap_prefix, raw }) catch null;
+                    if (wrapped) |wtxt| {
+                        if (code_block) |cb| allocator.free(cb);
+                        code_block = wtxt;
                     }
-                } else {
-                    allocator.free(new_text);
                 }
             } else if (code_block) |cb| {
-                // No fresh hits for this question — stale code context
-                // misleads; remove the block entirely.
-                if (turn_history.removeSystemBlockByText(&history, allocator, cb)) {
-                    allocator.free(cb);
-                    code_block = null;
-                }
+                allocator.free(cb);
+                code_block = null;
             }
         }
 
@@ -1129,8 +1173,16 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             //   仍 >92%  收窄保留窗（keep=2）再深压；再不行 φ 硬砍
             //   仍 >92%  病态（单条消息/系统提示自身超窗）——唯一断点
             {
-                const ceiling = llm.provider.contextEstimate(switcher.modelName(), switcher.backend);
-                const level = turn_history.pressureLadder(est_ctx, ceiling);
+                // fix #3（2026-11-15 长链路效率）：每轮迭代重估。est_ctx 原先
+                // 只在回合开始算一次、压缩分支内更新——回合内工具轮追加的
+                // 消息对梯子全盲，长链路一路"ok"到撞网关 400，再走有损
+                // phi 应急。现在增长可见，梯子按设计走 hybrid 提炼。O(n)
+                // 扫描在历史有界的前提下可忽略（≤50 轮 × 有界消息数）。
+                est_ctx = turn_history.estimateHistoryTokens(history.items);
+                const ceiling = effectiveContextCeiling(&switcher);
+                // F2：梯子读校准刻度——字符估算 × 会话系数（首响应后归真）。
+                var est_eff = turn_history.applyCalibration(est_ctx, token_calib);
+                const level = turn_history.pressureLadder(est_eff, ceiling);
 
                 // 提炼可用性：开关开 + provider 可达 + full 档（flash/本地
                 // 档不付摘要往返）+ 预算未尽 + 历史够长（hybrid 无从下刀
@@ -1143,27 +1195,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 if (level != .ok) {
                     if (deep_ok and level == .extract) {
                         deep_compacts += 1;
-                        const before_pct = est_ctx * 100 / ceiling;
+                        const before_pct = est_eff * 100 / ceiling;
                         std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 自动提炼压缩（LLM 摘要 + 近5轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
                         try std.Io.File.Writer.flush(&file_writer);
                         turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", turn_history.HYBRID_KEEP) catch {};
                         est_ctx = turn_history.estimateHistoryTokens(history.items);
+                        est_eff = turn_history.applyCalibration(est_ctx, token_calib);
                         if (live_trace) |*t| {
                             var tb: [96]u8 = undefined;
-                            const desc = std.fmt.bufPrint(&tb, "deep ~{d}% -> ~{d}%", .{ before_pct, est_ctx * 100 / ceiling }) catch "deep compact";
+                            const desc = std.fmt.bufPrint(&tb, "deep ~{d}% -> ~{d}%", .{ before_pct, est_eff * 100 / ceiling }) catch "deep compact";
                             traceAddStep(t, .context_assembly, 0.85, "context pressure", desc, "llm extraction", 0, allocator) catch {};
                         }
                     } else if (deep_ok and level == .emergency) {
                         // 收窄保留窗再提炼：keep=2 是信息保全的最后一级。
                         deep_compacts += 1;
-                        const before_pct = est_ctx * 100 / ceiling;
+                        const before_pct = est_eff * 100 / ceiling;
                         std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 紧急提炼（摘要 + 近2轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
                         try std.Io.File.Writer.flush(&file_writer);
                         turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", 2) catch {};
                         est_ctx = turn_history.estimateHistoryTokens(history.items);
+                        est_eff = turn_history.applyCalibration(est_ctx, token_calib);
                         if (live_trace) |*t| {
                             var tb: [96]u8 = undefined;
-                            const desc = std.fmt.bufPrint(&tb, "emergency keep=2 ~{d}% -> ~{d}%", .{ before_pct, est_ctx * 100 / ceiling }) catch "emergency compact";
+                            const desc = std.fmt.bufPrint(&tb, "emergency keep=2 ~{d}% -> ~{d}%", .{ before_pct, est_eff * 100 / ceiling }) catch "emergency compact";
                             traceAddStep(t, .context_assembly, 0.9, "context pressure", desc, "llm extraction (narrow)", 0, allocator) catch {};
                         }
                     }
@@ -1172,7 +1226,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     // >45% 且预算未尽，收窄保留窗再压一轮（回合内工具结果
                     // 折叠由 applyHybridLayout 统一处理）。原先 <75% 即停。
                     if (deep_compacts == 1 and level == .extract) {
-                        const pct_now = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                        const pct_now = @as(f64, @floatFromInt(est_eff)) / @as(f64, @floatFromInt(ceiling));
                         const prov2 = switcher.getProvider() catch null;
                         if (pct_now > turn_history.POST_COMPACT_TARGET and prov2 != null and
                             switcher.settings.auto_deep_compact and
@@ -1180,18 +1234,29 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                             history.items.len > 8)
                         {
                             deep_compacts += 1;
-                            const before_pct = est_ctx * 100 / ceiling;
+                            const before_pct = est_eff * 100 / ceiling;
                             std.Io.Writer.print(ow, "\x1b[2m  [压后仍 {d}%（目标 ≤45%）— 收窄再提炼（摘要 + 近2轮原文）…]\x1b[0m\n", .{before_pct}) catch {};
                             try std.Io.File.Writer.flush(&file_writer);
                             turn_history.compactHistoryKeep(&history, &switcher, &log, allocator, ow, &file_writer, &total_input_tokens, &total_output_tokens, "", 2) catch {};
                             est_ctx = turn_history.estimateHistoryTokens(history.items);
+                            est_eff = turn_history.applyCalibration(est_ctx, token_calib);
                         }
                     }
 
-                    // 提炼不可用/没压够 → φ 截断 + 瘦身（有损兜底）。
-                    if (turn_history.pressureLadder(est_ctx, ceiling) != .ok) {
-                        const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend);
+                    // 提炼不可用/没压够 → φ 截断 + 瘦身（有损兜底）。ceiling
+                    // 透传：用户配置的窗口（effectiveContextCeiling）优先于
+                    // 静态表，否则 override 下 phi 的内部门槛永远不满足。
+                    // 闭环修复 ②（2026-11-15 审计）：maybeCompact 内部用【裸
+                    // 估算】对 61.8%×ceiling 的门槛，而梯子用【校准值】——
+                    // calib>1.22 时会「梯子说必须压、phi 按兵不动」，随后被
+                    // 误诊为『提炼与截断均已用尽』。把 ceiling÷calib 传入：
+                    // 裸估算对 ceiling/calib ⟺ 校准估算对 ceiling，两把尺
+                    // 子归一（token_calib 夹逼 [0.5,3.0]，除法无溢出）。
+                    if (turn_history.pressureLadder(est_eff, ceiling) != .ok) {
+                        const phi_ceiling: u32 = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(ceiling)) / token_calib)));
+                        const cmp_ev = turn_history.maybeCompact(&history, allocator, ow, &file_writer, &log, &facts_block, switcher.modelName(), switcher.backend, phi_ceiling);
                         est_ctx = cmp_ev.tokens;
+                        est_eff = turn_history.applyCalibration(est_ctx, token_calib);
                         if (cmp_ev.compacted) {
                             if (live_trace) |*t| {
                                 var tb: [96]u8 = undefined;
@@ -1203,7 +1268,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
 
                     // 唯一断点：一切手段后仍 >92% —— 病态情形（单条消息或
                     // 系统提示自身超窗，压缩无从下手）。
-                    const pct_final = @as(f64, @floatFromInt(est_ctx)) / @as(f64, @floatFromInt(ceiling));
+                    const pct_final = @as(f64, @floatFromInt(est_eff)) / @as(f64, @floatFromInt(ceiling));
                     if (pct_final > 0.92) {
                         const pct100: u32 = @intFromFloat(pct_final * 100.0);
                         std.Io.Writer.print(ow, "\x1b[2m  [上下文 {d}% — 提炼与截断均已用尽仍超窗（单条消息/系统提示过大？）。本回合到此为止，发送新消息继续；/clear 可立即释放]\x1b[0m\n", .{pct100}) catch {};
@@ -1212,7 +1277,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                     }
                     if (!ctx_warned) {
                         ctx_warned = true;
-                        std.Io.Writer.print(ow, "\x1b[2m  [上下文已压缩至 {d}% — 继续本回合]\x1b[0m\n", .{est_ctx * 100 / ceiling}) catch {};
+                        std.Io.Writer.print(ow, "\x1b[2m  [上下文已压缩至 {d}% — 继续本回合]\x1b[0m\n", .{est_eff * 100 / ceiling}) catch {};
                         try std.Io.File.Writer.flush(&file_writer);
                     }
                 }
@@ -1245,7 +1310,12 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // Stream the response: text deltas print live as they arrive.
             const llm_t0 = util_time.nowMillis();
             var had_thinking = false;
-            const first_resp = stream_mod.streamComplete(prov, cron_ptr, history.items, .{
+            // F1: ephemeral code-context tail — request-only, freed with the
+            // iteration. Identical bytes across this turn's iterations.
+            const ctx_overlay: ?[]llm.Message = try codeContextOverlay(allocator, history.items, code_block, turn_t0);
+            defer if (ctx_overlay) |ov| freeCodeContextOverlay(allocator, ov);
+            const req_msgs: []const llm.Message = ctx_overlay orelse history.items;
+            const first_resp = stream_mod.streamComplete(prov, cron_ptr, req_msgs, .{
                 .max_tokens = switcher.settings.max_tokens,
                 .temperature = 0.7,
                 // Declare the tools so the model can actually call them.
@@ -1383,7 +1453,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                         response.usage.output_tokens, prev_cap, eff_cap,
                     }) catch {};
                     try std.Io.File.Writer.flush(&file_writer);
-                    const next = stream_mod.streamComplete(prov, cron_ptr, history.items, .{
+                    const next = stream_mod.streamComplete(prov, cron_ptr, req_msgs, .{
                         .max_tokens = eff_cap,
                         .temperature = 0.7,
                         .tools = reg.toolSpecs(),
@@ -1436,6 +1506,15 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             total_cached_tokens += response.usage.cached_tokens; // M3.1：前缀缓存命中
             turn_in += response.usage.input_tokens;
             turn_out += response.usage.output_tokens;
+            // F2（2026-11-15）：用本响应实测 input_tokens 校准会话系数——
+            // 估算对象 est_ctx 就是本次请求的字符估算（同一段历史，压缩分
+            // 支未在请求与响应之间动过手）。梯子从下一次压力检查起读校准
+            // 刻度。网关不报 usage 时 updateTokenCalibration 自行跳过。
+            // 闭环修复 ③（审计）：分母补上尾注块——实测含 code context 尾
+            // 注而 est_ctx 只估历史，不补会系统性高估 calib（尾注数百
+            // token，短会话里偏差可观）。
+            const overlay_tokens: u32 = if (code_block) |cb| turn_history.estimateTextTokens(cb) else 0;
+            turn_history.updateTokenCalibration(&token_calib, response.usage.input_tokens, est_ctx +| overlay_tokens);
             // Timing 口径: one window per generation, llm_t0 → accepted
             // response. The rare budget-escalation retry keeps the same
             // llm_t0, folding the discarded attempt into this window — a

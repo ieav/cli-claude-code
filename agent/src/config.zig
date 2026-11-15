@@ -70,6 +70,11 @@ pub const Settings = struct {
     /// cap now prefills 「继续」 instead of a bare stop; raise via
     /// settings.json. Clamp at parse: 1..200.
     agent_loop_limit: u32 = 50,
+    /// F2②（2026-11-15）：模型上下文窗口覆盖（tokens，0 = 按内置静态表
+    /// 估）。静态表对表外模型一律按 32K 算（真窗口更大 → 每次会话被过
+    /// 早压缩、摘要套摘要信息衰减），对表内但实际窗口更小的变体又会撞
+    /// 400——显式配置永远最准。提示符 % 与压缩梯子共用此口径。
+    context_window: u32 = 0,
     max_snapshots: u32 = 100,
     checkpointing_enabled: bool = true,
     system_prompt: ?[]const u8 = null,
@@ -231,6 +236,11 @@ fn loadJsonIntoSettings(settings: *Settings, allocator: std.mem.Allocator, io: s
     if (json_helpers.getInt(value, "agent_loop_limit")) |al| {
         if (al >= 1 and al <= 200) {
             settings.agent_loop_limit = @intCast(al);
+        }
+    }
+    if (json_helpers.getInt(value, "context_window")) |cw| {
+        if (cw >= 0 and cw <= 10_000_000) {
+            settings.context_window = @intCast(cw);
         }
     }
     if (json_helpers.getBool(value, "checkpointing_enabled")) |ce| {
@@ -494,6 +504,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     buf.print(allocator, "  \"auto_fix\": {},\n", .{settings.auto_fix}) catch {};
     buf.print(allocator, "  \"auto_deep_compact\": {},\n", .{settings.auto_deep_compact}) catch {};
     buf.print(allocator, "  \"agent_loop_limit\": {d},\n", .{settings.agent_loop_limit}) catch {};
+    buf.print(allocator, "  \"context_window\": {d},\n", .{settings.context_window}) catch {};
     buf.print(allocator, "  \"max_snapshots\": {d},\n", .{settings.max_snapshots}) catch {};
     // checkpointing_enabled
     buf.print(allocator, "  \"checkpointing_enabled\": {},\n", .{settings.checkpointing_enabled}) catch {};

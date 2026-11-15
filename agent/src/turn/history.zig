@@ -61,15 +61,25 @@ pub fn freeContentBlocks(alloc: std.mem.Allocator, blocks: []const llm.ContentBl
 }
 
 /// Estimate total tokens across all history messages.
+/// 闭环审计 R1（2026-11-15）：.thinking 不计——openai/ollama 序列化已跳过
+/// thinking（F5），它不再出现在请求里；若仍计入估算，思考密集会话的
+/// 校准分母虚高，calib 会被压向下限 0.5（饱和后梯子系统性高报压力 →
+/// 过早压缩）。本估算的全部消费方（梯子/校准/CompactEvent）都是"请求
+/// 体量"语义，与 wire 对齐才是正确口径。claude 后端原生发送 thinking
+/// → 该路径轻微低估，由 calib（>1 方向）吸收。
 pub fn estimateHistoryTokens(history: []const llm.Message) u32 {
     var total: u32 = 0;
     for (history) |msg| {
         for (msg.content) |block| {
             switch (block) {
                 .text => |t| total += estimateTextTokens(t),
-                .tool_use => total += 50,
+                // fix #7（2026-11-15）：按参数体积估（≈字节/4 + id/name 开
+                // 销）。原先恒 50——一次带 10 KiB 正文的 FileWrite 真实
+                // ~2.5K tokens 只计 50，写密集马拉松回合累计低估数万
+                // tokens，压缩晚触发，最后撞网关 400 走有损应急。
+                .tool_use => |tu| total += 32 + @as(u32, @intCast(compaction.jsonValueSize(tu.input) / 4)),
                 .tool_result => |tr| total += estimateTextTokens(tr.content),
-                .thinking => |t| total += estimateTextTokens(t),
+                .thinking => {},
             }
         }
     }
@@ -89,6 +99,25 @@ pub fn estimateTextTokens(text: []const u8) u32 {
         if (c < 0x80) ascii += 1 else wide += 1;
     }
     return @intCast(ascii / 4 + wide / 2);
+}
+
+/// F2（2026-11-15）：字符估算 ↔ 网关实测的会话校准系数。每个响应都带
+/// 真实 usage.input_tokens，却只进 /stats 统计不反馈进估算——梯子刻度
+/// 与真实窗口的系统性偏差（±20-30%）让压缩偏早（白付摘要调用+信息损
+/// 失）或偏晚（400 应急）。EMA(0.7/0.3) + 夹逼 [0.5, 3.0]：首响应即
+/// 归真，后续慢漂移；网关不报 usage 或估算为 0 时跳过。
+pub fn updateTokenCalibration(calib: *f64, measured: u32, estimated: u32) void {
+    if (measured == 0 or estimated == 0) return;
+    const r = @as(f64, @floatFromInt(measured)) / @as(f64, @floatFromInt(estimated));
+    calib.* = std.math.clamp(0.7 * calib.* + 0.3 * r, 0.5, 3.0);
+}
+
+/// The ladder sees the CALIBRATED estimate — callers multiply the raw
+/// char-based estimate by the session coefficient.
+pub fn applyCalibration(est: u32, calib: f64) u32 {
+    const eff = @as(f64, @floatFromInt(est)) * calib;
+    if (eff >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(eff);
 }
 
 /// Auto-compact if history exceeds phi threshold. Returns the history's
@@ -137,12 +166,14 @@ pub const CompactEvent = struct {
     slimmed: usize = 0,
 };
 
-pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog, facts: *?[]u8, model: []const u8, backend: llm.BackendType) CompactEvent {
+pub fn maybeCompact(history: *std.ArrayList(llm.Message), alloc: std.mem.Allocator, w: *std.Io.Writer, file_writer: *std.Io.File.Writer, log: *op_log.OperationLog, facts: *?[]u8, model: []const u8, backend: llm.BackendType, ceiling_override: u32) CompactEvent {
     const current_tokens = estimateHistoryTokens(history.items);
     // T4.1: the ceiling follows the ACTIVE model's context estimate, not
     // the old hardcoded 128K — an 8K local model now compacts at ~5K
-    // instead of overflowing first.
-    const ceiling = llm.provider.contextEstimate(model, backend);
+    // instead of overflowing first. F2②（2026-11-15）：调用方可透传用户
+    // 配置的窗口（settings.context_window，0 = 走静态表）——否则自定义
+    // 窗口下 phi 的内部门槛永远不满足，兜底路径名存实亡。
+    const ceiling = if (ceiling_override > 0) ceiling_override else llm.provider.contextEstimate(model, backend);
     if (!compaction.needsCompaction(current_tokens, ceiling)) return .{ .tokens = current_tokens };
 
     applyFactsUpdate(history, facts, alloc, compactHistoryImpl(history, alloc, facts.*));
@@ -412,7 +443,10 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
         if (round_idx == 0 or round_idx > round_total.items.len) continue;
         const totals = round_total.items[round_idx - 1];
 
-        // 先扫本消息有没有要折的块（决定是否重建）。
+        // 先扫本消息有没有要折的块（决定是否重建）。闭环审计 R2：use 侧
+        // 条件须与重建循环一致（含 F3 的写类豁免）——原先扫描不豁免，写类
+        // use 触发 has_fold 却一个都不折，白做一次"逐块复制+换数组"的空
+        // 重建（语义无害，纯浪费）。
         var res_n: usize = 0;
         var use_n: usize = 0;
         var has_fold = false;
@@ -421,8 +455,9 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
                 if (totals.results > FOLD_KEEP_PER_ROUND and seen_res + res_n + FOLD_KEEP_PER_ROUND < totals.results) has_fold = true;
                 res_n += 1;
             },
-            .tool_use => {
-                if (totals.uses > FOLD_KEEP_PER_ROUND and seen_use + use_n + FOLD_KEEP_PER_ROUND < totals.uses) has_fold = true;
+            .tool_use => |tu| {
+                if (totals.uses > FOLD_KEEP_PER_ROUND and seen_use + use_n + FOLD_KEEP_PER_ROUND < totals.uses and
+                    !registry.isFileModifyingToolName(tu.name)) has_fold = true;
                 use_n += 1;
             },
             else => {},
@@ -442,8 +477,12 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
             .tool_result => {
                 rord += 1;
                 if (totals.results > FOLD_KEEP_PER_ROUND and rord - 1 + FOLD_KEEP_PER_ROUND < totals.results) {
-                    var mbuf: [96]u8 = undefined;
-                    const marker = std.fmt.bufPrint(&mbuf, "[工具输出已并入摘要（原 {d} B）· /last 查全文]", .{b.tool_result.content.len}) catch "[folded]";
+                    // fix #6（2026-11-15 诚实性）：折叠发生在保留窗内，这些
+                    // 内容从未进过摘要（renderTranscript 只覆盖旧段），旧文案
+                    // 「已并入摘要」让模型信任摘要里不存在的信息；/last 是
+                    // 用户命令，模型也用不了。改为如实说明与恢复路径。
+                    var mbuf: [128]u8 = undefined;
+                    const marker = std.fmt.bufPrint(&mbuf, "[早期工具输出已折叠（原 {d} B）· 需要原文请重新调用相应工具]", .{b.tool_result.content.len}) catch "[folded]";
                     if (alloc.dupe(u8, marker)) |owned| {
                         stats.folded += 1;
                         stats.bytes_before += b.tool_result.content.len;
@@ -462,7 +501,13 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
             },
             .tool_use => {
                 uord += 1;
-                if (totals.uses > FOLD_KEEP_PER_ROUND and uord - 1 + FOLD_KEEP_PER_ROUND < totals.uses) {
+                // F3（2026-11-15）：文件写类工具的参数豁免折叠——old_string/
+                // new_string/content 是编辑轨迹本身，多文件马拉松里模型要靠
+                // 它核对"我给 A 文件写过什么"；探索类调用（Bash/Grep）照旧
+                // 折叠，省 token 的大头本就在结果侧。
+                if (totals.uses > FOLD_KEEP_PER_ROUND and uord - 1 + FOLD_KEEP_PER_ROUND < totals.uses and
+                    !registry.isFileModifyingToolName(b.tool_use.name))
+                {
                     if (foldedInput(alloc, b.tool_use.input)) |ph| {
                         stats.folded += 1;
                         stats.bytes_before += compaction.jsonValueSize(b.tool_use.input);
@@ -901,6 +946,26 @@ test "estimateTextTokens weights CJK above bytes/4" {
     try std.testing.expect(estimateTextTokens("一二三四五六七八") > "一二三四五六七八".len / 4);
     // ASCII keeps the classic chars/4 approximation.
     try std.testing.expectEqual(@as(u32, 1), estimateTextTokens("abcd"));
+}
+
+test "updateTokenCalibration converges to the measured ratio, clamped (F2)" {
+    var calib: f64 = 1.0;
+    // Gateway reports 2× the estimate → coefficient climbs toward 2.
+    for (0..20) |_| updateTokenCalibration(&calib, 20_000, 10_000);
+    try std.testing.expect(calib > 1.9 and calib <= 2.0);
+    // First response alone already moves most of the way (0.3 step).
+    var c2: f64 = 1.0;
+    updateTokenCalibration(&c2, 30_000, 10_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.6), c2, 0.001);
+    // Extreme ratios clamp to [0.5, 3.0].
+    var c3: f64 = 1.0;
+    for (0..10) |_| updateTokenCalibration(&c3, 1_000_000, 1_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), c3, 0.001);
+    // No usage reported (some gateways) → untouched.
+    updateTokenCalibration(&c3, 0, 5_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), c3, 0.001);
+    // applyCalibration scales and saturates.
+    try std.testing.expectEqual(@as(u32, 15_000), applyCalibration(10_000, 1.5));
 }
 
 test "compactHistoryImpl repairs tool pairing after the phi cut" {
@@ -1431,7 +1496,7 @@ test "maybeCompact auto path: phi cut + tier-3 slimming fire together" {
     var facts: ?[]u8 = null;
     defer if (facts) |f| alloc.free(f);
 
-    const ev = maybeCompact(&history, alloc, &w, &fw, &log, &facts, "unknown-model-x", .openai);
+    const ev = maybeCompact(&history, alloc, &w, &fw, &log, &facts, "unknown-model-x", .openai, 0);
     try std.testing.expect(ev.compacted);
     try std.testing.expect(ev.before_tokens > ev.tokens);
     try std.testing.expect(ev.slimmed > 0); // tier 3 rode along
@@ -1485,7 +1550,7 @@ test "foldOldToolResults: marathon round keeps only the last K results (pairing 
     for (history.items[2..]) |m| {
         for (m.content) |b| {
             if (b == .tool_result) {
-                if (std.mem.indexOf(u8, b.tool_result.content, "已并入摘要") != null) folded_markers += 1 else kept_full += 1;
+                if (std.mem.indexOf(u8, b.tool_result.content, "已折叠") != null) folded_markers += 1 else kept_full += 1;
             }
         }
     }
@@ -1493,11 +1558,11 @@ test "foldOldToolResults: marathon round keeps only the last K results (pairing 
     try std.testing.expectEqual(@as(usize, 8), kept_full);
 }
 
-test "foldOldToolResults: marathon tool_use ARGUMENTS folded too (2026-11-09)" {
-    // 取证：会话 1 的 tool_use 参数（Bash 命令/FileWrite 正文）占 878 KiB
-    // ——旧压缩只剪 result 侧。现在 use.input 超出保留窗的换成占位对象。
-    // 全程 arena：fold 的产物与输入同源，不逐块释放（避开 freeJsonValue
-    // 对树内 key 的所有权假设）。
+test "foldOldToolResults: marathon tool_use ARGUMENTS folded too (2026-11-09; F3 uses Bash)" {
+    // 取证：会话 1 的 tool_use 参数（Bash 命令正文）占 878 KiB——旧压缩
+    // 只剪 result 侧。现在 use.input 超出保留窗的换成占位对象。F3 后写
+    // 类工具豁免，故探索类（Bash）承担折叠断言；FileWrite 的豁免见下一
+    // 测试。全程 arena：fold 的产物与输入同源，不逐块释放。
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1507,21 +1572,20 @@ test "foldOldToolResults: marathon tool_use ARGUMENTS folded too (2026-11-09)" {
         sb[0] = .{ .text = "SYSTEM" };
         try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
         const ub = try alloc.alloc(llm.ContentBlock, 1);
-        ub[0] = .{ .text = "write these files" };
+        ub[0] = .{ .text = "run these commands" };
         try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
     }
     var i: usize = 0;
     while (i < 10) : (i += 1) {
         var input: std.json.ObjectMap = .empty;
-        try input.put(alloc, try alloc.dupe(u8, "path"), .{ .string = "f.zig" });
         const big_body = try alloc.alloc(u8, 4096);
         @memset(big_body, 'x');
-        try input.put(alloc, try alloc.dupe(u8, "content"), .{ .string = big_body });
+        try input.put(alloc, try alloc.dupe(u8, "command"), .{ .string = big_body });
         const ub = try alloc.alloc(llm.ContentBlock, 1);
-        ub[0] = .{ .tool_use = .{ .id = "u1", .name = "FileWrite", .input = .{ .object = input } } };
+        ub[0] = .{ .tool_use = .{ .id = "u1", .name = "Bash", .input = .{ .object = input } } };
         try history.append(alloc, .{ .role = .assistant, .content = ub, .timestamp = 0 });
         const rb = try alloc.alloc(llm.ContentBlock, 1);
-        rb[0] = .{ .tool_result = .{ .tool_use_id = "u1", .content = try alloc.dupe(u8, "Wrote 4096 bytes") } };
+        rb[0] = .{ .tool_result = .{ .tool_use_id = "u1", .content = try alloc.dupe(u8, "done") } };
         try history.append(alloc, .{ .role = .user, .content = rb, .timestamp = 0 });
     }
     _ = foldOldToolResults(history.items, alloc);
@@ -1539,11 +1603,47 @@ test "foldOldToolResults: marathon tool_use ARGUMENTS folded too (2026-11-09)" {
     }
     try std.testing.expectEqual(@as(usize, 2), folded_inputs); // 10 - 8
     try std.testing.expectEqual(@as(usize, 8), kept_inputs);
-    // id/name 原样——配对完整性。
+}
+
+test "foldOldToolResults: file-modifying tool_use inputs are exempt (F3)" {
+    // 编辑轨迹（old_string/new_string/content）是模型核对"我写过什么"
+    // 的唯一依据——哪怕超出保留窗也不折叠。多付的 token 有界（写参数
+    // 本身受 HISTORY_OUTPUT_CAP 约束的 result 侧与 SlimStats 兜底）。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var history: std.ArrayList(llm.Message) = .empty;
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = "SYSTEM" };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .text = "edit these files" };
+        try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
+    }
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var input: std.json.ObjectMap = .empty;
+        try input.put(alloc, try alloc.dupe(u8, "path"), .{ .string = "f.zig" });
+        const big_body = try alloc.alloc(u8, 4096);
+        @memset(big_body, 'x');
+        try input.put(alloc, try alloc.dupe(u8, "content"), .{ .string = big_body });
+        const names = [_][]const u8{ "FileWrite", "FileEdit", "Write", "Edit" };
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .tool_use = .{ .id = "u1", .name = names[i % names.len], .input = .{ .object = input } } };
+        try history.append(alloc, .{ .role = .assistant, .content = ub, .timestamp = 0 });
+        const rb = try alloc.alloc(llm.ContentBlock, 1);
+        rb[0] = .{ .tool_result = .{ .tool_use_id = "u1", .content = try alloc.dupe(u8, "ok") } };
+        try history.append(alloc, .{ .role = .user, .content = rb, .timestamp = 0 });
+    }
+    _ = foldOldToolResults(history.items, alloc);
     for (history.items[2..]) |m| {
         if (m.role != .assistant) continue;
         for (m.content) |b| {
-            if (b == .tool_use) try std.testing.expect(std.mem.eql(u8, b.tool_use.name, "FileWrite"));
+            if (b != .tool_use) continue;
+            // 12 uses 全部豁免：参数原样（含大正文），没有任何占位对象。
+            try std.testing.expect(b.tool_use.input == .object and b.tool_use.input.object.get("_folded") == null);
+            try std.testing.expect(b.tool_use.input.object.get("content") != null);
         }
     }
 }

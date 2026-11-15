@@ -89,7 +89,7 @@ fn ensureCleanupRegistered() void {
     cleanup.register("bash-tool-groups", ActiveGroups.killAll) catch {};
 }
 /// Output capture ceiling per stream. finishToolCall truncates tool results
-/// to 4 KiB for history anyway — 256 KiB headroom is plenty for display
+/// to 16 KiB for history anyway — 256 KiB headroom is plenty for display
 /// while a runaway producer (`yes`, `cat /dev/zero`) cannot OOM us.
 const OUTPUT_LIMIT: usize = 256 * 1024;
 

@@ -312,10 +312,11 @@ pub const OpenAIProvider = struct {
                         if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
                         try content_buf.appendSlice(self.allocator, t);
                     },
-                    .thinking => |t| {
-                        if (content_buf.items.len > 0) try content_buf.append(self.allocator, '\n');
-                        try content_buf.appendSlice(self.allocator, t);
-                    },
+                    // F5（2026-11-15）：历史 thinking 不再回传。以正文身份
+                    // 重发过往推理：token 白付（长马拉松可累积数十 K），还
+                    // 轻微污染模型对"自己说过什么"的认知。OpenAI 兼容网关
+                    // 不要求回显 reasoning——省下的是纯浪费。
+                    .thinking => {},
                     .tool_use => has_tool_use = true,
                     .tool_result => {},
                 }
