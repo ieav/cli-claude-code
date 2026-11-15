@@ -404,6 +404,15 @@ pub fn slimToolResults(messages: []llm.Message, alloc: std.mem.Allocator) SlimSt
 /// result——压完仍半窗的直接原因。
 pub const FOLD_KEEP_PER_ROUND: usize = 8;
 
+/// RCA 链 B1（2026-11-15 阅读理解衰减）：折叠从「抹除」降级为「摘要保
+/// 留」。≤FOLD_KEEP_MIN 的结果不折叠（状态类小输出——编辑确认、grep
+/// 命中行——永久存活，折叠它们是纯信息损失零预算收益）；超限的折叠成
+/// FOLD_DIGEST_HEAD 头部 + 标记（模型保有文件锚点：开头几行 + 原始体
+/// 量，知道*读过什么、多大、怎么取回*）。最坏预算代价 ≈ 每回合 +11 KiB，
+/// 有界。
+pub const FOLD_KEEP_MIN: usize = 512;
+pub const FOLD_DIGEST_HEAD: usize = 256;
+
 pub const FoldStats = struct { folded: usize = 0, bytes_before: usize = 0 };
 
 const RoundCounters = struct {
@@ -446,13 +455,14 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
         // 先扫本消息有没有要折的块（决定是否重建）。闭环审计 R2：use 侧
         // 条件须与重建循环一致（含 F3 的写类豁免）——原先扫描不豁免，写类
         // use 触发 has_fold 却一个都不折，白做一次"逐块复制+换数组"的空
-        // 重建（语义无害，纯浪费）。
+        // 重建（语义无害，纯浪费）。B1：≤FOLD_KEEP_MIN 的结果两处同豁免。
         var res_n: usize = 0;
         var use_n: usize = 0;
         var has_fold = false;
         for (m.content) |b| switch (b) {
-            .tool_result => {
-                if (totals.results > FOLD_KEEP_PER_ROUND and seen_res + res_n + FOLD_KEEP_PER_ROUND < totals.results) has_fold = true;
+            .tool_result => |tr| {
+                if (totals.results > FOLD_KEEP_PER_ROUND and seen_res + res_n + FOLD_KEEP_PER_ROUND < totals.results and
+                    tr.content.len > FOLD_KEEP_MIN) has_fold = true;
                 res_n += 1;
             },
             .tool_use => |tu| {
@@ -476,14 +486,19 @@ pub fn foldOldToolResults(messages: []llm.Message, alloc: std.mem.Allocator) Fol
         for (old) |b| switch (b) {
             .tool_result => {
                 rord += 1;
-                if (totals.results > FOLD_KEEP_PER_ROUND and rord - 1 + FOLD_KEEP_PER_ROUND < totals.results) {
-                    // fix #6（2026-11-15 诚实性）：折叠发生在保留窗内，这些
-                    // 内容从未进过摘要（renderTranscript 只覆盖旧段），旧文案
-                    // 「已并入摘要」让模型信任摘要里不存在的信息；/last 是
-                    // 用户命令，模型也用不了。改为如实说明与恢复路径。
+                if (totals.results > FOLD_KEEP_PER_ROUND and rord - 1 + FOLD_KEEP_PER_ROUND < totals.results and
+                    b.tool_result.content.len > FOLD_KEEP_MIN)
+                {
+                    // fix #6 诚实性 + B1 降级保留：折叠=头部摘要而非抹除——
+                    // 256B 头（UTF-8 边界回退）+ 原始体量标记。头部回退防
+                    // mid-rune 切断毒请求（与 finishToolCap 同课）。
+                    var head = @min(b.tool_result.content.len, FOLD_DIGEST_HEAD);
+                    while (head > 0 and head < b.tool_result.content.len and (b.tool_result.content[head] & 0xC0) == 0x80) head -= 1;
                     var mbuf: [128]u8 = undefined;
-                    const marker = std.fmt.bufPrint(&mbuf, "[早期工具输出已折叠（原 {d} B）· 需要原文请重新调用相应工具]", .{b.tool_result.content.len}) catch "[folded]";
-                    if (alloc.dupe(u8, marker)) |owned| {
+                    const marker = std.fmt.bufPrint(&mbuf, "\n[已折叠：原 {d} B，保留前 {d} B — 需要全文请重新调用相应工具]", .{ b.tool_result.content.len, head }) catch "\n[已折叠]";
+                    if (alloc.alloc(u8, head + marker.len)) |owned| {
+                        @memcpy(owned[0..head], b.tool_result.content[0..head]);
+                        @memcpy(owned[head..], marker);
                         stats.folded += 1;
                         stats.bytes_before += b.tool_result.content.len;
                         nb[bi] = .{ .tool_result = .{
@@ -946,6 +961,26 @@ test "estimateTextTokens weights CJK above bytes/4" {
     try std.testing.expect(estimateTextTokens("一二三四五六七八") > "一二三四五六七八".len / 4);
     // ASCII keeps the classic chars/4 approximation.
     try std.testing.expectEqual(@as(u32, 1), estimateTextTokens("abcd"));
+}
+
+test "estimateHistoryTokens excludes thinking (R1 wire parity)" {
+    // F5 后 openai/ollama 不再回传 thinking——估算若仍计入，思考密集会话
+    // 的校准分母虚高，calib 被压向下限饱和。
+    const alloc = std.testing.allocator;
+    const blocks = try alloc.alloc(llm.ContentBlock, 2);
+    defer alloc.free(blocks);
+    const think = try alloc.alloc(u8, 1100);
+    @memset(think, 'r');
+    blocks[0] = .{ .thinking = think };
+    const body = try alloc.alloc(u8, 12);
+    @memset(body, 'a');
+    blocks[1] = .{ .text = body };
+    defer {
+        alloc.free(blocks[0].thinking);
+        alloc.free(blocks[1].text);
+    }
+    const msgs = [_]llm.Message{.{ .role = .assistant, .content = blocks, .timestamp = 0 }};
+    try std.testing.expectEqual(estimateTextTokens(blocks[1].text), estimateHistoryTokens(&msgs));
 }
 
 test "updateTokenCalibration converges to the measured ratio, clamped (F2)" {
@@ -1512,6 +1547,62 @@ test "maybeCompact auto path: phi cut + tier-3 slimming fire together" {
     // cut itself is already asserted via ev.compacted.)
 }
 
+
+test "foldOldToolResults digest: tiny results exempt, big ones keep a 256B head (B1)" {
+    const alloc = std.testing.allocator;
+    var history: std.ArrayList(llm.Message) = .empty;
+    defer {
+        for (history.items) |m| freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        const ub = try alloc.alloc(llm.ContentBlock, 1);
+        ub[0] = .{ .text = try alloc.dupe(u8, "marathon") };
+        try history.append(alloc, .{ .role = .user, .content = ub, .timestamp = 0 });
+    }
+    // 最旧 2 条:小结果(100B,≤FOLD_KEEP_MIN)——豁免,原文永存。
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const fb = try alloc.alloc(llm.ContentBlock, 1);
+        const payload = try alloc.alloc(u8, 100);
+        @memset(payload, 't');
+        fb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "tid"), .content = payload } };
+        try history.append(alloc, .{ .role = .user, .content = fb, .timestamp = 0 });
+    }
+    // 再 12 条 2KiB 大结果:总 14 条,保 8 → 最旧 6 条出窗,其中小 2 条
+    // 豁免 → 恰 4 条大结果被折叠降级。
+    i = 0;
+    while (i < 12) : (i += 1) {
+        const fb = try alloc.alloc(llm.ContentBlock, 1);
+        const payload = try alloc.alloc(u8, 2048);
+        @memset(payload, 'R');
+        fb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "tid"), .content = payload } };
+        try history.append(alloc, .{ .role = .user, .content = fb, .timestamp = 0 });
+    }
+    const stats = foldOldToolResults(history.items, alloc);
+    try std.testing.expectEqual(@as(usize, 4), stats.folded); // 只折 2KiB 的 4 条
+    var tiny_intact: usize = 0;
+    var digests: usize = 0;
+    for (history.items[2..]) |msg| for (msg.content) |b| {
+        if (b != .tool_result) continue;
+        if (std.mem.indexOf(u8, b.tool_result.content, "已折叠") != null) {
+            digests += 1;
+            // 降级形态:256B 头(UTF-8 回退后) + 体量标记,总长有界。
+            try std.testing.expect(b.tool_result.content.len > 256 and b.tool_result.content.len < 256 + 160);
+            // 头部是原文前缀,标记带原始体量与"重新调用"指引。
+            try std.testing.expect(b.tool_result.content[0] == 'R');
+            try std.testing.expect(std.mem.indexOf(u8, b.tool_result.content, "2048") != null);
+            try std.testing.expect(std.mem.indexOf(u8, b.tool_result.content, "重新调用") != null);
+        } else if (b.tool_result.content.len == 100) {
+            tiny_intact += 1;
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 2), tiny_intact);
+    try std.testing.expectEqual(@as(usize, 4), digests);
+}
 
 test "foldOldToolResults: marathon round keeps only the last K results (pairing intact)" {
     const alloc = std.testing.allocator;

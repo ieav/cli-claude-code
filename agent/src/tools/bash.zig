@@ -239,9 +239,35 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     defer out_reader.buf.deinit(alloc);
     defer err_reader.buf.deinit(alloc);
 
+    // Own one combined buffer FIRST (RCA 链 D，2026-11-15)：三个"异常收
+    // 尾"分支（超时/超帽）都不再从零内容开始——已捕获的部分输出一律保
+    // 留，异常说明以标记追加。
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    out.appendSlice(alloc, out_reader.buf.items) catch {};
+    if (err_reader.buf.items.len > 0) {
+        if (out.items.len > 0) out.append(alloc, '\n') catch {};
+        out.appendSlice(alloc, err_reader.buf.items) catch {};
+    }
+
     if (timed_out.load(.acquire)) {
+        // D 第二层（实测）：原先 cat 大文件 = 读端到帽停读 → 写端堵满管
+        // 道 → 30s 超时被杀 → 本分支把已捕获的 256 KiB 全部丢弃（零内容
+        // + 纯等待）。读端已改转排水（PipeReader），有限写手毫秒级自然
+        // 退出走超帽标记；仍超时的是无限写手（yes 类）——保留其已捕获
+        // 部分。空输出场景维持原报错文案（既有测试/断言依赖）。
+        if (out.items.len > 0) {
+            const tm = try alloc.print("\n[ziv] 命令 {d}s 超时被杀——上方为已捕获输出（stdout {d} B，可能不完整）", .{ timeout_s, out_reader.buf.items.len });
+            defer alloc.free(tm);
+            out.appendSlice(alloc, tm) catch {};
+        } else {
+            out.clearRetainingCapacity();
+            const tm2 = try alloc.print("Command timed out after {d}s and was killed: {s}", .{ timeout_s, command });
+            defer alloc.free(tm2);
+            out.appendSlice(alloc, tm2) catch {};
+        }
         return registry.ToolResult{
-            .output = try alloc.print("Command timed out after {d}s and was killed: {s}", .{ timeout_s, command }),
+            .output = try out.toOwnedSlice(alloc),
             .is_error = true,
             .expected_stop = true, // deliberate control flow, not instability
         };
@@ -253,20 +279,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
             .expected_stop = true,
         };
     }
-    if (out_reader.truncated or err_reader.truncated) {
-        return registry.ToolResult{
-            .output = try alloc.print("Command output exceeded the {d} KiB capture limit and was truncated.", .{OUTPUT_LIMIT / 1024}),
-            .is_error = true,
-        };
-    }
 
-    // Own one combined buffer, then release the reader buffers.
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    out.appendSlice(alloc, out_reader.buf.items) catch {};
-    if (err_reader.buf.items.len > 0) {
-        if (out.items.len > 0) out.append(alloc, '\n') catch {};
-        out.appendSlice(alloc, err_reader.buf.items) catch {};
+    // D：超捕获帽保留部分内容 + 教学标记（窄化 / 落盘 + FileRead 分
+    // 页）。is_error 维持退出码语义——输出超帽本身不是命令失败。
+    const over_capture = out_reader.truncated or err_reader.truncated;
+    if (over_capture) {
+        const cm = try alloc.print("\n[ziv] 输出超过 {d} KiB 捕获帽被截断（上方为已捕获部分）。收窄输出（`| head -c 20000` / `| tail` / `| grep`），或落盘后分页：重定向到 /tmp/out.log 再用 FileRead 的 offset/limit 读", .{OUTPUT_LIMIT / 1024});
+        defer alloc.free(cm);
+        out.appendSlice(alloc, cm) catch {};
     }
     if (pipe_forced) {
         out.appendSlice(alloc, "\n[ziv] 输出管道被存活子进程占住，已强制断开（输出可能不完整）") catch {};
@@ -309,13 +329,21 @@ const PipeReader = struct {
             const chunk = r.peekGreedy(1) catch break; // EOF / error
             if (chunk.len == 0) break;
             if (self.buf.items.len >= OUTPUT_LIMIT) {
+                // RCA 链 D 第二层（2026-11-15 实测）：到帽**转排水**而非停
+                // 读——原先 break 后写端堵在满管道上直到 30s 超时被杀，
+                // 而超时分支又把已捕获的 256 KiB 全部丢弃：cat 大文件 =
+                // 等满 30s + 零内容。现在继续消费并丢弃，有限写手自然退
+                // 出（over_capture 标记路径），无限写手（yes 类）仍由超时
+                // 看门狗兜底。
                 self.truncated = true;
-                break;
+                r.toss(chunk.len);
+                continue;
             }
             const n2 = @min(chunk.len, OUTPUT_LIMIT - self.buf.items.len);
             self.buf.appendSlice(self.alloc, chunk[0..n2]) catch {
                 self.truncated = true;
-                break;
+                r.toss(chunk.len);
+                continue;
             };
             r.toss(n2);
         }

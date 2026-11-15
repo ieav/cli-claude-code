@@ -29,6 +29,7 @@ const dispatch_mod = @import("commands/dispatch.zig");
 const input_history_mod = @import("session/input_history.zig");
 const session_store = @import("session/session_store.zig");
 const code_index = @import("knowledge/code_index.zig");
+const file_read_mod = @import("tools/file_read.zig");
 const error_recovery = @import("turn/error_recovery.zig");
 const model_switcher = @import("session/model_switcher.zig");
 pub const ModelSwitcher = model_switcher.ModelSwitcher; // re-export: memory_ops/config_menu alias via repl_mod
@@ -556,6 +557,11 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // snippets differ; freed/nil when the index has no fresh hits.
     var code_block: ?[]u8 = null;
     defer if (code_block) |cb| allocator.free(cb);
+    // B5（2026-11-15）：请求尾注的最终合成文本 = 代码上下文（可选）+
+    // 会话读迹清单（可选）。每个提示符重建并冻结——回合内字节恒定的
+    // F1 契约不变；codeContextOverlay 与校准分母都消费这一份。
+    var overlay_text: ?[]u8 = null;
+    defer if (overlay_text) |ot| allocator.free(ot);
     // F2（2026-11-15）：字符估算 ↔ 网关实测的会话校准系数（1.0 = 未校
     // 准）。每个响应后用 usage.input_tokens 更新；压力梯子读
     // applyCalibration(est_ctx, token_calib)。
@@ -1102,6 +1108,32 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 code_block = null;
             }
         }
+        // B5：合成请求尾注 = 代码上下文（可选）+ 读迹清单（file_read 的
+        // 会话注册表快照，提示符时冻结）。读迹让模型全程知道"本会话读过
+        // 哪些文件、各多少行"——折叠/瘦身后仍可一次零 IO 调用取回。
+        {
+            const read_list = file_read_mod.readFilesText(allocator);
+            defer if (read_list) |rl| allocator.free(rl);
+            const code_part: []const u8 = code_block orelse "";
+            const has_list = read_list != null;
+            const combined: ?[]u8 = blk: {
+                if (code_part.len > 0 and has_list) {
+                    break :blk std.fmt.allocPrint(allocator, "{s}\nRecently read files (re-read with FileRead offset/limit to recall — repeats are cached):\n{s}", .{ code_part, read_list.? }) catch null;
+                } else if (code_part.len > 0) {
+                    break :blk allocator.dupe(u8, code_part) catch null;
+                } else if (has_list) {
+                    break :blk std.fmt.allocPrint(allocator, "Reference context for the current session — not a new request.\nRecently read files (re-read with FileRead offset/limit to recall — repeats are cached):\n{s}", .{read_list.?}) catch null;
+                }
+                break :blk null;
+            };
+            if (combined) |ct| {
+                if (overlay_text) |ot| allocator.free(ot);
+                overlay_text = ct;
+            } else if (overlay_text) |ot| {
+                allocator.free(ot);
+                overlay_text = null;
+            }
+        }
 
         // Agent loop
         var agent_iterations: usize = 0;
@@ -1312,7 +1344,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             var had_thinking = false;
             // F1: ephemeral code-context tail — request-only, freed with the
             // iteration. Identical bytes across this turn's iterations.
-            const ctx_overlay: ?[]llm.Message = try codeContextOverlay(allocator, history.items, code_block, turn_t0);
+            const ctx_overlay: ?[]llm.Message = try codeContextOverlay(allocator, history.items, overlay_text, turn_t0);
             defer if (ctx_overlay) |ov| freeCodeContextOverlay(allocator, ov);
             const req_msgs: []const llm.Message = ctx_overlay orelse history.items;
             const first_resp = stream_mod.streamComplete(prov, cron_ptr, req_msgs, .{
@@ -1513,7 +1545,7 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // 闭环修复 ③（审计）：分母补上尾注块——实测含 code context 尾
             // 注而 est_ctx 只估历史，不补会系统性高估 calib（尾注数百
             // token，短会话里偏差可观）。
-            const overlay_tokens: u32 = if (code_block) |cb| turn_history.estimateTextTokens(cb) else 0;
+            const overlay_tokens: u32 = if (overlay_text) |ot| turn_history.estimateTextTokens(ot) else 0;
             turn_history.updateTokenCalibration(&token_calib, response.usage.input_tokens, est_ctx +| overlay_tokens);
             // Timing 口径: one window per generation, llm_t0 → accepted
             // response. The rare budget-escalation retry keeps the same

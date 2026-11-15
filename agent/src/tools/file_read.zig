@@ -18,6 +18,86 @@ const code_index = @import("../knowledge/code_index.zig");
 pub const DEFAULT_LINE_CAP: usize = 400;
 pub const SLICE_BYTE_CAP: usize = 15 * 1024;
 
+/// RCA 链 A 修复（2026-11-15）：二进制嗅探——首 8 KiB 内出现 NUL 即判
+/// 二进制（ripgrep 同规则）。原先 .png/.db/.class 原样按行编号进上下
+/// 文，15 KiB 预算换零理解价值（writeJsonString 的 U+FFFD 清洗只保请
+/// 求不炸，模型看到的仍是乱码）。改为一次可教学的失败：报错并指路。
+/// UTF-16 文本会误中（ASCII 字符的 NUL 高位）——可接受：它以文本形态
+/// 呈现同样是乱码。
+fn looksBinary(contents: []const u8) bool {
+    const scan = @min(contents.len, 8 * 1024);
+    for (contents[0..scan]) |c| {
+        if (c == 0) return true;
+    }
+    return false;
+}
+
+// ── 会话读迹注册表（RCA 链 B5，2026-11-15 阅读理解衰减）──
+// 「读过什么」比「读到什么」死得快：折叠/瘦身后模型连文件名都不剩。
+// 注册表按 path 去重记录 path + 真实总行数（32 条环形），REPL 在每个提
+// 示符快照冻结、随 F1 尾注入请求——模型全程知道本会话读过哪些文件、
+// 各多少行，重读是一次零 IO 调用（FileStateCache）。并行 FileRead 安全
+//（自旋锁，临界区是 memcpy 级）。
+const RF_RING: usize = 32;
+const RF_PATH: usize = 512;
+const ReadEntry = struct { path: [RF_PATH]u8, path_len: u16, lines: u32 };
+var rf_mu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var rf_ring: [RF_RING]ReadEntry = undefined;
+var rf_head: usize = 0;
+var rf_count: usize = 0;
+
+fn rfLock() void {
+    while (rf_mu.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+}
+fn rfUnlock() void {
+    rf_mu.store(false, .release);
+}
+
+/// 成功读取后登记（按 path 去重、行数就地更新；不改变环内位置——
+/// 首读顺序即清单顺序，足够）。
+pub fn noteFileRead(path: []const u8, total_lines: usize) void {
+    const plen = @min(path.len, RF_PATH);
+    rfLock();
+    defer rfUnlock();
+    for (rf_ring[0..rf_count]) |*e| {
+        if (e.path_len == plen and std.mem.eql(u8, e.path[0..e.path_len], path[0..plen])) {
+            e.lines = @intCast(@min(total_lines, std.math.maxInt(u32)));
+            return;
+        }
+    }
+    const slot = &rf_ring[rf_head];
+    @memcpy(slot.path[0..plen], path[0..plen]);
+    slot.path_len = @intCast(plen);
+    slot.lines = @intCast(@min(total_lines, std.math.maxInt(u32)));
+    rf_head = (rf_head + 1) % RF_RING;
+    rf_count = @min(rf_count + 1, RF_RING);
+}
+
+/// 读迹文本（新→旧，`- path (N lines)` 行）。无记录 → null；调用方拥有
+/// 返回串。
+pub fn readFilesText(alloc: std.mem.Allocator) ?[]u8 {
+    rfLock();
+    defer rfUnlock();
+    if (rf_count == 0) return null;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    var i: usize = 0;
+    while (i < rf_count) : (i += 1) {
+        const idx = (rf_head + RF_RING - 1 - i) % RF_RING;
+        const e = &rf_ring[idx];
+        aw.writer.print("- {s} ({d} lines)\n", .{ e.path[0..e.path_len], e.lines }) catch break;
+    }
+    var list = aw.toArrayList();
+    return list.toOwnedSlice(alloc) catch null;
+}
+
+/// 测试隔离用：清空注册表。
+pub fn readFilesReset() void {
+    rfLock();
+    defer rfUnlock();
+    rf_head = 0;
+    rf_count = 0;
+}
+
 pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anyerror!registry.ToolResult {
     const path = getStringField(input, "path") orelse
         return registry.ToolResult{ .output = alloc.dupe(u8, "Error: 'path' field is required") catch "", .is_error = true };
@@ -51,6 +131,14 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
         const msg = alloc.print("Failed to read '{s}': {}", .{ path, err }) catch return error.OutOfMemory;
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
+    defer alloc.free(contents);
+
+    // RCA 链 A（2026-11-15）：二进制拒读——在索引落库与格式化之前，
+    // 垃圾既不进上下文也不进 code index。
+    if (looksBinary(contents)) {
+        const msg = try alloc.print("Binary file ({d} bytes): {s} — not readable as text. Locate content with Grep, or extract strings via Bash: strings {s}", .{ contents.len, path, path });
+        return registry.ToolResult{ .output = msg, .is_error = true };
+    }
 
     // P6: deposit the successful read into the code index (before the raw
     // buffer is freed) — literal Grep queries then serve from .ziv/index.db
@@ -66,7 +154,8 @@ pub fn execute(alloc: std.mem.Allocator, input: std.json.Value, io: std.Io) anye
     if (capped.shown > 0 and capped.shown < capped.total) {
         aw.writer.print("(showing lines 1-{d} of {d}; pass offset={d} to continue)\n", .{ capped.shown, capped.total, capped.shown + 1 }) catch {};
     }
-    alloc.free(contents);
+    // B5：登记读迹（真实总行数——即使只展示了帽内部分）。
+    noteFileRead(path, capped.total);
 
     var formatted = aw.toArrayList();
     const formatted_slice = try formatted.toOwnedSlice(alloc);
@@ -143,6 +232,10 @@ fn readSlice(alloc: std.mem.Allocator, io: std.Io, path: []const u8, opt_offset:
         return registry.ToolResult{ .output = msg, .is_error = true };
     };
     defer alloc.free(contents);
+    if (looksBinary(contents)) {
+        const msg = try alloc.print("Binary file ({d} bytes): {s} — not readable as text. Locate content with Grep, or extract strings via Bash: strings {s}", .{ contents.len, path, path });
+        return registry.ToolResult{ .output = msg, .is_error = true };
+    }
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
@@ -151,6 +244,8 @@ fn readSlice(alloc: std.mem.Allocator, io: std.Io, path: []const u8, opt_offset:
     const capped = writeCappedLines(&aw, contents, start_line, limit, SLICE_BYTE_CAP);
     const total_lines = capped.total;
     const shown = capped.shown;
+    // B5：切片读同样登记（同一 path 去重、行数更新）。
+    noteFileRead(path, total_lines);
     if (start_line > total_lines) {
         const msg = try alloc.print("offset {d} is past the end of the file (it has {d} lines)", .{ start_line, total_lines });
         return registry.ToolResult{ .output = msg, .is_error = true };
@@ -277,6 +372,72 @@ test "FileRead byte cap trumps an oversized explicit limit, honestly" {
     const r = try execute(alloc, .{ .object = obj }, io);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "to continue") != null);
     try std.testing.expect(r.output.len < registry.HISTORY_OUTPUT_CAP);
+}
+
+test "FileRead refuses binary files with a teaching error (RCA A)" {
+    defer code_index.closeGlobal();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const tmp = "/tmp/ziv_fileread_binary_test.bin";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = "PK\x00\x03\x04rest-of-archive" });
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(alloc, "path", .{ .string = tmp });
+    const r = try execute(alloc, .{ .object = obj }, io);
+    try std.testing.expect(r.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "Binary file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "strings") != null); // 取回路径在文案里
+
+    // 切片路径同门（NUL 在首 8KiB 内）。
+    var sobj: std.json.ObjectMap = .empty;
+    try sobj.put(alloc, "path", .{ .string = tmp });
+    try sobj.put(alloc, "offset", .{ .integer = 1 });
+    const rs = try execute(alloc, .{ .object = sobj }, io);
+    try std.testing.expect(rs.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, rs.output, "Binary file") != null);
+}
+
+test "reading registry: ring wraps at 32, oldest evicted (B5)" {
+    readFilesReset();
+    defer readFilesReset();
+    var i: usize = 0;
+    while (i < 34) : (i += 1) {
+        var pb: [64]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "/tmp/f{d}.zig", .{i}) catch unreachable;
+        noteFileRead(p, i + 1);
+    }
+    const t = (readFilesText(std.testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(t);
+    // 最旧两条(0、1)被挤出;最新在首行;恰 32 条。
+    try std.testing.expect(std.mem.indexOf(u8, t, "/tmp/f0.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "/tmp/f1.zig") == null);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, t, "\n"), "- /tmp/f33.zig"));
+    try std.testing.expect(std.mem.indexOf(u8, t, "/tmp/f2.zig") != null);
+    try std.testing.expectEqual(@as(usize, 32), std.mem.count(u8, t, "\n"));
+}
+
+test "reading registry: note, dedupe-by-path, render newest-first (B5)" {
+    readFilesReset();
+    defer readFilesReset();
+    noteFileRead("/tmp/a.zig", 100);
+    noteFileRead("/tmp/b.zig", 200);
+    noteFileRead("/tmp/a.zig", 150); // 去重：就地更新行数
+    const t = (readFilesText(std.testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(t);
+    const b_at = std.mem.indexOf(u8, t, "- /tmp/b.zig (200 lines)");
+    const a_at = std.mem.indexOf(u8, t, "- /tmp/a.zig (150 lines)");
+    try std.testing.expect(b_at != null and a_at != null);
+    try std.testing.expect(b_at.? < a_at.?); // 新→旧
+    try std.testing.expect(std.mem.indexOf(u8, t, "(100 lines)") == null); // 旧行数已更新
+    // 空注册表 → null。
+    readFilesReset();
+    try std.testing.expect(readFilesText(std.testing.allocator) == null);
 }
 
 test "FileRead formats with line numbers and caches repeats" {
