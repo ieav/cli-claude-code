@@ -496,12 +496,14 @@ fn runApiKeysMenu(
                     switcher.settings.api_keys.anthropic_base_url = new_url;
                 }
                 // Drop cached providers so the new key/URL takes effect now.
-                if (switcher.openai_provider) |*p| {
+                if (switcher.openai_provider) |p| {
                     p.deinit();
+                    std.heap.smp_allocator.destroy(p);
                     switcher.openai_provider = null;
                 }
-                if (switcher.claude_provider) |*p| {
+                if (switcher.claude_provider) |p| {
                     p.deinit();
+                    std.heap.smp_allocator.destroy(p);
                     switcher.claude_provider = null;
                 }
                 autoSaveSettings(w, file_writer, switcher, alloc, io);
@@ -538,8 +540,9 @@ fn runApiKeysMenu(
                     switcher.settings.api_keys.ollama_host = try alloc.dupe(u8, val);
                     // The provider caches base_url at init — drop it so the
                     // new host takes effect this session.
-                    if (switcher.ollama_provider) |*p| {
+                    if (switcher.ollama_provider) |p| {
                         p.deinit();
+                        std.heap.smp_allocator.destroy(p);
                         switcher.ollama_provider = null;
                     }
                     autoSaveSettings(w, file_writer, switcher, alloc, io);

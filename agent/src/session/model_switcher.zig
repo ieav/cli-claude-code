@@ -16,9 +16,16 @@ pub const ModelSwitcher = struct {
     model_name_len: usize = 0,
     backend: llm.BackendType,
     io: std.Io,
-    openai_provider: ?llm.OpenAIProvider = null,
-    claude_provider: ?llm.ClaudeProvider = null,
-    ollama_provider: ?llm.OllamaProvider = null,
+    /// 堆分配（2026-11-20 段错误修复）：std.http.Client 的连接池节点持
+    /// `client: *Client` 反向指针（std 0.17 Client.zig:230），TLS 连接的
+    /// destroy 经它读 allocator 与 free 长度字段——**按值存放/搬运
+    /// provider 会让这些反向指针悬垂**。曾用 `?llm.OpenAIProvider` 内联
+    /// 值 + `retired = .{ .openai = p }` 按值拷贝退役：第二次 /model 触发
+    /// freeRetired 时经陈旧反向指针读垃圾 allocator → 0x18 段错误。堆
+    /// 分配后 provider 地址终身不变，retire 只是零拷贝的指针转移。
+    openai_provider: ?*llm.OpenAIProvider = null,
+    claude_provider: ?*llm.ClaudeProvider = null,
+    ollama_provider: ?*llm.OllamaProvider = null,
     /// A provider retired by a model switch but NOT deinit'd yet: a
     /// detached reflection worker (3 s deadline abandon) may still be
     /// running a request on it — deinit-ing in place was a use-after-free
@@ -29,9 +36,9 @@ pub const ModelSwitcher = struct {
     settings: config_mod.Settings,
 
     const RetiredProvider = union(enum) {
-        openai: llm.OpenAIProvider,
-        claude: llm.ClaudeProvider,
-        ollama: llm.OllamaProvider,
+        openai: *llm.OpenAIProvider,
+        claude: *llm.ClaudeProvider,
+        ollama: *llm.OllamaProvider,
     };
 
     const Self = @This();
@@ -62,11 +69,20 @@ pub const ModelSwitcher = struct {
     }
 
     fn freeRetired(self: *Self) void {
-        if (self.retired) |*r| {
-            switch (r.*) {
-                .openai => |*p| p.deinit(),
-                .claude => |*p| p.deinit(),
-                .ollama => |*p| p.deinit(),
+        if (self.retired) |r| {
+            switch (r) {
+                .openai => |p| {
+                    p.deinit();
+                    allocator.destroy(p);
+                },
+                .claude => |p| {
+                    p.deinit();
+                    allocator.destroy(p);
+                },
+                .ollama => |p| {
+                    p.deinit();
+                    allocator.destroy(p);
+                },
             }
             self.retired = null;
         }
@@ -106,9 +122,18 @@ pub const ModelSwitcher = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.openai_provider) |*p| p.deinit();
-        if (self.claude_provider) |*p| p.deinit();
-        if (self.ollama_provider) |*p| p.deinit();
+        if (self.openai_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
+        if (self.claude_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
+        if (self.ollama_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
         self.freeRetired();
     }
 
@@ -155,31 +180,39 @@ pub const ModelSwitcher = struct {
             .openai => {
                 if (self.openai_provider == null) {
                     const api_key = self.settings.api_keys.openai orelse return error.MissingApiKey;
-                    self.openai_provider = llm.OpenAIProvider.init(allocator, self.io, .{
+                    const p = allocator.create(llm.OpenAIProvider) catch return error.OutOfMemory;
+                    // 一次性写入堆槽位（此刻连接池为空、无反向指针）——
+                    // 之后 provider 地址不再变，见字段注释。
+                    p.* = llm.OpenAIProvider.init(allocator, self.io, .{
                         .api_key = api_key,
                         .model = self.modelName(),
                         .base_url = self.settings.api_keys.openai_base_url orelse "https://api.openai.com/v1",
                     });
+                    self.openai_provider = p;
                 }
                 return self.openai_provider.?.toProvider();
             },
             .claude => {
                 if (self.claude_provider == null) {
                     const api_key = self.settings.api_keys.anthropic orelse return error.MissingApiKey;
-                    self.claude_provider = llm.ClaudeProvider.init(allocator, self.io, .{
+                    const p = allocator.create(llm.ClaudeProvider) catch return error.OutOfMemory;
+                    p.* = llm.ClaudeProvider.init(allocator, self.io, .{
                         .api_key = api_key,
                         .model = self.modelName(),
                         .base_url = self.settings.api_keys.anthropic_base_url orelse "https://api.anthropic.com",
                     });
+                    self.claude_provider = p;
                 }
                 return self.claude_provider.?.toProvider();
             },
             .ollama => {
                 if (self.ollama_provider == null) {
-                    self.ollama_provider = llm.OllamaProvider.init(allocator, self.io, .{
+                    const p = allocator.create(llm.OllamaProvider) catch return error.OutOfMemory;
+                    p.* = llm.OllamaProvider.init(allocator, self.io, .{
                         .model = self.modelName(),
                         .base_url = self.settings.api_keys.ollama_host,
                     });
+                    self.ollama_provider = p;
                 }
                 return self.ollama_provider.?.toProvider();
             },
@@ -218,20 +251,29 @@ fn invalidateStaleProviders(switcher: *ModelSwitcher, fresh: *const config_mod.S
         (differs(old.api_keys.openai, fresh.api_keys.openai) or
             differs(old.api_keys.openai_base_url, fresh.api_keys.openai_base_url)))
     {
-        if (switcher.openai_provider) |*p| p.deinit();
+        if (switcher.openai_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
         switcher.openai_provider = null;
     }
     if (switcher.claude_provider != null and
         (differs(old.api_keys.anthropic, fresh.api_keys.anthropic) or
             differs(old.api_keys.anthropic_base_url, fresh.api_keys.anthropic_base_url)))
     {
-        if (switcher.claude_provider) |*p| p.deinit();
+        if (switcher.claude_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
         switcher.claude_provider = null;
     }
     if (switcher.ollama_provider != null and
         !std.mem.eql(u8, old.api_keys.ollama_host, fresh.api_keys.ollama_host))
     {
-        if (switcher.ollama_provider) |*p| p.deinit();
+        if (switcher.ollama_provider) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
         switcher.ollama_provider = null;
     }
 }
