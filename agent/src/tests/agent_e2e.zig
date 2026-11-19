@@ -28,7 +28,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 // ── mock gateway ─────────────────────────────────────────────────────
 
-const MockMode = enum { happy, stall, gate_yes, gate_no };
+const MockMode = enum { happy, stall, gate_yes, gate_no, fail, happy_ka };
 
 const MockServer = struct {
     mode: MockMode,
@@ -83,6 +83,24 @@ fn mockServe(server: *MockServer) void {
         switch (server.mode) {
             .happy, .gate_yes, .gate_no => {
                 writeResponse(stream, io, server.mode);
+                stream.close(io);
+            },
+            // 2026-11-20 段错误回归：HTTP/1.1 默认 keep-alive（不回
+            // Connection: close、不关流）→ 客户端把连接**还进池子**——
+            // 池节点持有 `client: *Client` 反向指针，provider 按值拷贝/
+            // 搬移即悬垂。退役回归测试依赖这个形态。
+            .happy_ka => {
+                var rsp: [256]u8 = undefined;
+                const head = std.fmt.bufPrint(&rsp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{happy_body.len}) catch return;
+                writeAll(stream, io, head);
+                writeAll(stream, io, happy_body);
+                // 不 close：连接保活，客户端还池
+            },
+            .fail => {
+                // T4.1 breaker leg: immediate 500 — the openai provider
+                // maps non-2xx to an error, compactHistoryKeep swallows it
+                // and reports to the summary breaker.
+                writeAll(stream, io, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 stream.close(io);
             },
             .stall => {
@@ -230,14 +248,28 @@ fn waitReady(server: *MockServer) !u16 {
     return error.MockServerNotReady;
 }
 
+/// 2026-11-20 间歇崩溃修复：MockServer 必须堆分配。栈上实例在测试返
+/// 回后栈帧回收，而 mockServe 线程常驻阻塞在 accept()（running=false
+/// 唤不醒它）——下一次连接到达时它读/写已回收的栈内存（实测 panic
+/// "switch on corrupt value"，ABRT 杀掉整个测试进程，间歇报在无辜测
+/// 试头上）。堆实例进程生命周期持有，不 destroy——测试进程的微量泄
+/// 漏换确定性。固定 smp_allocator（不跟调用方走：testing.allocator 会
+/// 把不 destroy 记成泄漏失败）。
+fn spawnMock(mode: MockMode) !*MockServer {
+    const server = try std.heap.smp_allocator.create(MockServer);
+    server.* = .{ .mode = mode };
+    const th = try std.Thread.spawn(.{}, mockServe, .{server});
+    th.detach();
+    _ = try waitReady(server);
+    return server;
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 test "agent dispatch E2E happy path: 2 tasks, mock gateway, no hang" {
     const alloc = std.heap.smp_allocator;
-    var server = MockServer{ .mode = .happy };
-    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
-    th.detach();
-    const port = try waitReady(&server);
+    const server = try spawnMock(.happy);
+    const port = server.port;
     defer server.running.store(false, .release);
 
     const t0 = time_mod.nowMillis();
@@ -275,10 +307,8 @@ test "agent dispatch E2E stall: watchdog kills, retry fails, dispatch still retu
         }
     }
 
-    var server = MockServer{ .mode = .stall };
-    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
-    th.detach();
-    const port = try waitReady(&server);
+    const server = try spawnMock(.stall);
+    const port = server.port;
     defer server.running.store(false, .release);
 
     const t0 = time_mod.nowMillis();
@@ -301,10 +331,8 @@ test "agent dispatch E2E stall: watchdog kills, retry fails, dispatch still retu
 
 test "hybrid compact E2E: mock gateway summarizes, layout is three-tier" {
     const alloc = std.heap.smp_allocator;
-    var server = MockServer{ .mode = .happy };
-    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
-    th.detach();
-    const port = try waitReady(&server);
+    const server = try spawnMock(.happy);
+    const port = server.port;
     defer server.running.store(false, .release);
 
     var io_state = std.Io.Threaded.init(alloc, .{});
@@ -399,10 +427,8 @@ fn runReflectionWithMockGate(
     comptime expect_stored: bool,
 ) !void {
     const alloc = std.heap.smp_allocator;
-    var server = MockServer{ .mode = mode };
-    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
-    th.detach();
-    const port = try waitReady(&server);
+    const server = try spawnMock(mode);
+    const port = server.port;
     defer server.running.store(false, .release);
 
     var io_state = std.Io.Threaded.init(alloc, .{});
@@ -477,10 +503,8 @@ test "P5 quality gate: mock curator says yes → insight stored" {
 
 test "bounded exit extraction: stalled gateway falls back within deadline" {
     const alloc = std.heap.smp_allocator;
-    var server = MockServer{ .mode = .stall };
-    const th = try std.Thread.spawn(.{}, mockServe, .{&server});
-    th.detach();
-    const port = try waitReady(&server);
+    const server = try spawnMock(.stall);
+    const port = server.port;
     defer server.running.store(false, .release);
 
     var io_state = std.Io.Threaded.init(alloc, .{});
@@ -553,4 +577,163 @@ test "bounded exit extraction: stalled gateway falls back within deadline" {
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "正在提取本会话记忆") != null);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "降级") != null);
     alloc.free(settings.api_keys.openai_base_url.?);
+}
+
+// ── T4.1 summary breaker E2E ─────────────────────────────────────────
+
+// Three consecutive summary failures against a 500-ing gateway trip the
+// breaker (the ladder's deep_ok then short-circuits to phi); after the
+// cooldown tick a succeeding summary resets it. History stays untouched
+// on every failed leg.
+test "summary breaker E2E: 3 failed summaries trip, success after cooldown resets" {
+    const alloc = std.heap.smp_allocator;
+    const turn_history = @import("../turn/history.zig");
+
+    // Reset the session-level breaker state before driving it.
+    turn_history.noteSummaryOutcome(true);
+
+    const fail_server = try spawnMock(.fail);
+    const fail_port = fail_server.port;
+    defer fail_server.running.store(false, .release);
+
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const model_switcher = @import("../session/model_switcher.zig");
+    const config_mod = @import("../config.zig");
+    const op_log = @import("../checkpoint/op_log.zig");
+    const llm = @import("../llm/mod.zig");
+
+    var settings = config_mod.Settings{};
+    settings.default_model = "gpt-mock-e2e";
+    settings.api_keys.openai = "test-key";
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{fail_port});
+    var switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer switcher.deinit();
+
+    // [system] + 10 × ([user] [assistant] [user tool_result]) — enough for
+    // hybridSplit to carve an older segment to summarize.
+    var history: std.ArrayList(llm.Message) = .empty;
+    {
+        const sb = try alloc.alloc(llm.ContentBlock, 1);
+        sb[0] = .{ .text = try alloc.dupe(u8, "SYSTEM") };
+        try history.append(alloc, .{ .role = .system, .content = sb, .timestamp = 0 });
+        var round: usize = 0;
+        while (round < 10) : (round += 1) {
+            var ub: [64]u8 = undefined;
+            const ut = try std.fmt.bufPrint(&ub, "user question round {d}", .{round});
+            const ubb = try alloc.alloc(llm.ContentBlock, 1);
+            ubb[0] = .{ .text = try alloc.dupe(u8, ut) };
+            try history.append(alloc, .{ .role = .user, .content = ubb, .timestamp = 0 });
+            const abb = try alloc.alloc(llm.ContentBlock, 1);
+            abb[0] = .{ .text = try alloc.dupe(u8, "assistant answer") };
+            try history.append(alloc, .{ .role = .assistant, .content = abb, .timestamp = 0 });
+            const fat = try alloc.alloc(u8, 1024);
+            @memset(fat, 'x');
+            const trb = try alloc.alloc(llm.ContentBlock, 1);
+            trb[0] = .{ .tool_result = .{ .tool_use_id = try alloc.dupe(u8, "t0"), .content = fat } };
+            try history.append(alloc, .{ .role = .user, .content = trb, .timestamp = 0 });
+        }
+    }
+    const msgs_before = history.items.len;
+    defer {
+        for (history.items) |m| turn_history.freeMessage(m, alloc);
+        history.deinit(alloc);
+    }
+
+    var log = op_log.OperationLog.init(alloc);
+    defer log.deinit();
+    const null_file = try std.Io.Dir.cwd().openFile(io, "/dev/null", .{ .mode = .write_only });
+    defer null_file.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var fw = std.Io.File.Writer.initStreaming(null_file, io, &wbuf);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var total_in: u64 = 0;
+    var total_out: u64 = 0;
+
+    // Three failed summary rounds: history untouched each time, breaker
+    // closes on the third.
+    var leg: usize = 0;
+    while (leg < 3) : (leg += 1) {
+        turn_history.compactHistoryKeep(&history, &switcher, &log, alloc, &aw.writer, &fw, &total_in, &total_out, "", turn_history.HYBRID_KEEP) catch {};
+        try std.testing.expectEqual(msgs_before, history.items.len);
+    }
+    // 请求数只设下界：provider 内部可能重试一次（served=3 或 4），
+    // 语义断言是「三轮压缩全部失败 + 熔断打开」而非精确命中数。
+    try std.testing.expect(fail_server.served.load(.monotonic) >= 3);
+    try std.testing.expect(turn_history.summaryBreakerOpen());
+
+    // Cooldown tick → half-open (retry allowed next turn).
+    turn_history.summaryBreakerTurnTick();
+    try std.testing.expect(!turn_history.summaryBreakerOpen());
+
+    // Success leg against a happy gateway resets the breaker completely.
+    const ok_server = try spawnMock(.happy);
+    const ok_port = ok_server.port;
+    defer ok_server.running.store(false, .release);
+
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{ok_port});
+    var ok_switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer ok_switcher.deinit();
+
+    turn_history.compactHistoryKeep(&history, &ok_switcher, &log, alloc, &aw.writer, &fw, &total_in, &total_out, "", turn_history.HYBRID_KEEP) catch {};
+    try std.testing.expect(ok_server.served.load(.monotonic) >= 1);
+    try std.testing.expect(!turn_history.summaryBreakerOpen());
+    try std.testing.expect(history.items.len < msgs_before); // actually compacted
+}
+
+// ── model switcher retirement regression（2026-11-20 /model 段错误）──
+
+// 事故链：provider 曾按值内联在 ModelSwitcher 里，retireProvider 用
+// `retired = .{ .openai = p }` 整体 memcpy 退役。std.http.Client 的连接
+// 池节点持 `client: *Client` 反向指针（std 0.17 Client.zig:230），TLS
+// destroy 经它读 allocator 与 free 长度——拷贝后反向指针指向原槽位，
+// 该槽位随后被置 null / 被重建的新 provider 覆写 / 被并发请求改写。
+// 第二次 /model 触发 freeRetired → 经陈旧指针读垃圾 allocator →
+// 0x18 段错误（2026-11-19 用户实测）。修复 = provider 堆分配、地址终
+// 身不变、retire 只做零拷贝指针转移。本测试驱动用户原始序列：请求 →
+// 切换（停放）→ 重建+请求 → 再切换（释放上一位退役者），keep-alive
+// mock 保证连接真的还池（反向指针真实存在）。
+test "model switcher: retire/park cycle over pooled connections doesn't crash" {
+    const alloc = std.heap.smp_allocator;
+    const model_switcher = @import("../session/model_switcher.zig");
+    const config_mod = @import("../config.zig");
+    const provider_mod = @import("../llm/provider.zig");
+
+    const server = try spawnMock(.happy_ka);
+    const port = server.port;
+    defer server.running.store(false, .release);
+
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    var settings = config_mod.Settings{};
+    settings.default_model = "gpt-switch-a";
+    settings.api_keys.openai = "test-key";
+    settings.api_keys.openai_base_url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/v1", .{port});
+    var switcher = model_switcher.ModelSwitcher.init(settings, io);
+    defer switcher.deinit();
+
+    const msgs = [_]provider_mod.Message{
+        .{ .role = .user, .content = &.{.{ .text = "hi" }}, .timestamp = 0 },
+    };
+
+    // Provider #1 + keep-alive 请求 → 连接还池，节点反向指针指向 #1。
+    {
+        const prov = try switcher.getProvider();
+        _ = prov.complete(&msgs, .{}) catch {};
+    }
+    // 切换 #1：停放 #1（修复前是 memcpy 拷贝，槽位被 null）。
+    try switcher.switchModel("gpt-switch-b");
+    // 重建 #2 + 请求（修复前 #2 复用 #1 的原槽位——悬垂制造现场）。
+    {
+        const prov = try switcher.getProvider();
+        _ = prov.complete(&msgs, .{}) catch {};
+    }
+    // 切换 #2：freeRetired(#1)——用户 2026-11-19 `/model plan` 的崩帧。
+    try switcher.switchModel("gpt-switch-a");
+    try std.testing.expect(server.served.load(.monotonic) >= 2);
 }
