@@ -2,6 +2,7 @@
 /// token estimation, φ/auto compaction, key-fact preservation, tool-pair
 /// repair, content-block deep copy, clear/undo primitives.
 const std = @import("std");
+const hooks_mod = @import("../hooks/hooks.zig");
 const llm = @import("../llm/mod.zig");
 const compaction = @import("../llm/compaction.zig");
 const op_log = @import("../checkpoint/op_log.zig");
@@ -147,6 +148,44 @@ pub const POST_COMPACT_TARGET: f64 = 0.45;
 pub var compacts_done: u64 = 0;
 pub var tokens_reclaimed: u64 = 0;
 
+/// T4.1 摘要熔断器（会话级，2026-11-19）：compactHistoryKeep 的失败全部
+/// 在函数内部吞掉（打印后 return），压力梯子看不见——网关停摆/限流时
+/// deep_compacts 每回合重置，每回合白付最多 2 次摘要往返。连败
+/// SUMMARY_BREAKER_TRIP 次后熔断：梯子的 deep_ok 短路，直落 φ 截断；
+/// cooldown 以「回合」为单位指数退避（1→2→4→8），退尽后半开重试一次，
+/// 再败继续翻倍。任一次成功全复位。手动 /compact 走同一函数，同样
+/// 计数——手动压缩成功即网关恢复的信号，自动路径随之解锁。
+pub const SUMMARY_BREAKER_TRIP: u8 = 3;
+pub var summary_fails: u8 = 0;
+pub var summary_cooldown: u8 = 0;
+var summary_cooldown_cap: u8 = 1;
+
+pub fn summaryBreakerOpen() bool {
+    return summary_cooldown > 0;
+}
+
+/// 摘要结果上报（compactHistoryKeep 的全部失败/成功出口调用）。
+pub fn noteSummaryOutcome(ok: bool) void {
+    if (ok) {
+        summary_fails = 0;
+        summary_cooldown = 0;
+        summary_cooldown_cap = 1;
+        return;
+    }
+    summary_fails += 1;
+    if (summary_fails >= SUMMARY_BREAKER_TRIP) {
+        summary_cooldown = summary_cooldown_cap;
+        summary_cooldown_cap = @min(summary_cooldown_cap * 2, 8);
+        summary_fails = 0;
+        logger.info("compact: summary breaker tripped — deep path off for {d} turn(s), phi takes over", .{summary_cooldown});
+    }
+}
+
+/// 每回合开始 tick 一次（repl 在 agent 循环入口调用）。
+pub fn summaryBreakerTurnTick() void {
+    if (summary_cooldown > 0) summary_cooldown -= 1;
+}
+
 pub fn pressureLadder(est_tokens: u32, ceiling: u32) PressureLevel {
     if (ceiling == 0) return .emergency;
     const e: f64 = @floatFromInt(est_tokens);
@@ -242,7 +281,12 @@ pub fn compactHistoryKeep(
         return;
     }
 
+    // T5.2 PreCompact 钩子：压缩前触发（best-effort；挂在本函数单点即
+    // 覆盖自动压力梯子与 /compact 手动两条路）。
+    hooks_mod.preCompactHook(alloc, file_writer.io);
+
     const prov = switcher.getProvider() catch |err| {
+        noteSummaryOutcome(false);
         try std.Io.Writer.print(w, "  Summary model unavailable ({}).\n  History untouched — try /compact phi for plain truncation.\n\n", .{err});
         return;
     };
@@ -262,6 +306,7 @@ pub fn compactHistoryKeep(
     std.Io.File.Writer.flush(file_writer) catch {};
 
     const transcript = compaction.renderTranscript(alloc, history.items[1..summarize_to]) catch |err| {
+        noteSummaryOutcome(false);
         try std.Io.Writer.print(w, "  Compaction failed: {}\n  History untouched — try /compact phi.\n\n", .{err});
         return;
     };
@@ -289,6 +334,7 @@ pub fn compactHistoryKeep(
         // 优势，我们自己这侧先保证同输入尽量同输出。
         .temperature = 0,
     }) catch |err| {
+        noteSummaryOutcome(false);
         try std.Io.Writer.print(w, "  Summary call failed: {}.\n  History untouched — try /compact phi.\n\n", .{err});
         return;
     };
@@ -304,6 +350,7 @@ pub fn compactHistoryKeep(
     total_out.* += usage.output_tokens;
 
     if (summary.items.len == 0) {
+        noteSummaryOutcome(false);
         try std.Io.Writer.writeAll(w, "  Summary came back empty — history untouched.\n  Try /compact phi for plain truncation.\n\n");
         return;
     }
@@ -311,9 +358,11 @@ pub fn compactHistoryKeep(
     // Rebuild via the shared hybrid surgery: system + summary + verbatim
     // tail + tier-3 tool-result slimming.
     const slim = applyHybridLayout(history, alloc, summarize_to, summary.items) catch {
+        noteSummaryOutcome(false);
         try std.Io.Writer.writeAll(w, "  Compaction failed (rebuild layout).\n  History untouched — try /compact phi.\n\n");
         return;
     };
+    noteSummaryOutcome(true);
     log.bumpEpoch();
 
     const after_tokens = estimateHistoryTokens(history.items);
@@ -1892,4 +1941,49 @@ test "turnLabelAt finds the owning turn's prompt, skips tool-result users" {
     for (history.items) |m| {
         alloc.free(@constCast(m.content));
     }
+}
+
+test "T4.1 summary breaker: trip after 3 fails, exponential backoff, reset on success" {
+    // 复位（模块级状态，测试间互不污染）
+    summary_fails = 0;
+    summary_cooldown = 0;
+    summary_cooldown_cap = 1;
+
+    // 2 次失败不熔断
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    try std.testing.expect(!summaryBreakerOpen());
+
+    // 第 3 次连败 → 熔断，cooldown=1（首个退避档）
+    noteSummaryOutcome(false);
+    try std.testing.expect(summaryBreakerOpen());
+    summaryBreakerTurnTick();
+    try std.testing.expect(!summaryBreakerOpen()); // 半开：1 回合后可重试
+
+    // 网关仍坏：再连败 3 次 → 二次熔断，退避翻倍（2 回合）
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    try std.testing.expect(summaryBreakerOpen());
+    summaryBreakerTurnTick();
+    try std.testing.expect(summaryBreakerOpen()); // 仍在冷却
+    summaryBreakerTurnTick();
+    try std.testing.expect(!summaryBreakerOpen()); // 半开
+
+    // 半开后成功 → 全复位（计数/冷却/退避档全归零）
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    try std.testing.expect(!summaryBreakerOpen()); // 2 次未到阈值
+    noteSummaryOutcome(true);
+    try std.testing.expectEqual(@as(u8, 0), summary_fails);
+    try std.testing.expectEqual(@as(u8, 0), summary_cooldown);
+    try std.testing.expectEqual(@as(u8, 1), summary_cooldown_cap);
+
+    // 复位后再连败 3 次 → 退避档从头开始（1，而非延续 4）
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    noteSummaryOutcome(false);
+    try std.testing.expect(summaryBreakerOpen());
+    summaryBreakerTurnTick();
+    try std.testing.expect(!summaryBreakerOpen());
 }

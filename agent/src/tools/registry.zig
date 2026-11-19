@@ -91,6 +91,12 @@ pub const ToolDefinition = struct {
     execute_ctx: ?*anyopaque = null,
     is_read_only: bool = true,
     is_destructive: bool = false,
+    /// 复审 🔴1（2026-11-19）：交互工具（AskUserQuestion / plan_approve）
+    /// 的 execute 会在工具体里 COOKED 读 stdin。REPL 的工具波次默认跑在
+    /// worker 线程（UI 循环留在主线程 pollInput）——交互批次必须凭本
+    /// 标志被识别为同步执行，否则两个线程抢同一个 stdin Reader：首键
+    /// 被 editorLiveKey 吃掉、答案撕裂。新增交互工具时置 true。
+    is_interactive: bool = false,
 
     // NEW: input-aware behavioral functions
     is_concurrency_safe_fn: ?*const fn (std.json.Value) bool = null,
@@ -606,6 +612,7 @@ pub const ask_user_tool: ToolDefinition = .{
     .execute_fn = @import("ask_user.zig").execute,
     .is_read_only = true,
     .is_destructive = false,
+    .is_interactive = true,
     .is_concurrency_safe_fn = neverConcurrencySafe,
     .search_hint = "ask question user prompt choose option",
 };
@@ -621,6 +628,24 @@ pub const tool_search_tool: ToolDefinition = .{
     .is_destructive = false,
     .is_concurrency_safe_fn = alwaysConcurrencySafe,
     .search_hint = "search find tool discover",
+};
+
+/// T9.1 plan 出环门（2026-11-19）。is_read_only=true 是刻意的：它不碰
+/// 文件，且若标成写操作，plan 模式的写拦截（auth_mode Step .plan =>
+/// deny）会把自己人也拦在外面——出环门必须在 plan 模式里可用。
+pub const plan_approve_tool: ToolDefinition = .{
+    .name = "plan_approve",
+    .description = "Present your plan to the user for approval while in plan mode. Call it once the plan in the summary is complete. On approval the session leaves plan mode and you may execute immediately; other answers come back as instructions (refine or stop). Usable only in plan mode",
+    .input_schema =
+    \\{"type":"object","properties":{"summary":{"type":"string","description":"The plan to approve: goal, steps, files to touch"}},"required":["summary"]}
+    ,
+    .execute_fn = @import("plan_approve.zig").execute,
+    .is_read_only = true,
+    .is_destructive = false,
+    // 🔴1：呈批读 stdin（编号选择/Esc）——交互工具，必须同步执行。
+    .is_interactive = true,
+    .is_concurrency_safe_fn = neverConcurrencySafe,
+    .search_hint = "plan approve exit approval gate",
 };
 
 /// The default tool set — add more tools here to register them at compile time.
@@ -650,6 +675,9 @@ pub const default_tools = &[_]ToolDefinition{
 
     // Interaction
     ask_user_tool,
+
+    // Plan exit gate（T9.1：plan 模式出环）
+    plan_approve_tool,
 
     // Discovery
     tool_search_tool,
@@ -685,7 +713,8 @@ test "ToolRegistry has and getByName" {
 
 test "ToolRegistry count" {
     // +2 于 2026-11-09：TaskGet（任务详情）+ BgTask（后台任务自管理）。
-    try std.testing.expectEqual(@as(usize, 16), DefaultRegistry.count());
+    // +1 于 2026-11-19：plan_approve（T9.1 plan 出环门）。
+    try std.testing.expectEqual(@as(usize, 17), DefaultRegistry.count());
 }
 
 test "ToolDefinition matchesName" {

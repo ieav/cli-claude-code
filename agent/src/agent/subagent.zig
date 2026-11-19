@@ -29,7 +29,7 @@ pub const MAX_TURNS: usize = 16;
 /// "AskUser" shorthand (exact-match deny let the real tool slip through
 /// until 2026-11-10). DirTree/Glob/Grep etc. stay VISIBLE — read-only
 /// reconnaissance is exactly what research fan-outs are for.
-const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "TaskGet", "AskUserQuestion", "BgTask", "agent" };
+const deny_tools = [_][]const u8{ "TaskCreate", "TaskList", "TaskUpdate", "TaskGet", "AskUserQuestion", "BgTask", "agent", "plan_approve", "ScheduleWakeup" };
 
 fn toolAllowed(name: []const u8) bool {
     for (deny_tools) |d| {

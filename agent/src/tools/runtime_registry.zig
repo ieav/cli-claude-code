@@ -82,6 +82,13 @@ pub const RuntimeRegistry = struct {
         execute_ctx_fn: *const fn (?*anyopaque, std.mem.Allocator, std.json.Value, std.Io) anyerror!registry.ToolResult,
         execute_ctx: ?*anyopaque,
         concurrency_safe: bool,
+        /// 复审 🟡7（2026-11-19）：动态工具的只读声明与并发安全解耦——
+        /// ScheduleWakeup 只碰内存/时间（read_only=true → default 免询、
+        /// plan 放行）但不可并发（会话级 auto_submit 槽位）。MCP 的
+        /// readOnlyHint 是服务器自宣、不可审计——read_only 恒传 false
+        /// （🔴2：default 模式维持 ask 门，见 mcp/session.zig 调用点）；
+        /// agent 工具两者皆否。
+        read_only: bool,
     ) !void {
         if (self.findByName(name) != null) return error.ToolNameTaken;
         if (self.defs_cache) |c| self.allocator.free(c);
@@ -94,7 +101,7 @@ pub const RuntimeRegistry = struct {
                 .execute_fn = unreachable_fn,
                 .execute_ctx_fn = execute_ctx_fn,
                 .execute_ctx = execute_ctx,
-                .is_read_only = false,
+                .is_read_only = read_only,
                 // MCP tools are unauditable → "destructive unknown": the
                 // permission gate asks regardless of the concurrency flag.
                 .is_destructive = false,
@@ -209,14 +216,14 @@ test "RuntimeRegistry: built-ins present, specs in sync" {
 test "RuntimeRegistry: dynamic register, lookup, prefix removal" {
     var reg = RuntimeRegistry.init(std.testing.allocator);
     defer reg.deinit();
-    try reg.registerDynamic("mcp__srv__echo", "Echo", "{\"type\":\"object\"}", testExec, null, false);
-    try reg.registerDynamic("mcp__srv__ro", "ReadOnly", "{}", testExec, null, true);
+    try reg.registerDynamic("mcp__srv__echo", "Echo", "{\"type\":\"object\"}", testExec, null, false, false);
+    try reg.registerDynamic("mcp__srv__ro", "ReadOnly", "{}", testExec, null, true, true);
     try std.testing.expect(reg.findByName("mcp__srv__echo") != null);
     try std.testing.expect(reg.findByName("mcp__srv__ro").?.isConcurrencySafe(.null));
     try std.testing.expectEqual(registry.default_tools.len + 2, reg.toolSpecs().len);
 
     // Duplicate names are rejected.
-    try std.testing.expectError(error.ToolNameTaken, reg.registerDynamic("mcp__srv__echo", "x", "{}", testExec, null, false));
+    try std.testing.expectError(error.ToolNameTaken, reg.registerDynamic("mcp__srv__echo", "x", "{}", testExec, null, false, false));
 
     // execute() dispatches through the ctx trampoline.
     const def = reg.findByName("mcp__srv__echo").?;

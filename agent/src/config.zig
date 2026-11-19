@@ -34,6 +34,10 @@ pub const Settings = struct {
     /// = 无钩子（零开销——执行口先查长度再走配置）。
     hooks_pre: []const hooks_mod.HookEntry = &.{},
     hooks_post: []const hooks_mod.HookEntry = &.{},
+    /// T5.1 生命周期钩子（2026-11-19）：Stop/PreCompact/SessionStart。
+    hooks_stop: []const hooks_mod.HookEntry = &.{},
+    hooks_pre_compact: []const hooks_mod.HookEntry = &.{},
+    hooks_session_start: []const hooks_mod.HookEntry = &.{},
     api_keys: ApiKeys = .{},
     env_sourced: ApiKeysEnvSourced = .{},
     default_model: []const u8 = "gpt-4o",
@@ -296,6 +300,15 @@ fn applyHooksJson(settings: *Settings, allocator: std.mem.Allocator, value: std.
     if (json_helpers.getArray(h, "PostToolUse")) |arr| {
         settings.hooks_post = parseHookArray(allocator, arr) catch settings.hooks_post;
     }
+    if (json_helpers.getArray(h, "Stop")) |arr| {
+        settings.hooks_stop = parseHookArray(allocator, arr) catch settings.hooks_stop;
+    }
+    if (json_helpers.getArray(h, "PreCompact")) |arr| {
+        settings.hooks_pre_compact = parseHookArray(allocator, arr) catch settings.hooks_pre_compact;
+    }
+    if (json_helpers.getArray(h, "SessionStart")) |arr| {
+        settings.hooks_session_start = parseHookArray(allocator, arr) catch settings.hooks_session_start;
+    }
 }
 
 /// Parse a hooks array of {matcher, command} objects (dupe'd onto the
@@ -317,8 +330,13 @@ fn parseHookArray(allocator: std.mem.Allocator, arr: []std.json.Value) ![]hooks_
 }
 
 /// Serialize the hooks object back (comma-spliced like writeRuleArray).
-fn writeHooks(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), pre: []const hooks_mod.HookEntry, post: []const hooks_mod.HookEntry) void {
-    if (pre.len == 0 and post.len == 0) return;
+fn writeHooks(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), settings: *const Settings) void {
+    const pre = settings.hooks_pre;
+    const post = settings.hooks_post;
+    const stop = settings.hooks_stop;
+    const pre_compact = settings.hooks_pre_compact;
+    const session_start = settings.hooks_session_start;
+    if (pre.len == 0 and post.len == 0 and stop.len == 0 and pre_compact.len == 0 and session_start.len == 0) return;
     const tail = std.mem.trim(u8, buf.items, " \t\n");
     if (std.mem.endsWith(u8, tail, "}") or std.mem.endsWith(u8, tail, "]")) {
         if (buf.items.len > 0) buf.items[buf.items.len - 1] = ',';
@@ -335,6 +353,27 @@ fn writeHooks(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), pre: []cons
         if (!first_event) buf.appendSlice(allocator, ",") catch return;
         buf.appendSlice(allocator, "\n    \"PostToolUse\": [") catch return;
         writeHookEntries(allocator, buf, post);
+        buf.appendSlice(allocator, "]") catch return;
+        first_event = false;
+    }
+    if (stop.len > 0) {
+        if (!first_event) buf.appendSlice(allocator, ",") catch return;
+        buf.appendSlice(allocator, "\n    \"Stop\": [") catch return;
+        writeHookEntries(allocator, buf, stop);
+        buf.appendSlice(allocator, "]") catch return;
+        first_event = false;
+    }
+    if (pre_compact.len > 0) {
+        if (!first_event) buf.appendSlice(allocator, ",") catch return;
+        buf.appendSlice(allocator, "\n    \"PreCompact\": [") catch return;
+        writeHookEntries(allocator, buf, pre_compact);
+        buf.appendSlice(allocator, "]") catch return;
+        first_event = false;
+    }
+    if (session_start.len > 0) {
+        if (!first_event) buf.appendSlice(allocator, ",") catch return;
+        buf.appendSlice(allocator, "\n    \"SessionStart\": [") catch return;
+        writeHookEntries(allocator, buf, session_start);
         buf.appendSlice(allocator, "]") catch return;
     }
     buf.appendSlice(allocator, "\n  }\n") catch return;
@@ -564,7 +603,7 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
 
     // M6 hooks（symmetric with the load side——漏写会让任何一次
     // autoSaveSettings 静默清掉用户钩子）
-    writeHooks(allocator, &buf, settings.hooks_pre, settings.hooks_post);
+    writeHooks(allocator, &buf, settings);
 
     buf.appendSlice(allocator, "}\n") catch {};
 
@@ -573,6 +612,152 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
         .sub_path = path,
         .data = buf.items,
     }) catch |err| return err;
+}
+
+/// T2.2 学到的 allow 规则上限（2026-11-19）：防「a」无界膨胀。
+pub const LEARNED_RULES_CAP: usize = 200;
+
+/// T2.2 always-allow 学习落盘（2026-11-19；同日审查修正落点）：把 ask
+/// 门「a」批准合成的规则**合并追加**进 user 层 settings.json 的
+/// allow_rules（读旧 → 去重合并 → 整体写回，其他键原样保留）。
+/// 落点必须是 user 层：ziv 三层加载是「后层整字段覆盖前层」——若写
+/// local 层，local 的 allow_rules 会在下次加载时把 user 层手写规则整
+/// 体顶掉（写入方×加载方口径必须一致）。三个刻意行为：
+///   · 旧文件存在但 JSON 坏 → error.UnparseableLocalSettings，不覆盖
+///     （防吞用户手改）；调用方降级为一次性放行并提示。
+///   · 已有同串规则 → 幂等（不重复追加）。
+///   · 与 saveSettings 的整文件写回兼容：运行时已把规则 append 进
+///     switcher.settings，任何 autoSave 写出的 allow_rules 同样含它。
+pub fn appendUserAllowRule(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tool_name: []const u8,
+    pattern: ?[]const u8,
+) !void {
+    const dir = system_dirs.configDir(allocator) catch return error.NoConfigDir;
+    defer allocator.free(dir);
+    const path = try std.fs.path.join(allocator, &.{ dir, "settings.json" });
+    defer allocator.free(path);
+    return appendAllowRuleAtPath(allocator, io, path, tool_name, pattern);
+}
+
+/// 带显式路径的核心版（单测用临时路径，不碰真实配置）。
+pub fn appendAllowRuleAtPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    tool_name: []const u8,
+    pattern: ?[]const u8,
+) !void {
+    // 复审 🟡5（2026-11-19）：只有「不存在」才按新文件建；其余读错
+    // （权限拒绝/≥256 KiB 的 StreamTooLong 等）一律上抛拒写。曾是一律
+    // catch ""——超限的旧文件会被当成空文件，用仅含一条新规则的整写
+    // 覆盖，其余键全丢。
+    const text = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, allocator, .limited(256 * 1024)) catch |read_err| blk: {
+        if (read_err == error.FileNotFound) break :blk "";
+        return read_err;
+    };
+    defer if (text.len > 0) allocator.free(text);
+
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*p| p.deinit();
+    if (text.len > 0) {
+        parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch
+            return error.UnparseableLocalSettings;
+        if (parsed.?.value != .object) return error.UnparseableLocalSettings;
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    // allow_rules 永远排首键（简化逗号管理）；其他键用 Stringify 原样回写。
+    try w.writeAll("{\n  \"allow_rules\": [");
+    var count: usize = 0;
+    var already_present = false;
+    if (parsed != null) {
+        if (parsed.?.value.object.get("allow_rules")) |arr| {
+            if (arr == .array) {
+                for (arr.array.items) |item| {
+                    if (item != .string) continue;
+                    if (count >= LEARNED_RULES_CAP) break;
+                    if (count > 0) try w.writeAll(", ");
+                    try w.writeAll("\"");
+                    try writeJsonEscapedTo(w, item.string);
+                    try w.writeAll("\"");
+                    count += 1;
+                    // 幂等：与待写规则同串则已存在（下方跳过追加）。
+                    if (ruleStringEquals(item.string, tool_name, pattern)) already_present = true;
+                }
+            }
+        }
+    }
+    if (!already_present) {
+        if (count >= LEARNED_RULES_CAP) return error.LearnedRulesCapReached;
+        if (count > 0) try w.writeAll(", ");
+        try w.writeAll("\"");
+        try w.writeAll(tool_name);
+        if (pattern) |ptn| {
+            try w.writeAll("(");
+            try writeJsonEscapedTo(w, ptn);
+            try w.writeAll(")");
+        }
+        try w.writeAll("\"");
+        count += 1;
+    }
+    try w.writeAll("]");
+
+    // 其他键原样回写（含嵌套值——Stringify 处理任意 Value）。
+    if (parsed != null) {
+        var it = parsed.?.value.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "allow_rules")) continue;
+            try w.writeAll(",\n  \"");
+            try writeJsonEscapedTo(w, e.key_ptr.*);
+            try w.writeAll("\": ");
+            try std.json.Stringify.value(e.value_ptr.*, .{}, w);
+        }
+    }
+    try w.writeAll("\n}\n");
+
+    // .ziv 目录可能不存在（zivroot 回落 cwd 且无 .ziv）——补建父目录。
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    }
+    try std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = path, .data = aw.writer.buffered() });
+}
+
+/// 「Tool(pattern)」规则串与 (tool, pattern) 分量的等值比较（幂等去重用）。
+fn ruleStringEquals(rule_text: []const u8, tool_name: []const u8, pattern: ?[]const u8) bool {
+    var buf: [512]u8 = undefined;
+    const rebuilt = if (pattern) |ptn|
+        std.fmt.bufPrint(&buf, "{s}({s})", .{ tool_name, ptn }) catch return false
+    else
+        std.fmt.bufPrint(&buf, "{s}", .{tool_name}) catch return false;
+    return std.mem.eql(u8, rule_text, rebuilt);
+}
+
+/// Writer 版 JSON 转义（语义同 appendEscaped，写往 Io.Writer 而非 ArrayList）。
+fn writeJsonEscapedTo(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            // 控制字符必须 \u00XX（复审 🟡6）：裸字节会把 user
+            // settings.json 写成非法 JSON，下次 loadJsonIntoSettings
+            // 整文件静默丢弃（catch {}）——一次坏写丢全部配置。
+            else => {
+                if (ch < 0x20) {
+                    try w.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try w.writeByte(ch);
+                }
+            },
+        }
+    }
 }
 
 test "parseRuleArray parses Tool(pattern) rule strings" {
@@ -637,7 +822,7 @@ test "hooks: parse + serialize round-trip survives a settings save" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     buf.append(alloc, '{') catch return error.OutOfMemory;
-    writeHooks(alloc, &buf, settings.hooks_pre, settings.hooks_post);
+    writeHooks(alloc, &buf, &settings);
     buf.append(alloc, '}') catch return error.OutOfMemory;
     const reparsed = json_helpers.parse(alloc, buf.items) catch return error.ReparseFailed;
     defer reparsed.deinit();
@@ -684,4 +869,117 @@ fn loadJsonFieldIntoSettingsForStyleTest(settings: *Settings, allocator: std.mem
             settings.output_style = try allocator.dupe(u8, os);
         }
     }
+}
+
+test "T2.2 appendAllowRuleAtPath: merge, idempotency, foreign keys, bad-file guard" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const path = ".zig-cache/t422-settings.local.json";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // ① 首写：空文件不存在 → 创建，含一条规则 + 一个外来键
+    {
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{
+            .sub_path = path,
+            .data = "{\n  \"permission_mode\": \"plan\",\n  \"allow_rules\": [\"Bash(git status*)\"]\n}\n",
+        }) catch return error.TestSetup;
+    }
+    try appendAllowRuleAtPath(alloc, io, path, "Bash", "git push*");
+
+    const after1 = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
+    defer alloc.free(after1);
+    const p1 = try std.json.parseFromSlice(std.json.Value, alloc, after1, .{});
+    defer p1.deinit();
+    try std.testing.expect(p1.value == .object);
+    const rules1 = p1.value.object.get("allow_rules").?;
+    try std.testing.expectEqual(@as(usize, 2), rules1.array.items.len);
+    try std.testing.expectEqualStrings("Bash(git status*)", rules1.array.items[0].string);
+    try std.testing.expectEqualStrings("Bash(git push*)", rules1.array.items[1].string);
+    // 外来键原样保留
+    try std.testing.expectEqualStrings("plan", p1.value.object.get("permission_mode").?.string);
+
+    // ② 幂等：同规则再写 → 不重复
+    try appendAllowRuleAtPath(alloc, io, path, "Bash", "git push*");
+    const after2 = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
+    defer alloc.free(after2);
+    const p2 = try std.json.parseFromSlice(std.json.Value, alloc, after2, .{});
+    defer p2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p2.value.object.get("allow_rules").?.array.items.len);
+
+    // ③ 坏 JSON → 拒写且不动文件
+    {
+        const bad = "{ not json";
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = path, .data = bad }) catch return error.TestSetup;
+    }
+    try std.testing.expectError(error.UnparseableLocalSettings, appendAllowRuleAtPath(alloc, io, path, "Bash", "ls*"));
+    const after3 = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(64 * 1024));
+    defer alloc.free(after3);
+    try std.testing.expectEqualStrings("{ not json", after3);
+
+    // ④ 超限（≥256 KiB）读错 → 上抛拒写且不动文件（复审 🟡5：曾把
+    // StreamTooLong 当空文件，整写覆盖会丢掉其余全部键）
+    {
+        const big = try alloc.alloc(u8, 256 * 1024 + 1);
+        defer alloc.free(big);
+        @memset(big, 'x');
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = path, .data = big }) catch return error.TestSetup;
+    }
+    try std.testing.expectError(error.StreamTooLong, appendAllowRuleAtPath(alloc, io, path, "Bash", "ls*"));
+    const stat4 = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expectEqual(@as(u64, 256 * 1024 + 1), stat4.size);
+}
+
+test "T5.1 lifecycle hooks round-trip: Stop/PreCompact/SessionStart survive save" {
+    const alloc = std.testing.allocator;
+    const json_src =
+        \\{"hooks": {
+        \\  "Stop":        [{"command": "./check_done.sh"}],
+        \\  "PreCompact":  [{"command": "echo compacting"}],
+        \\  "SessionStart":[{"command": "./boot.sh"}]
+        \\}}
+    ;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const parsed = json_helpers.parse(alloc, json_src) catch return error.ParseFailed;
+    defer parsed.deinit();
+    var settings = Settings{};
+    applyHooksJson(&settings, alloc, parsed.value);
+    defer {
+        for (settings.hooks_stop) |e| {
+            alloc.free(e.matcher);
+            alloc.free(e.command);
+        }
+        alloc.free(settings.hooks_stop);
+        for (settings.hooks_pre_compact) |e| {
+            alloc.free(e.matcher);
+            alloc.free(e.command);
+        }
+        alloc.free(settings.hooks_pre_compact);
+        for (settings.hooks_session_start) |e| {
+            alloc.free(e.matcher);
+            alloc.free(e.command);
+        }
+        alloc.free(settings.hooks_session_start);
+    }
+    try std.testing.expectEqual(@as(usize, 1), settings.hooks_stop.len);
+    try std.testing.expectEqual(@as(usize, 1), settings.hooks_pre_compact.len);
+    try std.testing.expectEqual(@as(usize, 1), settings.hooks_session_start.len);
+    try std.testing.expectEqualStrings("./check_done.sh", settings.hooks_stop[0].command);
+
+    // 往返：autoSave 写回不得丢三事件（M6 教训：漏写 = 静默清钩子）。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    buf.append(alloc, '{') catch return error.OutOfMemory;
+    writeHooks(alloc, &buf, &settings);
+    buf.append(alloc, '}') catch return error.OutOfMemory;
+    const reparsed = json_helpers.parse(alloc, buf.items) catch return error.ReparseFailed;
+    defer reparsed.deinit();
+    const h = reparsed.value.object.get("hooks").?;
+    try std.testing.expect(h.object.get("Stop") != null);
+    try std.testing.expect(h.object.get("PreCompact") != null);
+    try std.testing.expect(h.object.get("SessionStart") != null);
+    try std.testing.expectEqualStrings("./check_done.sh", h.object.get("Stop").?.array.items[0].object.get("command").?.string);
 }

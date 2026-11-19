@@ -209,6 +209,15 @@ fn waiter(ctx: WaiterCtx) void {
         unlock();
     }
     t.done.store(true, .release);
+    // T1.3 完成通知（2026-11-19）：入 attachment 收件箱，下一次用户查询
+    // 随行注入——模型不再轮询 BgTask status。push 内部 dupe（waiter 线程
+    // → main 线程所有权移交），满箱丢弃属尽力而为语义。
+    {
+        const attachment = @import("../util/attachment.zig");
+        const code: i32 = if (t.exit_code & 0x7f != 0) t.exit_code & 0x7f else (t.exit_code >> 8) & 0xff;
+        const how: []const u8 = if (t.exit_code & 0x7f != 0) "signal" else "exit";
+        _ = attachment.pushNote(std.heap.smp_allocator, .bg_done, "background task #{d} finished ({s} code {d}): {s} — full output: {s}", .{ t.id, how, code, t.command, t.output_path });
+    }
 }
 
 /// 停止一个运行中的任务（杀整个进程组，waiter 随后收割落状态）。

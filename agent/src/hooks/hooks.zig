@@ -46,6 +46,13 @@ pub const HookEntry = struct {
 pub const HookConfig = struct {
     pre: []const HookEntry = &.{},
     post: []const HookEntry = &.{},
+    /// T5.1 生命周期事件（2026-11-19）：Stop（回合收尾；exit 2 = 阻止
+    /// 收工，REPL 注入续跑指令）、PreCompact（压缩前，best-effort）、
+    /// SessionStart（启动完成后，best-effort）。生命周期事件没有工具名
+    /// 可匹配——matcher 恒留空（全跑），配置里写了也忽略。
+    stop: []const HookEntry = &.{},
+    pre_compact: []const HookEntry = &.{},
+    session_start: []const HookEntry = &.{},
 };
 
 /// 当前生效配置（回合边界换装；执行线程只读）。
@@ -56,7 +63,8 @@ pub fn setConfig(cfg: HookConfig) void {
 }
 
 pub fn configLoaded() bool {
-    return active.pre.len > 0 or active.post.len > 0;
+    return active.pre.len > 0 or active.post.len > 0 or
+        active.stop.len > 0 or active.pre_compact.len > 0 or active.session_start.len > 0;
 }
 
 fn entryMatches(entry: HookEntry, tool_name: []const u8) bool {
@@ -378,4 +386,61 @@ test "postToolUse: smoke (no crash, config off = no-op)" {
     setConfig(.{ .post = &entries });
     defer setConfig(.{});
     postToolUse(alloc, io_state.io(), "FileRead", .null, "x");
+}
+
+// ── T5.1/T5.2 生命周期事件（2026-11-19）──────────────────────────────
+
+/// Stop：回合收尾时触发。exit 2 = 阻止收工——返回 true，REPL 把续跑
+/// 指令塞进 auto_submit（下一轮立即自动发送；连续续跑上限 2 防配置
+/// 错误死循环，用户真实输入重置计数）。其余退出码 best-effort 记日志。
+pub fn stopHook(alloc: std.mem.Allocator, io: std.Io) bool {
+    if (active.stop.len == 0) return false;
+    for (active.stop) |entry| {
+        const payload = buildPayload(alloc, "Stop", null, null);
+        defer alloc.free(payload);
+        const run = runHook(alloc, io, entry.command, payload, HOOK_TIMEOUT_MS);
+        defer alloc.free(run.stderr);
+        if (run.timed_out) {
+            logger.warning("hook Stop[{s}] timed out (>{d}ms)", .{ entry.command, HOOK_TIMEOUT_MS });
+            continue;
+        }
+        if (run.code == 2) return true;
+        if (run.code != 0) {
+            logger.warning("hook Stop[{s}] exit {d}: {s}", .{ entry.command, run.code, run.stderr });
+        }
+    }
+    return false;
+}
+
+/// PreCompact：压缩前触发（compactHistoryKeep 单点覆盖自动梯子与
+/// /compact 手动两条路）。best-effort——钩子失败不影响压缩。
+pub fn preCompactHook(alloc: std.mem.Allocator, io: std.Io) void {
+    if (active.pre_compact.len == 0) return;
+    for (active.pre_compact) |entry| {
+        const payload = buildPayload(alloc, "PreCompact", null, null);
+        defer alloc.free(payload);
+        const run = runHook(alloc, io, entry.command, payload, HOOK_TIMEOUT_MS);
+        defer alloc.free(run.stderr);
+        if (run.timed_out) {
+            logger.warning("hook PreCompact[{s}] timed out (>{d}ms)", .{ entry.command, HOOK_TIMEOUT_MS });
+        } else if (run.code != 0) {
+            logger.warning("hook PreCompact[{s}] exit {d}: {s}", .{ entry.command, run.code, run.stderr });
+        }
+    }
+}
+
+/// SessionStart：启动完成后触发（banner/存储就绪、主循环之前）。
+pub fn sessionStartHook(alloc: std.mem.Allocator, io: std.Io) void {
+    if (active.session_start.len == 0) return;
+    for (active.session_start) |entry| {
+        const payload = buildPayload(alloc, "SessionStart", null, null);
+        defer alloc.free(payload);
+        const run = runHook(alloc, io, entry.command, payload, HOOK_TIMEOUT_MS);
+        defer alloc.free(run.stderr);
+        if (run.timed_out) {
+            logger.warning("hook SessionStart[{s}] timed out (>{d}ms)", .{ entry.command, HOOK_TIMEOUT_MS });
+        } else if (run.code != 0) {
+            logger.warning("hook SessionStart[{s}] exit {d}: {s}", .{ entry.command, run.code, run.stderr });
+        }
+    }
 }

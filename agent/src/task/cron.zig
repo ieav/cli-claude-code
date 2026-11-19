@@ -21,6 +21,9 @@ pub const CronTask = struct {
     /// scheduler-registered state (e.g. a REPL-owned sweep context).
     task_fn: *const fn (?*anyopaque) anyerror!void,
     ctx: ?*anyopaque = null,
+    /// T3.1 one-shot 语义（2026-11-19）：drainDue 执行一次后自动
+    /// enabled=false——ScheduleWakeup 的「N 秒后唤醒」用，不再重复。
+    one_shot: bool = false,
 };
 
 pub const CronScheduler = struct {
@@ -29,6 +32,11 @@ pub const CronScheduler = struct {
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
     due_inbox: mpsc.BoundedMPSC(usize, 16),
+    /// T3.1 修复（2026-11-19 审查）：ScheduleWakeup 在会话中途 addTask
+    /// （append 可 realloc），与调度线程的 tasks.items 迭代构成数据竞
+    /// 争——调度线程会读到已搬迁的旧内存。自旋锁护住三处访问（add/
+    /// 迭代/drain 索引取值；task_fn 在锁外跑，SQLite/长任务不持锁）。
+    mutex: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     const Self = @This();
 
@@ -55,8 +63,30 @@ pub const CronScheduler = struct {
         self.tasks.deinit(self.allocator);
     }
 
+    fn lock(self: *Self) void {
+        while (self.mutex.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    }
+
+    fn unlock(self: *Self) void {
+        self.mutex.store(false, .release);
+    }
+
     pub fn addTask(self: *Self, task: CronTask) !void {
+        self.lock();
+        defer self.unlock();
         try self.tasks.append(self.allocator, task);
+    }
+
+    /// 复审 🟡4/🟢8（2026-11-19）：按名失效任务（one-shot 覆盖式安装用）。
+    /// 必须走锁——调用方（ScheduleWakeup 工具体）可能在 worker 线程执行，
+    /// 与调度线程的 tasks.items 迭代、主线程 drainDue 的锁内取值并发；
+    /// 此前调用侧的无锁遍历只是「当前时序上恰好无并发 append」的侥幸。
+    pub fn disableTaskByName(self: *Self, name: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        for (self.tasks.items) |*t| {
+            if (std.mem.eql(u8, t.name, name)) t.enabled.store(false, .release);
+        }
     }
 
     pub fn start(self: *Self) !void {
@@ -75,12 +105,19 @@ pub const CronScheduler = struct {
         while (self.running.load(.monotonic)) {
             const now = time_mod.nowMillis();
 
-            for (self.tasks.items, 0..) |*task, i| {
-                if (!task.enabled.load(.monotonic)) continue;
-                const last = task.last_run.load(.monotonic);
-                if (last == 0 or (now - last) >= @as(i64, @intCast(task.interval_ms))) {
-                    if (self.due_inbox.push(i)) {
-                        task.last_run.store(now, .release);
+            {
+                // 块作用域：defer 在块尾（for 之后）解锁——sleep 必须在
+                // 锁外（2026-11-19 复审修正：早先 defer 挂在循环体上，
+                // 调度线程持锁睡 1s，主线程 addTask 自旋卡顿）。
+                self.lock();
+                defer self.unlock();
+                for (self.tasks.items, 0..) |*task, i| {
+                    if (!task.enabled.load(.monotonic)) continue;
+                    const last = task.last_run.load(.monotonic);
+                    if (last == 0 or (now - last) >= @as(i64, @intCast(task.interval_ms))) {
+                        if (self.due_inbox.push(i)) {
+                            task.last_run.store(now, .release);
+                        }
                     }
                 }
             }
@@ -93,13 +130,33 @@ pub const CronScheduler = struct {
     /// loop top (same cadence as the reflection inbox).
     pub fn drainDue(self: *Self) void {
         while (self.due_inbox.pop()) |i| {
-            if (i >= self.tasks.items.len) continue;
-            const t = &self.tasks.items[i];
-            t.task_fn(t.ctx) catch |e| {
+            // 锁内只拷贝执行所需字段（append 可能使旧指针失效）；
+            // task_fn 在锁外跑——memory_decay 等任务做 DB 工作，不能
+            // 持自旋锁阻塞调度线程的 1s tick。
+            self.lock();
+            if (i >= self.tasks.items.len) {
+                self.unlock();
+                continue;
+            }
+            if (!self.tasks.items[i].enabled.load(.monotonic)) {
+                self.unlock();
+                continue; // one-shot 已消费
+            }
+            const fn_ptr = self.tasks.items[i].task_fn;
+            const ctx = self.tasks.items[i].ctx;
+            const one_shot = self.tasks.items[i].one_shot;
+            const name = self.tasks.items[i].name;
+            self.unlock();
+            fn_ptr(ctx) catch |e| {
                 // Cron failures must never take the session down; the
                 // scheduler will retry on the next interval anyway.
-                std.debug.print("[cron] {s} failed: {}\n", .{ t.name, e });
+                std.debug.print("[cron] {s} failed: {}\n", .{ name, e });
             };
+            if (one_shot) {
+                self.lock();
+                if (i < self.tasks.items.len) self.tasks.items[i].enabled.store(false, .release);
+                self.unlock();
+            }
         }
     }
 };

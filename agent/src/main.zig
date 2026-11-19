@@ -24,6 +24,11 @@ test {
     _ = @import("knowledge/graph.zig");
     _ = @import("knowledge/code_index.zig");
     _ = @import("knowledge/search.zig");
+    _ = @import("util/attachment.zig");
+    _ = @import("util/at_ref.zig");
+    _ = @import("util/ssrf.zig");
+    _ = @import("tools/schedule_wakeup.zig");
+    _ = @import("tools/web_fetch.zig");
     _ = @import("llm/claude.zig");
     _ = @import("llm/compaction.zig");
     _ = @import("util/json_tree.zig");
@@ -120,6 +125,9 @@ test {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // 复审 🟢9：通知收件箱在一切入口（repl/oneshot/-p）之前初始化——
+    // 任何路径起 BgTask waiter 时 ensureInit 已完成，无惰性竞争窗口。
+    @import("util/attachment.zig").ensureInit();
     // Windows console one-shot BEFORE any output byte: VT processing +
     // UTF-8 codepage (posix no-op). The banner used to print first —
     // under the ORIGINAL console CP — so on a default cmd.exe (GBK) the

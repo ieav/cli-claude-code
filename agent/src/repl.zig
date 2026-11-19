@@ -46,6 +46,9 @@ const op_log = @import("checkpoint/op_log.zig");
 const file_history = @import("checkpoint/file_history.zig");
 const rollback_mod = @import("checkpoint/rollback.zig");
 const llm = @import("llm/mod.zig");
+const attachment = @import("util/attachment.zig");
+const at_ref = @import("util/at_ref.zig");
+const schedule_wakeup = @import("tools/schedule_wakeup.zig");
 const compaction = @import("llm/compaction.zig");
 const config_mod = @import("config.zig");
 const util_time = @import("util/time.zig");
@@ -338,6 +341,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // 项目根锚定：main.zig 已在横幅处初始化（含继承提示）；此处幂等兜底
     // （直接单测调用 repl.run 的形态）。
     if (zivroot.rootLen() == 0) zivroot.init(io);
+    // T1.1 通知收件箱在启动期初始化——后续 waiter 线程的 pushNote 无
+    // 惰性 init 竞争窗口。
+    attachment.ensureInit();
     var fhist_buf: [std.fs.max_path_bytes]u8 = undefined;
     var fhist = file_history.FileHistoryState.init(allocator, try allocator.dupe(u8, zivroot.sub(&fhist_buf, "checkpoints")));
     // The /config snapshot cap used to be write-only — the state hardcoded
@@ -696,6 +702,21 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         }
     }
 
+    // T9.1 plan 出环门：plan 模式下模型可调 plan_approve 呈批；批准后
+    // 在工具体里镜像 /mode 切换链（模式+落盘+指纹重置）。
+    var plan_approve_ctx = turn_ask.PlanApproveCtx{
+        .ask = &ask_ctx,
+        .current_mode = &current_mode,
+        .switcher = &switcher,
+        .io = io,
+    };
+    for (reg.entries.items) |*entry| {
+        if (std.mem.eql(u8, entry.def.name, "plan_approve")) {
+            entry.def.execute_ctx_fn = turn_ask.planApproveExecute;
+            entry.def.execute_ctx = @ptrCast(&plan_approve_ctx);
+        }
+    }
+
     // T6.3: register the parallel-subagent dispatch tool. ctx borrows
     // stable references (model_name_buf updates in place on hot switches;
     // retired settings slices are never freed, so key snapshots stay
@@ -755,7 +776,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         agent_dispatch.executeWithCtx,
         @ptrCast(&dispatch_ctx),
         false,
+        false,
     ) catch |e| logger.warning("agent tool registration failed: {}", .{e});
+
     // MCP 自动连接（2026-11-10）：配置了就连——不该让人再敲 /mcp connect。
     // ZIV_MCP_AUTOSTART=0 或 settings.mcp_autostart=false 关闭。失败只记
     // 日志不打断启动（网关类工具离线是常态）。握手走短预算（默认 3s，
@@ -805,6 +828,28 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
     // that never hit a tool-round injection point auto-sends as the next
     // turn — the main loop consumes it instead of calling readLine.
     var auto_submit: ?[]u8 = null;
+    // T5.2 Stop 钩子连续续跑计数（用户真实输入时重置）。
+    var stop_hook_continues: u8 = 0;
+
+    // T3.2 ScheduleWakeup：模型自定时唤醒（one-shot，auto_submit 触发
+    // 回合）。注册即主线程串行（neverConcurrencySafe）+ 子代理拉黑
+    // （subagent.zig deny_tools）→ addTask 只在主线程调用（RPN 210 缓解）。
+    var wakeup_ctx = schedule_wakeup.WakeupCtx{
+        .sched = &cron,
+        .auto_submit = &auto_submit,
+        .alloc = allocator,
+    };
+    reg.registerDynamic(
+        "ScheduleWakeup",
+        "Schedule a one-shot wakeup for this session: after the delay the model continues autonomously with the given prompt (use for polling external work like CI, deploys, long builds — instead of idling). One pending wakeup at a time (a new call replaces it); session-scoped, not persisted",
+        "{\"type\":\"object\",\"properties\":{\"delay_seconds\":{\"type\":\"integer\",\"description\":\"Seconds until wakeup (60-3600, clamped)\"},\"prompt\":{\"type\":\"string\",\"description\":\"The prompt to continue with when the wakeup fires (1-2000 chars)\"}},\"required\":[\"prompt\"]}",
+        schedule_wakeup.scheduleWakeupExecute,
+        @ptrCast(&wakeup_ctx),
+        false,
+        // read_only：只碰内存/时间。plan 模式放行（轮询正是自主场景）、
+        // default 免询问——曾与并发标志合用导致两处全被锁死。
+        true,
+    ) catch |e| logger.warning("ScheduleWakeup registration failed: {}", .{e});
 
     // Ctrl+T style toggle goes live once every var it touches exists.
     style_toggle_ctx = .{
@@ -816,6 +861,18 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         .history = &history,
         .io = io,
     };
+
+    // T5.2 SessionStart 钩子：启动完成后触发。先装一次配置——首轮
+    // loop-top 的 setConfig 要到第一次用户输入后才跑，不预装则首启
+    // 的 SessionStart 永远没有钩子可执行。
+    hooks_mod.setConfig(.{
+        .pre = switcher.settings.hooks_pre,
+        .post = switcher.settings.hooks_post,
+        .stop = switcher.settings.hooks_stop,
+        .pre_compact = switcher.settings.hooks_pre_compact,
+        .session_start = switcher.settings.hooks_session_start,
+    });
+    hooks_mod.sessionStartHook(allocator, io);
 
     while (true) {
         // Turn boundary: persist whatever the finished turn appended (one
@@ -858,6 +915,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         hooks_mod.setConfig(.{
             .pre = switcher.settings.hooks_pre,
             .post = switcher.settings.hooks_post,
+            .stop = switcher.settings.hooks_stop,
+            .pre_compact = switcher.settings.hooks_pre_compact,
+            .session_start = switcher.settings.hooks_session_start,
         });
 
         // T8: sync the plan anchor with .ziv/plan.md (fingerprint-gated;
@@ -931,6 +991,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 std.debug.print("Error reading input: {}\n", .{err});
                 return;
             };
+            // T5.2：真实键入（非 auto_submit——用户排队幸存者/Stop 续跑/
+            // wakeup 都走上面分支）才重置 Stop 续跑计数。排队输入不重置
+            // 属保守方向：上限更易触发，死循环防护只强不弱。
+            if (maybe_line != null) stop_hook_continues = 0;
         }
         const line = maybe_line orelse {
             // Ctrl-D on an empty line (EOF): same session-end cleanup as
@@ -1029,6 +1093,33 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         if (dres == .quit) break;
         if (dres == .handled) continue;
         if (dres == .message) {
+            // T5.2 复审修正：Stop 续跑计数只在 readLine 真实键入时重置
+            // （见下方 else 分支）。曾放在这里——续跑指令自身走 auto_submit
+            // → 本分支 → 每次把自己计数清零，上限 2 形同虚设。
+            // T7 @引用：用户行里的 @path[:行域] 展开为随行文件内容帧
+            // （只读喂料不设询问；读不动的文件标注跳过）。先于异步通知。
+            if (at_ref.renderRefs(allocator, io, input)) |frame| {
+                const fb = try allocator.alloc(llm.ContentBlock, 1);
+                fb[0] = .{ .text = frame };
+                try history.append(allocator, .{
+                    .role = .user,
+                    .content = fb,
+                    .timestamp = util_time.nowMillis(),
+                });
+            }
+            // T1.2 随行注入：用户行入史前一拍 drain 收件箱，合并为单帧
+            // system-reminder user 消息——通知不触发回合，只在用户真的
+            // 发话时随行送达（bg 任务完成等事实；CC getAttachments 同款
+            // 语义）。reminder 所有权随 blocks 移交 history。
+            if (attachment.drainAndRender(allocator, ow)) |reminder| {
+                const rb = try allocator.alloc(llm.ContentBlock, 1);
+                rb[0] = .{ .text = reminder };
+                try history.append(allocator, .{
+                    .role = .user,
+                    .content = rb,
+                    .timestamp = util_time.nowMillis(),
+                });
+            }
             var user_blocks = try allocator.alloc(llm.ContentBlock, 1);
             user_blocks[0] = .{ .text = try allocator.dupe(u8, input) };
             try history.append(allocator, .{
@@ -1148,6 +1239,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
         // P2.5 提炼优先梯子预算：每回合最多 2 次 LLM 深压，防压缩→膨胀
         // →再压缩循环烧钱；预算尽或 LLM 不可用 → φ 截断兜底。
         var deep_compacts: u8 = 0;
+        // T4.1 摘要熔断：回合开始衰减 cooldown（连败 3 次熔断后按
+        // 1→2→4→8 回合退避，期间梯子直落 φ，退尽后半开重试一次）。
+        turn_history.summaryBreakerTurnTick();
         var result_blocks = std.ArrayList(llm.ContentBlock).empty;
         defer result_blocks.deinit(allocator);
         // One emergency compaction per turn on ContextOverflow — a second
@@ -1222,7 +1316,8 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 const prov_ok = switcher.getProvider() catch null;
                 const deep_ok = switcher.settings.auto_deep_compact and prov_ok != null and
                     llm.provider.capabilityTier(switcher.modelName(), switcher.backend) == .full and
-                    deep_compacts < 2 and history.items.len > 8;
+                    deep_compacts < 2 and history.items.len > 8 and
+                    !turn_history.summaryBreakerOpen();
 
                 if (level != .ok) {
                     if (deep_ok and level == .extract) {
@@ -1829,14 +1924,19 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // their declaration above); set by the UI loop (Esc) or the
                 // worker-failure path below. Tool results are still appended
                 // to history so every tool_use id keeps a tool_result.
-                // Interactive tools (AskUserQuestion) read stdin COOKED on
-                // the calling thread — running them inside the worker would
-                // race the UI loop for fd 0. Any batch containing one runs
+                // Interactive tools (AskUserQuestion, plan_approve — 复审
+                // 🔴1) read stdin COOKED on the calling thread — running
+                // them inside the worker would race the UI loop for fd 0
+                // (pollInput/editorLiveKey 与工具体里的 streamDelimiter
+                // 两个读者抢同一个 Reader)。Any batch containing one runs
                 // synchronously (the pre-P4 shape; the y/N permission gate
-                // already behaves this way).
+                // already behaves this way). 凭 ToolDefinition.is_interactive
+                // 判定——名字硬编码漏过 plan_approve 正是 🔴1 的事故形态。
                 var has_interactive = false;
                 for (prepared.items) |p| {
-                    if (std.mem.eql(u8, p.call.tool_name, "AskUserQuestion")) has_interactive = true;
+                    if (reg.findByName(p.call.tool_name)) |pdef| {
+                        if (pdef.is_interactive) has_interactive = true;
+                    }
                 }
                 // Fresh cancel slot per batch — a stale `true` from a
                 // previous Esc would silently no-op every tool in this one.
@@ -1992,6 +2092,17 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             // while the model was generating enter the conversation HERE —
             // the next iteration's request includes them, so supplements
             // land one tool-round later without interrupting anything.
+            // T1.2 工具轮间续投：回合进行中完成的 bg 任务通知在同一位置
+            // 并入（比等下一次用户发话更即时；同为 user 消息形态）。
+            if (attachment.drainAndRender(allocator, ow)) |reminder| {
+                const rb = try allocator.alloc(llm.ContentBlock, 1);
+                rb[0] = .{ .text = reminder };
+                try history.append(allocator, .{
+                    .role = .user,
+                    .content = rb,
+                    .timestamp = util_time.nowMillis(),
+                });
+            }
             while (lineinput.queuedTake()) |qm| {
                 const q = try allocator.dupe(u8, qm); // slot shifts on next take
                 const qb = try allocator.alloc(llm.ContentBlock, 1);
@@ -2018,6 +2129,9 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
             try std.Io.File.Writer.flush(&file_writer);
         }
 
+        // T5.2：正常完成（region 存活到 teardown）才问 Stop——中断路径
+        // （Esc/传输错误已提前撤 region）用户已显式叫停，不问续跑。
+        const turn_completed_normally = lineinput.regionUp();
         // Turn over: the live region comes down HERE — one teardown for
         // every exit path (completion, error break, Esc). Paths that
         // already ended it before their own message printing arrive with
@@ -2061,6 +2175,26 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 try std.Io.Writer.writeAll(w, "\n");
             }
             try std.Io.File.Writer.flush(&file_writer);
+        }
+
+        // T5.2 Stop 钩子：回合收尾（全退出路径汇聚于此）。exit 2 = 阻止
+        // 收工——把续跑指令塞进 auto_submit，下一轮立即自动发送；连续
+        // 续跑上限 2（防钩子配置错误死循环），用户真实输入重置计数。
+        // 仅正常完成且有实际生成的回合触发；若用户在回合尾排队了输入
+        // （下方 queued 幸存者并槽会占用/覆盖 auto_submit），用户输入优
+        // 先于续跑指令——这是声明语义，静默丢弃续跑。
+        if (turn_completed_normally and turn_in + turn_out > 0 and hooks_mod.stopHook(allocator, io)) {
+            if (stop_hook_continues < 2) {
+                if (auto_submit == null) {
+                    auto_submit = allocator.dupe(u8, "[stop-hook] 上一个回合被 Stop 钩子叫停收工；请检查结果完整性与未竟事项，必要时继续完成") catch null;
+                    if (auto_submit != null) {
+                        stop_hook_continues += 1;
+                        std.Io.Writer.print(ow, "\x1b[2m  [Stop hook 阻止收工 — 自动续跑（{d}/2）]\x1b[0m\n", .{stop_hook_continues}) catch {};
+                    }
+                }
+            } else {
+                std.Io.Writer.print(ow, "\x1b[2m  [Stop hook 仍要求续跑 — 已达连续上限 2，交还控制权]\x1b[0m\n", .{}) catch {};
+            }
         }
 
         // ③ Turn telemetry: persist the decision trace (per-step
@@ -2153,6 +2287,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 joined.appendSlice(allocator, qm) catch break;
             }
             if (joined.items.len > 0) {
+                // 复审 🟡3：槽位可能还持有 Stop 续跑指令或 wakeup prompt
+                //（本回合尾静默段 drainDue 填入）——用户输入优先覆盖它们
+                // 是声明语义，但覆盖必须先释放，否则每次撞车漏一块。
+                if (auto_submit) |stale| allocator.free(stale);
                 auto_submit = joined.toOwnedSlice(allocator) catch blk: {
                     joined.deinit(allocator);
                     break :blk null;

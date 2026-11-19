@@ -368,7 +368,12 @@ pub fn bridgeSessionTools(
         tc.* = .{ .session = session, .tool_name = try session.allocator.dupe(u8, tool_name) };
         try session.trampolines.append(session.allocator, tc);
 
-        try reg.registerDynamic(full, meta.description, meta.schema, trampoline, tc, meta.read_only);
+        // 复审 🔴2（2026-11-19）：read_only 恒传 false。readOnlyHint 是
+        // 服务器自宣（上方注释：Unverified claim）——若采信，default 模式
+        // Step 2a 会按 isReadOnly 直接放行，绕过 ask 门（"MCP tools are
+        // unauditable → the permission gate asks" 的既有态势被静默翻成
+        // fail-open）。并发标志仍取 hint：并行安全与授权宽窄是两回事。
+        try reg.registerDynamic(full, meta.description, meta.schema, trampoline, tc, meta.read_only, false);
     }
 }
 

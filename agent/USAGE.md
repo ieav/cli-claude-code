@@ -549,13 +549,23 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 - **不安全工具串行执行**（Bash、FileWrite、FileEdit 等）
 - **auto 模式分类器缓存**：LLM 安全判定按 (工具+入参) 进程内缓存，重复 ask 级操作零额外请求
 
+**v0.9.4 工具面增量**：
+- `ScheduleWakeup`（模型工具）——自定时唤醒：`{delay_seconds: 60-3600, prompt}`，到点以 prompt 自动续跑（轮询 CI/部署/长构建的替代）。会话级不落盘；一次一个（新调用覆盖）。**空闲提示符期最长等到下一次终端活动（任意键）才触发**——readLine 阻塞的架构约束
+- `plan_approve`（模型工具，仅 plan 模式）——计划呈批三选一：批准 → 自动切出 plan 模式（落盘）立即可执行；继续完善 / 放弃 → 决议回传
+- **ask 门「总是允许」**：权限确认 `[y/N/a]` 答 `a` → 合成最窄 allow 规则（Bash 取前两词+`*`，如 `git push*`；文件工具取精确路径）**合并追加**进 user 层 settings.json 的 allow_rules（与手写规则共存去重；上限 200 条；链式命令其余段不被覆盖——fail-closed 不变）
+- **@文件引用**（输入前缀）：消息里 `@path` / `@path:10` / `@path:10-50` → 文件内容（≤200 行/16 KiB 截断）随行注入为 `<system-reminder>` 帧；读不动的文件标注跳过。与后台任务完成通知同一随行通道——**通知类注入不触发自主回合**
+- **后台任务完成通知**：`run_in_background` 的命令结束后，完成摘要（含退出码与日志路径）随下一次查询自动注入——模型不再轮询 BgTask status
+
 **M6 Hooks**（v0.9.0）——工具调用前后的外部脚本钩子，三个执行口全走（REPL 回合 / 子代理 / /run 直达），顺序恒定：**权限判定 → PreToolUse → 执行 → PostToolUse**：
 
 ```json
 // settings.json
 "hooks": {
   "PreToolUse":  [{"matcher": "Bash",     "command": "./guard.sh"}],
-  "PostToolUse": [{"matcher": "FileEdit", "command": "make lint"}]
+  "PostToolUse": [{"matcher": "FileEdit", "command": "make lint"}],
+  "Stop":        [{"command": "./check_done.sh"}],
+  "PreCompact":  [{"command": "./snapshot.sh"}],
+  "SessionStart":[{"command": "./boot_notice.sh"}]
 }
 ```
 
@@ -564,6 +574,7 @@ comptime 泛型注册，零运行时开销。每个工具支持并发安全检�
 - stdin 喂 JSON：`{"tool": 名, "input": 原参数}`（Post 另带 `"output"`；载荷超 32K 截尾标记）
 - **PreToolUse 退出码**：0 = 放行；**2 = 阻断**（stderr 摘要回给模型，可改道重试）；其他非零 = 非阻断记日志
 - PostToolUse 退出码忽略（钩子不许破坏回合）
+- **生命周期事件（v0.9.4）**：`Stop`（回合收尾；**exit 2 = 阻止收工**——续跑指令自动发送，连续上限 2 次防死循环，用户真实输入重置计数）、`PreCompact`（压缩前，best-effort）、`SessionStart`（启动完成后，best-effort）。生命周期事件无工具名可匹配，`matcher` 留空；payload 的 `"tool"` 字段填事件名（`"Stop"`/`"PreCompact"`/`"SessionStart"`），`"input"`/`"output"` 为 null——钩子脚本可用统一 schema 解析
 
 ### 5.5 权限系统
 

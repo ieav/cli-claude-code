@@ -187,6 +187,75 @@ fn allowRulesMatch(rules: []const PermissionRule, tool: anytype, input: std.json
     return false;
 }
 
+/// T2.2 always-allow 规则合成（2026-11-19）：ask 门选「a」时从工具入参
+/// 提取最窄可复用 pattern。保守原则——
+///   · command 类（Bash）：首个链段的前两个 token + `*`
+///     （`git push origin main` → `git push*`）。allow 是全段 glob：链式
+///     命令的其余段不被该 pattern 覆盖 → 仍会询问（fail-closed 不变）。
+///   · path 类（文件工具）：原值精确匹配（无通配 = 只放行这个文件）。
+///   · 无 command/path 字段：不合成（调用方退化为一次性放行）。
+/// 返回的字符串分配在 alloc 上，调用方随 settings 生命周期持有。
+pub fn synthesizeAllowRule(alloc: std.mem.Allocator, tool_name: []const u8, input: std.json.Value) ?PermissionRule {
+    if (input != .object) return null;
+    if (registry.getStringField(input, "command")) |cmd| {
+        if (cmd.len == 0) return null;
+        const seg = firstChainSegment(cmd);
+        // 复审加固（2026-11-19）：两类「盲切出过宽规则」不合成——
+        // ① 首段含引号：分隔符在引号内会被切开（`sh -c 'a && b'` 切出
+        //   `sh -c` → `sh -c*` = 永久放行任意 sh 命令，fail-open）；
+        // ② 首 token 是解释器/提权器：`sh -c git push`（无引号形态）
+        //   同样合成 `sh -c*`，其后任意载荷全部命中。
+        // 两者都退化为一次性放行（用户本次明确允许的只是这一条命令）。
+        if (std.mem.indexOfAny(u8, seg, "\"'`") != null) return null;
+        var tit = std.mem.tokenizeAny(u8, seg, " \t");
+        if (tit.next()) |t1| {
+            if (interpreterToken(t1)) return null;
+        }
+        var it = std.mem.tokenizeAny(u8, seg, " \t");
+        const t1 = it.next() orelse return null;
+        const pat = if (it.next()) |t2|
+            alloc.print("{s} {s}*", .{ t1, t2 }) catch return null
+        else
+            alloc.print("{s}*", .{t1}) catch return null;
+        return .{
+            .source = .local_settings,
+            .behavior = .allow,
+            .tool_name = alloc.dupe(u8, tool_name) catch return null,
+            .content_pattern = pat,
+        };
+    }
+    if (registry.getStringField(input, "path")) |p| {
+        if (p.len == 0) return null;
+        return .{
+            .source = .local_settings,
+            .behavior = .allow,
+            .tool_name = alloc.dupe(u8, tool_name) catch return null,
+            .content_pattern = alloc.dupe(u8, p) catch return null,
+        };
+    }
+    return null;
+}
+
+/// 解释器/提权器 token：它们的首两词后跟任意载荷，`X -c*` 形态的
+/// allow 规则等于放行该解释器的全部调用。
+fn interpreterToken(t: []const u8) bool {
+    const hosts = [_][]const u8{ "sh", "bash", "zsh", "dash", "ksh", "env", "ssh", "sudo", "xargs", "osascript", "pwsh", "powershell", "nohup", "exec" };
+    for (hosts) |h| {
+        if (std.ascii.eqlIgnoreCase(t, h)) return true;
+    }
+    return false;
+}
+
+/// 链式命令取首段（与 inputMatchesPatternAny 的分段符一致子集）。
+fn firstChainSegment(cmd: []const u8) []const u8 {
+    var seg = cmd;
+    const seps = [_][]const u8{ "&&", "||", ";", "|", "&" };
+    for (seps) |s| {
+        if (std.mem.indexOf(u8, seg, s)) |i| seg = seg[0..i];
+    }
+    return seg;
+}
+
 /// Pattern match for deny/ask rules: the whole operative field, or — for
 /// shell commands — ANY single segment of a chained command. Chaining used
 /// to smuggle "cd x && git push --force" past a deny on "git push*".
@@ -544,4 +613,74 @@ test "protected-path guard: writes-only, and never in bypass (2026-11-09 修订)
     try w.put(std.testing.allocator, "path", .{ .string = "/repo/.git/config" });
     try std.testing.expect(checkToolPermission(&registry.file_write_tool, .{ .object = w }, &d_ctx) == .ask);
     try std.testing.expect(checkToolPermission(&registry.file_read_tool, .{ .object = w }, &d_ctx) == .allow);
+}
+
+test "T2.2 synthesizeAllowRule: conservative pattern extraction" {
+    const alloc = std.testing.allocator;
+
+    // Bash 双 token：`git push origin main` → `git push*`
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const two = parseInputForTest(a, "{\"command\":\"git push origin main\"}");
+    if (synthesizeAllowRule(alloc, "Bash", two)) |r| {
+        defer {
+            alloc.free(r.tool_name);
+            alloc.free(r.content_pattern.?);
+        }
+        try std.testing.expectEqualStrings("Bash", r.tool_name);
+        try std.testing.expectEqualStrings("git push*", r.content_pattern.?);
+        try std.testing.expect(r.behavior == .allow);
+        try std.testing.expect(r.source == .local_settings);
+    } else return error.NoRule;
+
+    // 单 token：`make` → `make*`
+    const one = parseInputForTest(a, "{\"command\":\"make\"}");
+    if (synthesizeAllowRule(alloc, "Bash", one)) |r| {
+        defer {
+            alloc.free(r.tool_name);
+            alloc.free(r.content_pattern.?);
+        }
+        try std.testing.expectEqualStrings("make*", r.content_pattern.?);
+    } else return error.NoRule;
+
+    // 链式：只取首段（`git push && rm -rf /` → `git push*`，其余段不被
+    // 覆盖 → 链式命令仍会询问）
+    const chain = parseInputForTest(a, "{\"command\":\"git push && rm -rf /\"}");
+    if (synthesizeAllowRule(alloc, "Bash", chain)) |r| {
+        defer {
+            alloc.free(r.tool_name);
+            alloc.free(r.content_pattern.?);
+        }
+        try std.testing.expectEqualStrings("git push*", r.content_pattern.?);
+    } else return error.NoRule;
+
+    // path：精确原值（无通配 = 只放行这个文件）
+    const path_in = parseInputForTest(a, "{\"path\":\"/tmp/notes/a.txt\"}");
+    if (synthesizeAllowRule(alloc, "FileWrite", path_in)) |r| {
+        defer {
+            alloc.free(r.tool_name);
+            alloc.free(r.content_pattern.?);
+        }
+        try std.testing.expectEqualStrings("/tmp/notes/a.txt", r.content_pattern.?);
+    } else return error.NoRule;
+
+    // 复审：引号链与解释器首 token 不合成（过宽防线）
+    const quoted = parseInputForTest(a, "{\"command\":\"sh -c 'git push && evil'\"}");
+    try std.testing.expect(synthesizeAllowRule(alloc, "Bash", quoted) == null);
+    const interp = parseInputForTest(a, "{\"command\":\"bash -c git push\"}");
+    try std.testing.expect(synthesizeAllowRule(alloc, "Bash", interp) == null);
+
+    // 无 command/path：不合成
+    const bare = parseInputForTest(a, "{\"query\":\"hello\"}");
+    try std.testing.expect(synthesizeAllowRule(alloc, "WebSearch", bare) == null);
+    // 空串也不合成
+    const empty_cmd = parseInputForTest(a, "{\"command\":\"\"}");
+    try std.testing.expect(synthesizeAllowRule(alloc, "Bash", empty_cmd) == null);
+}
+
+/// 测试缝：字符串 → std.json.Value（leaky 进 arena；调用方用
+/// ArenaAllocator 包 testing.allocator，deinit 时统一归还）。
+fn parseInputForTest(arena_alloc: std.mem.Allocator, s: []const u8) std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, s, .{}) catch unreachable;
 }
