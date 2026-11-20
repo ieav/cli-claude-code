@@ -607,11 +607,43 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
 
     buf.appendSlice(allocator, "}\n") catch {};
 
-    // Write file
+    // Write file（F2 原子落盘——见 writeFileAtomic 注释）
+    writeFileAtomic(io, path, buf.items, allocator) catch |err| return err;
+}
+
+/// F2（2026-11-20 RCA）：settings.json 原子落盘——写同目录临时文件 +
+/// rename 替换。直接 truncate+整写期间，并发读者（另一 ziv 实例热重
+/// 载、本进程指纹扫描）会读到半截 JSON，而加载侧 `parse catch return`
+/// 静默丢弃整层配置（API key/权限模式/钩子全回默认）。rename 在同文
+/// 件系统上原子：读者看到的要么全旧要么全新。写败/rename 失败原样上
+/// 抛，残留 .tmp 尽力清理。临时文件显式 0600（rename 后即最终权限，
+/// API key 不落 0644）。
+fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8, alloc: std.mem.Allocator) !void {
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp);
     std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{
-        .sub_path = path,
-        .data = buf.items,
-    }) catch |err| return err;
+        .sub_path = tmp,
+        .data = data,
+        // 审查补丁（2026-11-20）：rename 替换后文件权限取 .tmp 的创建
+        // 默认（0o666 & ~umask ≈ 0644）——settings.json 含 API key，
+        // 0644 在多用户机器上是泄露面（dist 有 linux/windows 产物）。
+        // 显式 0600：仅属主读写，对既有文件也是收紧方向、从不放松。
+        // Windows 分支 Permissions 是文件属性位枚举，保持默认。
+        .flags = .{
+            .permissions = if (@import("builtin").os.tag == .windows)
+                .default_file
+            else
+                @enumFromInt(0o600),
+        },
+    }) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return err;
+    };
+    const cwd = std.Io.Dir.cwd();
+    cwd.rename(tmp, cwd, path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return err;
+    };
 }
 
 /// T2.2 学到的 allow 规则上限（2026-11-19）：防「a」无界膨胀。
@@ -724,7 +756,7 @@ pub fn appendAllowRuleAtPath(
     if (std.fs.path.dirname(path)) |dir| {
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     }
-    try std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = path, .data = aw.writer.buffered() });
+    try writeFileAtomic(io, path, aw.writer.buffered(), allocator);
 }
 
 /// 「Tool(pattern)」规则串与 (tool, pattern) 分量的等值比较（幂等去重用）。
@@ -930,6 +962,32 @@ test "T2.2 appendAllowRuleAtPath: merge, idempotency, foreign keys, bad-file gua
     try std.testing.expectError(error.StreamTooLong, appendAllowRuleAtPath(alloc, io, path, "Bash", "ls*"));
     const stat4 = try std.Io.Dir.cwd().statFile(io, path, .{});
     try std.testing.expectEqual(@as(u64, 256 * 1024 + 1), stat4.size);
+}
+
+test "F2 writeFileAtomic: replace takes effect, no .tmp residue" {
+    const alloc = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(alloc, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const path = ".zig-cache/f2-atomic.json";
+    const tmp = ".zig-cache/f2-atomic.json.tmp";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    std.Io.Dir.writeFile(std.Io.Dir.cwd(), io, .{ .sub_path = path, .data = "{\"old\":true}" }) catch return error.TestSetup;
+    try writeFileAtomic(io, path, "{\"new\":1}", alloc);
+
+    const after = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, .limited(1024));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings("{\"new\":1}", after);
+    // rename 后临时文件不残留
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, tmp, .{}));
+    // 审查补丁断言：替换后权限为 0600（API key 不落 0644；POSIX only）
+    if (@import("builtin").os.tag != .windows) {
+        const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), @intFromEnum(st.permissions) & 0o777);
+    }
 }
 
 test "T5.1 lifecycle hooks round-trip: Stop/PreCompact/SessionStart survive save" {
