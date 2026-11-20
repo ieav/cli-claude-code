@@ -712,7 +712,25 @@ pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
             return .handled;
         } else if (std.mem.startsWith(u8, input, "/model ")) {
             // Switch model: /model <name>
-            const new_model = input[7..];
+            const new_model = std.mem.trim(u8, input[7..], " \t");
+            // 入口校验（2026-11-20 用户双事故：/model --help 把选项当
+            // 模型名切了（提示符直接显示 "--help"）；/model plan（想打
+            // /mode plan）切到无效名，此后所有请求 404，用户感知为
+            // "模型不响应"却无从归因）。flag/空白/超长直接拒；未知名
+            // 不拦只警示——网关自定义名（glm-5.3 等）不在内置表，拦了
+            // 就没法用，警示行 + 提示符即可见。
+            if (modelArgProblem(new_model)) |problem| {
+                switch (problem) {
+                    .flag => try std.Io.Writer.print(ctx.w, "  未知选项：{s}\n  用法：/model <模型名>；交互菜单：/model\n\n", .{new_model}),
+                    .too_long => try std.Io.Writer.print(ctx.w, "  模型名过长（>{d} 字符）：{s}…\n\n", .{ @as(usize, 63), new_model[0..12] }),
+                    else => try std.Io.Writer.writeAll(ctx.w, "  用法：/model <模型名>；交互菜单：/model\n\n"),
+                }
+                try std.Io.File.Writer.flush(ctx.file_writer);
+                return .handled;
+            }
+            if (llm.findKnownModel(new_model) == null and !std.mem.eql(u8, new_model, ctx.switcher.modelName())) {
+                try std.Io.Writer.print(ctx.w, "  \x1b[2m⚠ '{s}' 不在内置模型表——网关自定义名请继续；若打错了，菜单重选：/model\x1b[0m\n", .{new_model});
+            }
             ctx.switcher.switchModel(new_model) catch |err| {
                 if (err == error.MissingApiKey) {
                     // Report the backend that VALIDATED the key
@@ -1402,3 +1420,37 @@ fn truncFor(s: []const u8, max: usize) []const u8 {
     return s[0 .. max - 1];
 }
 
+
+// ── /model 参数校验（2026-11-20 双事故）─────────────────────────────
+
+pub const ModelArgProblem = enum { blank, flag, has_space, too_long };
+
+/// `/model <name>` 的静态校验：flag 形态（--help/-h）、空白垃圾、超长
+/// （model_name_buf 64 字节，switchModel 的 @min 截断会静默改名）全部
+/// 拒绝在 switchModel 之前。名字是否"存在"不在此判——网关自定义名合法，
+/// 由调用方给警示行。
+pub fn modelArgProblem(name: []const u8) ?ModelArgProblem {
+    if (name.len == 0) return .blank;
+    if (name[0] == '-') return .flag;
+    if (std.mem.indexOfAny(u8, name, " \t") != null) return .has_space;
+    if (name.len > 63) return .too_long;
+    return null;
+}
+
+test "modelArgProblem: flags, blank, spaces, oversize rejected; real names pass" {
+    // 2026-11-20 事故形态
+    try std.testing.expect(modelArgProblem("--help") == .flag);
+    try std.testing.expect(modelArgProblem("-h") == .flag);
+    try std.testing.expect(modelArgProblem("") == .blank);
+    try std.testing.expect(modelArgProblem("gpt 4o") == .has_space);
+    var xs64: [64]u8 = undefined;
+    @memset(&xs64, 'x');
+    var xs63: [63]u8 = undefined;
+    @memset(&xs63, 'x');
+    try std.testing.expect(modelArgProblem(&xs64) == .too_long);
+    // 真实名（含网关自定义形态）不受影响
+    try std.testing.expect(modelArgProblem("gpt-4o") == null);
+    try std.testing.expect(modelArgProblem("glm-5.3") == null);
+    try std.testing.expect(modelArgProblem("deepseek-v3") == null);
+    try std.testing.expect(modelArgProblem(&xs63) == null);
+}

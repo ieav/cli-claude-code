@@ -1537,7 +1537,10 @@ pub fn run(io: std.Io, stdin_file: std.Io.File, stdout_file: std.Io.File) !void 
                 // the user (Esc retract / ↑ rewind-on-recall, both armed
                 // via rewind_pending below).
                 lineinput.rewind_pending = true;
-                try std.Io.Writer.print(ow, "  \x1b[31m[API Error: {s}]\x1b[0m\n", .{@errorName(err)});
+                // 2026-11-20：带上当前模型名——/model 切到无效名（plan/
+                // --help 类事故）后请求全 404，用户感知"模型不响应"却
+                // 无从归因；名字就在错误行里，一眼挂钩。
+                try std.Io.Writer.print(ow, "  \x1b[31m[API Error: {s} — 当前模型: {s} ({s})]\x1b[0m\n", .{ @errorName(err), switcher.modelName(), switcher.backendLabel() });
                 if (err == error.ContextOverflow) {
                     try std.Io.Writer.print(ow, "  [Still too long after compaction — try /compact phi or /clear]\n", .{});
                 }
