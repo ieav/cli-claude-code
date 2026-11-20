@@ -81,6 +81,9 @@ pub fn renderRefs(alloc: std.mem.Allocator, io: std.Io, input_text: []const u8) 
             // 该改行域（@path:1-100）而不是放弃这个文件。
             if (err == error.FileTooLarge) {
                 w.print("<file {s}: 文件过大（≥{d} KiB 读取上限），已跳过——可指定行域重试，如 @{s}:1-100>\n", .{ r.path, 4 * MAX_BYTES / 1024, r.path }) catch return null;
+            } else if (err == error.NotRegularFile) {
+                // F1：管道/设备/目录不 open——open/read 可无限阻塞。
+                w.print("<file {s}: 非常规文件（管道/设备/目录），@ 引用不支持，已跳过>\n", .{r.path}) catch return null;
             } else {
                 w.print("<file {s}: 读取失败，已跳过>\n", .{r.path}) catch return null;
             }
@@ -91,6 +94,12 @@ pub fn renderRefs(alloc: std.mem.Allocator, io: std.Io, input_text: []const u8) 
 }
 
 fn renderOne(alloc: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, r: AtRef) !void {
+    // F1（2026-11-20 RCA）：stat 先行——FIFO 无写者时 openFile 阻塞等写
+    // 端、字符设备（/dev/stdin 等）read 等输入，主线程假死在消息派发
+    // 前。非常规文件一律不 open，标注跳过。symlink 经 statFile 跟随后
+    // 按目标判（指向管道的链接同样拦下）。
+    const st = try std.Io.Dir.cwd().statFile(io, r.path, .{});
+    if (st.kind != .file) return error.NotRegularFile;
     const text = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, r.path, alloc, .limited(4 * MAX_BYTES)) catch |read_err| {
         // StreamTooLong 单列（.limited 语义：达到/超过上限即抛）——
         // 上层据此标注「文件过大」而非误导性的「读取失败」。
@@ -183,4 +192,14 @@ test "T7.1 renderRefs: missing file degrades to note, no refs → null" {
     defer alloc.free(frame2);
     try std.testing.expect(std.mem.indexOf(u8, frame2, "文件过大") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame2, "读取失败") == null);
+
+    // F1：非常规文件（字符设备/FIFO/目录）stat 先行拦截，不 open——
+    // open/read 会无限阻塞。/dev/null 是现成的 character_device。
+    const frame3 = renderRefs(alloc, io, "see @/dev/null") orelse return error.NoFrame;
+    defer alloc.free(frame3);
+    try std.testing.expect(std.mem.indexOf(u8, frame3, "非常规文件") != null);
+    // 目录同样拦下（不依赖 openFile 的 IsDir 错误路径）
+    const frame4 = renderRefs(alloc, io, "see @/tmp") orelse return error.NoFrame;
+    defer alloc.free(frame4);
+    try std.testing.expect(std.mem.indexOf(u8, frame4, "非常规文件") != null);
 }
