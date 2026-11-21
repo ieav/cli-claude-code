@@ -1377,6 +1377,103 @@ def s24_slash_popup():
         z.close()
 
 
+def s25_mode_model_args():
+    """2026-11-21 RCA 修复回归:/mode <名> 直切(plan 直进、非法名列值)、
+    /model --help 拒、/model 未知名黄字警示后仍切、/mode default 切回。
+    纯命令层——零网关。"""
+    z = ZivSession()
+    try:
+        z.wait_prompt()
+        z.send("/mode plan\r")
+        out = z.read_until("Permission mode: Plan (read-only)", 10)
+        if "已保存" not in out:
+            raise Fail("plan 直切未落盘提示")
+        z.send("/mode yolo\r")
+        out = z.read_until("未知模式", 10)
+        if "default | plan | auto" not in out:
+            raise Fail("非法模式未列出合法值")
+        z.send("/model --help\r")
+        z.read_until("未知选项", 10)
+        z.send("/model zzz-custom\r")
+        out = z.read_until("不在内置模型表", 10)
+        z.read_until("Switched to zzz-custom", 10)
+        z.send("/mode default\r")
+        z.read_until("Permission mode: Default", 10)
+        return "plan/yolo/--help/zzz-custom/default 全过"
+    finally:
+        quit_and_wait(z)
+
+
+def s26_plan_approve_rounds():
+    """plan_approve 审批四轮(is_interactive 同步批路由的端到端锁定):
+    按 1=PLAN_APPROVED 且切出 plan、2=PLAN_REFINE、3=PLAN_REJECTED、
+    Esc=取消留 plan。mock 网关第 1 响应 tool_use(plan_approve),
+    第 2 响应纯文本收束。"""
+    import threading, http.server, json as _json, tempfile
+
+    def make_gateway(req_log):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get('Content-Length', 0))
+                body = _json.loads(self.rfile.read(n)) if n else {}
+                req_log.append(body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                if len(req_log) == 1:
+                    args = _json.dumps({"summary": "S26 测试计划:三步走"})
+                    chunks = [
+                        {"tool_calls": [{"index": 0, "id": "call_s26", "type": "function",
+                                         "function": {"name": "plan_approve", "arguments": args}}]},
+                        {},
+                    ]
+                    fin = "tool_calls"
+                else:
+                    chunks = [{"content": "ok-done"}]
+                    fin = "stop"
+                for c in chunks:
+                    self.wfile.write(f"data: {_json.dumps({'choices': [{'index': 0, 'delta': c}]})}\n\n".encode())
+                self.wfile.write(f"data: {_json.dumps({'choices': [{'index': 0, 'delta': {}, 'finish_reason': fin}], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2}})}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def round(key, expect, name):
+        reqs = []
+        srv = make_gateway(reqs)
+        d = tempfile.mkdtemp(prefix="ziv-s26-")
+        z = ZivSession(reuse_dir=d, settings=_json.dumps({
+            "permission_mode": "plan",
+            "api_keys": {"openai": "sk-mock", "openai_base_url": f"http://127.0.0.1:{srv.server_address[1]}/v1"}}))
+        try:
+            z.wait_prompt()
+            z.send("做个计划\r")
+            z.read_until("批准以下计划", 30)
+            z.send(key)
+            z.read_until(expect, 30)
+            z.read_until("完成", 60)
+            # Esc 轮的字节残留会把首个 /quit 拼成消息(35d344f 同类):
+            # 排空 + 双 Ctrl-C 清草稿再退。
+            z.drain(0.8)
+            z.send("\x03"); z.drain(0.3)
+            return len(reqs)
+        finally:
+            quit_and_wait(z)
+
+    n1 = round("1\r", "PLAN_APPROVED", "approve")
+    n2 = round("2\r", "PLAN_REFINE", "refine")
+    n3 = round("3\r", "PLAN_REJECTED", "reject")
+    # Esc 必须跟 Enter:cooked read 等 \n 终止,裸 Esc 只回显不结束读取
+    n4 = round("\x1b\r", "user cancelled", "esc")
+    if not all(n == 2 for n in (n1, n2, n3, n4)):
+        raise Fail(f"网关请求数异常(期望每轮 2):{n1},{n2},{n3},{n4}")
+    return "四轮 1/2/3/Esc 决议正确,每轮两请求收束"
+
+
 SCENARIOS = [
     ("S1 raw-session", s1_raw_session),
     ("S2 midturn-keys", s2_midturn_keys),
@@ -1402,6 +1499,8 @@ SCENARIOS = [
     ("S22 modal-exit", s22_modal_exit_canonical),
     ("S23 output-style", s23_output_style),
     ("S24 slash-popup", s24_slash_popup),
+    ("S25 mode/model args", s25_mode_model_args),
+    ("S26 plan_approve rounds", s26_plan_approve_rounds),
 ]
 
 
