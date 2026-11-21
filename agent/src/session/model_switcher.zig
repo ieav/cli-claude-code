@@ -16,13 +16,10 @@ pub const ModelSwitcher = struct {
     model_name_len: usize = 0,
     backend: llm.BackendType,
     io: std.Io,
-    /// 堆分配（2026-11-20 段错误修复）：std.http.Client 的连接池节点持
-    /// `client: *Client` 反向指针（std 0.17 Client.zig:230），TLS 连接的
-    /// destroy 经它读 allocator 与 free 长度字段——**按值存放/搬运
-    /// provider 会让这些反向指针悬垂**。曾用 `?llm.OpenAIProvider` 内联
-    /// 值 + `retired = .{ .openai = p }` 按值拷贝退役：第二次 /model 触发
-    /// freeRetired 时经陈旧反向指针读垃圾 allocator → 0x18 段错误。堆
-    /// 分配后 provider 地址终身不变，retire 只是零拷贝的指针转移。
+    /// 堆分配(2026-11-20 段错误修复):std.http.Client 连接池节点持
+    /// `client: *Client` 反向指针,destroy 经它读 allocator——按值拷贝
+    /// provider(退役曾 memcpy)即悬垂,第二次 /model 崩 0x18。堆地址
+    /// 终身不变,retire 只做零拷贝指针转移。
     openai_provider: ?*llm.OpenAIProvider = null,
     claude_provider: ?*llm.ClaudeProvider = null,
     ollama_provider: ?*llm.OllamaProvider = null,

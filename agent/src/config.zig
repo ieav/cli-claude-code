@@ -611,13 +611,10 @@ pub fn saveSettings(settings: *const Settings, allocator: std.mem.Allocator, io:
     writeFileAtomic(io, path, buf.items, allocator) catch |err| return err;
 }
 
-/// F2（2026-11-20 RCA）：settings.json 原子落盘——写同目录临时文件 +
-/// rename 替换。直接 truncate+整写期间，并发读者（另一 ziv 实例热重
-/// 载、本进程指纹扫描）会读到半截 JSON，而加载侧 `parse catch return`
-/// 静默丢弃整层配置（API key/权限模式/钩子全回默认）。rename 在同文
-/// 件系统上原子：读者看到的要么全旧要么全新。写败/rename 失败原样上
-/// 抛，残留 .tmp 尽力清理。临时文件显式 0600（rename 后即最终权限，
-/// API key 不落 0644）。
+/// settings.json 原子落盘(F2,2026-11-20):同目录 tmp + rename——
+/// truncate+整写期间并发读者(热重载/指纹扫描)会读到半截 JSON,加载
+/// 侧 `parse catch return` 静默丢整层。tmp 显式 0600(rename 后即最终
+/// 权限,API key 不落 0644)。
 fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8, alloc: std.mem.Allocator) !void {
     const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp);

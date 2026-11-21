@@ -217,12 +217,9 @@ fn runInner(cfg: SubagentConfig) !SubagentResult {
             .cancel_flag = cfg.cancel,
         }) catch |e| {
             if (e == error.EscCancelled) {
-                // #9（2026-11-21）语义加固：只有 cancel 标志【真的置位】才
-                // 是用户取消——provider 端 EscCancelled 仅由 cancel_flag
-                // 触发，若标志未置而错误仍来（映射边界），伪装成
-                // "(canceled by user)" 的正常结果会让 dispatch 的 merge
-                // 输出既无失败标注也无中断标注（stall e2e 断言间歇失败
-                // 的头号嫌疑形态）。按普通失败上抛。
+                // 只有 cancel 标志真置位才是用户取消;标志未置的错误按
+                // 普通失败上抛——伪装成 "(canceled by user)" 正常结果会让
+                // merge 输出既无失败标注也无中断标注(#9)。
                 const user_canceled = if (cfg.cancel) |cf| cf.load(.acquire) else false;
                 if (user_canceled) {
                     return .{ .summary = try alloc.dupe(u8, "(canceled by user)"), .turns_used = turn + 1, .tool_calls = tool_calls, .tokens_in = tokens_in, .tokens_out = tokens_out };

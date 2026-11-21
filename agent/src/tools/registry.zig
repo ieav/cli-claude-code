@@ -91,11 +91,9 @@ pub const ToolDefinition = struct {
     execute_ctx: ?*anyopaque = null,
     is_read_only: bool = true,
     is_destructive: bool = false,
-    /// 复审 🔴1（2026-11-19）：交互工具（AskUserQuestion / plan_approve）
-    /// 的 execute 会在工具体里 COOKED 读 stdin。REPL 的工具波次默认跑在
-    /// worker 线程（UI 循环留在主线程 pollInput）——交互批次必须凭本
-    /// 标志被识别为同步执行，否则两个线程抢同一个 stdin Reader：首键
-    /// 被 editorLiveKey 吃掉、答案撕裂。新增交互工具时置 true。
+    /// 交互工具(AskUserQuestion/plan_approve)的 execute 会 COOKED 读
+    /// stdin——工具波次默认跑 worker 线程,交互批次必须凭本标志走同步
+    /// 执行,否则与 UI 循环抢同一个 stdin Reader(🔴1,2026-11-19)。
     is_interactive: bool = false,
 
     // NEW: input-aware behavioral functions

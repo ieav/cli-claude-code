@@ -694,11 +694,8 @@ pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
         } else if (std.mem.startsWith(u8, input, "/mode ")) {
-            // /mode <name> 直切（2026-11-21 RCA 修复）：无参轮换要求
-            // "恰好停"（多按一次滑进 bypass——用户实测事故），自然写法
-            // /mode plan 此前落 Unknown command，把用户推向一字母之差
-            // 的 /model。名字解析走 auth.parseModeName（全名+连字符/
-            // 下划线等价+缩写）；非法名列出合法值，不猜。
+            // /mode <name> 直切(2026-11-21):无参轮换要求"恰好停",多
+            // 按一次滑进 bypass;名字解析见 auth.parseModeName。
             const arg = std.mem.trim(u8, input[6..], " \t");
             if (arg.len == 0) {
                 try std.Io.Writer.writeAll(ctx.w, "  用法：/mode <模式名>（无参轮换：/mode）\n  可选：default | plan | auto | accept_edits | dont_ask | bypass\n\n");
@@ -733,12 +730,9 @@ pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
         } else if (std.mem.startsWith(u8, input, "/model ")) {
             // Switch model: /model <name>
             const new_model = std.mem.trim(u8, input[7..], " \t");
-            // 入口校验（2026-11-20 用户双事故：/model --help 把选项当
-            // 模型名切了（提示符直接显示 "--help"）；/model plan（想打
-            // /mode plan）切到无效名，此后所有请求 404，用户感知为
-            // "模型不响应"却无从归因）。flag/空白/超长直接拒；未知名
-            // 不拦只警示——网关自定义名（glm-5.3 等）不在内置表，拦了
-            // 就没法用，警示行 + 提示符即可见。
+            // 入口校验(2026-11-20 双事故:/model --help、/model plan 都
+            // 被当模型名切过):flag/空白/超长直接拒;未知名只警示不拦
+            // ——网关自定义名不在内置表。
             if (modelArgProblem(new_model)) |problem| {
                 switch (problem) {
                     .flag => try std.Io.Writer.print(ctx.w, "  未知选项：{s}\n  用法：/model <模型名>；交互菜单：/model\n\n", .{new_model}),
