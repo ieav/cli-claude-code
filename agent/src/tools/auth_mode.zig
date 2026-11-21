@@ -40,6 +40,31 @@ pub fn modeLabel(mode: PermissionMode) []const u8 {
     };
 }
 
+/// `/mode <name>` 的名字解析（2026-11-21 RCA 修复）：/mode 曾只支持
+/// 无参轮换——想进指定模式只能"恰好停"，多按一次滑进 bypass（用户
+/// 实测提示符 ziv[bypass] 即此事故）；而自然写法 /mode plan 落
+/// Unknown command，把用户推向一字母之差的 /model。全名 + 下划线/
+/// 连字符等价 + 常用缩写；非法名返回 null 由调用方列合法值。
+pub fn parseModeName(name: []const u8) ?PermissionMode {
+    const Entry = struct { n: []const u8, m: PermissionMode };
+    const entries = [_]Entry{
+        .{ .n = "default", .m = .default },
+        .{ .n = "plan", .m = .plan },
+        .{ .n = "auto", .m = .auto },
+        .{ .n = "bypass", .m = .bypass },
+        .{ .n = "accept_edits", .m = .accept_edits },
+        .{ .n = "accept-edits", .m = .accept_edits },
+        .{ .n = "acceptedits", .m = .accept_edits },
+        .{ .n = "dont_ask", .m = .dont_ask },
+        .{ .n = "dont-ask", .m = .dont_ask },
+        .{ .n = "dontask", .m = .dont_ask },
+    };
+    for (entries) |e| {
+        if (std.ascii.eqlIgnoreCase(e.n, name)) return e.m;
+    }
+    return null;
+}
+
 /// Core permission pipeline — six-step check.
 /// Mirrors TS hasPermissionsToUseToolInner flow.
 pub fn checkToolPermission(
@@ -683,4 +708,23 @@ test "T2.2 synthesizeAllowRule: conservative pattern extraction" {
 /// ArenaAllocator 包 testing.allocator，deinit 时统一归还）。
 fn parseInputForTest(arena_alloc: std.mem.Allocator, s: []const u8) std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, s, .{}) catch unreachable;
+}
+
+test "parseModeName: full names, hyphen/slash variants, case-insensitive; junk rejected" {
+    const pm = @import("../tools/registry.zig").PermissionMode;
+    _ = pm;
+    try std.testing.expect(parseModeName("plan") == .plan);
+    try std.testing.expect(parseModeName("PLAN") == .plan);
+    try std.testing.expect(parseModeName("default") == .default);
+    try std.testing.expect(parseModeName("bypass") == .bypass);
+    try std.testing.expect(parseModeName("accept_edits") == .accept_edits);
+    try std.testing.expect(parseModeName("accept-edits") == .accept_edits);
+    try std.testing.expect(parseModeName("dont-ask") == .dont_ask);
+    try std.testing.expect(parseModeName("auto") == .auto);
+    // 2026-11-21 事故形态:/model plan 的 "plan" 在这里是合法模式名,
+    // 但 "plan mode"/"--help" 这类垃圾必须拒
+    try std.testing.expect(parseModeName("plan mode") == null);
+    try std.testing.expect(parseModeName("--help") == null);
+    try std.testing.expect(parseModeName("") == null);
+    try std.testing.expect(parseModeName("yolo") == null);
 }

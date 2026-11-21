@@ -693,6 +693,26 @@ pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
             allocator.free(result.output);
             try std.Io.File.Writer.flush(ctx.file_writer);
             return .handled;
+        } else if (std.mem.startsWith(u8, input, "/mode ")) {
+            // /mode <name> 直切（2026-11-21 RCA 修复）：无参轮换要求
+            // "恰好停"（多按一次滑进 bypass——用户实测事故），自然写法
+            // /mode plan 此前落 Unknown command，把用户推向一字母之差
+            // 的 /model。名字解析走 auth.parseModeName（全名+连字符/
+            // 下划线等价+缩写）；非法名列出合法值，不猜。
+            const arg = std.mem.trim(u8, input[6..], " \t");
+            if (arg.len == 0) {
+                try std.Io.Writer.writeAll(ctx.w, "  用法：/mode <模式名>（无参轮换：/mode）\n  可选：default | plan | auto | accept_edits | dont_ask | bypass\n\n");
+            } else if (auth.parseModeName(arg)) |m| {
+                ctx.current_mode.* = m;
+                ctx.switcher.settings.permission_mode = m;
+                config_mod.saveSettings(&ctx.switcher.settings, allocator, ctx.io) catch {};
+                repl_mod.settings_fp_baseline = config_mod.settingsFingerprint(allocator, ctx.io);
+                try std.Io.Writer.print(ctx.w, "  Permission mode: {s} (已保存)\n\n", .{auth.modeLabel(m)});
+            } else {
+                try std.Io.Writer.print(ctx.w, "  未知模式：{s}\n  可选：default | plan | auto | accept_edits | dont_ask | bypass\n\n", .{arg});
+            }
+            try std.Io.File.Writer.flush(ctx.file_writer);
+            return .handled;
         } else if (std.mem.eql(u8, input, "/mode")) {
             // Cycle permission mode
             ctx.current_mode.* = auth.nextMode(ctx.current_mode.*);
@@ -729,7 +749,10 @@ pub fn dispatchSlash(ctx: *ReplCtx, input_orig: []const u8) !DispatchOutcome {
                 return .handled;
             }
             if (llm.findKnownModel(new_model) == null and !std.mem.eql(u8, new_model, ctx.switcher.modelName())) {
-                try std.Io.Writer.print(ctx.w, "  \x1b[2m⚠ '{s}' 不在内置模型表——网关自定义名请继续；若打错了，菜单重选：/model\x1b[0m\n", .{new_model});
+                // 2026-11-21 RCA 升级：灰色小字实测会被忽略（用户切到
+                // 'plan' 后 404"不响应"无从归因）——黄字 + 后果写明。
+                // 仍放行：菜单"自定义…"项与这条路等价（网关自定义名合法）。
+                try std.Io.Writer.print(ctx.w, "  \x1b[33m⚠ '{s}' 不在内置模型表——网关自定义名请继续；切错名字后续请求会全部失败（权限模式请用 /mode <名>）\x1b[0m\n", .{new_model});
             }
             ctx.switcher.switchModel(new_model) catch |err| {
                 if (err == error.MissingApiKey) {
