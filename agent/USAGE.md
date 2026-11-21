@@ -223,7 +223,7 @@ tar xzf ziv-0.9.2-aarch64-macos.tar.gz && ./ziv-aarch64-macos
 | **模型 & 配置** | |
 | `/model`、`/models` | **交互式模型选择器**（方向键 + Enter；q 显示纯文本列表） |
 | `/model <name>` | 切换到指定模型（如 `claude-sonnet-4-6`、`gpt-4o`、`llama3.2`，自定义名如 `glm-4.6` 可选后端接入） |
-| `/mode` | 切换权限模式（**已持久化**到 settings，重启不再回落） |
+| `/mode [name]` | 权限模式切换（**已持久化**到 settings，重启不再回落）。v0.9.6 起支持带参直切：`/mode plan`、`/mode default`、`/mode auto`、`/mode accept_edits`、`/mode dont_ask`、`/mode bypass`（下划线/连字符等价、大小写不敏感；非法名列出合法值）；无参 `/mode` 仍为循环轮换 |
 | `/config` | 打开交互式配置菜单（中文，方向键导航，**改动自动保存**即时生效） |
 | **对话管理** | |
 | `/compact` | LLM 提炼压缩：摘要替换较早历史、**最近消息原样保留**（双侧保护）；可带自由文本引导重点——`/compact 重点保留数据库迁移的决策` |
@@ -299,7 +299,7 @@ ziv -p "..." || echo "回合失败"
 
 ### 权限模式 (Permission Modes)
 
-Ziv 内置 6 种授权执行模式，通过 `/mode` 命令循环切换（选择持久化；无快捷键）：
+Ziv 内置 6 种授权执行模式，通过 `/mode` 命令切换：带参直切（`/mode plan`，v0.9.6）或无参循环轮换（选择持久化；无快捷键）。**注意 `/mode`（权限）与 `/model`（LLM 模型）一字母之差、语义完全不同**——`/model <name>` 切的是对话模型，未知名会黄字警示后放行：
 
 | 模式 | 提示符 | 说明 |
 |------|--------|------|
