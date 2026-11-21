@@ -80,8 +80,7 @@ fn mockServe(server: *MockServer) void {
             continue;
         }
         _ = server.served.fetchAdd(1, .monotonic);
-        // #9 观测(仅 stall):连接时间线——三次连接的间隔可判归属
-        // (1.5s=watchdog 节奏 / 1s+1.5s=dispatch backoff+watchdog)。
+        // 连接时间线(#9 观测):间隔可判归属(1.5s=watchdog / 1s+1.5s=backoff)
         if (server.mode == .stall) {
             std.debug.print("[stall-mock] conn #{d} t={d}ms\n", .{ server.served.load(.monotonic), time_mod.nowMillis() });
         }
@@ -109,11 +108,22 @@ fn mockServe(server: *MockServer) void {
                 stream.close(io);
             },
             .stall => {
-                const t = std.Thread.spawn(.{}, stallParker, .{ server, stream }) catch {
-                    stream.close(io);
-                    continue;
-                };
-                t.detach();
+                // spawn 失败曾走 close → 客户端 reset → provider 死池重试
+                // 误触 → served=3 间歇失败(#9)。重试三次;仍败才 inline
+                // park 兜底(占住 accept,后续连接排队,日志留痕)。
+                var t: ?std.Thread = null;
+                var attempt: usize = 0;
+                while (attempt < 3) : (attempt += 1) {
+                    t = std.Thread.spawn(.{}, stallParker, .{ server, stream }) catch null;
+                    if (t != null) break;
+                    time_mod.sleepMs(10);
+                }
+                if (t) |th| {
+                    th.detach();
+                } else {
+                    std.debug.print("[stall-mock] parker spawn failed ×3 — parking inline(#9 根因路径,后续连接将排队)\n", .{});
+                    stallParker(server, stream);
+                }
             },
         }
     }
@@ -323,15 +333,14 @@ test "agent dispatch E2E stall: watchdog kills, retry fails, dispatch still retu
     // The dispatch RETURNS (this is the P38 regression lock): the job
     // failed, the fail-fast retry failed, the merge reports it — no hang.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "## 子任务 1") != null);
-    // 诊断加固(#9):间歇失败时把 merge 输出带出来——分支归属(失败
-    // 标注/仍在运行/canceled by user)一眼可辨,不再盲猜。
+    // 失败时带现场(#9):merge 输出与连接计数,不再盲猜。
     if (std.mem.indexOf(u8, result.output, "(子代理执行失败)") == null) {
         std.debug.print("\n[stall-e2e FAIL] merge output was:\n{s}\n", .{result.output});
         return error.TestUnexpectedResult;
     }
     try std.testing.expect(std.mem.indexOf(u8, result.output, "取消") == null); // not a cancel path
     // Two stalls: initial attempt + the one fail-fast retry (~1.5s each,
-    // plus the 1s backoff). Far under the 180s default watchdog.
+    // plus the 1s backoff).
     if (server.served.load(.monotonic) != 2) {
         std.debug.print("\n[stall-e2e FAIL] served={d} (expected 2), elapsed={d}ms\n", .{ server.served.load(.monotonic), elapsed });
         return error.TestUnexpectedResult;
