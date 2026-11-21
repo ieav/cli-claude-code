@@ -80,6 +80,11 @@ fn mockServe(server: *MockServer) void {
             continue;
         }
         _ = server.served.fetchAdd(1, .monotonic);
+        // #9 观测(仅 stall):连接时间线——三次连接的间隔可判归属
+        // (1.5s=watchdog 节奏 / 1s+1.5s=dispatch backoff+watchdog)。
+        if (server.mode == .stall) {
+            std.debug.print("[stall-mock] conn #{d} t={d}ms\n", .{ server.served.load(.monotonic), time_mod.nowMillis() });
+        }
         switch (server.mode) {
             .happy, .gate_yes, .gate_no => {
                 writeResponse(stream, io, server.mode);
@@ -318,11 +323,19 @@ test "agent dispatch E2E stall: watchdog kills, retry fails, dispatch still retu
     // The dispatch RETURNS (this is the P38 regression lock): the job
     // failed, the fail-fast retry failed, the merge reports it — no hang.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "## 子任务 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "(子代理执行失败)") != null);
+    // 诊断加固(#9):间歇失败时把 merge 输出带出来——分支归属(失败
+    // 标注/仍在运行/canceled by user)一眼可辨,不再盲猜。
+    if (std.mem.indexOf(u8, result.output, "(子代理执行失败)") == null) {
+        std.debug.print("\n[stall-e2e FAIL] merge output was:\n{s}\n", .{result.output});
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expect(std.mem.indexOf(u8, result.output, "取消") == null); // not a cancel path
     // Two stalls: initial attempt + the one fail-fast retry (~1.5s each,
     // plus the 1s backoff). Far under the 180s default watchdog.
-    try std.testing.expectEqual(@as(u32, 2), server.served.load(.monotonic));
+    if (server.served.load(.monotonic) != 2) {
+        std.debug.print("\n[stall-e2e FAIL] served={d} (expected 2), elapsed={d}ms\n", .{ server.served.load(.monotonic), elapsed });
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expect(elapsed < 30_000);
     alloc.free(result.output);
 }
